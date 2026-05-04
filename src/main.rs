@@ -1,19 +1,3 @@
-#![allow(dead_code)]
-
-mod agent;
-mod cli;
-mod config;
-mod hooks;
-mod llm;
-mod mcp;
-mod permission;
-mod prompt;
-mod repl;
-mod session;
-mod skills;
-mod slash;
-mod tools;
-
 use anyhow::Result;
 use clap::Parser;
 
@@ -27,6 +11,6 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = cli::Cli::parse();
-    cli::dispatch(args).await
+    let args = lodan::cli::Cli::parse();
+    lodan::cli::dispatch(args).await
 }

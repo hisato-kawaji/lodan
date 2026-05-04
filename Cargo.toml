@@ -5,6 +5,10 @@ edition = "2024"
 description = "Local-LLM coding agent inspired by Claude Code"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "lodan"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lodan"
 path = "src/main.rs"

@@ -13,7 +13,7 @@
 
 ## 必要環境
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.86+（`edition = "2024"` の最低要件は 1.85 だが、依存クレート（`icu_properties` など）が 1.86 以上を要求するため）
 - ローカル LLM サーバー（後述）
 
 ## インストール
@@ -46,6 +46,31 @@ cargo run --release -- \
     --base-url http://localhost:8080/v1 \
     --model qwen2.5-coder
 ```
+
+GGUF をローカルに用意せず HuggingFace から自動取得することもできる:
+
+```bash
+llama-server -hf bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M \
+    --jinja --port 8080
+
+cargo run --release -- \
+    --base-url http://localhost:8080/v1 \
+    --model "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M"
+```
+
+### モデルの相性メモ
+
+ツール呼び出し (tool calling) を安定して通すには、モデルが自身の chat template が要求する形式（Qwen 系なら `<tool_call>...</tool_call>` 単数）を厳密に守る必要がある。低ビット量子化（Q4_K_M 以下）の小型モデルはこの形式を時々踏み外し、llama.cpp 側のパーサが構造化 tool_calls を抽出できず素テキストで返してしまうことがある。
+
+手元の動作確認 (Apple M3 / llama.cpp b9020) で得た傾向:
+
+| モデル | ツール呼び出し成功率の体感 |
+|---|---|
+| `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M` | 安定 |
+| `bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M` 以上 | 概ね安定 |
+| `bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M` | 不安定（`<tool_calls>` 複数形を吐いて素テキストになることがある） |
+
+lodan が「LLM が応答するだけでツールが起きない」場合は、まず量子化を Q5_K_M 以上に上げるか、Llama-3.1-8B-Instruct のような instruction-following が強いモデルに切り替えると良い。
 
 ## 設定
 

@@ -6,7 +6,7 @@
 
 - **ランタイム非依存**: OpenAI 互換の Chat Completions + tool calling を話せる任意のサーバーに接続可能（Ollama / llama.cpp `--jinja` / vLLM / LM Studio など）
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
-- **MVP コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob`
+- **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite`
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash）は実行前にユーザー確認 (`y / n / a / e`)
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
 - **拡張機構の枠だけ用意**: hooks / MCP / サブエージェント / skills / slash 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
@@ -135,9 +135,10 @@ src/
 │   └── openai.rs        # 非ストリーム + SSE 実装
 ├── tools/
 │   ├── mod.rs           # trait Tool, ToolCtx, ToolOutput
-│   ├── registry.rs      # 既定 6 ツール登録（スコープ外はコメントアウト）
+│   ├── registry.rs      # 既定 7 ツール登録（スコープ外はコメントアウト）
 │   ├── read.rs / write.rs / edit.rs / bash.rs / grep.rs / glob.rs
-│   └── todo_write.rs / web_fetch.rs / web_search.rs / ask_user_question.rs
+│   ├── todo_write.rs                                    # セッション scope の Todo リスト
+│   └── web_fetch.rs / web_search.rs / ask_user_question.rs
 │       monitor.rs / notebook_edit.rs / multi_edit.rs    # MVP 外スタブ
 ├── hooks/   mcp/   skills/   slash/   session.rs        # MVP 外スタブ
 ```
@@ -147,7 +148,7 @@ src/
 - hooks (PreToolUse / PostToolUse / SessionStart 等のディスパッチ)
 - MCP (stdio / http トランスポートのクライアント・サーバー登録)
 - サブエージェント spawn
-- TodoWrite / WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
+- WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - skills（`.lodan/skills` のロード）
 - slash 拡張（ユーザー定義コマンド）
 - 永続セッション・トランスクリプト保存・トークン会計
@@ -164,7 +165,10 @@ cargo test
 カバレッジ:
 - `tools/edit.rs` — 一意マッチ / 多重マッチ拒否 / Read 必須
 - `tools/read.rs` — offset / limit
+- `tools/todo_write.rs` — replace / clear / multi-in_progress 拒否 / 引数不正
 - `permission.rs` — auto_approve / always-tool / always-command の判定
+- `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
+- `tests/e2e_mock.rs` — 6 ツールを順に走らせるエンドツーエンドのモック試験
 
 ## ライセンス
 

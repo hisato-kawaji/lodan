@@ -18,6 +18,7 @@ pub mod web_fetch;
 pub mod web_search;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -55,9 +56,27 @@ impl ToolOutput {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+    #[serde(default, alias = "activeForm", skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+}
+
 pub struct ToolCtx {
     pub cwd: PathBuf,
     pub read_tracker: Arc<Mutex<HashSet<PathBuf>>>,
+    pub todos: Arc<Mutex<Vec<TodoItem>>>,
 }
 
 impl ToolCtx {
@@ -65,6 +84,7 @@ impl ToolCtx {
         Self {
             cwd,
             read_tracker: Arc::new(Mutex::new(HashSet::new())),
+            todos: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -80,6 +100,40 @@ impl ToolCtx {
             .map(|s| s.contains(p))
             .unwrap_or(false)
     }
+
+    pub fn replace_todos(&self, items: Vec<TodoItem>) {
+        if let Ok(mut t) = self.todos.lock() {
+            *t = items;
+        }
+    }
+
+    pub fn render_todos(&self) -> String {
+        match self.todos.lock() {
+            Ok(t) => render_todo_list(&t),
+            Err(_) => String::new(),
+        }
+    }
+}
+
+pub fn render_todo_list(items: &[TodoItem]) -> String {
+    if items.is_empty() {
+        return "Todos: (empty)".to_string();
+    }
+    let mut out = String::from("Todos:\n");
+    for item in items {
+        let marker = match item.status {
+            TodoStatus::Pending => "[ ]",
+            TodoStatus::InProgress => "[~]",
+            TodoStatus::Completed => "[x]",
+        };
+        let label = if item.status == TodoStatus::InProgress {
+            item.active_form.as_deref().unwrap_or(&item.content)
+        } else {
+            &item.content
+        };
+        out.push_str(&format!("  {marker} {} {label}\n", item.id));
+    }
+    out
 }
 
 #[async_trait]

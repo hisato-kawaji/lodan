@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use crate::agent::messages::{ToolSpec, ToolSpecFunction};
 use crate::tools::{
-    bash, edit, glob, grep, read, write, Tool,
+    bash, edit, glob, grep, read, todo_write, write, Tool,
 };
 
 // MVP 外（import はあえて残し、登録行で利用する想定でコメントアウト）
 #[allow(unused_imports)]
 use crate::tools::{
-    ask_user_question, monitor, multi_edit, notebook_edit, todo_write, web_fetch, web_search,
+    ask_user_question, monitor, multi_edit, notebook_edit, web_fetch, web_search,
 };
 
 pub struct ToolRegistry {
@@ -58,9 +58,9 @@ pub fn default_registry() -> ToolRegistry {
     r.register(Arc::new(bash::Bash));
     r.register(Arc::new(grep::Grep));
     r.register(Arc::new(glob::Glob));
+    r.register(Arc::new(todo_write::TodoWrite));
 
     // --- MVP スコープ外: 登録は意図的に無効化 ---
-    // r.register(Arc::new(todo_write::TodoWrite));
     // r.register(Arc::new(web_fetch::WebFetch));
     // r.register(Arc::new(web_search::WebSearch));
     // r.register(Arc::new(ask_user_question::AskUserQuestion));

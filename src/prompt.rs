@@ -24,6 +24,7 @@ Available tools:\n\
 {tools}\n\
 \n\
 Rules:\n\
+- Only call tools when the user's request actually needs to inspect or modify the file system, run commands, or search the codebase. For greetings, clarifications, and conceptual questions, reply in plain text without any tool call.\n\
 - Use Read before editing existing files.\n\
 - Prefer Grep/Glob over Bash for searches.\n\
 - Use absolute paths.\n\

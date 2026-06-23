@@ -72,8 +72,8 @@ async fn demo_runs_all_six_tools_via_streaming() {
     let server = start_mock(&demo_dir);
 
     let mut cfg = Config::default();
-    cfg.llm.base_url = format!("http://127.0.0.1:{}/v1", server.port);
-    cfg.llm.model = "mock".to_string();
+    cfg.llm.local.base_url = format!("http://127.0.0.1:{}/v1", server.port);
+    cfg.llm.local.model = "mock".to_string();
     cfg.agent.auto_approve = true;
     cfg.agent.max_iterations = 25;
 

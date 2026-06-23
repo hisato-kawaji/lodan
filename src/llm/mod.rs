@@ -1,4 +1,5 @@
 pub mod openai;
+pub mod sakana;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -6,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::messages::{Message, ToolCall, ToolSpec};
-use crate::config::Config;
+use crate::config::{Config, Provider};
 
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -42,6 +43,8 @@ pub trait LlmClient: Send + Sync {
 }
 
 pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
-    let client = openai::OpenAiClient::new(&cfg.llm)?;
-    Ok(Arc::new(client))
+    match cfg.llm.provider {
+        Provider::Local => Ok(Arc::new(openai::OpenAiClient::new(&cfg.llm.local)?)),
+        Provider::Sakana => Ok(Arc::new(sakana::SakanaClient::new(&cfg.llm.sakana)?)),
+    }
 }

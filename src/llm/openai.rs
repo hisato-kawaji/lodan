@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::messages::{Message, ToolCall, ToolCallFunction, ToolSpec};
-use crate::config::LlmConfig;
+use crate::config::ProviderConfig;
 use crate::llm::{ChatEvent, ChatResponse, LlmClient};
 
 pub struct OpenAiClient {
@@ -21,7 +21,7 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    pub fn new(cfg: &LlmConfig) -> Result<Self> {
+    pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()

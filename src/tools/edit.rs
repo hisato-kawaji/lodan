@@ -7,10 +7,10 @@ pub struct Edit;
 
 #[async_trait]
 impl Tool for Edit {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Edit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replace an exact string in a file. The match must be unique unless replace_all is true."
     }
     fn schema(&self) -> serde_json::Value {

@@ -8,10 +8,10 @@ pub struct NotebookEdit;
 
 #[async_trait]
 impl Tool for NotebookEdit {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "NotebookEdit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Edit Jupyter notebook cells (out of MVP scope)."
     }
     fn schema(&self) -> serde_json::Value {

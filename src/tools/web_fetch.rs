@@ -8,10 +8,10 @@ pub struct WebFetch;
 
 #[async_trait]
 impl Tool for WebFetch {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "WebFetch"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Fetch a URL and summarize (out of MVP scope)."
     }
     fn schema(&self) -> serde_json::Value {

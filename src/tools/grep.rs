@@ -12,10 +12,10 @@ pub struct Grep;
 
 #[async_trait]
 impl Tool for Grep {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Grep"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Regex search across files (gitignore-aware). Returns up to `max` matches."
     }
     fn schema(&self) -> serde_json::Value {

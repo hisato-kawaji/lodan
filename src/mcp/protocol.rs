@@ -1,0 +1,249 @@
+// JSON-RPC 2.0 + MCP メッセージ型。
+// MCP protocolVersion: 2025-06-18
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const CLIENT_NAME: &str = "lodan";
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcRequest<'a, P: Serialize> {
+    pub jsonrpc: &'static str,
+    pub id: u64,
+    pub method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<P>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcNotification<'a, P: Serialize> {
+    pub jsonrpc: &'static str,
+    pub method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<P>,
+}
+
+/// Server → client frame. Either a response (has `id`) or a notification (no `id`).
+#[derive(Debug, Deserialize)]
+pub struct JsonRpcIncoming {
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub jsonrpc: Option<String>,
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<JsonRpcError>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub params: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+// ---------------- initialize ----------------
+
+#[derive(Debug, Serialize)]
+pub struct InitializeParams<'a> {
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: &'a str,
+    pub capabilities: ClientCapabilities,
+    #[serde(rename = "clientInfo")]
+    pub client_info: ClientInfo<'a>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ClientCapabilities {}
+
+#[derive(Debug, Serialize)]
+pub struct ClientInfo<'a> {
+    pub name: &'a str,
+    pub version: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InitializeResult {
+    #[allow(dead_code)]
+    #[serde(default, rename = "protocolVersion")]
+    pub protocol_version: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default, rename = "serverInfo")]
+    pub server_info: Option<ServerInfo>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub capabilities: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ServerInfo {
+    #[allow(dead_code)]
+    pub name: String,
+    #[allow(dead_code)]
+    pub version: String,
+}
+
+// ---------------- tools/list ----------------
+
+#[derive(Debug, Serialize)]
+pub struct ToolsListParams<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolsListResult {
+    pub tools: Vec<McpToolMeta>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpToolMeta {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "inputSchema")]
+    pub input_schema: Option<Value>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub annotations: Option<Value>,
+}
+
+// ---------------- tools/call ----------------
+
+#[derive(Debug, Serialize)]
+pub struct ToolsCallParams<'a> {
+    pub name: &'a str,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolsCallResult {
+    #[serde(default)]
+    pub content: Vec<ContentBlock>,
+    #[serde(default, rename = "isError")]
+    pub is_error: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text { text: String },
+    // 他 (image / audio / resource / resource_link) は今回テキスト化して扱わない →
+    // 受け取った場合は捨てるか stub 出力にする
+    #[serde(other)]
+    Other,
+}
+
+impl ToolsCallResult {
+    /// Flatten content blocks into a single string. Non-text blocks are noted but skipped.
+    pub fn flatten_text(&self) -> String {
+        let mut buf = String::new();
+        let mut non_text = 0usize;
+        for block in &self.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(text);
+                }
+                ContentBlock::Other => non_text += 1,
+            }
+        }
+        if non_text > 0 {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(&format!("[{non_text} non-text block(s) omitted]"));
+        }
+        buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_initialize_params() {
+        let p = InitializeParams {
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: ClientCapabilities::default(),
+            client_info: ClientInfo {
+                name: CLIENT_NAME,
+                version: CLIENT_VERSION,
+            },
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("protocolVersion"));
+        assert!(s.contains("clientInfo"));
+    }
+
+    #[test]
+    fn parses_tools_list_response() {
+        let s = r#"{
+            "tools": [
+                {"name":"echo", "description":"x", "inputSchema":{"type":"object"}}
+            ]
+        }"#;
+        let r: ToolsListResult = serde_json::from_str(s).unwrap();
+        assert_eq!(r.tools.len(), 1);
+        assert_eq!(r.tools[0].name, "echo");
+        assert!(r.next_cursor.is_none());
+    }
+
+    #[test]
+    fn flattens_text_content() {
+        let r = ToolsCallResult {
+            content: vec![
+                ContentBlock::Text {
+                    text: "a".into(),
+                },
+                ContentBlock::Text {
+                    text: "b".into(),
+                },
+            ],
+            is_error: false,
+        };
+        assert_eq!(r.flatten_text(), "a\nb");
+    }
+
+    #[test]
+    fn flatten_notes_non_text_blocks() {
+        let r: ToolsCallResult = serde_json::from_str(
+            r#"{"content":[{"type":"text","text":"x"},{"type":"image","data":"...","mimeType":"image/png"}]}"#,
+        )
+        .unwrap();
+        let s = r.flatten_text();
+        assert!(s.contains("x"));
+        assert!(s.contains("non-text"));
+    }
+
+    #[test]
+    fn incoming_decodes_response() {
+        let s = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let inc: JsonRpcIncoming = serde_json::from_str(s).unwrap();
+        assert_eq!(inc.id, Some(1));
+        assert!(inc.result.is_some());
+        assert!(inc.error.is_none());
+    }
+
+    #[test]
+    fn incoming_decodes_error() {
+        let s = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"x"}}"#;
+        let inc: JsonRpcIncoming = serde_json::from_str(s).unwrap();
+        assert_eq!(inc.error.unwrap().code, -32601);
+    }
+}

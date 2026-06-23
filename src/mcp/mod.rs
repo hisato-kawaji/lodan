@@ -1,13 +1,9 @@
-// MVP 外: MCP (Model Context Protocol) クライアント抽象。
+// MCP (Model Context Protocol) クライアント。
+// 現状は stdio transport + tools capability のみ。
+// resources / prompts / sampling / roots / Streamable HTTP は未対応 (将来)。
 
 pub mod client;
+pub mod config;
+pub mod protocol;
 pub mod registry;
-
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum McpServerSpec {
-    Stdio { command: String, args: Vec<String> },
-    Http { url: String },
-}
+pub mod tool;

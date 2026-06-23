@@ -11,10 +11,10 @@ pub struct Bash;
 
 #[async_trait]
 impl Tool for Bash {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Bash"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Run a shell command non-interactively. Captures stdout/stderr/exit_code with a timeout."
     }
     fn schema(&self) -> serde_json::Value {

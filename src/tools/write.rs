@@ -7,10 +7,10 @@ pub struct Write;
 
 #[async_trait]
 impl Tool for Write {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Create or overwrite a file. For existing files, you must Read first."
     }
     fn schema(&self) -> serde_json::Value {

@@ -8,10 +8,10 @@ pub struct AskUserQuestion;
 
 #[async_trait]
 impl Tool for AskUserQuestion {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "AskUserQuestion"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Ask the user a structured question (out of MVP scope)."
     }
     fn schema(&self) -> serde_json::Value {

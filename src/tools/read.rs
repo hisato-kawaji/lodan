@@ -9,10 +9,10 @@ pub struct Read;
 
 #[async_trait]
 impl Tool for Read {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Read"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read a file by absolute path. Optional 0-based offset and line limit."
     }
     fn schema(&self) -> serde_json::Value {

@@ -1,6 +1,24 @@
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum Provider {
+    Local,
+    Sakana,
+}
+
+impl Provider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Provider::Local => "local",
+            Provider::Sakana => "sakana",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -13,6 +31,14 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
+    pub provider: Provider,
+    pub local: ProviderConfig,
+    pub sakana: ProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
@@ -51,8 +77,33 @@ impl Default for Config {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: Provider::Local,
+            local: ProviderConfig::default_local(),
+            sakana: ProviderConfig::default_sakana(),
+        }
+    }
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self::default_local()
+    }
+}
+
+impl ProviderConfig {
+    pub fn default_local() -> Self {
+        Self {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "qwen2.5-coder:7b".to_string(),
+            api_key: String::new(),
+            timeout_secs: 120,
+        }
+    }
+
+    pub fn default_sakana() -> Self {
+        Self {
+            base_url: "https://api.sakana.ai/v1".to_string(),
+            model: "fugu".to_string(),
             api_key: String::new(),
             timeout_secs: 120,
         }
@@ -79,6 +130,22 @@ impl Default for ToolsConfig {
 impl Default for BashConfig {
     fn default() -> Self {
         Self { timeout_secs: 30 }
+    }
+}
+
+impl LlmConfig {
+    pub fn active(&self) -> &ProviderConfig {
+        match self.provider {
+            Provider::Local => &self.local,
+            Provider::Sakana => &self.sakana,
+        }
+    }
+
+    pub fn active_mut(&mut self) -> &mut ProviderConfig {
+        match self.provider {
+            Provider::Local => &mut self.local,
+            Provider::Sakana => &mut self.sakana,
+        }
     }
 }
 
@@ -111,21 +178,29 @@ impl Config {
         Ok(cfg)
     }
 
+    /// CLI/env overrides. `base_url` / `model` / `api_key` act on the
+    /// currently-active provider so users can flip provider once and tweak
+    /// per-call without rewriting their config.
     pub fn apply_overrides(
         &mut self,
+        provider: Option<Provider>,
         base_url: Option<String>,
         model: Option<String>,
         api_key: Option<String>,
         auto_approve: bool,
     ) {
+        if let Some(p) = provider {
+            self.llm.provider = p;
+        }
+        let active = self.llm.active_mut();
         if let Some(v) = base_url {
-            self.llm.base_url = v;
+            active.base_url = v;
         }
         if let Some(v) = model {
-            self.llm.model = v;
+            active.model = v;
         }
         if let Some(v) = api_key {
-            self.llm.api_key = v;
+            active.api_key = v;
         }
         if auto_approve {
             self.agent.auto_approve = true;
@@ -152,4 +227,55 @@ fn read_toml(path: &Path) -> Result<Option<Config>> {
 /// Shallow merge: `over` fields replace `base` fields (TOML defaults already populated).
 fn merge(_base: Config, over: Config) -> Config {
     over
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_set_local_provider_and_endpoints() {
+        let cfg = Config::default();
+        assert_eq!(cfg.llm.provider, Provider::Local);
+        assert_eq!(cfg.llm.local.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.llm.sakana.base_url, "https://api.sakana.ai/v1");
+        assert_eq!(cfg.llm.sakana.model, "fugu");
+        assert!(cfg.llm.sakana.api_key.is_empty());
+    }
+
+    #[test]
+    fn active_follows_provider_switch() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.llm.active().base_url, "http://localhost:11434/v1");
+        cfg.llm.provider = Provider::Sakana;
+        assert_eq!(cfg.llm.active().base_url, "https://api.sakana.ai/v1");
+    }
+
+    #[test]
+    fn overrides_target_active_provider_only() {
+        let mut cfg = Config::default();
+        cfg.apply_overrides(
+            Some(Provider::Sakana),
+            Some("https://example.test/v1".into()),
+            Some("fugu-ultra".into()),
+            Some("sk-test".into()),
+            false,
+        );
+        assert_eq!(cfg.llm.sakana.base_url, "https://example.test/v1");
+        assert_eq!(cfg.llm.sakana.model, "fugu-ultra");
+        assert_eq!(cfg.llm.sakana.api_key, "sk-test");
+        // local block is untouched
+        assert_eq!(cfg.llm.local.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.llm.local.model, "qwen2.5-coder:7b");
+        assert!(cfg.llm.local.api_key.is_empty());
+    }
+
+    #[test]
+    fn auto_approve_flag_only_when_true() {
+        let mut cfg = Config::default();
+        cfg.apply_overrides(None, None, None, None, false);
+        assert!(!cfg.agent.auto_approve);
+        cfg.apply_overrides(None, None, None, None, true);
+        assert!(cfg.agent.auto_approve);
+    }
 }

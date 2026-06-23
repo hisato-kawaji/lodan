@@ -21,7 +21,7 @@ pub struct Session {
 impl Session {
     pub fn new(cfg: Config, registry: Arc<ToolRegistry>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let system = prompt::build_system_prompt(&cwd, &cfg.llm.model, registry.as_ref());
+        let system = prompt::build_system_prompt(&cwd, &cfg.llm.active().model, registry.as_ref());
         let history = vec![Message::System { content: system }];
         let ctx = ToolCtx::new(cwd);
         Self {
@@ -45,7 +45,8 @@ impl Session {
 
         for _ in 0..self.cfg.agent.max_iterations {
             let specs = self.registry.tool_specs();
-            let resp = stream_once(llm, &self.history, &specs, &self.cfg.llm.model).await?;
+            let resp =
+                stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
 
             let tool_calls = resp.tool_calls.clone();
             self.history.push(Message::Assistant {

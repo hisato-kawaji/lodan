@@ -5,6 +5,7 @@
 ## 特徴
 
 - **ランタイム非依存**: OpenAI 互換の Chat Completions + tool calling を話せる任意のサーバーに接続可能（Ollama / llama.cpp `--jinja` / vLLM / LM Studio など）
+- **マルチプロバイダ**: ローカル LLM と Sakana AI (`fugu` / `fugu-ultra`) を環境変数で随時切り替え
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
 - **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite`
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash）は実行前にユーザー確認 (`y / n / a / e`)
@@ -34,6 +35,25 @@ ollama pull qwen2.5-coder:7b
 
 # 既定で http://localhost:11434/v1, qwen2.5-coder:7b を見にいく
 cargo run --release
+```
+
+## クイックスタート (Sakana AI)
+
+Sakana Fugu API は OpenAI 互換の Chat Completions を喋るので、`--provider sakana` を渡すだけで切り替わる。API キーは `.env` または環境変数から拾われる。
+
+```bash
+# lodan/.env を作る（自分で書く / .gitignore 済み）
+echo 'SAKANA_API_KEY=sk-...' > .env
+
+cargo run --release -- --provider sakana --model fugu
+# あるいは fugu-ultra
+cargo run --release -- --provider sakana --model fugu-ultra
+```
+
+環境変数だけで切り替える例:
+
+```bash
+LODAN_PROVIDER=sakana LODAN_MODEL=fugu cargo run --release
 ```
 
 ## クイックスタート (llama.cpp)
@@ -74,14 +94,23 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 ## 設定
 
-階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← 環境変数 ← CLI フラグ
+階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
 
 ```toml
 # ~/.config/lodan/config.toml
 [llm]
-base_url = "http://localhost:11434/v1"
-model    = "qwen2.5-coder:7b"
-api_key  = ""
+provider = "local"   # "local" または "sakana"
+
+[llm.local]
+base_url     = "http://localhost:11434/v1"
+model        = "qwen2.5-coder:7b"
+api_key      = ""
+timeout_secs = 120
+
+[llm.sakana]
+base_url     = "https://api.sakana.ai/v1"
+model        = "fugu"      # または "fugu-ultra"
+api_key      = ""           # 空なら SAKANA_API_KEY env を使う
 timeout_secs = 120
 
 [agent]
@@ -92,16 +121,27 @@ auto_approve   = false
 timeout_secs = 30
 ```
 
-環境変数: `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
+`--base-url` / `--model` / `--api-key` および対応する `LODAN_*` env は **現在 active な provider** の設定を上書きする (provider を `--provider` で切り替えれば反対側を触らずに済む)。
 
-CLI フラグ: `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes`
+環境変数:
+- `LODAN_PROVIDER` (`local` | `sakana`)
+- `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
+- `SAKANA_API_KEY` (provider=sakana のときに `api_key` が空ならフォールバック)
+
+CLI フラグ: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes`
+
+`$CWD/.env` は起動時に自動ロード (dotenvy)。コミット対象外 (`.gitignore` 済)。
+
+### v0.1.0 以前からのスキーマ移行
+
+`[llm]` 直下にあった `base_url` / `model` / `api_key` / `timeout_secs` は `[llm.local]` 配下に移った。Sakana 側 (`[llm.sakana]`) は新規追加。既存の `~/.config/lodan/config.toml` は上記の新フォーマットに書き換えが必要。
 
 ## REPL の使い方
 
 ```
 $ cargo run
 lodan 0.1.0 — type /help for commands, /exit to quit
-model: qwen2.5-coder:7b @ http://localhost:11434/v1
+model: qwen2.5-coder:7b @ http://localhost:11434/v1 (local)
 lodan> /tmp/lodan-demo/hello.txt に hi と書いて
 [lodan] Allow Write: /tmp/lodan-demo/hello.txt
   (y) yes once  (n) no  (a) always allow Write  (e) always allow this exact
@@ -131,8 +171,9 @@ src/
 │   ├── loop.rs          # run_turn(): chat_stream → tool dispatch → 反復
 │   └── subagent.rs      # MVP 外（スタブ）
 ├── llm/
-│   ├── mod.rs           # trait LlmClient (chat / chat_stream)
-│   └── openai.rs        # 非ストリーム + SSE 実装
+│   ├── mod.rs           # trait LlmClient + provider 分岐 (build_client)
+│   ├── openai.rs        # ローカル/汎用 OpenAI 互換クライアント
+│   └── sakana.rs        # Sakana AI (Fugu) adapter (内部で OpenAiClient に委譲)
 ├── tools/
 │   ├── mod.rs           # trait Tool, ToolCtx, ToolOutput
 │   ├── registry.rs      # 既定 7 ツール登録（スコープ外はコメントアウト）

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::config::Config;
+use crate::config::{Config, Provider};
 use crate::repl;
 
 #[derive(Debug, Parser)]
@@ -11,15 +11,19 @@ use crate::repl;
     about = "Local-LLM coding agent (Claude Code inspired)"
 )]
 pub struct Cli {
-    /// Override LLM base URL (OpenAI-compatible)
+    /// Select LLM provider
+    #[arg(long, env = "LODAN_PROVIDER", value_enum)]
+    pub provider: Option<Provider>,
+
+    /// Override base URL for the active provider (OpenAI-compatible)
     #[arg(long, env = "LODAN_BASE_URL")]
     pub base_url: Option<String>,
 
-    /// Override model name
+    /// Override model name for the active provider
     #[arg(long, env = "LODAN_MODEL")]
     pub model: Option<String>,
 
-    /// Override API key (sent as Bearer if non-empty)
+    /// Override API key for the active provider (sent as Bearer if non-empty)
     #[arg(long, env = "LODAN_API_KEY")]
     pub api_key: Option<String>,
 
@@ -41,15 +45,17 @@ pub enum Command {
     Config,
     /// Start the interactive REPL (default if omitted)
     Repl,
-    // /// Manage MCP servers (out of MVP scope)
-    // Mcp,
-    // /// Manage plugins (out of MVP scope)
-    // Plugin,
 }
 
 pub async fn dispatch(args: Cli) -> Result<()> {
     let mut cfg = Config::load(args.config.as_deref())?;
-    cfg.apply_overrides(args.base_url, args.model, args.api_key, args.yes);
+    cfg.apply_overrides(
+        args.provider,
+        args.base_url,
+        args.model,
+        args.api_key,
+        args.yes,
+    );
 
     match args.cmd.unwrap_or(Command::Repl) {
         Command::Repl => repl::run(cfg).await,

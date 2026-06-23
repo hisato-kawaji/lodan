@@ -12,7 +12,13 @@ use crate::tools::registry::default_registry;
 pub async fn run(cfg: Config) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
     println!("lodan {} — type /help for commands, /exit to quit", env!("CARGO_PKG_VERSION"));
-    println!("model: {} @ {}", cfg.llm.model, cfg.llm.base_url);
+    let active = cfg.llm.active();
+    println!(
+        "model: {} @ {} ({})",
+        active.model,
+        active.base_url,
+        cfg.llm.provider.as_str()
+    );
 
     // skills::load_from(...)              // MVP 外
     // slash::register_user_commands(...)  // MVP 外

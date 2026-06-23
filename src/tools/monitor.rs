@@ -8,10 +8,10 @@ pub struct Monitor;
 
 #[async_trait]
 impl Tool for Monitor {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Monitor"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Monitor a background process's output (out of MVP scope)."
     }
     fn schema(&self) -> serde_json::Value {

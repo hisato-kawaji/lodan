@@ -8,10 +8,10 @@ pub struct WebSearch;
 
 #[async_trait]
 impl Tool for WebSearch {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "WebSearch"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search the web (out of MVP scope)."
     }
     fn schema(&self) -> serde_json::Value {

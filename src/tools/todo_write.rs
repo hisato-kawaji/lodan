@@ -6,10 +6,10 @@ pub struct TodoWrite;
 
 #[async_trait]
 impl Tool for TodoWrite {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "TodoWrite"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Replace the session todo list. Use at the start of multi-step work and after each item finishes. Pass the full list every call; one item at most may be in_progress."
     }
     fn schema(&self) -> serde_json::Value {

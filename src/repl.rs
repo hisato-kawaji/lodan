@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::agent;
 use crate::config::Config;
 use crate::llm;
+use crate::mcp;
 use crate::permission::PermissionGate;
 use crate::tools::registry::default_registry;
 
@@ -22,9 +23,23 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     // skills::load_from(...)              // MVP 外
     // slash::register_user_commands(...)  // MVP 外
-    // mcp::registry::start_configured(...) // MVP 外
 
-    let registry = Arc::new(default_registry());
+    let mut registry = default_registry();
+    let mcp_outcome = mcp::registry::load_and_register(&mut registry)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("mcp: {e}");
+            mcp::registry::LoadOutcome::default()
+        });
+    if mcp_outcome.servers > 0 {
+        println!(
+            "mcp: {} server(s), {} tool(s) registered",
+            mcp_outcome.servers, mcp_outcome.tools
+        );
+    }
+    // Keep clients alive for the full session; Drop kills subprocesses.
+    let _mcp_clients = mcp_outcome.clients;
+    let registry = Arc::new(registry);
     let llm_client: Arc<dyn llm::LlmClient> = llm::build_client(&cfg)?;
     let gate = PermissionGate::new(cfg.agent.auto_approve);
     let mut session = agent::Session::new(cfg.clone(), Arc::clone(&registry));

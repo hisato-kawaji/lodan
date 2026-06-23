@@ -6,11 +6,12 @@
 
 - **ランタイム非依存**: OpenAI 互換の Chat Completions + tool calling を話せる任意のサーバーに接続可能（Ollama / llama.cpp `--jinja` / vLLM / LM Studio など）
 - **マルチプロバイダ**: ローカル LLM と Sakana AI (`fugu` / `fugu-ultra`) を環境変数で随時切り替え
+- **MCP クライアント (stdio + tools)**: `.mcp.json` を CWD に置くと MCP サーバを起動して公開 tools を取り込む
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
 - **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite`
-- **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash）は実行前にユーザー確認 (`y / n / a / e`)
+- **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
-- **拡張機構の枠だけ用意**: hooks / MCP / サブエージェント / skills / slash 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
+- **拡張機構の枠だけ用意**: hooks / サブエージェント / skills / slash 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
 
 ## 必要環境
 
@@ -159,6 +160,36 @@ lodan> /exit
 - `a` セッション中はこのツールを常時許可
 - `e` Bash の場合のみ、その完全一致コマンドを常時許可
 
+## MCP サーバ接続 (stdio + tools)
+
+`$CWD/.mcp.json` を置くと REPL 起動時に MCP サーバを spawn し、公開された tools を `mcp__<server>__<tool>` 名で `ToolRegistry` に取り込む。
+
+```json
+// .mcp.json (Claude Code 互換スキーマ)
+{
+  "mcpServers": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/lodan-fs"]
+    }
+  }
+}
+```
+
+サンプルは `.mcp.json.example` を参照。
+
+- **transport**: stdio のみ (Streamable HTTP は未対応)
+- **capabilities**: tools のみ (resources / prompts / sampling / roots は未対応)
+- **permission**: MCP 由来のツールは **常に destructive** 扱い。初回呼び出しで `y/n/a/e` の確認が出る (Claude Code 同様)
+- **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in 7 ツールのみで継続起動
+- **プロトコル**: MCP `2025-06-18`、JSON-RPC 2.0、newline-delimited
+
+REPL 起動時に MCP サーバが見つかると次の行がバナーに出る:
+
+```
+mcp: 1 server(s), 11 tool(s) registered
+```
+
 ## アーキテクチャ概要
 
 ```
@@ -187,7 +218,7 @@ src/
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - hooks (PreToolUse / PostToolUse / SessionStart 等のディスパッチ)
-- MCP (stdio / http トランスポートのクライアント・サーバー登録)
+- MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots
 - サブエージェント spawn
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - skills（`.lodan/skills` のロード）
@@ -207,9 +238,12 @@ cargo test
 - `tools/edit.rs` — 一意マッチ / 多重マッチ拒否 / Read 必須
 - `tools/read.rs` — offset / limit
 - `tools/todo_write.rs` — replace / clear / multi-in_progress 拒否 / 引数不正
+- `tools/registry.rs` — 動的名登録 / built-in 既定 7 ツール
 - `permission.rs` — auto_approve / always-tool / always-command の判定
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
+- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/tool.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、namespacing
 - `tests/e2e_mock.rs` — 6 ツールを順に走らせるエンドツーエンドのモック試験
+- `tests/e2e_mcp.rs` — mock MCP サーバとの handshake + tools/list + tools/call 一周
 
 ## ライセンス
 

@@ -138,8 +138,8 @@ pub fn render_todo_list(items: &[TodoItem]) -> String {
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;
     fn is_destructive(&self) -> bool {
         false

@@ -8,10 +8,10 @@ pub struct MultiEdit;
 
 #[async_trait]
 impl Tool for MultiEdit {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "MultiEdit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Apply multiple edits across files atomically (out of MVP scope)."
     }
     fn schema(&self) -> serde_json::Value {

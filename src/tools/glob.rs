@@ -11,10 +11,10 @@ pub struct Glob;
 
 #[async_trait]
 impl Tool for Glob {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Glob"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Find files by glob pattern (gitignore-aware)."
     }
     fn schema(&self) -> serde_json::Value {

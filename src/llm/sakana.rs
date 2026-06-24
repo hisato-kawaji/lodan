@@ -21,10 +21,10 @@ pub struct SakanaClient {
 impl SakanaClient {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         let mut effective = cfg.clone();
-        if effective.api_key.is_empty() {
-            if let Ok(k) = std::env::var(API_KEY_ENV) {
-                effective.api_key = k;
-            }
+        if effective.api_key.is_empty()
+            && let Ok(k) = std::env::var(API_KEY_ENV)
+        {
+            effective.api_key = k;
         }
         if effective.api_key.is_empty() {
             return Err(anyhow!(

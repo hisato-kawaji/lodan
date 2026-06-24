@@ -54,10 +54,13 @@ fn start_mock(demo_dir: &Path) -> MockServer {
         .spawn()
         .expect("spawn python3 mock_llm.py (is python3 on PATH?)");
 
+    // child を即 MockServer に包む。タイムアウト panic でも Drop が kill+wait するため
+    // 子プロセスが zombie として取り残されない。
+    let server = MockServer { child, port };
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return MockServer { child, port };
+            return server;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -90,5 +93,8 @@ async fn demo_runs_all_six_tools_via_streaming() {
     let final_path = demo_dir.join("hello.txt");
     let content = std::fs::read_to_string(&final_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", final_path.display()));
-    assert_eq!(content, "hello world", "Edit should rewrite hi -> hello world");
+    assert_eq!(
+        content, "hello world",
+        "Edit should rewrite hi -> hello world"
+    );
 }

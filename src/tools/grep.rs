@@ -81,10 +81,10 @@ impl Tool for Grep {
                     continue;
                 }
                 let path: &Path = entry.path();
-                if let Some(g) = &glob {
-                    if !g.is_match(path) {
-                        continue;
-                    }
+                if let Some(g) = &glob
+                    && !g.is_match(path)
+                {
+                    continue;
                 }
                 let mut hits: Vec<(u64, String)> = Vec::new();
                 let mut sink = MatchSink {
@@ -94,11 +94,19 @@ impl Tool for Grep {
                 if sink.remaining == 0 {
                     break;
                 }
-                if Searcher::new().search_path(&matcher, path, &mut sink).is_err() {
+                if Searcher::new()
+                    .search_path(&matcher, path, &mut sink)
+                    .is_err()
+                {
                     continue;
                 }
                 for (lineno, line) in hits {
-                    out.push(format!("{}:{}: {}", path.display(), lineno, line.trim_end()));
+                    out.push(format!(
+                        "{}:{}: {}",
+                        path.display(),
+                        lineno,
+                        line.trim_end()
+                    ));
                     if out.len() >= max {
                         return Ok(out);
                     }

@@ -22,7 +22,7 @@ impl Provider {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub llm: LlmConfig,
@@ -56,7 +56,7 @@ pub struct AgentConfig {
     pub auto_approve: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     pub bash: BashConfig,
@@ -66,17 +66,6 @@ pub struct ToolsConfig {
 #[serde(default)]
 pub struct BashConfig {
     pub timeout_secs: u64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            llm: LlmConfig::default(),
-            agent: AgentConfig::default(),
-            tools: ToolsConfig::default(),
-            hooks: Vec::new(),
-        }
-    }
 }
 
 impl Default for LlmConfig {
@@ -124,14 +113,6 @@ impl Default for AgentConfig {
     }
 }
 
-impl Default for ToolsConfig {
-    fn default() -> Self {
-        Self {
-            bash: BashConfig::default(),
-        }
-    }
-}
-
 impl Default for BashConfig {
     fn default() -> Self {
         Self { timeout_secs: 30 }
@@ -159,24 +140,24 @@ impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         let mut cfg = Config::default();
 
-        if let Some(user_path) = user_config_path() {
-            if let Some(loaded) = read_toml(&user_path)? {
-                cfg = merge(cfg, loaded);
-            }
+        if let Some(user_path) = user_config_path()
+            && let Some(loaded) = read_toml(&user_path)?
+        {
+            cfg = merge(cfg, loaded);
         }
 
         let project_path = std::env::current_dir()
             .ok()
             .map(|p| p.join(".lodan").join("config.toml"));
-        if let Some(p) = project_path {
-            if let Some(loaded) = read_toml(&p)? {
-                cfg = merge(cfg, loaded);
-            }
+        if let Some(p) = project_path
+            && let Some(loaded) = read_toml(&p)?
+        {
+            cfg = merge(cfg, loaded);
         }
 
         if let Some(p) = explicit {
-            let loaded = read_toml(p)?
-                .with_context(|| format!("config file not found: {}", p.display()))?;
+            let loaded =
+                read_toml(p)?.with_context(|| format!("config file not found: {}", p.display()))?;
             cfg = merge(cfg, loaded);
         }
 
@@ -214,18 +195,15 @@ impl Config {
 }
 
 fn user_config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "lodan")
-        .map(|d| d.config_dir().join("config.toml"))
+    directories::ProjectDirs::from("", "", "lodan").map(|d| d.config_dir().join("config.toml"))
 }
 
 fn read_toml(path: &Path) -> Result<Option<Config>> {
     if !path.exists() {
         return Ok(None);
     }
-    let s = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config =
-        toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+    let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: Config = toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(cfg))
 }
 

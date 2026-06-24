@@ -321,6 +321,8 @@ description: コードレビューの観点と手順
 - frontmatter の `name` を省略するとディレクトリ名が使われます。`description` は一覧表示用です。
 - skill が 1 つも無ければ `Skill` ツール自体を登録しません。
 
+> ⚠️ **信頼前提**: `SKILL.md` の本文は CWD の `.lodan/skills/` から読まれ、そのままモデルへのプロンプトとして注入されます。信頼できないリポジトリの skill は prompt injection ベクタになり得ます（hooks / slash / `.mcp.json` と同じ CWD 信頼前提）。破壊的ツールは従来どおりパーミッションゲートを通ります。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots

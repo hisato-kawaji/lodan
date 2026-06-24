@@ -157,15 +157,21 @@ fn resume_session(
         return new_session(&cwd, cfg, registry);
     };
 
-    match crate::session::load_transcript(&id).and_then(|prior| {
-        let recorder = Recorder::open(&id)?;
-        Ok((prior, recorder))
-    }) {
-        Ok((prior, recorder)) => {
+    match crate::session::load_transcript(&id) {
+        Ok(prior) => {
             let n = prior.len();
             let session = agent::Session::resume(cfg.clone(), Arc::clone(registry), prior);
-            println!("session: resumed {id} ({n} messages)");
-            (session, Some(recorder))
+            // recorder は復元後の history を基準に「保存済み」位置を決める。
+            match Recorder::open_resumed(&id, session.history()) {
+                Ok(recorder) => {
+                    println!("session: resumed {id} ({n} messages)");
+                    (session, Some(recorder))
+                }
+                Err(e) => {
+                    eprintln!("session: resumed {id} but persistence disabled ({e})");
+                    (session, None)
+                }
+            }
         }
         Err(e) => {
             eprintln!("session: cannot resume {id}: {e}");

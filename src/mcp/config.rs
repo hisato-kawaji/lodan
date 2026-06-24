@@ -41,8 +41,8 @@ impl McpServersConfig {
         if !path.exists() {
             return Ok(None);
         }
-        let s = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: McpServersConfig =
             serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
         Ok(Some(cfg))

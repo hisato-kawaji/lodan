@@ -12,6 +12,12 @@ pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -33,6 +39,10 @@ impl ToolRegistry {
 
     pub fn len(&self) -> usize {
         self.tools.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec<'_>> {

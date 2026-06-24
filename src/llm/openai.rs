@@ -181,11 +181,11 @@ impl LlmClient for OpenAiClient {
                 Err(_) => continue,
             };
             for choice in chunk.choices {
-                if let Some(d) = choice.delta.content {
-                    if !d.is_empty() {
-                        text_buf.push_str(&d);
-                        let _ = sink.send(ChatEvent::TextDelta(d));
-                    }
+                if let Some(d) = choice.delta.content
+                    && !d.is_empty()
+                {
+                    text_buf.push_str(&d);
+                    let _ = sink.send(ChatEvent::TextDelta(d));
                 }
                 for tc in choice.delta.tool_calls {
                     let idx = tc.index as usize;

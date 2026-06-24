@@ -29,12 +29,11 @@ impl PermissionGate {
             if p.always_tools.contains(tool_name) {
                 return true;
             }
-            if tool_name == "Bash" {
-                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                    if p.always_commands.contains(cmd) {
-                        return true;
-                    }
-                }
+            if tool_name == "Bash"
+                && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+                && p.always_commands.contains(cmd)
+            {
+                return true;
             }
         }
         self.prompt(tool_name, args)
@@ -67,13 +66,13 @@ impl PermissionGate {
                     return true;
                 }
                 "e" | "E" => {
-                    if tool_name == "Bash" {
-                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                            if let Ok(mut p) = self.policy.lock() {
-                                p.always_commands.insert(cmd.to_string());
-                            }
-                            return true;
+                    if tool_name == "Bash"
+                        && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+                    {
+                        if let Ok(mut p) = self.policy.lock() {
+                            p.always_commands.insert(cmd.to_string());
                         }
+                        return true;
                     }
                     if let Ok(mut p) = self.policy.lock() {
                         p.always_tools.insert(tool_name.to_string());

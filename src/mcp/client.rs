@@ -151,8 +151,7 @@ impl McpClient {
         };
         let _: InitializeResult = self.request("initialize", Some(&params)).await?;
         // notifications/initialized — no response expected.
-        self.notify::<()>("notifications/initialized", None)
-            .await?;
+        self.notify::<()>("notifications/initialized", None).await?;
         Ok(())
     }
 
@@ -240,12 +239,8 @@ impl McpClient {
             ));
         }
         let result = inc.result.unwrap_or(Value::Null);
-        serde_json::from_value(result).with_context(|| {
-            format!(
-                "mcp[{}]: decoding {} result",
-                self.server_label, method
-            )
-        })
+        serde_json::from_value(result)
+            .with_context(|| format!("mcp[{}]: decoding {} result", self.server_label, method))
     }
 
     async fn notify<P: Serialize>(&self, method: &str, params: Option<&P>) -> Result<()> {
@@ -269,10 +264,10 @@ impl McpClient {
 impl Drop for McpClient {
     fn drop(&mut self) {
         // Best effort: take the child synchronously and let kill_on_drop finish it.
-        if let Ok(mut guard) = self.child.try_lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.start_kill();
-            }
+        if let Ok(mut guard) = self.child.try_lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.start_kill();
         }
     }
 }

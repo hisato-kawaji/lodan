@@ -171,9 +171,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            tokio::fs::read_to_string(&p).await.unwrap(),
-            "hello lodan"
-        );
+        assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "hello lodan");
     }
 }

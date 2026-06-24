@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::{Tool, TodoItem, TodoStatus, ToolCtx, ToolError, ToolOutput};
+use super::{TodoItem, TodoStatus, Tool, ToolCtx, ToolError, ToolOutput};
 
 pub struct TodoWrite;
 

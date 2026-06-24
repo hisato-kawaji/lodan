@@ -139,7 +139,9 @@ pub struct ToolsCallResult {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     // 他 (image / audio / resource / resource_link) は今回テキスト化して扱わない →
     // 受け取った場合は捨てるか stub 出力にする
     #[serde(other)]
@@ -208,12 +210,8 @@ mod tests {
     fn flattens_text_content() {
         let r = ToolsCallResult {
             content: vec![
-                ContentBlock::Text {
-                    text: "a".into(),
-                },
-                ContentBlock::Text {
-                    text: "b".into(),
-                },
+                ContentBlock::Text { text: "a".into() },
+                ContentBlock::Text { text: "b".into() },
             ],
             is_error: false,
         };

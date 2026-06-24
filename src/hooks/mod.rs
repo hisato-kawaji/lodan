@@ -40,9 +40,7 @@ impl HookConfig {
     pub fn matches(&self, tool_name: Option<&str>) -> bool {
         match tool_name {
             None => true,
-            Some(name) => {
-                self.matcher.is_empty() || self.matcher == "*" || self.matcher == name
-            }
+            Some(name) => self.matcher.is_empty() || self.matcher == "*" || self.matcher == name,
         }
     }
 }
@@ -50,8 +48,7 @@ impl HookConfig {
 #[async_trait]
 pub trait Hook: Send + Sync {
     fn name(&self) -> &str;
-    async fn run(&self, lc: Lifecycle, payload: &serde_json::Value)
-    -> anyhow::Result<HookOutcome>;
+    async fn run(&self, lc: Lifecycle, payload: &serde_json::Value) -> anyhow::Result<HookOutcome>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

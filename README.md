@@ -14,6 +14,7 @@
 - **hooks**: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` で外部コマンドを発火し、exit code でツール実行をブロック（後述）
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
 - **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
+- **skills**: `.lodan/skills/<name>/SKILL.md` を読み込み、`Skill` ツールとしてモデルへ公開（後述）
 - **拡張機構の枠だけ用意**: skills 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
 
 ## 必要環境
@@ -302,15 +303,34 @@ session: resumed 1782332785130-31477 (12 messages)
                  "prompt": "config.toml を読む箇所を列挙し、優先順位を要約して" } }
 ```
 
+## skills（`Skill` ツール）
+
+`$CWD/.lodan/skills/<name>/SKILL.md` を置くと、起動時に読み込まれ `Skill` ツールとしてモデルへ公開されます。
+ユーザーが `/name` で明示起動する slash コマンドと対になり、**skills はモデルが必要に応じて自分で起動**します。
+
+```markdown
+<!-- .lodan/skills/review/SKILL.md -->
+---
+name: review
+description: コードレビューの観点と手順
+---
+次の観点で diff をレビューしてください: 1. 正しさ 2. 命名 3. テスト ...
+```
+
+- `Skill` ツールの説明文に利用可能な skill 一覧（`name: description`）が載り、モデルが `Skill { "name": "review" }` を呼ぶと **本文（instructions）が返されて文脈に載ります**（progressive disclosure）。
+- frontmatter の `name` を省略するとディレクトリ名が使われます。`description` は一覧表示用です。
+- skill が 1 つも無ければ `Skill` ツール自体を登録しません。
+
+> ⚠️ **信頼前提**: `SKILL.md` の本文は CWD の `.lodan/skills/` から読まれ、そのままモデルへのプロンプトとして注入されます。信頼できないリポジトリの skill は prompt injection ベクタになり得ます（hooks / slash / `.mcp.json` と同じ CWD 信頼前提）。破壊的ツールは従来どおりパーミッションゲートを通ります。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
-- skills（`.lodan/skills` のロード）
 - トークン会計
 - 中断時の副作用ロールバック
 
-各ファイルは `src/{mcp,skills,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
+各ファイルは `src/{mcp,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
 
 ## テスト
 

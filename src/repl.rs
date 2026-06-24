@@ -30,12 +30,18 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         cfg.llm.provider.as_str()
     );
 
-    // skills::load_from(...)              // MVP 外
-
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let user_commands = load_user_commands(&cwd.join(".lodan/commands"));
     if !user_commands.is_empty() {
         println!("slash: {} user command(s) loaded", user_commands.len());
+    }
+
+    let user_skills = crate::skills::load_from(&cwd.join(".lodan/skills")).unwrap_or_else(|e| {
+        eprintln!("skills: load failed: {e}");
+        Vec::new()
+    });
+    if !user_skills.is_empty() {
+        println!("skills: {} loaded", user_skills.len());
     }
 
     let mut registry = default_registry();
@@ -66,6 +72,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         cwd.clone(),
         cfg.agent.max_iterations,
     )));
+
+    // Skill ツール: モデルが名前で手順書を読み込める。skill が無ければ登録しない。
+    if !user_skills.is_empty() {
+        registry.register(Arc::new(crate::skills::SkillTool::new(user_skills)));
+    }
 
     let registry = Arc::new(registry);
     let gate = PermissionGate::new(cfg.agent.auto_approve);

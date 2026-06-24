@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::messages::Message;
 use crate::config::Config;
+use crate::hooks::{self, HookOutcome, Lifecycle};
 use crate::llm::{ChatEvent, ChatResponse, LlmClient};
 use crate::permission::PermissionGate;
 use crate::prompt;
@@ -38,7 +39,18 @@ impl Session {
         llm: &dyn LlmClient,
         gate: &PermissionGate,
     ) -> Result<()> {
-        // hooks::runner::dispatch(Lifecycle::UserPromptSubmit, user_input).await?;  // MVP 外
+        let prompt_payload = serde_json::json!({ "prompt": user_input });
+        if let HookOutcome::Block(reason) = hooks::runner::dispatch(
+            Lifecycle::UserPromptSubmit,
+            None,
+            &prompt_payload,
+            &self.cfg.hooks,
+        )
+        .await?
+        {
+            println!("prompt blocked by hook: {reason}");
+            return Ok(());
+        }
         self.history.push(Message::User {
             content: user_input.to_string(),
         });
@@ -63,32 +75,62 @@ impl Session {
             println!();
 
             for call in tool_calls {
-                // hooks::runner::dispatch(Lifecycle::PreToolUse, &call).await?;  // MVP 外
-                let output = match self.registry.get(&call.function.name) {
-                    None => ToolOutput::error(format!("unknown tool: {}", call.function.name)),
+                let name = call.function.name.clone();
+                let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
+
+                let mut output = match self.registry.get(&name) {
+                    None => ToolOutput::error(format!("unknown tool: {name}")),
                     Some(tool) => {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| {
-                                serde_json::json!({ "raw": call.function.arguments })
-                            });
-                        let approved = !tool.is_destructive() || gate.allow(tool.name(), &args);
-                        if !approved {
-                            ToolOutput::error("user denied execution")
-                        } else {
-                            match tool.execute(args, &self.ctx).await {
-                                Ok(o) => o,
-                                Err(e) => ToolOutput::error(format!("tool error: {e}")),
+                        let pre_payload =
+                            serde_json::json!({ "tool_name": name, "tool_input": args });
+                        match hooks::runner::dispatch(
+                            Lifecycle::PreToolUse,
+                            Some(&name),
+                            &pre_payload,
+                            &self.cfg.hooks,
+                        )
+                        .await?
+                        {
+                            HookOutcome::Block(reason) => {
+                                ToolOutput::error(format!("blocked by hook: {reason}"))
+                            }
+                            HookOutcome::Continue => {
+                                let approved =
+                                    !tool.is_destructive() || gate.allow(tool.name(), &args);
+                                if !approved {
+                                    ToolOutput::error("user denied execution")
+                                } else {
+                                    match tool.execute(args.clone(), &self.ctx).await {
+                                        Ok(o) => o,
+                                        Err(e) => ToolOutput::error(format!("tool error: {e}")),
+                                    }
+                                }
                             }
                         }
                     }
                 };
-                // hooks::runner::dispatch(Lifecycle::PostToolUse, ...).await?;  // MVP 外
 
-                println!(
-                    "[{}] {}",
-                    call.function.name,
-                    truncate(&output.content, 400)
-                );
+                let post_payload = serde_json::json!({
+                    "tool_name": name,
+                    "tool_input": args,
+                    "tool_output": output.content,
+                });
+                if let HookOutcome::Block(reason) = hooks::runner::dispatch(
+                    Lifecycle::PostToolUse,
+                    Some(&name),
+                    &post_payload,
+                    &self.cfg.hooks,
+                )
+                .await?
+                {
+                    // 実行後なので取り消せない。理由をツール出力へ追記し、
+                    // history 経由でモデルへフィードバックする。
+                    println!("post-tool hook: {reason}");
+                    output.content = format!("{}\n[post-tool hook] {reason}", output.content);
+                }
+
+                println!("[{}] {}", name, truncate(&output.content, 400));
                 self.history.push(Message::Tool {
                     tool_call_id: call.id,
                     content: output.content,

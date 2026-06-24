@@ -3,6 +3,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::hooks::HookConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
@@ -26,6 +28,8 @@ pub struct Config {
     pub llm: LlmConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub hooks: Vec<HookConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +74,7 @@ impl Default for Config {
             llm: LlmConfig::default(),
             agent: AgentConfig::default(),
             tools: ToolsConfig::default(),
+            hooks: Vec::new(),
         }
     }
 }

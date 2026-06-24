@@ -11,7 +11,8 @@
 - **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite`
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
-- **拡張機構の枠だけ用意**: hooks / サブエージェント / skills / slash 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
+- **hooks**: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` で外部コマンドを発火し、exit code でツール実行をブロック（後述）
+- **拡張機構の枠だけ用意**: サブエージェント / skills / slash 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
 
 ## 必要環境
 
@@ -212,12 +213,34 @@ src/
 │   ├── todo_write.rs                                    # セッション scope の Todo リスト
 │   └── web_fetch.rs / web_search.rs / ask_user_question.rs
 │       monitor.rs / notebook_edit.rs / multi_edit.rs    # MVP 外スタブ
-├── hooks/   mcp/   skills/   slash/   session.rs        # MVP 外スタブ
+├── hooks/                                                # 外部コマンド hook ディスパッチ
+├── mcp/   skills/   slash/   session.rs                  # MVP 外スタブ
 ```
+
+## hooks
+
+`config.toml` の `[[hooks]]` 配列で、ライフサイクルイベント発火時に外部コマンドを実行できます。
+コマンドはイベントの JSON ペイロードを stdin で受け取り、終了コードで制御します
+（exit 0 = 続行、非 0 = ブロック。理由は stderr → stdout の順で採用）。
+
+```toml
+# Bash 実行前にガードスクリプトを通す。non-zero で実行をブロック。
+[[hooks]]
+event = "PreToolUse"     # UserPromptSubmit | PreToolUse | PostToolUse
+matcher = "Bash"         # 省略可: ツール名一致（Pre/PostToolUse のみ）。空 / "*" で全ツール
+command = "./scripts/guard.sh"
+```
+
+- **UserPromptSubmit**: ペイロード `{"prompt": "..."}`。ブロック時はそのターンを実行せず破棄。
+- **PreToolUse**: `{"tool_name", "tool_input"}`。ブロック時はツールを実行せず、理由をモデルへ返す。
+- **PostToolUse**: `{"tool_name", "tool_input", "tool_output"}`。実行後の観測用（取り消し不可、理由を表示）。
+
+hook の起動自体に失敗した場合は警告のみで続行（fail-open）、30 秒でタイムアウトします。
+
+> ⚠️ **信頼前提**: hook コマンドは CWD のプロジェクト `config.toml` から無確認で `sh -c` 実行されます（パーミッションゲートを経ません）。`.mcp.json` と同様、信頼できないリポジトリの設定をそのまま起動しないでください（任意コード実行になり得ます）。
 
 ## ロードマップ（MVP 外、骨組みは存在）
 
-- hooks (PreToolUse / PostToolUse / SessionStart 等のディスパッチ)
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots
 - サブエージェント spawn
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
@@ -226,7 +249,7 @@ src/
 - 永続セッション・トランスクリプト保存・トークン会計
 - 中断時の副作用ロールバック
 
-各ファイルは `src/{hooks,mcp,skills,slash,session,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
+各ファイルは `src/{mcp,skills,slash,session,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
 
 ## テスト
 

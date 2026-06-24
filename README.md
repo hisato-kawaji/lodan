@@ -8,12 +8,13 @@
 - **マルチプロバイダ**: ローカル LLM と Sakana AI (`fugu` / `fugu-ultra`) を環境変数で随時切り替え
 - **MCP クライアント (stdio + tools)**: `.mcp.json` を CWD に置くと MCP サーバを起動して公開 tools を取り込む
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
-- **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite`
+- **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite` / `Task`（調査用サブエージェント）
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
 - **hooks**: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` で外部コマンドを発火し、exit code でツール実行をブロック（後述）
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
-- **拡張機構の枠だけ用意**: サブエージェント / skills 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
+- **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
+- **拡張機構の枠だけ用意**: skills 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
 
 ## 必要環境
 
@@ -285,10 +286,25 @@ session: resumed 1782332785130-31477 (12 messages)
 - transcript には Read したファイル内容や貼り付けた値が**平文**で残ります。セッションディレクトリは本人のみアクセス可（unix で dir `0700` / file `0600`）に制限しますが、秘密情報の扱いには留意してください。
 - 中断などで tool 呼び出しの結果が揃わなかったターンは、再投入の整合性のため保存されません（解決済みの履歴のみ追記）。
 
+## サブエージェント（`Task` ツール）
+
+メインエージェントは `Task` ツールで調査タスクを子エージェントに委譲できます。
+
+- 子は **読み取り専用ツール（`Read` / `Grep` / `Glob`）だけ** を持ち、headless にツールループを回して最終テキストを 1 つの要約として返します。
+- 破壊的操作を持たないため承認ゲートを経ず、`Task` 自身を含めないため無限再帰しません。
+- 引数: `description`（短いラベル）+ `prompt`（自己完結した調査指示。子は親の会話を見ません）。
+- ループは `agent.max_iterations` と子専用上限（12）の小さい方で打ち切られます。起動時に `↳ Task: <description>` を表示します。
+
+```jsonc
+// メインエージェントが発行する tool call の例
+{ "name": "Task",
+  "arguments": { "description": "find config loaders",
+                 "prompt": "config.toml を読む箇所を列挙し、優先順位を要約して" } }
+```
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots
-- サブエージェント spawn
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - skills（`.lodan/skills` のロード）
 - トークン会計

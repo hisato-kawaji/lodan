@@ -81,6 +81,17 @@ pub fn default_registry() -> ToolRegistry {
     r
 }
 
+/// サブエージェント (`Task`) に渡す読み取り専用ツールのみの registry。
+/// 破壊的ツール (Write/Edit/Bash) と Task 自身は含めないため、headless 実行でも
+/// 承認ゲート不要・無限再帰なし。
+pub fn read_only_registry() -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    r.register(Arc::new(read::Read));
+    r.register(Arc::new(grep::Grep));
+    r.register(Arc::new(glob::Glob));
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

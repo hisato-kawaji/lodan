@@ -53,8 +53,21 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }
     // Keep clients alive for the full session; Drop kills subprocesses.
     let _mcp_clients = mcp_outcome.clients;
-    let registry = Arc::new(registry);
+
     let llm_client: Arc<dyn llm::LlmClient> = llm::build_client(&cfg)?;
+
+    // サブエージェント (Task): 読み取り専用ツールで調査を委譲する。
+    // LLM クライアントが要るため default_registry ではなくここで登録する。
+    let sub_tools = Arc::new(crate::tools::registry::read_only_registry());
+    registry.register(Arc::new(agent::subagent::SubAgentTool::new(
+        Arc::clone(&llm_client),
+        cfg.llm.active().model.clone(),
+        sub_tools,
+        cwd.clone(),
+        cfg.agent.max_iterations,
+    )));
+
+    let registry = Arc::new(registry);
     let gate = PermissionGate::new(cfg.agent.auto_approve);
 
     let (mut session, mut recorder) = match resume {

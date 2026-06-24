@@ -257,6 +257,8 @@ git diff を確認して、$ARGUMENTS の観点でレビューしてください
 - frontmatter の `description:` は任意で、`/help` の一覧に表示されます
 - 組み込み（`/exit` `/clear` `/tools` `/help`）と同名のファイルは警告して無視されます
 
+> ⚠️ **信頼前提**: コマンドファイルは CWD の `.lodan/commands/` から読まれ、本文がそのままモデルへのプロンプトになります。信頼できないリポジトリのコマンドは prompt injection ベクタになり得ます（hooks / `.mcp.json` と同じ CWD 信頼前提）。ただし展開結果はユーザー入力と同じ経路で、破壊的ツールは従来どおりパーミッションゲートを通ります。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots

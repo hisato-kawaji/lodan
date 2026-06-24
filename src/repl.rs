@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -17,7 +17,10 @@ const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools"];
 
 pub async fn run(cfg: Config) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
-    println!("lodan {} — type /help for commands, /exit to quit", env!("CARGO_PKG_VERSION"));
+    println!(
+        "lodan {} — type /help for commands, /exit to quit",
+        env!("CARGO_PKG_VERSION")
+    );
     let active = cfg.llm.active();
     println!(
         "model: {} @ {} ({})",
@@ -73,7 +76,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
         let _ = rl.add_history_entry(line);
 
-        if let Some(rest) = line.strip_prefix('/').filter(|r| looks_like_slash_command(r)) {
+        if let Some(rest) = line
+            .strip_prefix('/')
+            .filter(|r| looks_like_slash_command(r))
+        {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let head = parts.next().unwrap_or("");
             let args = parts.next().unwrap_or("").trim();
@@ -85,7 +91,8 @@ pub async fn run(cfg: Config) -> Result<()> {
                     // 組み込みに無ければユーザ定義コマンドを試す。
                     if let Some(cmd) = user_commands.get(head) {
                         let prompt = slash::expand(&cmd.body, args);
-                        if let Err(e) = session.run_turn(&prompt, llm_client.as_ref(), &gate).await {
+                        if let Err(e) = session.run_turn(&prompt, llm_client.as_ref(), &gate).await
+                        {
                             eprintln!("error: {e:#}");
                         }
                     } else {
@@ -188,7 +195,9 @@ mod tests {
     #[test]
     fn absolute_paths_are_not_commands() {
         assert!(!looks_like_slash_command("tmp/foo"));
-        assert!(!looks_like_slash_command("tmp/lodan-demo/hello.txt に hi と書いて"));
+        assert!(!looks_like_slash_command(
+            "tmp/lodan-demo/hello.txt に hi と書いて"
+        ));
         assert!(!looks_like_slash_command("Users/me/file.rs"));
     }
 

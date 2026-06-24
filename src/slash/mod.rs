@@ -53,26 +53,11 @@ pub fn load_dir(dir: &Path) -> Result<Vec<SlashCommand>> {
 /// frontmatter が無ければ description は空、body は全文。
 /// 認識するキーは `description` のみ (依存追加を避けた最小パース)。
 fn parse_frontmatter(content: &str) -> (String, String) {
-    let rest = match content.strip_prefix("---\n") {
-        Some(r) => r,
-        None => return (String::new(), content.trim_start().to_string()),
-    };
-    let Some(end) = rest.find("\n---") else {
-        // 閉じ `---` 無し → frontmatter として扱わない。
-        return (String::new(), content.trim_start().to_string());
-    };
-    let front = &rest[..end];
-    // `\n---` の次の改行以降が本文。
-    let after = &rest[end + 4..];
-    let body = after.strip_prefix('\n').unwrap_or(after);
-
-    let mut description = String::new();
-    for line in front.lines() {
-        if let Some(v) = line.strip_prefix("description:") {
-            description = v.trim().trim_matches('"').to_string();
-        }
-    }
-    (description, body.trim_start().to_string())
+    let (front, body) = crate::frontmatter::split(content);
+    let description = front
+        .and_then(|f| crate::frontmatter::field(f, "description"))
+        .unwrap_or_default();
+    (description, body.to_string())
 }
 
 /// テンプレート本文に引数を差し込む。

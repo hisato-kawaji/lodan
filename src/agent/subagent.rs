@@ -17,9 +17,12 @@ use crate::prompt;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{Tool, ToolCtx, ToolError, ToolOutput};
 
+/// 子エージェントの反復上限。親 (`agent.max_iterations`) より小さく抑え、
+/// 静かに走る子が LLM を回しすぎてコスト超過しないようにする。
+const SUBAGENT_MAX_ITERATIONS: usize = 12;
+
 #[derive(Debug, Deserialize)]
 struct TaskArgs {
-    #[allow(dead_code)]
     description: String,
     prompt: String,
 }
@@ -47,7 +50,8 @@ impl SubAgentTool {
             model,
             tools,
             cwd,
-            max_iterations,
+            // 親の上限と子専用上限の小さい方を採る。
+            max_iterations: max_iterations.min(SUBAGENT_MAX_ITERATIONS),
         }
     }
 
@@ -148,6 +152,8 @@ impl Tool for SubAgentTool {
     ) -> Result<ToolOutput, ToolError> {
         let args: TaskArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("Task: {e}")))?;
+        // 子は静かに走るので、起動を 1 行知らせて可視性を確保する。
+        println!("  ↳ Task: {}", args.description);
         let summary = self.run(&args.prompt).await?;
         Ok(ToolOutput::ok(summary))
     }
@@ -290,5 +296,20 @@ mod tests {
         assert!(!names.contains(&"Edit"));
         assert!(!names.contains(&"Bash"));
         assert!(!names.contains(&"Task"));
+    }
+
+    #[test]
+    fn read_only_registry_has_no_destructive_tools() {
+        // 名前ベースの allowlist に頼らず、子に渡る全ツールが非破壊であることを
+        // 本質で固定する。将来 default_registry に破壊的ツールが増えても、
+        // 誤って read_only_registry に混入すればここで落ちる。
+        let r = read_only_registry();
+        for name in r.names() {
+            let tool = r.get(name).expect("registered");
+            assert!(
+                !tool.is_destructive(),
+                "sub-agent tool {name} must be non-destructive"
+            );
+        }
     }
 }

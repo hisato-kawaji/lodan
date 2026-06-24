@@ -293,7 +293,7 @@ session: resumed 1782332785130-31477 (12 messages)
 - 子は **読み取り専用ツール（`Read` / `Grep` / `Glob`）だけ** を持ち、headless にツールループを回して最終テキストを 1 つの要約として返します。
 - 破壊的操作を持たないため承認ゲートを経ず、`Task` 自身を含めないため無限再帰しません。
 - 引数: `description`（短いラベル）+ `prompt`（自己完結した調査指示。子は親の会話を見ません）。
-- ループは `agent.max_iterations` で打ち切られます。
+- ループは `agent.max_iterations` と子専用上限（12）の小さい方で打ち切られます。起動時に `↳ Task: <description>` を表示します。
 
 ```jsonc
 // メインエージェントが発行する tool call の例

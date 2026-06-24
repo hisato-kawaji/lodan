@@ -12,7 +12,8 @@
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
 - **hooks**: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` で外部コマンドを発火し、exit code でツール実行をブロック（後述）
-- **拡張機構の枠だけ用意**: サブエージェント / skills / slash 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
+- **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
+- **拡張機構の枠だけ用意**: サブエージェント / skills 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
 
 ## 必要環境
 
@@ -153,7 +154,7 @@ hi を書きました。
 lodan> /exit
 ```
 
-組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools`
+組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools`（ユーザー定義コマンドは後述）
 
 破壊的ツール承認:
 - `y` 一度だけ許可
@@ -214,7 +215,8 @@ src/
 │   └── web_fetch.rs / web_search.rs / ask_user_question.rs
 │       monitor.rs / notebook_edit.rs / multi_edit.rs    # MVP 外スタブ
 ├── hooks/                                                # 外部コマンド hook ディスパッチ
-├── mcp/   skills/   slash/   session.rs                  # MVP 外スタブ
+├── slash/                                                # ユーザー定義 slash コマンド
+├── mcp/   skills/   session.rs                           # MVP 外スタブ
 ```
 
 ## hooks
@@ -239,17 +241,34 @@ hook の起動自体に失敗した場合は警告のみで続行（fail-open）
 
 > ⚠️ **信頼前提**: hook コマンドは CWD のプロジェクト `config.toml` から無確認で `sh -c` 実行されます（パーミッションゲートを経ません）。`.mcp.json` と同様、信頼できないリポジトリの設定をそのまま起動しないでください（任意コード実行になり得ます）。
 
+## ユーザー定義 slash コマンド
+
+`$CWD/.lodan/commands/<name>.md` を置くと、起動時に読み込まれて `/name` で使えます。
+ファイル本文がプロンプトテンプレートになり、`/name 引数...` で展開してエージェントへ投入されます。
+
+```markdown
+---
+description: 直近の diff をレビューする
+---
+git diff を確認して、$ARGUMENTS の観点でレビューしてください。
+```
+
+- `$ARGUMENTS` → 引数全体、`$1`..`$9` → 空白区切りの位置引数（該当なしは空文字）
+- frontmatter の `description:` は任意で、`/help` の一覧に表示されます
+- 組み込み（`/exit` `/clear` `/tools` `/help`）と同名のファイルは警告して無視されます
+
+> ⚠️ **信頼前提**: コマンドファイルは CWD の `.lodan/commands/` から読まれ、本文がそのままモデルへのプロンプトになります。信頼できないリポジトリのコマンドは prompt injection ベクタになり得ます（hooks / `.mcp.json` と同じ CWD 信頼前提）。ただし展開結果はユーザー入力と同じ経路で、破壊的ツールは従来どおりパーミッションゲートを通ります。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots
 - サブエージェント spawn
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - skills（`.lodan/skills` のロード）
-- slash 拡張（ユーザー定義コマンド）
 - 永続セッション・トランスクリプト保存・トークン会計
 - 中断時の副作用ロールバック
 
-各ファイルは `src/{mcp,skills,slash,session,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
+各ファイルは `src/{mcp,skills,session,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
 
 ## テスト
 

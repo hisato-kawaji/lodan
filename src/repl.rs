@@ -1,6 +1,7 @@
 use anyhow::Result;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::agent;
@@ -8,11 +9,18 @@ use crate::config::Config;
 use crate::llm;
 use crate::mcp;
 use crate::permission::PermissionGate;
+use crate::slash::{self, SlashCommand};
 use crate::tools::registry::default_registry;
+
+/// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
+const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools"];
 
 pub async fn run(cfg: Config) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
-    println!("lodan {} — type /help for commands, /exit to quit", env!("CARGO_PKG_VERSION"));
+    println!(
+        "lodan {} — type /help for commands, /exit to quit",
+        env!("CARGO_PKG_VERSION")
+    );
     let active = cfg.llm.active();
     println!(
         "model: {} @ {} ({})",
@@ -22,7 +30,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     );
 
     // skills::load_from(...)              // MVP 外
-    // slash::register_user_commands(...)  // MVP 外
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let user_commands = load_user_commands(&cwd.join(".lodan/commands"));
+    if !user_commands.is_empty() {
+        println!("slash: {} user command(s) loaded", user_commands.len());
+    }
 
     let mut registry = default_registry();
     let mcp_outcome = mcp::registry::load_and_register(&mut registry)
@@ -63,12 +76,28 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
         let _ = rl.add_history_entry(line);
 
-        if let Some(rest) = line.strip_prefix('/').filter(|r| looks_like_slash_command(r)) {
-            match handle_slash(rest, &registry) {
+        if let Some(rest) = line
+            .strip_prefix('/')
+            .filter(|r| looks_like_slash_command(r))
+        {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let head = parts.next().unwrap_or("");
+            let args = parts.next().unwrap_or("").trim();
+
+            match handle_slash(head, &registry, &user_commands) {
                 SlashResult::Exit => break,
                 SlashResult::Handled => continue,
                 SlashResult::Unknown => {
-                    eprintln!("unknown command: /{rest}");
+                    // 組み込みに無ければユーザ定義コマンドを試す。
+                    if let Some(cmd) = user_commands.get(head) {
+                        let prompt = slash::expand(&cmd.body, args);
+                        if let Err(e) = session.run_turn(&prompt, llm_client.as_ref(), &gate).await
+                        {
+                            eprintln!("error: {e:#}");
+                        }
+                    } else {
+                        eprintln!("unknown command: /{head}");
+                    }
                     continue;
                 }
             }
@@ -100,11 +129,22 @@ fn looks_like_slash_command(rest: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-fn handle_slash(cmd: &str, registry: &crate::tools::registry::ToolRegistry) -> SlashResult {
+fn handle_slash(
+    cmd: &str,
+    registry: &crate::tools::registry::ToolRegistry,
+    user_commands: &BTreeMap<String, SlashCommand>,
+) -> SlashResult {
     match cmd {
         "exit" | "quit" => SlashResult::Exit,
         "help" => {
             println!("/exit /clear /tools /help");
+            for c in user_commands.values() {
+                if c.description.is_empty() {
+                    println!("/{}", c.name);
+                } else {
+                    println!("/{} — {}", c.name, c.description);
+                }
+            }
             SlashResult::Handled
         }
         "clear" => {
@@ -121,6 +161,26 @@ fn handle_slash(cmd: &str, registry: &crate::tools::registry::ToolRegistry) -> S
     }
 }
 
+/// `.lodan/commands/` を読み、組み込みと衝突する名前は警告して除外する。
+fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
+    let cmds = match slash::load_dir(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("slash: load failed: {e}");
+            return BTreeMap::new();
+        }
+    };
+    let mut map = BTreeMap::new();
+    for cmd in cmds {
+        if BUILTINS.contains(&cmd.name.as_str()) {
+            eprintln!("slash: /{} shadows a builtin, skipped", cmd.name);
+            continue;
+        }
+        map.insert(cmd.name.clone(), cmd);
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::looks_like_slash_command;
@@ -135,7 +195,9 @@ mod tests {
     #[test]
     fn absolute_paths_are_not_commands() {
         assert!(!looks_like_slash_command("tmp/foo"));
-        assert!(!looks_like_slash_command("tmp/lodan-demo/hello.txt に hi と書いて"));
+        assert!(!looks_like_slash_command(
+            "tmp/lodan-demo/hello.txt に hi と書いて"
+        ));
         assert!(!looks_like_slash_command("Users/me/file.rs"));
     }
 

@@ -9,13 +9,14 @@ use crate::config::Config;
 use crate::llm;
 use crate::mcp;
 use crate::permission::PermissionGate;
+use crate::session::Recorder;
 use crate::slash::{self, SlashCommand};
 use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools"];
 
-pub async fn run(cfg: Config) -> Result<()> {
+pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
     println!(
         "lodan {} — type /help for commands, /exit to quit",
@@ -55,7 +56,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     let registry = Arc::new(registry);
     let llm_client: Arc<dyn llm::LlmClient> = llm::build_client(&cfg)?;
     let gate = PermissionGate::new(cfg.agent.auto_approve);
-    let mut session = agent::Session::new(cfg.clone(), Arc::clone(&registry));
+
+    let (mut session, mut recorder) = match resume {
+        Some(arg) => resume_session(&arg, &cfg, &registry),
+        None => new_session(&cwd, &cfg, &registry),
+    };
 
     loop {
         let line = match rl.readline("lodan> ") {
@@ -95,6 +100,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                         {
                             eprintln!("error: {e:#}");
                         }
+                        persist(&mut recorder, &session);
                     } else {
                         eprintln!("unknown command: /{head}");
                     }
@@ -106,9 +112,82 @@ pub async fn run(cfg: Config) -> Result<()> {
         if let Err(e) = session.run_turn(line, llm_client.as_ref(), &gate).await {
             eprintln!("error: {e:#}");
         }
+        persist(&mut recorder, &session);
     }
 
     Ok(())
+}
+
+/// 新規セッションを作り、永続化レコーダを用意する。
+/// レコーダ作成に失敗してもセッションは続行する (永続化なしの ephemeral)。
+fn new_session(
+    cwd: &std::path::Path,
+    cfg: &Config,
+    registry: &Arc<crate::tools::registry::ToolRegistry>,
+) -> (agent::Session, Option<Recorder>) {
+    let session = agent::Session::new(cfg.clone(), Arc::clone(registry));
+    let recorder = match Recorder::create(cwd, cfg.llm.provider.as_str(), &cfg.llm.active().model) {
+        Ok(r) => {
+            println!("session: {}", r.id());
+            Some(r)
+        }
+        Err(e) => {
+            eprintln!("session: persistence disabled ({e})");
+            None
+        }
+    };
+    (session, recorder)
+}
+
+/// 保存済みセッションを復元する。失敗時は警告して新規セッションにフォールバックする。
+fn resume_session(
+    arg: &str,
+    cfg: &Config,
+    registry: &Arc<crate::tools::registry::ToolRegistry>,
+) -> (agent::Session, Option<Recorder>) {
+    let resolved = if arg == "last" {
+        crate::session::latest_session_id().ok().flatten()
+    } else {
+        Some(arg.to_string())
+    };
+
+    let Some(id) = resolved else {
+        eprintln!("session: no session to resume");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        return new_session(&cwd, cfg, registry);
+    };
+
+    match crate::session::load_transcript(&id) {
+        Ok(prior) => {
+            let n = prior.len();
+            let session = agent::Session::resume(cfg.clone(), Arc::clone(registry), prior);
+            // recorder は復元後の history を基準に「保存済み」位置を決める。
+            match Recorder::open_resumed(&id, session.history()) {
+                Ok(recorder) => {
+                    println!("session: resumed {id} ({n} messages)");
+                    (session, Some(recorder))
+                }
+                Err(e) => {
+                    eprintln!("session: resumed {id} but persistence disabled ({e})");
+                    (session, None)
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("session: cannot resume {id}: {e}");
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            new_session(&cwd, cfg, registry)
+        }
+    }
+}
+
+/// ターン後に履歴を transcript へ追記する (レコーダ無効時は no-op)。
+fn persist(recorder: &mut Option<Recorder>, session: &agent::Session) {
+    if let Some(rec) = recorder.as_mut()
+        && let Err(e) = rec.sync(session.history())
+    {
+        eprintln!("session: save failed: {e}");
+    }
 }
 
 enum SlashResult {

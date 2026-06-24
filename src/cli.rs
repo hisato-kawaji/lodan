@@ -35,6 +35,10 @@ pub struct Cli {
     #[arg(long, env = "LODAN_AUTO_APPROVE")]
     pub yes: bool,
 
+    /// Resume a saved session by id (or `last` for the most recent)
+    #[arg(long, value_name = "ID")]
+    pub resume: Option<String>,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }
@@ -45,6 +49,8 @@ pub enum Command {
     Config,
     /// Start the interactive REPL (default if omitted)
     Repl,
+    /// List saved sessions
+    Sessions,
 }
 
 pub async fn dispatch(args: Cli) -> Result<()> {
@@ -58,10 +64,26 @@ pub async fn dispatch(args: Cli) -> Result<()> {
     );
 
     match args.cmd.unwrap_or(Command::Repl) {
-        Command::Repl => repl::run(cfg).await,
+        Command::Repl => repl::run(cfg, args.resume).await,
         Command::Config => {
             println!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())
         }
+        Command::Sessions => list_sessions(),
     }
+}
+
+fn list_sessions() -> Result<()> {
+    let sessions = crate::session::list_sessions()?;
+    if sessions.is_empty() {
+        println!("no saved sessions");
+        return Ok(());
+    }
+    for meta in sessions {
+        println!(
+            "{}  {} ({})  {}",
+            meta.id, meta.model, meta.provider, meta.cwd
+        );
+    }
+    Ok(())
 }

@@ -21,9 +21,24 @@ pub struct Session {
 
 impl Session {
     pub fn new(cfg: Config, registry: Arc<ToolRegistry>) -> Self {
+        Self::with_prior(cfg, registry, Vec::new())
+    }
+
+    /// 保存済みセッションから復元する。`prior` の System メッセージは捨て、
+    /// 現環境のツール一覧で system prompt を作り直してから残りを引き継ぐ。
+    pub fn resume(cfg: Config, registry: Arc<ToolRegistry>, prior: Vec<Message>) -> Self {
+        let prior: Vec<Message> = prior
+            .into_iter()
+            .filter(|m| !matches!(m, Message::System { .. }))
+            .collect();
+        Self::with_prior(cfg, registry, prior)
+    }
+
+    fn with_prior(cfg: Config, registry: Arc<ToolRegistry>, prior: Vec<Message>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let system = prompt::build_system_prompt(&cwd, &cfg.llm.active().model, registry.as_ref());
-        let history = vec![Message::System { content: system }];
+        let mut history = vec![Message::System { content: system }];
+        history.extend(prior);
         let ctx = ToolCtx::new(cwd);
         Self {
             cfg,
@@ -31,6 +46,11 @@ impl Session {
             history,
             ctx,
         }
+    }
+
+    /// 永続化のための会話履歴 (system を含む全メッセージ)。
+    pub fn history(&self) -> &[Message] {
+        &self.history
     }
 
     pub async fn run_turn(

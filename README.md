@@ -216,7 +216,8 @@ src/
 │       monitor.rs / notebook_edit.rs / multi_edit.rs    # MVP 外スタブ
 ├── hooks/                                                # 外部コマンド hook ディスパッチ
 ├── slash/                                                # ユーザー定義 slash コマンド
-├── mcp/   skills/   session.rs                           # MVP 外スタブ
+├── session.rs                                            # セッション永続化 (transcript / resume)
+├── mcp/   skills/                                         # MVP 外スタブ
 ```
 
 ## hooks
@@ -259,16 +260,37 @@ git diff を確認して、$ARGUMENTS の観点でレビューしてください
 
 > ⚠️ **信頼前提**: コマンドファイルは CWD の `.lodan/commands/` から読まれ、本文がそのままモデルへのプロンプトになります。信頼できないリポジトリのコマンドは prompt injection ベクタになり得ます（hooks / `.mcp.json` と同じ CWD 信頼前提）。ただし展開結果はユーザー入力と同じ経路で、破壊的ツールは従来どおりパーミッションゲートを通ります。
 
+## セッション永続化・再開
+
+REPL セッションは自動的に保存され、後から再開できます。
+
+- 保存先: `<データディレクトリ>/lodan/sessions/<id>/`（macOS なら `~/Library/Application Support/lodan/sessions/`）
+  - `meta.json`: id / 作成時刻 / cwd / provider / model
+  - `transcript.jsonl`: 各メッセージを 1 行 1 件でターンごとに追記
+- `lodan sessions` — 保存済みセッションを一覧表示
+- `lodan --resume <id>` — 指定 id を再開（`--resume last` で直近を再開）
+
+```console
+$ lodan
+session: 1782332785130-31477   # 起動時に新規 id を表示
+...
+$ lodan --resume last
+session: resumed 1782332785130-31477 (12 messages)
+```
+
+再開時は保存済みの会話を読み戻したうえで、**system prompt は現在の環境（ツール一覧）で作り直します**。
+永続化に失敗してもセッションは継続します（その場合は保存なしの ephemeral 動作）。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots
 - サブエージェント spawn
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - skills（`.lodan/skills` のロード）
-- 永続セッション・トランスクリプト保存・トークン会計
+- トークン会計
 - 中断時の副作用ロールバック
 
-各ファイルは `src/{mcp,skills,session,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
+各ファイルは `src/{mcp,skills,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
 
 ## テスト
 

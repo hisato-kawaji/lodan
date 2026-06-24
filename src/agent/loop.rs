@@ -79,7 +79,7 @@ impl Session {
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
 
-                let output = match self.registry.get(&name) {
+                let mut output = match self.registry.get(&name) {
                     None => ToolOutput::error(format!("unknown tool: {name}")),
                     Some(tool) => {
                         let pre_payload =
@@ -124,8 +124,10 @@ impl Session {
                 )
                 .await?
                 {
-                    // 実行後なので取り消せない。理由をモデルへフィードバックする。
+                    // 実行後なので取り消せない。理由をツール出力へ追記し、
+                    // history 経由でモデルへフィードバックする。
                     println!("post-tool hook: {reason}");
+                    output.content = format!("{}\n[post-tool hook] {reason}", output.content);
                 }
 
                 println!("[{}] {}", name, truncate(&output.content, 400));

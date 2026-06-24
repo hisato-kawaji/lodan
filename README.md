@@ -237,6 +237,8 @@ command = "./scripts/guard.sh"
 
 hook の起動自体に失敗した場合は警告のみで続行（fail-open）、30 秒でタイムアウトします。
 
+> ⚠️ **信頼前提**: hook コマンドは CWD のプロジェクト `config.toml` から無確認で `sh -c` 実行されます（パーミッションゲートを経ません）。`.mcp.json` と同様、信頼できないリポジトリの設定をそのまま起動しないでください（任意コード実行になり得ます）。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots

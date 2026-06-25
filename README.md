@@ -215,7 +215,8 @@ lodan> /exit
 こちらの**モデル・トークンを駆動**するため、既定では無効。`.mcp.json` の各サーバに
 **`"allowSampling": true`** を付けたサーバにのみ許可し、initialize で sampling capability を
 広告します（stdio のみ）。許可サーバの要求は、現在 active な provider/model の LLM へ
-そのまま渡され、結果を assistant テキストとして返します。
+そのまま渡され、結果を assistant テキストとして返します。サーバ指定の `maxTokens` は
+生成上限として LLM に渡され、無制限生成を防ぎます。
 
 ```jsonc
 {

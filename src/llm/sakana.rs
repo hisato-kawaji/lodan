@@ -44,8 +44,9 @@ impl LlmClient for SakanaClient {
         history: &[Message],
         tools: &[ToolSpec<'_>],
         model: &str,
+        max_tokens: Option<u32>,
     ) -> Result<ChatResponse> {
-        self.inner.chat(history, tools, model).await
+        self.inner.chat(history, tools, model, max_tokens).await
     }
 
     async fn chat_stream(

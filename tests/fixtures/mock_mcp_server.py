@@ -44,8 +44,16 @@ GET_ROOTS_TOOL = {
     "inputSchema": {"type": "object", "properties": {}},
 }
 
+GET_SAMPLE_TOOL = {
+    "name": "get_sample",
+    "description": "Return the assistant text from the client's sampling/createMessage reply.",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+
 # Captured from the client's response to our server-initiated roots/list request.
 CAPTURED_ROOTS: list = []
+# Captured from the client's response to our server-initiated sampling request.
+CAPTURED_SAMPLE: list[str] = []
 
 
 def send(obj: dict[str, Any]) -> None:
@@ -57,12 +65,17 @@ def handle(msg: dict[str, Any]) -> None:
     method = msg.get("method")
     msg_id = msg.get("id")
 
-    # Response to our server→client roots/list request (no method, has result).
+    # Response to a server→client request (no method, has result).
+    # Either roots/list (has "roots") or sampling/createMessage (has "content").
     if method is None and isinstance(msg.get("result"), dict):
-        roots = msg["result"].get("roots")
+        result = msg["result"]
+        roots = result.get("roots")
         if isinstance(roots, list):
             CAPTURED_ROOTS.clear()
             CAPTURED_ROOTS.extend(roots)
+        elif isinstance(result.get("content"), dict):
+            CAPTURED_SAMPLE.clear()
+            CAPTURED_SAMPLE.append(result["content"].get("text", ""))
         return
 
     if method == "initialize":
@@ -77,8 +90,23 @@ def handle(msg: dict[str, Any]) -> None:
                 },
             }
         )
-        # Exercise the server→client direction: ask the client for its roots.
+        # Exercise the server→client direction: ask the client for its roots,
+        # and request an LLM completion via sampling (honored only if the client
+        # opted in with allowSampling — otherwise it replies method-not-found).
         send({"jsonrpc": "2.0", "id": 9001, "method": "roots/list"})
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 9002,
+                "method": "sampling/createMessage",
+                "params": {
+                    "maxTokens": 16,
+                    "messages": [
+                        {"role": "user", "content": {"type": "text", "text": "ping"}}
+                    ],
+                },
+            }
+        )
         return
 
     if method == "notifications/initialized":
@@ -89,7 +117,7 @@ def handle(msg: dict[str, Any]) -> None:
             {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"tools": [ECHO_TOOL, GET_ROOTS_TOOL]},
+                "result": {"tools": [ECHO_TOOL, GET_ROOTS_TOOL, GET_SAMPLE_TOOL]},
             }
         )
         return
@@ -112,6 +140,18 @@ def handle(msg: dict[str, Any]) -> None:
             )
         elif name == "get_roots":
             text = json.dumps(CAPTURED_ROOTS, separators=(",", ":"))
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": text}],
+                        "isError": False,
+                    },
+                }
+            )
+        elif name == "get_sample":
+            text = CAPTURED_SAMPLE[0] if CAPTURED_SAMPLE else ""
             send(
                 {
                     "jsonrpc": "2.0",

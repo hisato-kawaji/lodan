@@ -5,9 +5,15 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use async_trait::async_trait;
+use lodan::agent::messages::{Message, ToolSpec};
+use lodan::llm::{ChatEvent, ChatResponse, LlmClient};
 use lodan::mcp::client::McpClient;
 use lodan::mcp::config::McpServerSpec;
+use lodan::mcp::sampling::SamplingProvider;
+use tokio::sync::mpsc;
 
 fn fixture_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -32,7 +38,11 @@ async fn handshake_list_and_call_round_trip() {
         .expect("connect MCP mock");
 
     let tools = client.list_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 2, "expected echo + get_roots, got {tools:?}");
+    assert_eq!(
+        tools.len(),
+        3,
+        "expected echo + get_roots + get_sample, got {tools:?}"
+    );
     assert!(tools.iter().any(|t| t.name == "echo"));
 
     let result = client
@@ -85,5 +95,71 @@ async fn handshake_list_and_call_round_trip() {
         roots.content.contains("file://"),
         "expected a file:// root, got: {}",
         roots.content
+    );
+}
+
+/// 固定文を返すスタブ LLM。sampling の往復確認用。
+struct StubLlm;
+
+#[async_trait]
+impl LlmClient for StubLlm {
+    async fn chat(
+        &self,
+        _history: &[Message],
+        _tools: &[ToolSpec<'_>],
+        _model: &str,
+        _max_tokens: Option<u32>,
+    ) -> anyhow::Result<ChatResponse> {
+        Ok(ChatResponse {
+            content: Some("sampled-ok".into()),
+            tool_calls: Vec::new(),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _history: &[Message],
+        _tools: &[ToolSpec<'_>],
+        _model: &str,
+        _sink: mpsc::UnboundedSender<ChatEvent>,
+    ) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+}
+
+/// server→client sampling/createMessage の往復。allowSampling を opt-in したクライアントは
+/// サーバの sampling 要求を stub LLM へ橋渡しし、結果を返す。mock は受け取った assistant
+/// テキストを `get_sample` で echo するので、stub の固定文が往復したことを確認する。
+#[tokio::test]
+async fn sampling_round_trip_when_opted_in() {
+    let spec = McpServerSpec {
+        command: Some("python3".to_string()),
+        args: vec![fixture_script().to_string_lossy().into_owned()],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        allow_sampling: true,
+    };
+
+    let sampling = Arc::new(SamplingProvider::new(
+        Arc::new(StubLlm),
+        "stub-model".into(),
+    ));
+    let client = McpClient::connect("mock", &spec, Some(sampling))
+        .await
+        .expect("connect MCP mock");
+
+    // A round-trip ensures the client has processed the server's sampling request
+    // and sent its reply (which the mock captures) before we read it back.
+    let _ = client.list_tools().await.expect("list_tools");
+
+    let sample = client
+        .call_tool("get_sample", serde_json::json!({}))
+        .await
+        .expect("get_sample");
+    assert_eq!(
+        sample.content, "sampled-ok",
+        "expected the stub LLM reply to round-trip via sampling, got: {}",
+        sample.content
     );
 }

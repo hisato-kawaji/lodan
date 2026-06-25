@@ -70,13 +70,13 @@ pub fn default_registry() -> ToolRegistry {
     r.register(Arc::new(glob::Glob));
     r.register(Arc::new(todo_write::TodoWrite));
     r.register(Arc::new(multi_edit::MultiEdit));
+    r.register(Arc::new(notebook_edit::NotebookEdit));
 
     // --- MVP スコープ外: 登録は意図的に無効化 ---
     // r.register(Arc::new(web_fetch::WebFetch));
     // r.register(Arc::new(web_search::WebSearch));
     // r.register(Arc::new(ask_user_question::AskUserQuestion));
     // r.register(Arc::new(monitor::Monitor));
-    // r.register(Arc::new(notebook_edit::NotebookEdit));
 
     r
 }
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn default_registry_has_builtins() {
         let r = default_registry();
-        assert_eq!(r.len(), 8);
+        assert_eq!(r.len(), 9);
         for n in [
             "Read",
             "Write",
@@ -152,6 +152,7 @@ mod tests {
             "Glob",
             "TodoWrite",
             "MultiEdit",
+            "NotebookEdit",
         ] {
             assert!(r.get(n).is_some(), "missing {n}");
         }

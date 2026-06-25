@@ -8,7 +8,7 @@
 - **マルチプロバイダ**: ローカル LLM と Sakana AI (`fugu` / `fugu-ultra`) を環境変数で随時切り替え
 - **MCP クライアント (stdio / HTTP + tools / prompts / resources)**: `.mcp.json` を CWD に置くと MCP サーバ（ローカル stdio / リモート Streamable HTTP）へ接続し、公開 tools を取り込み、prompts は `/mcp__<server>__<prompt>`、resources は `mcp__<server>__read_resource` で扱える
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
-- **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite` / `MultiEdit` / `Task`（調査用サブエージェント）
+- **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite` / `MultiEdit` / `NotebookEdit`（.ipynb セル編集） / `Task`（調査用サブエージェント）
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
 - **hooks**: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` で外部コマンドを発火し、exit code でツール実行をブロック（後述）
@@ -254,11 +254,10 @@ src/
 │   └── sakana.rs        # Sakana AI (Fugu) adapter (内部で OpenAiClient に委譲)
 ├── tools/
 │   ├── mod.rs           # trait Tool, ToolCtx, ToolOutput
-│   ├── registry.rs      # 既定 7 ツール登録（スコープ外はコメントアウト）
+│   ├── registry.rs      # 既定 9 ツール登録（スコープ外はコメントアウト）
 │   ├── read.rs / write.rs / edit.rs / bash.rs / grep.rs / glob.rs
-│   ├── todo_write.rs                                    # セッション scope の Todo リスト
-│   └── web_fetch.rs / web_search.rs / ask_user_question.rs
-│       monitor.rs / notebook_edit.rs / multi_edit.rs    # MVP 外スタブ
+│   ├── todo_write.rs / multi_edit.rs / notebook_edit.rs # 追加ビルトイン
+│   └── web_fetch.rs / web_search.rs / ask_user_question.rs / monitor.rs  # MVP 外スタブ
 ├── hooks/                                                # 外部コマンド hook ディスパッチ
 ├── slash/                                                # ユーザー定義 slash コマンド
 ├── session.rs                                            # セッション永続化 (transcript / resume)
@@ -368,7 +367,7 @@ description: コードレビューの観点と手順
 
 ## ロードマップ（MVP 外、骨組みは存在）
 
-- WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
+- WebFetch / WebSearch / AskUserQuestion / Monitor
 - トークン会計
 - 中断時の副作用ロールバック
 
@@ -384,7 +383,7 @@ cargo test
 - `tools/edit.rs` — 一意マッチ / 多重マッチ拒否 / Read 必須
 - `tools/read.rs` — offset / limit
 - `tools/todo_write.rs` — replace / clear / multi-in_progress 拒否 / 引数不正
-- `tools/registry.rs` — 動的名登録 / built-in 既定 7 ツール
+- `tools/registry.rs` — 動的名登録 / built-in 既定 9 ツール
 - `permission.rs` — auto_approve / always-tool / always-command の判定
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
 - `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` / `mcp/roots.rs` / `mcp/sampling.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing、roots 提供、sampling (server→client LLM 補完) の opt-in 橋渡し

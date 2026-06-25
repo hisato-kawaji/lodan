@@ -39,6 +39,12 @@ pub struct McpServerSpec {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    // --- capabilities ---
+    /// server→client の sampling/createMessage を許可するか。
+    /// 許可するとサーバがこちらの LLM (モデル/トークン) を駆動できるため、
+    /// 既定は false。信頼するサーバのみ明示的に opt-in する。
+    #[serde(default, rename = "allowSampling")]
+    pub allow_sampling: bool,
 }
 
 impl McpServerSpec {
@@ -140,6 +146,15 @@ mod tests {
         let cfg: McpServersConfig = serde_json::from_str(s).unwrap();
         assert_eq!(cfg.mcp_servers["x"].env.get("K").unwrap(), "v");
         assert_eq!(cfg.mcp_servers["x"].command.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn allow_sampling_defaults_false_and_parses_when_set() {
+        let off: McpServerSpec = serde_json::from_str(r#"{ "command": "c" }"#).unwrap();
+        assert!(!off.allow_sampling);
+        let on: McpServerSpec =
+            serde_json::from_str(r#"{ "command": "c", "allowSampling": true }"#).unwrap();
+        assert!(on.allow_sampling);
     }
 
     #[test]

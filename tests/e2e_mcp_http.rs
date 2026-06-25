@@ -67,9 +67,10 @@ async fn http_handshake_list_and_call_round_trip() {
         env: BTreeMap::new(),
         url: Some(format!("http://127.0.0.1:{port}/")),
         headers: BTreeMap::new(),
+        allow_sampling: false,
     };
 
-    let client = McpClient::connect("mock-http", &spec)
+    let client = McpClient::connect("mock-http", &spec, None)
         .await
         .expect("connect HTTP MCP mock");
 

@@ -7,16 +7,29 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::llm::LlmClient;
 use crate::mcp::client::McpClient;
 use crate::mcp::config::McpServersConfig;
 use crate::mcp::prompt::{McpPrompt, namespaced as prompt_namespaced};
 use crate::mcp::resource::McpResourceTool;
+use crate::mcp::sampling::SamplingProvider;
 use crate::mcp::tool::{McpTool, namespaced};
 use crate::tools::registry::ToolRegistry;
 
+/// `allowSampling` を opt-in したサーバに渡す LLM 補完の出口。
+#[derive(Clone)]
+pub struct SamplingContext {
+    pub llm: Arc<dyn LlmClient>,
+    pub model: String,
+}
+
 /// Load `.mcp.json` from CWD, connect each server, and register their tools.
 /// Returns the live clients so the caller can keep them alive (Drop on session end).
-pub async fn load_and_register(reg: &mut ToolRegistry) -> Result<LoadOutcome> {
+/// `sampling` を渡すと、allowSampling=true のサーバに sampling/createMessage を許可する。
+pub async fn load_and_register(
+    reg: &mut ToolRegistry,
+    sampling: Option<SamplingContext>,
+) -> Result<LoadOutcome> {
     let cfg = match McpServersConfig::load_from_cwd()? {
         Some(c) => c,
         None => return Ok(LoadOutcome::default()),
@@ -24,7 +37,15 @@ pub async fn load_and_register(reg: &mut ToolRegistry) -> Result<LoadOutcome> {
 
     let mut outcome = LoadOutcome::default();
     for (server_name, spec) in cfg.mcp_servers {
-        match McpClient::connect(&server_name, &spec).await {
+        // sampling は opt-in サーバかつ LLM コンテキストがある場合のみ有効化する。
+        let sampling_provider = match (&sampling, spec.allow_sampling) {
+            (Some(ctx), true) => Some(Arc::new(SamplingProvider::new(
+                Arc::clone(&ctx.llm),
+                ctx.model.clone(),
+            ))),
+            _ => None,
+        };
+        match McpClient::connect(&server_name, &spec, sampling_provider).await {
             Ok(client) => {
                 let client = Arc::new(client);
                 match client.list_tools().await {

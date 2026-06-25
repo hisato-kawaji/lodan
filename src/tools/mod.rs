@@ -13,11 +13,11 @@ pub mod multi_edit;
 pub mod notebook_edit;
 pub mod todo_write;
 pub mod web_fetch;
+pub mod web_search;
 
 // MVP 外（スタブのみ。registry での登録行はコメントアウトされている）
 pub mod ask_user_question;
 pub mod monitor;
-pub mod web_search;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

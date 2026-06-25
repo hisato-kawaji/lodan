@@ -23,6 +23,14 @@ ECHO_TOOL = {
     },
 }
 
+GREET_PROMPT = {
+    "name": "greet",
+    "description": "Greet someone by name.",
+    "arguments": [
+        {"name": "who", "description": "the person", "required": True},
+    ],
+}
+
 
 def send(obj: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
@@ -40,7 +48,7 @@ def handle(msg: dict[str, Any]) -> None:
                 "id": msg_id,
                 "result": {
                     "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "prompts": {}},
                     "serverInfo": {"name": "mock-mcp", "version": "0.0.1"},
                 },
             }
@@ -82,6 +90,50 @@ def handle(msg: dict[str, Any]) -> None:
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "error": {"code": -32601, "message": f"unknown tool: {name}"},
+                }
+            )
+        return
+
+    if method == "prompts/list":
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"prompts": [GREET_PROMPT]},
+            }
+        )
+        return
+
+    if method == "prompts/get":
+        params = msg.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "greet":
+            who = args.get("who", "world")
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "description": "greeting",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": f"Say hello to {who}.",
+                                },
+                            }
+                        ],
+                    },
+                }
+            )
+        else:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32601, "message": f"unknown prompt: {name}"},
                 }
             )
         return

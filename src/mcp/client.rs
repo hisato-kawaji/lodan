@@ -21,7 +21,8 @@ use crate::mcp::config::McpServerSpec;
 use crate::mcp::protocol::{
     CLIENT_NAME, CLIENT_VERSION, ClientCapabilities, ClientInfo, ContentBlock, InitializeParams,
     InitializeResult, JsonRpcIncoming, JsonRpcNotification, JsonRpcRequest, McpToolMeta,
-    PROTOCOL_VERSION, ToolsCallParams, ToolsCallResult, ToolsListParams, ToolsListResult,
+    PROTOCOL_VERSION, PromptMeta, PromptsGetParams, PromptsGetResult, PromptsListParams,
+    PromptsListResult, ToolsCallParams, ToolsCallResult, ToolsListParams, ToolsListResult,
 };
 use crate::tools::ToolOutput;
 
@@ -170,6 +171,28 @@ impl McpClient {
             }
         }
         Ok(all)
+    }
+
+    pub async fn list_prompts(&self) -> Result<Vec<PromptMeta>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = PromptsListParams {
+                cursor: cursor.as_deref(),
+            };
+            let resp: PromptsListResult = self.request("prompts/list", Some(&params)).await?;
+            all.extend(resp.prompts);
+            match resp.next_cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(all)
+    }
+
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<PromptsGetResult> {
+        let params = PromptsGetParams { name, arguments };
+        self.request("prompts/get", Some(&params)).await
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {

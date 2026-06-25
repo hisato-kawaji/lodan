@@ -31,6 +31,13 @@ GREET_PROMPT = {
     ],
 }
 
+NOTES_RESOURCE = {
+    "uri": "mem://notes",
+    "name": "notes",
+    "description": "Scratch notes.",
+    "mimeType": "text/plain",
+}
+
 
 def send(obj: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
@@ -48,7 +55,7 @@ def handle(msg: dict[str, Any]) -> None:
                 "id": msg_id,
                 "result": {
                     "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}, "prompts": {}},
+                    "capabilities": {"tools": {}, "prompts": {}, "resources": {}},
                     "serverInfo": {"name": "mock-mcp", "version": "0.0.1"},
                 },
             }
@@ -134,6 +141,45 @@ def handle(msg: dict[str, Any]) -> None:
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "error": {"code": -32601, "message": f"unknown prompt: {name}"},
+                }
+            )
+        return
+
+    if method == "resources/list":
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"resources": [NOTES_RESOURCE]},
+            }
+        )
+        return
+
+    if method == "resources/read":
+        params = msg.get("params") or {}
+        uri = params.get("uri")
+        if uri == "mem://notes":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": uri,
+                                "mimeType": "text/plain",
+                                "text": "remember the milk",
+                            }
+                        ]
+                    },
+                }
+            )
+        else:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32602, "message": f"unknown resource: {uri}"},
                 }
             )
         return

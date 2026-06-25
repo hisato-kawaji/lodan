@@ -57,4 +57,19 @@ async fn handshake_list_and_call_round_trip() {
         .await
         .expect("get_prompt");
     assert_eq!(got.render(), "Say hello to Ada.");
+
+    // resources/list + resources/read round-trip.
+    let resources = client.list_resources().await.expect("list_resources");
+    assert_eq!(
+        resources.len(),
+        1,
+        "expected one resource, got {resources:?}"
+    );
+    assert_eq!(resources[0].uri, "mem://notes");
+
+    let read = client
+        .read_resource("mem://notes")
+        .await
+        .expect("read_resource");
+    assert_eq!(read.flatten_text(), "remember the milk");
 }

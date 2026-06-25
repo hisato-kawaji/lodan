@@ -266,6 +266,86 @@ impl PromptsGetResult {
     }
 }
 
+// ---------------- resources/list ----------------
+
+#[derive(Debug, Serialize)]
+pub struct ResourcesListParams<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResourcesListResult {
+    #[serde(default)]
+    pub resources: Vec<ResourceMeta>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResourceMeta {
+    pub uri: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+// ---------------- resources/read ----------------
+
+#[derive(Debug, Serialize)]
+pub struct ResourcesReadParams<'a> {
+    pub uri: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResourcesReadResult {
+    #[serde(default)]
+    pub contents: Vec<ResourceContents>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResourceContents {
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+    /// テキストリソースの本文。バイナリ (blob) は今回扱わない。
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl ResourcesReadResult {
+    /// テキスト content を 1 つの文字列へ畳む。非テキスト (blob) は件数のみ注記。
+    pub fn flatten_text(&self) -> String {
+        let mut buf = String::new();
+        let mut non_text = 0usize;
+        for c in &self.contents {
+            match &c.text {
+                Some(t) => {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(t);
+                }
+                None => non_text += 1,
+            }
+        }
+        if non_text > 0 {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(&format!("[{non_text} non-text resource(s) omitted]"));
+        }
+        buf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +432,33 @@ mod tests {
         assert!(out.contains("[assistant] context"));
         // 非テキスト (image) は捨てられる。
         assert!(!out.contains("image"));
+    }
+
+    #[test]
+    fn parses_resources_list_response() {
+        let s = r#"{
+            "resources": [
+                {"uri":"file:///a.txt","name":"a","description":"file a","mimeType":"text/plain"}
+            ]
+        }"#;
+        let r: ResourcesListResult = serde_json::from_str(s).unwrap();
+        assert_eq!(r.resources.len(), 1);
+        assert_eq!(r.resources[0].uri, "file:///a.txt");
+        assert_eq!(r.resources[0].name.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn flattens_resource_contents_and_notes_blob() {
+        let r: ResourcesReadResult = serde_json::from_str(
+            r#"{"contents":[
+                {"uri":"file:///a","text":"hello"},
+                {"uri":"file:///b","mimeType":"image/png","blob":"=="}
+            ]}"#,
+        )
+        .unwrap();
+        let out = r.flatten_text();
+        assert!(out.contains("hello"));
+        assert!(out.contains("non-text resource"));
     }
 
     #[test]

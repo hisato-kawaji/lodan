@@ -54,10 +54,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         });
     if mcp_outcome.servers > 0 {
         println!(
-            "mcp: {} server(s), {} tool(s), {} prompt(s) registered",
+            "mcp: {} server(s), {} tool(s), {} prompt(s), {} resource(s) registered",
             mcp_outcome.servers,
             mcp_outcome.tools,
-            mcp_outcome.prompts.len()
+            mcp_outcome.prompts.len(),
+            mcp_outcome.resources
         );
     }
     let mcp_prompts: BTreeMap<String, McpPrompt> = mcp_outcome

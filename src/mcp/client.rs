@@ -22,7 +22,8 @@ use crate::mcp::protocol::{
     CLIENT_NAME, CLIENT_VERSION, ClientCapabilities, ClientInfo, ContentBlock, InitializeParams,
     InitializeResult, JsonRpcIncoming, JsonRpcNotification, JsonRpcRequest, McpToolMeta,
     PROTOCOL_VERSION, PromptMeta, PromptsGetParams, PromptsGetResult, PromptsListParams,
-    PromptsListResult, ToolsCallParams, ToolsCallResult, ToolsListParams, ToolsListResult,
+    PromptsListResult, ResourceMeta, ResourcesListParams, ResourcesListResult, ResourcesReadParams,
+    ResourcesReadResult, ToolsCallParams, ToolsCallResult, ToolsListParams, ToolsListResult,
 };
 use crate::tools::ToolOutput;
 
@@ -193,6 +194,28 @@ impl McpClient {
     pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<PromptsGetResult> {
         let params = PromptsGetParams { name, arguments };
         self.request("prompts/get", Some(&params)).await
+    }
+
+    pub async fn list_resources(&self) -> Result<Vec<ResourceMeta>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = ResourcesListParams {
+                cursor: cursor.as_deref(),
+            };
+            let resp: ResourcesListResult = self.request("resources/list", Some(&params)).await?;
+            all.extend(resp.resources);
+            match resp.next_cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(all)
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> Result<ResourcesReadResult> {
+        let params = ResourcesReadParams { uri };
+        self.request("resources/read", Some(&params)).await
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {

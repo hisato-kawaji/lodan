@@ -187,7 +187,7 @@ lodan> /exit
 サンプルは `.mcp.json.example` を参照。`command` があれば stdio、`url` があれば HTTP（両方／どちらも無いはエラー）。
 
 - **transport**: **stdio** (`command`) と **Streamable HTTP** (`url`)。HTTP は POST で JSON-RPC を送り、`application/json` または `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぎ、`headers` で認証ヘッダを付与できる。HTTP の server→client GET ストリームは未対応
-- **capabilities**: tools / prompts / resources / roots (sampling は未対応)。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストの受信は **stdio のみ**対応
+- **capabilities**: tools / prompts / resources / roots (sampling は未対応)。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストの受信は **stdio のみ**対応。⚠️ roots はサーバに **cwd の絶対パスを開示**します（`.mcp.json` のサーバを信頼する前提と同じ範囲）
 - **permission**: MCP 由来の **tools/call は常に destructive** 扱いで初回呼び出しに `y/n/a/e` 確認 (Claude Code 同様)。**resources は read-only なので非破壊** (ゲートを経ない)
 - **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in ツールのみで継続起動。`prompts/list` / `resources/list` 非対応サーバは warning で skip
 - **プロトコル**: MCP `2025-06-18`、JSON-RPC 2.0（stdio は newline-delimited、HTTP は POST 1 リクエスト/レスポンス）

@@ -118,6 +118,8 @@ impl StdioTransport {
                     }
                 };
                 match (inc.method.as_deref(), inc.id) {
+                    // server→client リクエスト。現状は roots/list のみ。将来 sampling
+                    // (sampling/createMessage) を足す場合もこの handler 経由で応答する。
                     (Some(method), Some(id)) => {
                         let response = match handler(method) {
                             Some(result) => {

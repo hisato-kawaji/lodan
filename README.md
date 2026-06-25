@@ -254,11 +254,10 @@ src/
 │   └── sakana.rs        # Sakana AI (Fugu) adapter (内部で OpenAiClient に委譲)
 ├── tools/
 │   ├── mod.rs           # trait Tool, ToolCtx, ToolOutput
-│   ├── registry.rs      # 既定 7 ツール登録（スコープ外はコメントアウト）
+│   ├── registry.rs      # 既定 9 ツール登録（スコープ外はコメントアウト）
 │   ├── read.rs / write.rs / edit.rs / bash.rs / grep.rs / glob.rs
-│   ├── todo_write.rs                                    # セッション scope の Todo リスト
-│   └── web_fetch.rs / web_search.rs / ask_user_question.rs
-│       monitor.rs / notebook_edit.rs / multi_edit.rs    # MVP 外スタブ
+│   ├── todo_write.rs / multi_edit.rs / notebook_edit.rs # 追加ビルトイン
+│   └── web_fetch.rs / web_search.rs / ask_user_question.rs / monitor.rs  # MVP 外スタブ
 ├── hooks/                                                # 外部コマンド hook ディスパッチ
 ├── slash/                                                # ユーザー定義 slash コマンド
 ├── session.rs                                            # セッション永続化 (transcript / resume)

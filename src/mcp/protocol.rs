@@ -68,6 +68,10 @@ pub struct ClientCapabilities {
     /// roots を提供できることをサーバへ知らせる。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roots: Option<RootsCapability>,
+    /// sampling (server→client の LLM 補完要求) を受け付けることを知らせる。
+    /// opt-in したサーバにのみ広告する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingCapability>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,12 +81,18 @@ pub struct RootsCapability {
     pub list_changed: bool,
 }
 
+/// sampling capability は中身を持たない (空オブジェクトとして広告する)。
+#[derive(Debug, Serialize)]
+pub struct SamplingCapability {}
+
 impl ClientCapabilities {
-    pub fn with_roots() -> Self {
+    /// roots は常に提供する。sampling は opt-in 時のみ広告する。
+    pub fn new(sampling_enabled: bool) -> Self {
         Self {
             roots: Some(RootsCapability {
                 list_changed: false,
             }),
+            sampling: sampling_enabled.then_some(SamplingCapability {}),
         }
     }
 }
@@ -367,6 +377,77 @@ impl ResourcesReadResult {
     }
 }
 
+// ---------------- sampling/createMessage (server → client) ----------------
+
+/// サーバから来る `sampling/createMessage` の params。MVP では messages /
+/// systemPrompt / maxTokens のみ解釈し、modelPreferences 等は無視する。
+#[derive(Debug, Deserialize)]
+pub struct CreateMessageParams {
+    #[serde(default)]
+    pub messages: Vec<SamplingMessage>,
+    #[serde(default, rename = "systemPrompt")]
+    pub system_prompt: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default, rename = "maxTokens")]
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SamplingMessage {
+    pub role: String,
+    pub content: SamplingContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SamplingContent {
+    Text {
+        text: String,
+    },
+    /// image / audio 等の非テキストは MVP では扱わず捨てる。
+    #[serde(other)]
+    Other,
+}
+
+impl SamplingMessage {
+    /// テキスト content を取り出す。非テキストは None。
+    pub fn text(&self) -> Option<&str> {
+        match &self.content {
+            SamplingContent::Text { text } => Some(text),
+            SamplingContent::Other => None,
+        }
+    }
+}
+
+/// `sampling/createMessage` の result。client→server へ返す。
+#[derive(Debug, Serialize)]
+pub struct CreateMessageResult {
+    pub role: &'static str,
+    pub content: CreateMessageContent,
+    pub model: String,
+    #[serde(rename = "stopReason")]
+    pub stop_reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateMessageContent {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub text: String,
+}
+
+impl CreateMessageResult {
+    /// assistant のテキスト応答を MCP result 形へ包む。
+    pub fn assistant_text(text: String, model: String) -> Self {
+        Self {
+            role: "assistant",
+            content: CreateMessageContent { kind: "text", text },
+            model,
+            stop_reason: "endTurn",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +561,46 @@ mod tests {
         let out = r.flatten_text();
         assert!(out.contains("hello"));
         assert!(out.contains("non-text resource"));
+    }
+
+    #[test]
+    fn parses_create_message_params_and_skips_non_text() {
+        let p: CreateMessageParams = serde_json::from_str(
+            r#"{
+                "systemPrompt": "be brief",
+                "maxTokens": 100,
+                "messages": [
+                    {"role":"user","content":{"type":"text","text":"hi"}},
+                    {"role":"user","content":{"type":"image","data":"..","mimeType":"image/png"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(p.system_prompt.as_deref(), Some("be brief"));
+        assert_eq!(p.max_tokens, Some(100));
+        assert_eq!(p.messages.len(), 2);
+        assert_eq!(p.messages[0].text(), Some("hi"));
+        assert_eq!(p.messages[1].text(), None);
+    }
+
+    #[test]
+    fn serializes_create_message_result() {
+        let r = CreateMessageResult::assistant_text("hello".into(), "gpt".into());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"]["type"], "text");
+        assert_eq!(v["content"]["text"], "hello");
+        assert_eq!(v["model"], "gpt");
+        assert_eq!(v["stopReason"], "endTurn");
+    }
+
+    #[test]
+    fn sampling_capability_advertised_only_when_enabled() {
+        let off = serde_json::to_value(ClientCapabilities::new(false)).unwrap();
+        assert!(off.get("sampling").is_none());
+        assert!(off.get("roots").is_some());
+        let on = serde_json::to_value(ClientCapabilities::new(true)).unwrap();
+        assert!(on.get("sampling").is_some());
     }
 
     #[test]

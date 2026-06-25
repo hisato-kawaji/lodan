@@ -45,8 +45,15 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         println!("skills: {} loaded", user_skills.len());
     }
 
+    let llm_client: Arc<dyn llm::LlmClient> = llm::build_client(&cfg)?;
+
     let mut registry = default_registry();
-    let mcp_outcome = mcp::registry::load_and_register(&mut registry)
+    // sampling は opt-in サーバにのみ active モデルの LLM を貸す。
+    let sampling_ctx = mcp::registry::SamplingContext {
+        llm: Arc::clone(&llm_client),
+        model: cfg.llm.active().model.clone(),
+    };
+    let mcp_outcome = mcp::registry::load_and_register(&mut registry, Some(sampling_ctx))
         .await
         .unwrap_or_else(|e| {
             eprintln!("mcp: {e}");
@@ -68,8 +75,6 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         .collect();
     // Keep clients alive for the full session; Drop kills subprocesses.
     let _mcp_clients = mcp_outcome.clients;
-
-    let llm_client: Arc<dyn llm::LlmClient> = llm::build_client(&cfg)?;
 
     // サブエージェント (Task): 読み取り専用ツールで調査を委譲する。
     // LLM クライアントが要るため default_registry ではなくここで登録する。

@@ -2,6 +2,7 @@
 // 高レベルの list/call と JSON-RPC request/notify のデコードを担い、ワイヤ送受信は
 // `transport::Transport` (stdio / Streamable HTTP) に委譲する。
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, anyhow};
@@ -16,28 +17,61 @@ use crate::mcp::protocol::{
     ResourceMeta, ResourcesListParams, ResourcesListResult, ResourcesReadParams,
     ResourcesReadResult, ToolsCallParams, ToolsCallResult, ToolsListParams, ToolsListResult,
 };
-use crate::mcp::transport::{self, Transport};
+use crate::mcp::sampling::SamplingProvider;
+use crate::mcp::transport::{self, HandlerOutcome, Transport};
 use crate::tools::ToolOutput;
 
 pub struct McpClient {
     next_id: AtomicU64,
     server_label: String,
     transport: Box<dyn Transport>,
+    sampling_enabled: bool,
 }
 
 impl McpClient {
-    pub async fn connect(label: &str, spec: &McpServerSpec) -> Result<Self> {
-        // server→client の roots/list に cwd で応答するハンドラ (stdio のみ有効)。
+    /// `sampling` に `Some` を渡すと、このサーバの sampling/createMessage を許可し
+    /// capability を広告する (config の allowSampling が真のサーバのみ)。
+    pub async fn connect(
+        label: &str,
+        spec: &McpServerSpec,
+        sampling: Option<Arc<SamplingProvider>>,
+    ) -> Result<Self> {
+        // server→client リクエストのハンドラ (stdio のみ有効)。
+        //   roots/list           → cwd を返す
+        //   sampling/createMessage → opt-in 時のみ LLM を呼ぶ
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let roots = crate::mcp::roots::RootsProvider::from_cwd(&cwd);
+        let sampling_enabled = sampling.is_some();
         let handler: transport::ServerRequestHandler =
-            std::sync::Arc::new(move |method: &str| roots.handle(method));
+            Arc::new(move |method: String, params: Option<Value>| {
+                let roots = roots.clone();
+                let sampling = sampling.clone();
+                Box::pin(async move {
+                    if let Some(result) = roots.handle(&method) {
+                        return HandlerOutcome::Result(result);
+                    }
+                    if method == "sampling/createMessage" {
+                        let Some(sampling) = sampling else {
+                            return HandlerOutcome::Unhandled;
+                        };
+                        return match sampling.create_message(params.unwrap_or(Value::Null)).await {
+                            Ok(result) => HandlerOutcome::Result(result),
+                            Err(e) => HandlerOutcome::Error {
+                                code: -32603,
+                                message: format!("sampling failed: {e}"),
+                            },
+                        };
+                    }
+                    HandlerOutcome::Unhandled
+                }) as _
+            });
 
         let transport = transport::connect(label, spec, handler).await?;
         let client = McpClient {
             next_id: transport::id_source(),
             server_label: label.to_string(),
             transport,
+            sampling_enabled,
         };
         client.handshake().await?;
         Ok(client)
@@ -46,7 +80,7 @@ impl McpClient {
     async fn handshake(&self) -> Result<()> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ClientCapabilities::with_roots(),
+            capabilities: ClientCapabilities::new(self.sampling_enabled),
             client_info: ClientInfo {
                 name: CLIENT_NAME,
                 version: CLIENT_VERSION,

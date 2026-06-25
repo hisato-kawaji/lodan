@@ -24,9 +24,10 @@ async fn handshake_list_and_call_round_trip() {
         env: BTreeMap::new(),
         url: None,
         headers: BTreeMap::new(),
+        allow_sampling: false,
     };
 
-    let client = McpClient::connect("mock", &spec)
+    let client = McpClient::connect("mock", &spec, None)
         .await
         .expect("connect MCP mock");
 

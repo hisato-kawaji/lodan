@@ -187,7 +187,7 @@ lodan> /exit
 サンプルは `.mcp.json.example` を参照。`command` があれば stdio、`url` があれば HTTP（両方／どちらも無いはエラー）。
 
 - **transport**: **stdio** (`command`) と **Streamable HTTP** (`url`)。HTTP は POST で JSON-RPC を送り、`application/json` または `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぎ、`headers` で認証ヘッダを付与できる。HTTP の server→client GET ストリームは未対応
-- **capabilities**: tools / prompts / resources / roots (sampling は未対応)。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストの受信は **stdio のみ**対応。⚠️ roots はサーバに **cwd の絶対パスを開示**します（`.mcp.json` のサーバを信頼する前提と同じ範囲）
+- **capabilities**: tools / prompts / resources / roots、および opt-in の **sampling**。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストの受信は **stdio のみ**対応。⚠️ roots はサーバに **cwd の絶対パスを開示**します（`.mcp.json` のサーバを信頼する前提と同じ範囲）
 - **permission**: MCP 由来の **tools/call は常に destructive** 扱いで初回呼び出しに `y/n/a/e` 確認 (Claude Code 同様)。**resources は read-only なので非破壊** (ゲートを経ない)
 - **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in ツールのみで継続起動。`prompts/list` / `resources/list` 非対応サーバは warning で skip
 - **プロトコル**: MCP `2025-06-18`、JSON-RPC 2.0（stdio は newline-delimited、HTTP は POST 1 リクエスト/レスポンス）
@@ -208,6 +208,27 @@ lodan> /exit
 テキスト化して返します。read-only なので**非破壊**（パーミッションゲートを経ません）。バイナリ (blob) リソースは件数のみ注記してスキップします。
 
 > ⚠️ **信頼前提**: read_resource は非ゲートなので、`file://` 等を公開するサーバ相手では**無確認の任意ファイル読み出し**になり得ます。クライアントは `uri` を制限せず認可境界はサーバ側に委ねるため、`.mcp.json` のサーバ自体を信頼する前提（prompts と同じ信頼モデル）で利用してください。
+
+### MCP sampling (server→client の LLM 補完)
+
+サーバが `sampling/createMessage` でクライアント側の LLM 補完を要求できます。サーバが
+こちらの**モデル・トークンを駆動**するため、既定では無効。`.mcp.json` の各サーバに
+**`"allowSampling": true`** を付けたサーバにのみ許可し、initialize で sampling capability を
+広告します（stdio のみ）。許可サーバの要求は、現在 active な provider/model の LLM へ
+そのまま渡され、結果を assistant テキストとして返します。
+
+```jsonc
+{
+  "mcpServers": {
+    "trusted": { "command": "npx", "args": ["-y", "some-mcp"], "allowSampling": true }
+  }
+}
+```
+
+> ⚠️ **信頼前提**: sampling を許可したサーバは、こちらの LLM へ任意のプロンプトを投げて
+> モデル/トークンを消費できます。`allowSampling` は信頼するサーバにのみ付けてください
+> （MVP では都度承認プロンプトは挟まず、config の opt-in で一括許可します）。未許可サーバの
+> `sampling/createMessage` は `method not found` を返します。
 
 REPL 起動時に MCP サーバが見つかると次の行がバナーに出る:
 
@@ -346,7 +367,6 @@ description: コードレビューの観点と手順
 
 ## ロードマップ（MVP 外、骨組みは存在）
 
-- MCP の拡張: sampling（server→client の LLM 補完依頼）
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - トークン会計
 - 中断時の副作用ロールバック
@@ -366,7 +386,7 @@ cargo test
 - `tools/registry.rs` — 動的名登録 / built-in 既定 7 ツール
 - `permission.rs` — auto_approve / always-tool / always-command の判定
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
-- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` / `mcp/roots.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing、roots 提供
+- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` / `mcp/roots.rs` / `mcp/sampling.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing、roots 提供、sampling (server→client LLM 補完) の opt-in 橋渡し
 - `tests/e2e_mock.rs` — 6 ツールを順に走らせるエンドツーエンドのモック試験
 - `tests/e2e_mcp.rs` — mock MCP サーバとの handshake + tools/list + tools/call 一周
 

@@ -5,10 +5,13 @@
 //! - `HttpTransport`: Streamable HTTP。POST で JSON-RPC を送り、`application/json` か
 //!   `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぐ
 //!
-//! server→client の GET ストリーム (server-initiated request) は未対応
-//! (sampling / roots 未実装のため不要)。
+//! stdio は server→client リクエスト (roots/list, sampling/createMessage) に
+//! `ServerRequestHandler` 経由で応答する。HTTP は server→client チャネルを
+//! 持たないため handler を使わない。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,9 +29,26 @@ use crate::mcp::protocol::JsonRpcIncoming;
 
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// server→client リクエストのハンドラ。method を受け取り、対応すれば結果 JSON を返す。
-/// 未対応なら `None` (呼び出し側で method-not-found 応答)。
-pub type ServerRequestHandler = Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
+/// server→client リクエストの処理結果。
+pub enum HandlerOutcome {
+    /// 正常応答 (JSON-RPC result)。
+    Result(serde_json::Value),
+    /// 処理したが失敗した (JSON-RPC error)。method-not-found とは区別する。
+    Error { code: i64, message: String },
+    /// 未対応のメソッド (呼び出し側で method-not-found 応答)。
+    Unhandled,
+}
+
+/// server→client リクエストのハンドラ。method と params を受け取り、結果を
+/// 非同期に返す。sampling は LLM 呼び出しを伴うため async。
+pub type ServerRequestHandler = Arc<
+    dyn Fn(
+            String,
+            Option<serde_json::Value>,
+        ) -> Pin<Box<dyn Future<Output = HandlerOutcome> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[async_trait]
 pub trait Transport: Send + Sync {
@@ -104,6 +124,7 @@ impl StdioTransport {
         let pending_clone = Arc::clone(&pending);
         let label_for_reader = label.to_string();
         let reader_outbound = outbound_tx.clone();
+        let handler = Arc::clone(&handler);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -117,20 +138,30 @@ impl StdioTransport {
                         continue;
                     }
                 };
-                match (inc.method.as_deref(), inc.id) {
-                    // server→client リクエスト。現状は roots/list のみ。将来 sampling
-                    // (sampling/createMessage) を足す場合もこの handler 経由で応答する。
+                match (inc.method.clone(), inc.id) {
+                    // server→client リクエスト (roots/list, sampling/createMessage 等)。
+                    // handler は async (sampling は LLM 呼び出しを伴う) なので、reader を
+                    // 塞がないよう要求ごとに task を spawn して応答する。
                     (Some(method), Some(id)) => {
-                        let response = match handler(method) {
-                            Some(result) => {
-                                serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                            }
-                            None => serde_json::json!({
-                                "jsonrpc":"2.0","id":id,
-                                "error":{"code":-32601,"message":format!("method not found: {method}")}
-                            }),
-                        };
-                        let _ = reader_outbound.send(response.to_string());
+                        let handler = Arc::clone(&handler);
+                        let out = reader_outbound.clone();
+                        let params = inc.params.clone();
+                        tokio::spawn(async move {
+                            let response = match handler(method.clone(), params).await {
+                                HandlerOutcome::Result(result) => {
+                                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                                }
+                                HandlerOutcome::Error { code, message } => serde_json::json!({
+                                    "jsonrpc":"2.0","id":id,
+                                    "error":{"code":code,"message":message}
+                                }),
+                                HandlerOutcome::Unhandled => serde_json::json!({
+                                    "jsonrpc":"2.0","id":id,
+                                    "error":{"code":-32601,"message":format!("method not found: {method}")}
+                                }),
+                            };
+                            let _ = out.send(response.to_string());
+                        });
                     }
                     (Some(method), None) => {
                         tracing::debug!(server=%label_for_reader, method, "mcp: notification ignored");

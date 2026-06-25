@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::mcp::client::McpClient;
 use crate::mcp::config::McpServersConfig;
 use crate::mcp::prompt::{McpPrompt, namespaced as prompt_namespaced};
+use crate::mcp::resource::McpResourceTool;
 use crate::mcp::tool::{McpTool, namespaced};
 use crate::tools::registry::ToolRegistry;
 
@@ -66,6 +67,23 @@ pub async fn load_and_register(reg: &mut ToolRegistry) -> Result<LoadOutcome> {
                             }
                         }
 
+                        // resources も任意 capability。公開していれば 1 つの
+                        // read_resource ツールとして登録する。
+                        match client.list_resources().await {
+                            Ok(resources) if !resources.is_empty() => {
+                                reg.register(Arc::new(McpResourceTool::new(
+                                    &server_name,
+                                    &resources,
+                                    Arc::clone(&client),
+                                )));
+                                outcome.resources += resources.len();
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("mcp[{server_name}]: resources/list skipped: {e}");
+                            }
+                        }
+
                         outcome.clients.push(client);
                     }
                     Err(e) => {
@@ -85,6 +103,8 @@ pub async fn load_and_register(reg: &mut ToolRegistry) -> Result<LoadOutcome> {
 pub struct LoadOutcome {
     pub servers: usize,
     pub tools: usize,
+    /// 公開された resource の総数 (read_resource ツールは ToolRegistry に登録済み)。
+    pub resources: usize,
     /// MCP サーバが公開する prompt (slash として呼び出される)。
     pub prompts: Vec<McpPrompt>,
     /// Kept alive by the caller; on Drop the subprocess is killed.

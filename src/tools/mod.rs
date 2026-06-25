@@ -9,6 +9,7 @@ pub mod read;
 pub mod write;
 
 // 追加ビルトイン（default_registry に登録済み）
+pub mod ask_user_question;
 pub mod multi_edit;
 pub mod notebook_edit;
 pub mod todo_write;
@@ -16,7 +17,6 @@ pub mod web_fetch;
 pub mod web_search;
 
 // MVP 外（スタブのみ。registry での登録行はコメントアウトされている）
-pub mod ask_user_question;
 pub mod monitor;
 
 use async_trait::async_trait;

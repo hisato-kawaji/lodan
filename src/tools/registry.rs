@@ -73,9 +73,9 @@ pub fn default_registry() -> ToolRegistry {
     r.register(Arc::new(notebook_edit::NotebookEdit));
     r.register(Arc::new(web_fetch::WebFetch));
     r.register(Arc::new(web_search::WebSearch));
+    r.register(Arc::new(ask_user_question::AskUserQuestion));
 
     // --- MVP スコープ外: 登録は意図的に無効化 ---
-    // r.register(Arc::new(ask_user_question::AskUserQuestion));
     // r.register(Arc::new(monitor::Monitor));
 
     r
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn default_registry_has_builtins() {
         let r = default_registry();
-        assert_eq!(r.len(), 11);
+        assert_eq!(r.len(), 12);
         for n in [
             "Read",
             "Write",
@@ -155,6 +155,7 @@ mod tests {
             "NotebookEdit",
             "WebFetch",
             "WebSearch",
+            "AskUserQuestion",
         ] {
             assert!(r.get(n).is_some(), "missing {n}");
         }

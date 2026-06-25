@@ -174,6 +174,98 @@ impl ToolsCallResult {
     }
 }
 
+// ---------------- prompts/list ----------------
+
+#[derive(Debug, Serialize)]
+pub struct PromptsListParams<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptsListResult {
+    #[serde(default)]
+    pub prompts: Vec<PromptMeta>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptMeta {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<PromptArgument>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptArgument {
+    pub name: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub required: bool,
+}
+
+// ---------------- prompts/get ----------------
+
+#[derive(Debug, Serialize)]
+pub struct PromptsGetParams<'a> {
+    pub name: &'a str,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptsGetResult {
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<PromptMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptMessage {
+    pub role: String,
+    pub content: PromptContent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptContent {
+    Text {
+        text: String,
+    },
+    // image / resource 等の非テキストは今回テキスト化せず捨てる。
+    #[serde(other)]
+    Other,
+}
+
+impl PromptsGetResult {
+    /// メッセージ群を 1 つのテキストへ畳む。user 以外の role は接頭辞を付ける
+    /// (run_turn は単一の user 入力を取るため)。非テキストブロックは捨てる。
+    pub fn render(&self) -> String {
+        let mut buf = String::new();
+        for msg in &self.messages {
+            let PromptContent::Text { text } = &msg.content else {
+                continue;
+            };
+            if !buf.is_empty() {
+                buf.push_str("\n\n");
+            }
+            if msg.role == "user" {
+                buf.push_str(text);
+            } else {
+                buf.push_str(&format!("[{}] {text}", msg.role));
+            }
+        }
+        buf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +319,39 @@ mod tests {
         let s = r.flatten_text();
         assert!(s.contains("x"));
         assert!(s.contains("non-text"));
+    }
+
+    #[test]
+    fn parses_prompts_list_response() {
+        let s = r#"{
+            "prompts": [
+                {"name":"review","description":"review code",
+                 "arguments":[{"name":"path","required":true},{"name":"focus"}]}
+            ]
+        }"#;
+        let r: PromptsListResult = serde_json::from_str(s).unwrap();
+        assert_eq!(r.prompts.len(), 1);
+        assert_eq!(r.prompts[0].name, "review");
+        assert_eq!(r.prompts[0].arguments.len(), 2);
+        assert_eq!(r.prompts[0].arguments[0].name, "path");
+        assert!(r.prompts[0].arguments[0].required);
+    }
+
+    #[test]
+    fn renders_prompt_messages_into_text() {
+        let r: PromptsGetResult = serde_json::from_str(
+            r#"{"messages":[
+                {"role":"user","content":{"type":"text","text":"do X"}},
+                {"role":"assistant","content":{"type":"text","text":"context"}},
+                {"role":"user","content":{"type":"image","data":"..","mimeType":"image/png"}}
+            ]}"#,
+        )
+        .unwrap();
+        let out = r.render();
+        assert!(out.contains("do X"));
+        assert!(out.contains("[assistant] context"));
+        // 非テキスト (image) は捨てられる。
+        assert!(!out.contains("image"));
     }
 
     #[test]

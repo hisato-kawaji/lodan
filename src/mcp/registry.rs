@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use crate::mcp::client::McpClient;
 use crate::mcp::config::McpServersConfig;
+use crate::mcp::prompt::{McpPrompt, namespaced as prompt_namespaced};
 use crate::mcp::tool::{McpTool, namespaced};
 use crate::tools::registry::ToolRegistry;
 
@@ -41,6 +42,30 @@ pub async fn load_and_register(reg: &mut ToolRegistry) -> Result<LoadOutcome> {
                             outcome.tools += 1;
                         }
                         outcome.servers += 1;
+
+                        // prompts は任意 capability。未対応サーバは prompts/list が
+                        // method-not-found を返すだけなので warning に留めて続行する。
+                        match client.list_prompts().await {
+                            Ok(prompts) => {
+                                for meta in prompts {
+                                    let full = prompt_namespaced(&server_name, &meta.name);
+                                    let desc = meta.description.unwrap_or_default();
+                                    let arg_names =
+                                        meta.arguments.into_iter().map(|a| a.name).collect();
+                                    outcome.prompts.push(McpPrompt::new(
+                                        full,
+                                        meta.name,
+                                        desc,
+                                        arg_names,
+                                        Arc::clone(&client),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("mcp[{server_name}]: prompts/list skipped: {e}");
+                            }
+                        }
+
                         outcome.clients.push(client);
                     }
                     Err(e) => {
@@ -60,6 +85,8 @@ pub async fn load_and_register(reg: &mut ToolRegistry) -> Result<LoadOutcome> {
 pub struct LoadOutcome {
     pub servers: usize,
     pub tools: usize,
+    /// MCP サーバが公開する prompt (slash として呼び出される)。
+    pub prompts: Vec<McpPrompt>,
     /// Kept alive by the caller; on Drop the subprocess is killed.
     pub clients: Vec<Arc<McpClient>>,
 }

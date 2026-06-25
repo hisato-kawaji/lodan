@@ -8,6 +8,7 @@ use crate::agent;
 use crate::config::Config;
 use crate::llm;
 use crate::mcp;
+use crate::mcp::prompt::McpPrompt;
 use crate::permission::PermissionGate;
 use crate::session::Recorder;
 use crate::slash::{self, SlashCommand};
@@ -53,10 +54,17 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         });
     if mcp_outcome.servers > 0 {
         println!(
-            "mcp: {} server(s), {} tool(s) registered",
-            mcp_outcome.servers, mcp_outcome.tools
+            "mcp: {} server(s), {} tool(s), {} prompt(s) registered",
+            mcp_outcome.servers,
+            mcp_outcome.tools,
+            mcp_outcome.prompts.len()
         );
     }
+    let mcp_prompts: BTreeMap<String, McpPrompt> = mcp_outcome
+        .prompts
+        .into_iter()
+        .map(|p| (p.full_name().to_string(), p))
+        .collect();
     // Keep clients alive for the full session; Drop kills subprocesses.
     let _mcp_clients = mcp_outcome.clients;
 
@@ -113,11 +121,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             let head = parts.next().unwrap_or("");
             let args = parts.next().unwrap_or("").trim();
 
-            match handle_slash(head, &registry, &user_commands) {
+            match handle_slash(head, &registry, &user_commands, &mcp_prompts) {
                 SlashResult::Exit => break,
                 SlashResult::Handled => continue,
                 SlashResult::Unknown => {
-                    // 組み込みに無ければユーザ定義コマンドを試す。
+                    // 組み込みに無ければユーザ定義コマンド → MCP prompt の順に試す。
                     if let Some(cmd) = user_commands.get(head) {
                         let prompt = slash::expand(&cmd.body, args);
                         if let Err(e) = session.run_turn(&prompt, llm_client.as_ref(), &gate).await
@@ -125,6 +133,20 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                             eprintln!("error: {e:#}");
                         }
                         persist(&mut recorder, &session);
+                    } else if let Some(mcp_prompt) = mcp_prompts.get(head) {
+                        let positional: Vec<&str> = args.split_whitespace().collect();
+                        match mcp_prompt.render(&positional).await {
+                            Ok(text) if !text.trim().is_empty() => {
+                                if let Err(e) =
+                                    session.run_turn(&text, llm_client.as_ref(), &gate).await
+                                {
+                                    eprintln!("error: {e:#}");
+                                }
+                                persist(&mut recorder, &session);
+                            }
+                            Ok(_) => eprintln!("mcp prompt /{head} returned no text"),
+                            Err(e) => eprintln!("mcp prompt /{head} failed: {e:#}"),
+                        }
                     } else {
                         eprintln!("unknown command: /{head}");
                     }
@@ -236,6 +258,7 @@ fn handle_slash(
     cmd: &str,
     registry: &crate::tools::registry::ToolRegistry,
     user_commands: &BTreeMap<String, SlashCommand>,
+    mcp_prompts: &BTreeMap<String, McpPrompt>,
 ) -> SlashResult {
     match cmd {
         "exit" | "quit" => SlashResult::Exit,
@@ -246,6 +269,13 @@ fn handle_slash(
                     println!("/{}", c.name);
                 } else {
                     println!("/{} — {}", c.name, c.description);
+                }
+            }
+            for p in mcp_prompts.values() {
+                if p.description().is_empty() {
+                    println!("/{}", p.full_name());
+                } else {
+                    println!("/{} — {}", p.full_name(), p.description());
                 }
             }
             SlashResult::Handled

@@ -6,7 +6,7 @@
 
 - **ランタイム非依存**: OpenAI 互換の Chat Completions + tool calling を話せる任意のサーバーに接続可能（Ollama / llama.cpp `--jinja` / vLLM / LM Studio など）
 - **マルチプロバイダ**: ローカル LLM と Sakana AI (`fugu` / `fugu-ultra`) を環境変数で随時切り替え
-- **MCP クライアント (stdio + tools)**: `.mcp.json` を CWD に置くと MCP サーバを起動して公開 tools を取り込む
+- **MCP クライアント (stdio + tools / prompts)**: `.mcp.json` を CWD に置くと MCP サーバを起動して公開 tools を取り込み、prompts は `/mcp__<server>__<prompt>` で呼べる
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
 - **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite` / `Task`（調査用サブエージェント）
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
@@ -164,9 +164,9 @@ lodan> /exit
 - `a` セッション中はこのツールを常時許可
 - `e` Bash の場合のみ、その完全一致コマンドを常時許可
 
-## MCP サーバ接続 (stdio + tools)
+## MCP サーバ接続 (stdio + tools / prompts)
 
-`$CWD/.mcp.json` を置くと REPL 起動時に MCP サーバを spawn し、公開された tools を `mcp__<server>__<tool>` 名で `ToolRegistry` に取り込む。
+`$CWD/.mcp.json` を置くと REPL 起動時に MCP サーバを spawn し、公開された tools を `mcp__<server>__<tool>` 名で `ToolRegistry` に取り込む。サーバが prompts を公開していれば `mcp__<server>__<prompt>` 名の slash コマンドとしても取り込む。
 
 ```json
 // .mcp.json (Claude Code 互換スキーマ)
@@ -183,15 +183,22 @@ lodan> /exit
 サンプルは `.mcp.json.example` を参照。
 
 - **transport**: stdio のみ (Streamable HTTP は未対応)
-- **capabilities**: tools のみ (resources / prompts / sampling / roots は未対応)
+- **capabilities**: tools / prompts (resources / sampling / roots は未対応)
 - **permission**: MCP 由来のツールは **常に destructive** 扱い。初回呼び出しで `y/n/a/e` の確認が出る (Claude Code 同様)
-- **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in 7 ツールのみで継続起動
+- **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in ツールのみで継続起動。`prompts/list` 非対応サーバは warning で skip
 - **プロトコル**: MCP `2025-06-18`、JSON-RPC 2.0、newline-delimited
+
+### MCP prompts
+
+サーバが公開する prompt は `/mcp__<server>__<prompt> 引数...` で呼び出せます。
+位置引数を prompt の宣言引数に順番で対応づけて `prompts/get` を実行し、返ってきたメッセージを
+テキスト化してユーザターンとしてエージェントへ投入します（`/help` に一覧表示）。
+ユーザー定義 slash・skills と同じ「サーバ提供のコマンド」レイヤです。
 
 REPL 起動時に MCP サーバが見つかると次の行がバナーに出る:
 
 ```
-mcp: 1 server(s), 11 tool(s) registered
+mcp: 1 server(s), 11 tool(s), 2 prompt(s) registered
 ```
 
 ## アーキテクチャ概要
@@ -325,7 +332,7 @@ description: コードレビューの観点と手順
 
 ## ロードマップ（MVP 外、骨組みは存在）
 
-- MCP の拡張: Streamable HTTP transport / resources / prompts / sampling / roots
+- MCP の拡張: Streamable HTTP transport / resources / sampling / roots
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - トークン会計
 - 中断時の副作用ロールバック
@@ -345,7 +352,7 @@ cargo test
 - `tools/registry.rs` — 動的名登録 / built-in 既定 7 ツール
 - `permission.rs` — auto_approve / always-tool / always-command の判定
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
-- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/tool.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、namespacing
+- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/tool.rs` / `mcp/prompt.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、tool / prompt の namespacing
 - `tests/e2e_mock.rs` — 6 ツールを順に走らせるエンドツーエンドのモック試験
 - `tests/e2e_mcp.rs` — mock MCP サーバとの handshake + tools/list + tools/call 一周
 

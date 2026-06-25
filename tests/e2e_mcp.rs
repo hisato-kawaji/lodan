@@ -44,4 +44,17 @@ async fn handshake_list_and_call_round_trip() {
         "unexpected content: {}",
         result.content
     );
+
+    // prompts/list + prompts/get round-trip.
+    let prompts = client.list_prompts().await.expect("list_prompts");
+    assert_eq!(prompts.len(), 1, "expected one prompt, got {prompts:?}");
+    assert_eq!(prompts[0].name, "greet");
+    assert_eq!(prompts[0].arguments.len(), 1);
+    assert_eq!(prompts[0].arguments[0].name, "who");
+
+    let got = client
+        .get_prompt("greet", serde_json::json!({ "who": "Ada" }))
+        .await
+        .expect("get_prompt");
+    assert_eq!(got.render(), "Say hello to Ada.");
 }

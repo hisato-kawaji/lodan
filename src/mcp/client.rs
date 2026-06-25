@@ -27,7 +27,13 @@ pub struct McpClient {
 
 impl McpClient {
     pub async fn connect(label: &str, spec: &McpServerSpec) -> Result<Self> {
-        let transport = transport::connect(label, spec).await?;
+        // server→client の roots/list に cwd で応答するハンドラ (stdio のみ有効)。
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let roots = crate::mcp::roots::RootsProvider::from_cwd(&cwd);
+        let handler: transport::ServerRequestHandler =
+            std::sync::Arc::new(move |method: &str| roots.handle(method));
+
+        let transport = transport::connect(label, spec, handler).await?;
         let client = McpClient {
             next_id: transport::id_source(),
             server_label: label.to_string(),
@@ -40,7 +46,7 @@ impl McpClient {
     async fn handshake(&self) -> Result<()> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ClientCapabilities::default(),
+            capabilities: ClientCapabilities::with_roots(),
             client_info: ClientInfo {
                 name: CLIENT_NAME,
                 version: CLIENT_VERSION,

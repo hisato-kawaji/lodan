@@ -26,6 +26,10 @@ use crate::mcp::protocol::JsonRpcIncoming;
 
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// server→client リクエストのハンドラ。method を受け取り、対応すれば結果 JSON を返す。
+/// 未対応なら `None` (呼び出し側で method-not-found 応答)。
+pub type ServerRequestHandler = Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync>;
+
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// `line` (JSON-RPC リクエスト) を送り、`id` で相関した応答を返す。
@@ -46,7 +50,12 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    pub async fn connect(label: &str, command: &str, spec: &McpServerSpec) -> Result<Self> {
+    pub async fn connect(
+        label: &str,
+        command: &str,
+        spec: &McpServerSpec,
+        handler: ServerRequestHandler,
+    ) -> Result<Self> {
         let mut cmd = Command::new(command);
         cmd.args(&spec.args)
             .envs(spec.env.iter())
@@ -88,9 +97,13 @@ impl StdioTransport {
             }
         });
 
-        // Reader task: newline-delimited JSON from stdout → dispatch by id.
+        // Reader task: newline-delimited JSON from stdout.
+        // 三分岐: method+id = server→client リクエスト (応答する) /
+        //         id のみ = 自分のリクエストへの応答 (pending へ) /
+        //         method のみ = 通知 (無視)。
         let pending_clone = Arc::clone(&pending);
         let label_for_reader = label.to_string();
+        let reader_outbound = outbound_tx.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -104,14 +117,32 @@ impl StdioTransport {
                         continue;
                     }
                 };
-                if let Some(id) = inc.id {
-                    if let Some(tx) = pending_clone.lock().await.remove(&id) {
-                        let _ = tx.send(inc);
-                    } else {
-                        tracing::debug!(server=%label_for_reader, id, "mcp: response with no waiter");
+                match (inc.method.as_deref(), inc.id) {
+                    (Some(method), Some(id)) => {
+                        let response = match handler(method) {
+                            Some(result) => {
+                                serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                            }
+                            None => serde_json::json!({
+                                "jsonrpc":"2.0","id":id,
+                                "error":{"code":-32601,"message":format!("method not found: {method}")}
+                            }),
+                        };
+                        let _ = reader_outbound.send(response.to_string());
                     }
-                } else {
-                    tracing::debug!(server=%label_for_reader, method=?inc.method, "mcp: notification ignored");
+                    (Some(method), None) => {
+                        tracing::debug!(server=%label_for_reader, method, "mcp: notification ignored");
+                    }
+                    (None, Some(id)) => {
+                        if let Some(tx) = pending_clone.lock().await.remove(&id) {
+                            let _ = tx.send(inc);
+                        } else {
+                            tracing::debug!(server=%label_for_reader, id, "mcp: response with no waiter");
+                        }
+                    }
+                    (None, None) => {
+                        tracing::debug!(server=%label_for_reader, "mcp: malformed frame (no method/id)");
+                    }
                 }
             }
         });
@@ -314,11 +345,17 @@ fn extract_response_from_sse(body: &str, id: u64) -> Option<JsonRpcIncoming> {
 // ---------------- dispatch ----------------
 
 /// spec の transport 種別に応じて接続し、boxed transport を返す。
-pub async fn connect(label: &str, spec: &McpServerSpec) -> Result<Box<dyn Transport>> {
+/// `handler` は server→client リクエスト (roots/list 等) の応答に使う。
+/// HTTP は server→client チャネルを持たないため handler を使わない。
+pub async fn connect(
+    label: &str,
+    spec: &McpServerSpec,
+    handler: ServerRequestHandler,
+) -> Result<Box<dyn Transport>> {
     use crate::mcp::config::Transport as Kind;
     match spec.transport()? {
         Kind::Stdio { command } => Ok(Box::new(
-            StdioTransport::connect(label, command, spec).await?,
+            StdioTransport::connect(label, command, spec, handler).await?,
         )),
         Kind::Http { url } => Ok(Box::new(HttpTransport::connect(label, url, spec)?)),
     }

@@ -64,7 +64,28 @@ pub struct InitializeParams<'a> {
 }
 
 #[derive(Debug, Default, Serialize)]
-pub struct ClientCapabilities {}
+pub struct ClientCapabilities {
+    /// roots を提供できることをサーバへ知らせる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roots: Option<RootsCapability>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RootsCapability {
+    /// roots が動的に変わると通知するか。cwd 固定なので false。
+    #[serde(rename = "listChanged")]
+    pub list_changed: bool,
+}
+
+impl ClientCapabilities {
+    pub fn with_roots() -> Self {
+        Self {
+            roots: Some(RootsCapability {
+                list_changed: false,
+            }),
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct ClientInfo<'a> {

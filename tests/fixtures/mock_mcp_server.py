@@ -38,6 +38,15 @@ NOTES_RESOURCE = {
     "mimeType": "text/plain",
 }
 
+GET_ROOTS_TOOL = {
+    "name": "get_roots",
+    "description": "Return the roots reported by the client (server→client roots/list).",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+
+# Captured from the client's response to our server-initiated roots/list request.
+CAPTURED_ROOTS: list = []
+
 
 def send(obj: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
@@ -47,6 +56,14 @@ def send(obj: dict[str, Any]) -> None:
 def handle(msg: dict[str, Any]) -> None:
     method = msg.get("method")
     msg_id = msg.get("id")
+
+    # Response to our server→client roots/list request (no method, has result).
+    if method is None and isinstance(msg.get("result"), dict):
+        roots = msg["result"].get("roots")
+        if isinstance(roots, list):
+            CAPTURED_ROOTS.clear()
+            CAPTURED_ROOTS.extend(roots)
+        return
 
     if method == "initialize":
         send(
@@ -60,6 +77,8 @@ def handle(msg: dict[str, Any]) -> None:
                 },
             }
         )
+        # Exercise the server→client direction: ask the client for its roots.
+        send({"jsonrpc": "2.0", "id": 9001, "method": "roots/list"})
         return
 
     if method == "notifications/initialized":
@@ -70,7 +89,7 @@ def handle(msg: dict[str, Any]) -> None:
             {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"tools": [ECHO_TOOL]},
+                "result": {"tools": [ECHO_TOOL, GET_ROOTS_TOOL]},
             }
         )
         return
@@ -87,6 +106,18 @@ def handle(msg: dict[str, Any]) -> None:
                     "id": msg_id,
                     "result": {
                         "content": [{"type": "text", "text": f"echo:{text}"}],
+                        "isError": False,
+                    },
+                }
+            )
+        elif name == "get_roots":
+            text = json.dumps(CAPTURED_ROOTS, separators=(",", ":"))
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": text}],
                         "isError": False,
                     },
                 }

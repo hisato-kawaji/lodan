@@ -42,6 +42,8 @@ struct ChatRequest<'a> {
     tools: &'a [ToolSpec<'a>],
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     stream: bool,
 }
 
@@ -89,6 +91,7 @@ impl LlmClient for OpenAiClient {
         history: &[Message],
         tools: &[ToolSpec<'_>],
         model: &str,
+        max_tokens: Option<u32>,
     ) -> Result<ChatResponse> {
         let url = format!("{}/chat/completions", self.base_url);
         let req = ChatRequest {
@@ -96,6 +99,7 @@ impl LlmClient for OpenAiClient {
             messages: history,
             tools,
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
+            max_tokens,
             stream: false,
         };
 
@@ -153,6 +157,7 @@ impl LlmClient for OpenAiClient {
             messages: history,
             tools,
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
+            max_tokens: None,
             stream: true,
         };
 

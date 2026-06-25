@@ -30,7 +30,11 @@ impl SamplingProvider {
     pub async fn create_message(&self, params: Value) -> Result<Value> {
         let params: CreateMessageParams = serde_json::from_value(params)?;
         let history = Self::to_history(&params);
-        let resp = self.llm.chat(&history, &[], &self.model).await?;
+        // サーバ指定の maxTokens を生成上限として渡し、無制限生成を防ぐ。
+        let resp = self
+            .llm
+            .chat(&history, &[], &self.model, params.max_tokens)
+            .await?;
         let text = resp.content.unwrap_or_default();
         let result = CreateMessageResult::assistant_text(text, self.model.clone());
         Ok(serde_json::to_value(result)?)
@@ -72,9 +76,10 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::mpsc;
 
-    /// 受け取った履歴を控えて固定文を返すスタブ LLM。
+    /// 受け取った履歴と maxTokens を控えて固定文を返すスタブ LLM。
     struct EchoLlm {
         seen: std::sync::Mutex<Vec<Message>>,
+        seen_max_tokens: std::sync::Mutex<Option<u32>>,
     }
 
     #[async_trait]
@@ -84,8 +89,10 @@ mod tests {
             history: &[Message],
             _tools: &[ToolSpec<'_>],
             _model: &str,
+            max_tokens: Option<u32>,
         ) -> Result<ChatResponse> {
             *self.seen.lock().unwrap() = history.to_vec();
+            *self.seen_max_tokens.lock().unwrap() = max_tokens;
             Ok(ChatResponse {
                 content: Some("stub reply".into()),
                 tool_calls: Vec::new(),
@@ -107,6 +114,7 @@ mod tests {
     async fn create_message_converts_history_and_wraps_result() {
         let llm = Arc::new(EchoLlm {
             seen: std::sync::Mutex::new(Vec::new()),
+            seen_max_tokens: std::sync::Mutex::new(None),
         });
         let provider = SamplingProvider::new(llm.clone(), "test-model".into());
         let params = serde_json::json!({
@@ -133,12 +141,16 @@ mod tests {
         assert!(
             matches!(&seen[2], Message::Assistant { content, .. } if content.as_deref() == Some("pong"))
         );
+
+        // サーバ指定の maxTokens が LLM へ生成上限として渡る。
+        assert_eq!(*llm.seen_max_tokens.lock().unwrap(), Some(50));
     }
 
     #[tokio::test]
     async fn create_message_rejects_malformed_params() {
         let llm = Arc::new(EchoLlm {
             seen: std::sync::Mutex::new(Vec::new()),
+            seen_max_tokens: std::sync::Mutex::new(None),
         });
         let provider = SamplingProvider::new(llm, "m".into());
         // messages が配列でない → パース失敗。

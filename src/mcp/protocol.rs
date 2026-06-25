@@ -387,7 +387,7 @@ pub struct CreateMessageParams {
     pub messages: Vec<SamplingMessage>,
     #[serde(default, rename = "systemPrompt")]
     pub system_prompt: Option<String>,
-    #[allow(dead_code)]
+    /// 生成上限。sampling 経由で LLM へ渡し、無制限生成を防ぐ。
     #[serde(default, rename = "maxTokens")]
     pub max_tokens: Option<u32>,
 }

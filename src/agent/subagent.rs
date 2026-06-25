@@ -72,7 +72,7 @@ impl SubAgentTool {
             let specs = self.tools.tool_specs();
             let resp = self
                 .llm
-                .chat(&history, &specs, &self.model)
+                .chat(&history, &specs, &self.model, None)
                 .await
                 .map_err(|e| ToolError::Other(format!("sub-agent llm error: {e}")))?;
 
@@ -193,6 +193,7 @@ mod tests {
             _history: &[Message],
             _tools: &[ToolSpec<'_>],
             _model: &str,
+            _max_tokens: Option<u32>,
         ) -> Result<ChatResponse> {
             let i = self.idx.fetch_add(1, Ordering::SeqCst);
             Ok(self.steps.get(i).cloned().unwrap_or(ChatResponse {

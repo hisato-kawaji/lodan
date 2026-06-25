@@ -26,11 +26,14 @@ pub enum ChatEvent {
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    /// `max_tokens` で 1 応答の生成上限を渡せる (`None` はモデル既定)。MCP sampling は
+    /// 外部サーバ由来の上限をここで適用して無制限生成を防ぐ。
     async fn chat(
         &self,
         history: &[Message],
         tools: &[ToolSpec<'_>],
         model: &str,
+        max_tokens: Option<u32>,
     ) -> Result<ChatResponse>;
 
     async fn chat_stream(

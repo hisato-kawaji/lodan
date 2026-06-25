@@ -14,6 +14,8 @@ use super::{Tool, ToolCtx, ToolError, ToolOutput};
 /// 返す本文の最大文字数。超過分は切り詰めて注記する。
 const MAX_CHARS: usize = 50_000;
 const TIMEOUT: Duration = Duration::from_secs(15);
+/// 追従するリダイレクトの最大ホップ数。
+const MAX_REDIRECTS: usize = 5;
 
 pub struct WebFetch;
 
@@ -55,8 +57,22 @@ impl Tool for WebFetch {
             )));
         }
 
+        // リダイレクトは追うが、各ホップを http/https に限定しホップ数を制限する。
+        // (初回 URL だけ検証してもリダイレクト先が非 http へ逃げると検証を迂回できるため。
+        //  なお内部ホストへのリダイレクトは依然あり得る — README の信頼前提を参照。)
+        let redirect = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if matches!(attempt.url().scheme(), "http" | "https") {
+                attempt.follow()
+            } else {
+                attempt.error("redirect to non-http(s) scheme")
+            }
+        });
+
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
+            .redirect(redirect)
             .build()
             .map_err(|e| ToolError::Other(format!("building HTTP client: {e}")))?;
 
@@ -290,5 +306,37 @@ mod tests {
         assert!(out.content.contains("-> 200"));
         assert!(out.content.contains("hello & bye"));
         assert!(!out.content.contains("<p>"));
+    }
+
+    // リダイレクト先が非 http(s) なら追従せずエラーにする (scheme 検証の迂回を防ぐ)。
+    #[tokio::test]
+    async fn does_not_follow_redirect_to_non_http_scheme() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = "HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\n\
+                            Content-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let ctx = ToolCtx::new(std::env::temp_dir());
+        let out = WebFetch
+            .execute(
+                serde_json::json!({ "url": format!("http://127.0.0.1:{port}/") }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        // 非 http(s) への 302 は追わず、request failed として返る。
+        assert!(out.is_error, "{}", out.content);
+        assert!(!out.content.contains("/etc/passwd"));
     }
 }

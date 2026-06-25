@@ -10,7 +10,7 @@
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
 - **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite` / `MultiEdit` / `NotebookEdit`（.ipynb セル編集） / `WebFetch`（http(s) GET → テキスト化） / `Task`（調査用サブエージェント）
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
-  - `WebFetch` は read-only な GET なので**非破壊**（ゲートを経ない）。⚠️ ただしフェッチ先 URL はモデルが決めるため、内部ネットワーク到達 (SSRF) やクエリ経由の情報送出があり得る。http/https のみ許可・タイムアウト・サイズ上限を課すが、実行環境を信頼する前提（hooks / `.mcp.json` と同じ）で使うこと
+  - `WebFetch` は read-only な GET なので**非破壊**（ゲートを経ない）。⚠️ ただしフェッチ先 URL はモデルが決めるため、内部ネットワーク到達 (SSRF) やクエリ経由の情報送出があり得る。http/https のみ許可・タイムアウト・サイズ上限を課し、リダイレクトも各ホップを http/https に限定して最大 5 ホップに制限する。**ただしリダイレクト先の内部ホスト到達まではブロックしない**ため、実行環境を信頼する前提（hooks / `.mcp.json` と同じ）で使うこと
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
 - **hooks**: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` で外部コマンドを発火し、exit code でツール実行をブロック（後述）
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）

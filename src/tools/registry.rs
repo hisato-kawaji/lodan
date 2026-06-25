@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::agent::messages::{ToolSpec, ToolSpecFunction};
-use crate::tools::{Tool, bash, edit, glob, grep, read, todo_write, write};
+use crate::tools::{Tool, bash, edit, glob, grep, multi_edit, read, todo_write, write};
 
 // MVP 外（import はあえて残し、登録行で利用する想定でコメントアウト）
 #[allow(unused_imports)]
-use crate::tools::{ask_user_question, monitor, multi_edit, notebook_edit, web_fetch, web_search};
+use crate::tools::{ask_user_question, monitor, notebook_edit, web_fetch, web_search};
 
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -69,6 +69,7 @@ pub fn default_registry() -> ToolRegistry {
     r.register(Arc::new(grep::Grep));
     r.register(Arc::new(glob::Glob));
     r.register(Arc::new(todo_write::TodoWrite));
+    r.register(Arc::new(multi_edit::MultiEdit));
 
     // --- MVP スコープ外: 登録は意図的に無効化 ---
     // r.register(Arc::new(web_fetch::WebFetch));
@@ -76,7 +77,6 @@ pub fn default_registry() -> ToolRegistry {
     // r.register(Arc::new(ask_user_question::AskUserQuestion));
     // r.register(Arc::new(monitor::Monitor));
     // r.register(Arc::new(notebook_edit::NotebookEdit));
-    // r.register(Arc::new(multi_edit::MultiEdit));
 
     r
 }
@@ -140,10 +140,19 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_has_seven_builtins() {
+    fn default_registry_has_builtins() {
         let r = default_registry();
-        assert_eq!(r.len(), 7);
-        for n in ["Read", "Write", "Edit", "Bash", "Grep", "Glob", "TodoWrite"] {
+        assert_eq!(r.len(), 8);
+        for n in [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "Grep",
+            "Glob",
+            "TodoWrite",
+            "MultiEdit",
+        ] {
             assert!(r.get(n).is_some(), "missing {n}");
         }
     }

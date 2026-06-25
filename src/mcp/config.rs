@@ -2,10 +2,14 @@
 //
 // {
 //   "mcpServers": {
-//     "filesystem": {
+//     "filesystem": {                                   // stdio transport
 //       "command": "npx",
 //       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"],
 //       "env": { "FOO": "bar" }
+//     },
+//     "remote": {                                        // Streamable HTTP transport
+//       "url": "https://example.com/mcp",
+//       "headers": { "Authorization": "Bearer ..." }
 //     }
 //   }
 // }
@@ -23,11 +27,38 @@ pub struct McpServersConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerSpec {
-    pub command: String,
+    // --- stdio transport ---
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    // --- Streamable HTTP transport ---
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl McpServerSpec {
+    /// `url` があれば HTTP、`command` があれば stdio。両方無い / 両方ある場合はエラー。
+    pub fn transport(&self) -> Result<Transport<'_>> {
+        match (self.command.as_deref(), self.url.as_deref()) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("server spec has both `command` and `url`; pick one")
+            }
+            (Some(cmd), None) => Ok(Transport::Stdio { command: cmd }),
+            (None, Some(url)) => Ok(Transport::Http { url }),
+            (None, None) => anyhow::bail!("server spec needs either `command` or `url`"),
+        }
+    }
+}
+
+/// 選択された transport (借用ビュー)。
+pub enum Transport<'a> {
+    Stdio { command: &'a str },
+    Http { url: &'a str },
 }
 
 impl McpServersConfig {
@@ -63,9 +94,34 @@ mod tests {
         let cfg: McpServersConfig = serde_json::from_str(s).unwrap();
         assert_eq!(cfg.mcp_servers.len(), 1);
         let fs = &cfg.mcp_servers["fs"];
-        assert_eq!(fs.command, "npx");
+        assert_eq!(fs.command.as_deref(), Some("npx"));
         assert_eq!(fs.args, vec!["-y", "x"]);
         assert!(fs.env.is_empty());
+        assert!(matches!(fs.transport().unwrap(), Transport::Stdio { .. }));
+    }
+
+    #[test]
+    fn parses_http_config() {
+        let s = r#"{
+            "mcpServers": {
+                "remote": { "url": "https://x/mcp", "headers": { "Authorization": "Bearer t" } }
+            }
+        }"#;
+        let cfg: McpServersConfig = serde_json::from_str(s).unwrap();
+        let r = &cfg.mcp_servers["remote"];
+        assert_eq!(r.url.as_deref(), Some("https://x/mcp"));
+        assert_eq!(r.headers.get("Authorization").unwrap(), "Bearer t");
+        assert!(matches!(r.transport().unwrap(), Transport::Http { .. }));
+    }
+
+    #[test]
+    fn transport_requires_exactly_one_of_command_or_url() {
+        let both: McpServerSpec =
+            serde_json::from_str(r#"{ "command": "c", "url": "http://x" }"#).unwrap();
+        assert!(both.transport().is_err());
+
+        let neither: McpServerSpec = serde_json::from_str(r#"{ "args": [] }"#).unwrap();
+        assert!(neither.transport().is_err());
     }
 
     #[test]
@@ -83,6 +139,7 @@ mod tests {
         }"#;
         let cfg: McpServersConfig = serde_json::from_str(s).unwrap();
         assert_eq!(cfg.mcp_servers["x"].env.get("K").unwrap(), "v");
+        assert_eq!(cfg.mcp_servers["x"].command.as_deref(), Some("c"));
     }
 
     #[test]

@@ -19,12 +19,14 @@ fn fixture_script() -> PathBuf {
 #[tokio::test]
 async fn handshake_list_and_call_round_trip() {
     let spec = McpServerSpec {
-        command: "python3".to_string(),
+        command: Some("python3".to_string()),
         args: vec![fixture_script().to_string_lossy().into_owned()],
         env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
     };
 
-    let client = McpClient::connect_stdio("mock", &spec)
+    let client = McpClient::connect("mock", &spec)
         .await
         .expect("connect MCP mock");
 

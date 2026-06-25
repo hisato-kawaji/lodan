@@ -6,7 +6,7 @@
 
 - **ランタイム非依存**: OpenAI 互換の Chat Completions + tool calling を話せる任意のサーバーに接続可能（Ollama / llama.cpp `--jinja` / vLLM / LM Studio など）
 - **マルチプロバイダ**: ローカル LLM と Sakana AI (`fugu` / `fugu-ultra`) を環境変数で随時切り替え
-- **MCP クライアント (stdio + tools / prompts / resources)**: `.mcp.json` を CWD に置くと MCP サーバを起動して公開 tools を取り込み、prompts は `/mcp__<server>__<prompt>`、resources は `mcp__<server>__read_resource` で扱える
+- **MCP クライアント (stdio / HTTP + tools / prompts / resources)**: `.mcp.json` を CWD に置くと MCP サーバ（ローカル stdio / リモート Streamable HTTP）へ接続し、公開 tools を取り込み、prompts は `/mcp__<server>__<prompt>`、resources は `mcp__<server>__read_resource` で扱える
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
 - **コアツール**: `Read` / `Write` / `Edit` / `Bash` / `Grep` / `Glob` / `TodoWrite` / `Task`（調査用サブエージェント）
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
@@ -164,29 +164,33 @@ lodan> /exit
 - `a` セッション中はこのツールを常時許可
 - `e` Bash の場合のみ、その完全一致コマンドを常時許可
 
-## MCP サーバ接続 (stdio + tools / prompts)
+## MCP サーバ接続 (stdio / HTTP + tools / prompts / resources)
 
-`$CWD/.mcp.json` を置くと REPL 起動時に MCP サーバを spawn し、公開された tools を `mcp__<server>__<tool>` 名で `ToolRegistry` に取り込む。サーバが prompts を公開していれば `mcp__<server>__<prompt>` 名の slash コマンドとしても取り込む。
+`$CWD/.mcp.json` を置くと REPL 起動時に MCP サーバへ接続し、公開された tools を `mcp__<server>__<tool>` 名で `ToolRegistry` に取り込む。サーバが prompts を公開していれば `mcp__<server>__<prompt>` 名の slash コマンドとしても取り込む。
 
 ```json
 // .mcp.json (Claude Code 互換スキーマ)
 {
   "mcpServers": {
-    "fs": {
+    "fs": {                                              // stdio transport
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/lodan-fs"]
+    },
+    "remote": {                                          // Streamable HTTP transport
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
     }
   }
 }
 ```
 
-サンプルは `.mcp.json.example` を参照。
+サンプルは `.mcp.json.example` を参照。`command` があれば stdio、`url` があれば HTTP（両方／どちらも無いはエラー）。
 
-- **transport**: stdio のみ (Streamable HTTP は未対応)
+- **transport**: **stdio** (`command`) と **Streamable HTTP** (`url`)。HTTP は POST で JSON-RPC を送り、`application/json` または `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぎ、`headers` で認証ヘッダを付与できる。server→client の GET ストリーム（server-initiated request）は未対応
 - **capabilities**: tools / prompts / resources (sampling / roots は未対応)
 - **permission**: MCP 由来の **tools/call は常に destructive** 扱いで初回呼び出しに `y/n/a/e` 確認 (Claude Code 同様)。**resources は read-only なので非破壊** (ゲートを経ない)
 - **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in ツールのみで継続起動。`prompts/list` / `resources/list` 非対応サーバは warning で skip
-- **プロトコル**: MCP `2025-06-18`、JSON-RPC 2.0、newline-delimited
+- **プロトコル**: MCP `2025-06-18`、JSON-RPC 2.0（stdio は newline-delimited、HTTP は POST 1 リクエスト/レスポンス）
 
 ### MCP prompts
 
@@ -342,7 +346,7 @@ description: コードレビューの観点と手順
 
 ## ロードマップ（MVP 外、骨組みは存在）
 
-- MCP の拡張: Streamable HTTP transport / sampling / roots
+- MCP の拡張: sampling / roots
 - WebFetch / WebSearch / AskUserQuestion / Monitor / NotebookEdit / MultiEdit
 - トークン会計
 - 中断時の副作用ロールバック
@@ -362,7 +366,7 @@ cargo test
 - `tools/registry.rs` — 動的名登録 / built-in 既定 7 ツール
 - `permission.rs` — auto_approve / always-tool / always-command の判定
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
-- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、tool / prompt / resource の namespacing
+- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing
 - `tests/e2e_mock.rs` — 6 ツールを順に走らせるエンドツーエンドのモック試験
 - `tests/e2e_mcp.rs` — mock MCP サーバとの handshake + tools/list + tools/call 一周
 

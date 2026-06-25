@@ -24,7 +24,7 @@ pub async fn load_and_register(reg: &mut ToolRegistry) -> Result<LoadOutcome> {
 
     let mut outcome = LoadOutcome::default();
     for (server_name, spec) in cfg.mcp_servers {
-        match McpClient::connect_stdio(&server_name, &spec).await {
+        match McpClient::connect(&server_name, &spec).await {
             Ok(client) => {
                 let client = Arc::new(client);
                 match client.list_tools().await {

@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
+pub mod frontmatter;
 pub mod hooks;
 pub mod llm;
 pub mod mcp;

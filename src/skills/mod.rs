@@ -58,38 +58,19 @@ pub fn load_from(dir: &Path) -> Result<Vec<Skill>> {
 /// frontmatter (`name` / `description`) を抜き、本文を instructions とする。
 /// frontmatter が無ければ name はディレクトリ名、description は空。
 fn parse_skill(dir_name: &str, content: &str) -> Skill {
-    if let Some(rest) = content.strip_prefix("---\n")
-        && let Some(end) = rest.find("\n---")
-    {
-        let front = &rest[..end];
-        let after = &rest[end + 4..];
-        let mut name = dir_name.to_string();
-        let mut description = String::new();
-        for line in front.lines() {
-            if let Some(v) = line.strip_prefix("name:") {
-                let v = v.trim().trim_matches('"');
-                if !v.is_empty() {
-                    name = v.to_string();
-                }
-            } else if let Some(v) = line.strip_prefix("description:") {
-                description = v.trim().trim_matches('"').to_string();
-            }
-        }
-        return Skill {
-            name,
-            description,
-            instructions: after
-                .strip_prefix('\n')
-                .unwrap_or(after)
-                .trim_start()
-                .to_string(),
-        };
-    }
-
+    let (front, body) = crate::frontmatter::split(content);
+    // `name` 省略 (または空) のときはディレクトリ名を使う。
+    let name = front
+        .and_then(|f| crate::frontmatter::field(f, "name"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| dir_name.to_string());
+    let description = front
+        .and_then(|f| crate::frontmatter::field(f, "description"))
+        .unwrap_or_default();
     Skill {
-        name: dir_name.to_string(),
-        description: String::new(),
-        instructions: content.trim_start().to_string(),
+        name,
+        description,
+        instructions: body.to_string(),
     }
 }
 

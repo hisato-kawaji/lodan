@@ -190,6 +190,13 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn connect(label: &str, url: &str, spec: &McpServerSpec) -> Result<Self> {
+        // http:// に認証ヘッダを載せると平文でトークンが流れる。明示的に警告する。
+        if !url.starts_with("https://") && !spec.headers.is_empty() {
+            eprintln!(
+                "mcp[{label}]: warning: sending headers over non-HTTPS url ({url}) — \
+                 credentials are sent in cleartext"
+            );
+        }
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()

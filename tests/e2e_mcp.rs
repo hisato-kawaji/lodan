@@ -31,9 +31,8 @@ async fn handshake_list_and_call_round_trip() {
         .expect("connect MCP mock");
 
     let tools = client.list_tools().await.expect("list_tools");
-    assert_eq!(tools.len(), 1, "expected one tool, got {tools:?}");
-    assert_eq!(tools[0].name, "echo");
-    assert!(tools[0].description.is_some());
+    assert_eq!(tools.len(), 2, "expected echo + get_roots, got {tools:?}");
+    assert!(tools.iter().any(|t| t.name == "echo"));
 
     let result = client
         .call_tool("echo", serde_json::json!({ "msg": "hi" }))
@@ -74,4 +73,16 @@ async fn handshake_list_and_call_round_trip() {
         .await
         .expect("read_resource");
     assert_eq!(read.flatten_text(), "remember the milk");
+
+    // server→client roots/list: the mock asked us for roots during initialize and
+    // captured our reply; `get_roots` echoes it back. Assert it carries a file:// root.
+    let roots = client
+        .call_tool("get_roots", serde_json::json!({}))
+        .await
+        .expect("get_roots");
+    assert!(
+        roots.content.contains("file://"),
+        "expected a file:// root, got: {}",
+        roots.content
+    );
 }

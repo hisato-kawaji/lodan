@@ -8,5 +8,6 @@ pub mod prompt;
 pub mod protocol;
 pub mod registry;
 pub mod resource;
+pub mod roots;
 pub mod tool;
 pub mod transport;

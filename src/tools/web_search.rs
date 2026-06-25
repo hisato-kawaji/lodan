@@ -75,6 +75,12 @@ impl Tool for WebSearch {
         }
         let endpoint =
             std::env::var("BRAVE_SEARCH_API_URL").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+        // env 由来 (信頼) だが、WebFetch と同様に http/https へ揃えておく。
+        if !is_http_url(&endpoint) {
+            return Ok(ToolOutput::error(format!(
+                "WebSearch: BRAVE_SEARCH_API_URL must be http/https (got {endpoint})"
+            )));
+        }
 
         let client = reqwest::Client::builder()
             .timeout(TIMEOUT)
@@ -176,6 +182,11 @@ fn format_results(query: &str, results: &[SearchResult]) -> String {
     out
 }
 
+fn is_http_url(u: &str) -> bool {
+    let l = u.to_ascii_lowercase();
+    l.starts_with("http://") || l.starts_with("https://")
+}
+
 /// Brave の title/description に含まれる簡易 HTML タグ (<strong> 等) を落とす。
 fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -232,6 +243,14 @@ mod tests {
     #[test]
     fn formats_empty_results() {
         assert_eq!(format_results("x", &[]), "No results for \"x\".");
+    }
+
+    #[test]
+    fn endpoint_scheme_check() {
+        assert!(is_http_url(DEFAULT_ENDPOINT));
+        assert!(is_http_url("http://127.0.0.1:8080/"));
+        assert!(!is_http_url("file:///x"));
+        assert!(!is_http_url("ftp://x"));
     }
 
     #[tokio::test]

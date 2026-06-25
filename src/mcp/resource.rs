@@ -84,6 +84,8 @@ impl Tool for McpResourceTool {
             .get("uri")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("read_resource: missing `uri`".into()))?;
+        // schema の uri enum は advisory。クライアントは uri を制限せず、認可境界は
+        // サーバ側に委ねる (enum 外 uri はサーバが error を返し ToolOutput::error になる)。
         match self.client.read_resource(uri).await {
             Ok(result) => Ok(ToolOutput::ok(result.flatten_text())),
             Err(e) => Ok(ToolOutput::error(format!("resources/read failed: {e}"))),

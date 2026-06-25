@@ -203,10 +203,12 @@ lodan> /exit
 ツールの説明文に公開 resource の `uri` 一覧が載り、モデルが `uri` を指定して呼ぶと `resources/read` の内容を
 テキスト化して返します。read-only なので**非破壊**（パーミッションゲートを経ません）。バイナリ (blob) リソースは件数のみ注記してスキップします。
 
+> ⚠️ **信頼前提**: read_resource は非ゲートなので、`file://` 等を公開するサーバ相手では**無確認の任意ファイル読み出し**になり得ます。クライアントは `uri` を制限せず認可境界はサーバ側に委ねるため、`.mcp.json` のサーバ自体を信頼する前提（prompts と同じ信頼モデル）で利用してください。
+
 REPL 起動時に MCP サーバが見つかると次の行がバナーに出る:
 
 ```
-mcp: 1 server(s), 11 tool(s), 2 prompt(s), 3 resource(s) registered
+mcp: 1 server(s), 11 tool(s), 2 prompt(s), 1 resource(s) registered
 ```
 
 ## アーキテクチャ概要

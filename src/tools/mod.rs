@@ -8,12 +8,14 @@ pub mod grep;
 pub mod read;
 pub mod write;
 
-// MVP 外（Stage A はスタブのみ。registry での登録行はコメントアウトされている）
-pub mod ask_user_question;
-pub mod monitor;
+// 追加ビルトイン（default_registry に登録済み）
 pub mod multi_edit;
 pub mod notebook_edit;
 pub mod todo_write;
+
+// MVP 外（スタブのみ。registry での登録行はコメントアウトされている）
+pub mod ask_user_question;
+pub mod monitor;
 pub mod web_fetch;
 pub mod web_search;
 

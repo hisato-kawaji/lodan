@@ -36,7 +36,7 @@ run_one() {
       > "$log" 2>&1
   local rc=$?
   local tools
-  tools=$(grep -oE '^\[(Write|Edit|MultiEdit|Read|Bash|Glob|Grep|NotebookEdit)\]' "$log" 2>/dev/null \
+  tools=$(grep -oE '^\[(Read|Write|Edit|MultiEdit|Bash|Grep|Glob|TodoWrite|NotebookEdit|WebFetch|WebSearch|AskUserQuestion)\]' "$log" 2>/dev/null \
           | tr -d '[]' | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')
   local status note
   if [ $rc -eq 124 ]; then

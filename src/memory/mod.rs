@@ -26,10 +26,10 @@ fn load_memory_from(cwd: &Path, home: Option<&Path>) -> String {
     let mut sources: Vec<(PathBuf, String)> = Vec::new();
 
     // ユーザ全体（最も汎用なので先頭）。
-    if let Some(home) = home {
-        if let Some(hit) = read_first(&home.join(".lodan"), &["LODAN.md"]) {
-            sources.push(hit);
-        }
+    if let Some(home) = home
+        && let Some(hit) = read_first(&home.join(".lodan"), &["LODAN.md"])
+    {
+        sources.push(hit);
     }
 
     // cwd → 上方向。home がパス上にあればそこで打ち切る（その上の system 領域は読まない）。
@@ -75,10 +75,10 @@ fn load_memory_from(cwd: &Path, home: Option<&Path>) -> String {
 fn read_first(dir: &Path, names: &[&str]) -> Option<(PathBuf, String)> {
     for name in names {
         let p = dir.join(name);
-        if let Ok(c) = std::fs::read_to_string(&p) {
-            if !c.trim().is_empty() {
-                return Some((p, c));
-            }
+        if let Ok(c) = std::fs::read_to_string(&p)
+            && !c.trim().is_empty()
+        {
+            return Some((p, c));
         }
     }
     None

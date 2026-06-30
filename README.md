@@ -17,6 +17,7 @@
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
 - **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
 - **skills**: `.lodan/skills/<name>/SKILL.md` を読み込み、`Skill` ツールとしてモデルへ公開（後述）
+- **プロジェクトメモリ**: cwd 階層の `LODAN.md`（無ければ `CLAUDE.md`）と `~/.lodan/LODAN.md` を読み、system prompt へ注入（後述）
 - **拡張機構の枠だけ用意**: skills 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
 
 ## 必要環境
@@ -386,6 +387,16 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 `Monitor` は読み取り専用なのでパーミッションゲートを経ない（`Bash` の起動自体は従来どおりゲート対象）。
 `KillShell` はプロセスを終了させる副作用があるため**破壊的ツール扱い**で承認ゲートを通る。
 
+## プロジェクトメモリ（`LODAN.md` / `CLAUDE.md`）
+
+起動時に **cwd から上方向**（`$HOME` まで、無ければ root まで）の各ディレクトリにある `LODAN.md`（無ければ `CLAUDE.md`）と、ユーザ全体の `~/.lodan/LODAN.md` を読み込み、**system prompt の末尾へ注入**する。Claude Code の `CLAUDE.md` 階層に相当。
+
+- 連結順は **外側（汎用）→ 内側（具体）**。各エントリに `# Memory: <path>` ヘッダが付く。
+- 合計 32 KiB を上限に、超過分は文字境界で打ち切る（`...[memory truncated]...`）。
+- 中身が空（空白のみ）のファイルは無視。`$HOME` より上の system 領域は読まない。
+
+> ⚠️ **信頼前提**: memory は CWD 階層からそのままプロンプトへ注入される。信頼できないリポジトリの `LODAN.md` / `CLAUDE.md` は prompt injection ベクタになり得る（skills / hooks / `.mcp.json` と同じ CWD 信頼前提）。注入時に「承認ゲートを回避する指示ではない」旨を system prompt に明記している。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - トークン会計
@@ -405,6 +416,7 @@ cargo test
 - `tools/todo_write.rs` — replace / clear / multi-in_progress 拒否 / 引数不正
 - `tools/registry.rs` — 動的名登録 / built-in 既定 14 ツール
 - `tools/background.rs` / `tools/bash.rs` — BG ストアの増分読み出し・上限 append・kill 合図 / Bash の run_in_background → Monitor / KillShell 一周
+- `memory/mod.rs` — LODAN.md/CLAUDE.md 探索・優先順・外内連結・空ファイル除外・上限の文字境界打ち切り
 - `permission.rs` — auto_approve / always-tool / always-command の判定
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
 - `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` / `mcp/roots.rs` / `mcp/sampling.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing、roots 提供、sampling (server→client LLM 補完) の opt-in 橋渡し

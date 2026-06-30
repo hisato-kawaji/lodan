@@ -154,10 +154,51 @@ impl Bash {
 /// 子プロセスのパイプを EOF まで読み、上限付きで共有バッファへ流す。
 async fn pump<R: tokio::io::AsyncRead + Unpin>(mut reader: R, buf: SharedBuf) {
     let mut chunk = [0u8; 4096];
+    // チャンク境界でマルチバイト文字が割れても化けないよう、未完バイトは carry に持ち越す。
+    let mut carry: Vec<u8> = Vec::new();
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => append_capped(&buf, &String::from_utf8_lossy(&chunk[..n])),
+            Ok(n) => {
+                carry.extend_from_slice(&chunk[..n]);
+                let decoded = decode_utf8_prefix(&mut carry);
+                if !decoded.is_empty() {
+                    append_capped(&buf, &decoded);
+                }
+            }
+        }
+    }
+    // EOF: 残った未完バイトは lossy に吐く。
+    if !carry.is_empty() {
+        append_capped(&buf, &String::from_utf8_lossy(&carry));
+    }
+}
+
+/// `carry` の先頭から完全な UTF-8 プレフィックスを取り出して返し、残り（未完の
+/// マルチバイト等）を `carry` に残す。不正バイト列は U+FFFD に置換して消費する。
+fn decode_utf8_prefix(carry: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(carry) {
+        Ok(s) => {
+            let out = s.to_string();
+            carry.clear();
+            out
+        }
+        Err(e) => {
+            let valid = e.valid_up_to();
+            let mut out = String::from_utf8_lossy(&carry[..valid]).into_owned();
+            match e.error_len() {
+                // error_len() == Some なら境界跨ぎでなく真に不正なバイト列。
+                // 置換文字を出して該当バイトを捨て、carry が詰まらないようにする。
+                Some(bad) => {
+                    out.push('\u{FFFD}');
+                    carry.drain(..valid + bad);
+                }
+                // 未完（more bytes 待ち）: valid 分だけ消費して残りを持ち越す。
+                None => {
+                    carry.drain(..valid);
+                }
+            }
+            out
         }
     }
 }
@@ -173,6 +214,30 @@ fn truncate(mut s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// マルチバイト文字がチャンク境界で割れても carry 経由で正しく復元される。
+    #[test]
+    fn decode_utf8_prefix_handles_split_multibyte() {
+        // "あ" は E3 81 82。先頭 2 バイトだけ来た状態。
+        let mut carry = vec![0xE3, 0x81];
+        let out = decode_utf8_prefix(&mut carry);
+        assert_eq!(out, ""); // まだ確定文字なし
+        assert_eq!(carry, vec![0xE3, 0x81]); // 持ち越し
+        // 残り 1 バイト到着 → "あ" が確定。
+        carry.push(0x82);
+        let out2 = decode_utf8_prefix(&mut carry);
+        assert_eq!(out2, "あ");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn decode_utf8_prefix_emits_replacement_for_invalid() {
+        // 0xFF は不正な先頭バイト。U+FFFD を出して消費する（無限ループしない）。
+        let mut carry = vec![0xFF, b'a'];
+        let out = decode_utf8_prefix(&mut carry);
+        assert!(out.starts_with('\u{FFFD}'));
+        assert_eq!(carry, vec![b'a']);
+    }
 
     /// バックグラウンド実行 → Monitor で終了まで読み切れることを確認する。
     #[tokio::test]

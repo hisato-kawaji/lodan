@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::agent::messages::{ToolSpec, ToolSpecFunction};
 use crate::tools::{Tool, bash, edit, glob, grep, multi_edit, read, todo_write, write};
-use crate::tools::{ask_user_question, monitor, notebook_edit, web_fetch, web_search};
+use crate::tools::{ask_user_question, kill_shell, monitor, notebook_edit, web_fetch, web_search};
 
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -72,6 +72,7 @@ pub fn default_registry() -> ToolRegistry {
     r.register(Arc::new(web_search::WebSearch));
     r.register(Arc::new(ask_user_question::AskUserQuestion));
     r.register(Arc::new(monitor::Monitor));
+    r.register(Arc::new(kill_shell::KillShell));
 
     r
 }
@@ -137,7 +138,7 @@ mod tests {
     #[test]
     fn default_registry_has_builtins() {
         let r = default_registry();
-        assert_eq!(r.len(), 13);
+        assert_eq!(r.len(), 14);
         for n in [
             "Read",
             "Write",
@@ -152,6 +153,7 @@ mod tests {
             "WebSearch",
             "AskUserQuestion",
             "Monitor",
+            "KillShell",
         ] {
             assert!(r.get(n).is_some(), "missing {n}");
         }

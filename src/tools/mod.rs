@@ -16,9 +16,10 @@ pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
 
+pub mod kill_shell;
 pub mod monitor;
 
-// バックグラウンドプロセスの共有ストア（Bash run_in_background ↔ Monitor）
+// バックグラウンドプロセスの共有ストア（Bash run_in_background ↔ Monitor / KillShell）
 pub mod background;
 
 use async_trait::async_trait;

@@ -7,6 +7,7 @@ pub mod frontmatter;
 pub mod hooks;
 pub mod llm;
 pub mod mcp;
+pub mod memory;
 pub mod permission;
 pub mod prompt;
 pub mod repl;

@@ -96,6 +96,7 @@ mod tests {
             Ok(ChatResponse {
                 content: Some("stub reply".into()),
                 tool_calls: Vec::new(),
+                usage: None,
             })
         }
 

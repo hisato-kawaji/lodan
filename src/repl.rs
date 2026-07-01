@@ -16,7 +16,7 @@ use crate::slash::{self, SlashCommand};
 use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
-const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools", "compact"];
+const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools", "compact", "cost"];
 
 pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
@@ -155,6 +155,12 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                     }
                 }
                 persist(&mut recorder, &session);
+                continue;
+            }
+
+            // /cost も session を要するためここで処理する。
+            if head == "cost" {
+                println!("{}", session.usage().describe());
                 continue;
             }
 
@@ -322,6 +328,7 @@ fn handle_slash(
                 ("/clear", "画面をクリア"),
                 ("/tools", "利用可能なツール一覧"),
                 ("/compact [指示]", "会話履歴を要約して圧縮"),
+                ("/cost", "セッション累積のトークン使用量を表示"),
             ] {
                 println!("  {} — {desc}", crate::term::cyan(name));
             }

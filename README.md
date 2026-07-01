@@ -159,7 +159,7 @@ hi を書きました。
 lodan> /exit
 ```
 
-組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
+組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
 
 **端末装飾**: ツール出力・エラー・承認プロンプトを ANSI で色分けし、LLM 応答待ちは `…thinking` インジケータを表示する。stdout が tty でない（パイプ／リダイレクト）とき、または `NO_COLOR` 環境変数が設定されているときは着色・インジケータを一切出さない。
 
@@ -409,11 +409,27 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 - 分割は**ユーザターン境界**に限定するので、Assistant の `tool_calls` と対応する Tool 応答の対を跨いで切らない。
 - ユーザターンが 2 以下のときは何もしない（`skipped`）。要約 LLM が空を返したら `failed`。
-- 要約には active モデルを使う（別モデル指定は未対応）。自動圧縮（しきい値トリガ）はトークン会計（ロードマップ）後に対応予定。
+- 要約には active モデルを使う（別モデル指定は未対応）。自動圧縮（しきい値トリガ）はトークン会計の上に今後対応予定。
+
+## トークン会計（`/cost`）
+
+LLM 応答ごとのトークン使用量を収集し、セッション累積を `/cost` で表示する。
+
+```text
+lodan> /cost
+tokens: 4321 total (prompt 3800 + completion 521) across 5 LLM call(s)
+last context: 1200 prompt tokens
+```
+
+- 非ストリームは応答 body の `usage`、ストリームは `stream_options: {"include_usage": true}` を付けて最終チャンクの `usage` から取得する（OpenAI / vLLM / llama.cpp 対応）。
+- `total_tokens` を返さないサーバは `prompt + completion` で補完する。
+- **usage 非対応サーバへのフォールバック**: usage が取れない呼び出しは文字数ベース（約 3 文字 / トークン）で概算し、`/cost` に概算だった呼び出し数を注記する。桁を合わせるのが目的の粗い近似。
+- `last context` は直近呼び出しの prompt_tokens で、現在のコンテキストサイズの近似。自動圧縮（しきい値トリガ）や `/goal` 状態行の基盤になる。
+- ローカル / Sakana では確定単価が無いため、料金換算はせずトークン数のみ表示する。
+- 累積はメモリ上のみ（transcript には保存しない）。`--resume` 後の `/cost` は 0 から数え直す。
 
 ## ロードマップ（MVP 外、骨組みは存在）
 
-- トークン会計
 - 中断時の副作用ロールバック
 
 各ファイルは `src/{mcp,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
@@ -433,6 +449,8 @@ cargo test
 - `memory/mod.rs` — LODAN.md/CLAUDE.md 探索・優先順・外内連結・空ファイル除外・上限の文字境界打ち切り
 - `permission.rs` — auto_approve / always-tool / always-command の判定
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
+- `llm/openai.rs` — usage パース（非ストリーム / ストリーム最終チャンク）・`total_tokens` 補完・`stream_options` の付与
+- `agent/loop.rs` — Stop hook 継続 / compact 境界・要約前置 / usage 累積・概算フォールバック
 - `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` / `mcp/roots.rs` / `mcp/sampling.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing、roots 提供、sampling (server→client LLM 補完) の opt-in 橋渡し
 - `tests/e2e_mock.rs` — 6 ツールを順に走らせるエンドツーエンドのモック試験
 - `tests/e2e_mcp.rs` — mock MCP サーバとの handshake + tools/list + tools/call 一周

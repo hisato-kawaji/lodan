@@ -334,12 +334,14 @@ impl SessionUsage {
     }
 }
 
-/// 応答の usage を返す。サーバが usage を返さなかった場合は
-/// 送信メッセージ列と応答本文から文字数ベースで概算する (bool は概算フラグ)。
+/// 応答の usage を返す。サーバが usage を返さなかった場合、または空の
+/// `usage: {}` (全ゼロ) を返した場合は、送信メッセージ列と応答本文から
+/// 文字数ベースで概算する (bool は概算フラグ)。
 fn resolve_usage(resp: &ChatResponse, prompt_messages: &[Message]) -> (Usage, bool) {
     match resp.usage {
-        Some(u) => (u, false),
-        None => (estimate_usage(prompt_messages, resp), true),
+        // normalized 済みなので total == 0 は全フィールドゼロ = 実質未報告。
+        Some(u) if u.total_tokens > 0 => (u, false),
+        _ => (estimate_usage(prompt_messages, resp), true),
     }
 }
 
@@ -725,6 +727,22 @@ mod tests {
         assert!(u.prompt_tokens > 0, "system prompt should yield tokens");
         assert!(u.completion_tokens > 0);
         assert_eq!(u.total_tokens, u.prompt_tokens + u.completion_tokens);
+    }
+
+    /// 空の `usage: {}` (全ゼロ) を返すサーバも未報告とみなし概算にフォールバックする。
+    #[tokio::test]
+    async fn usage_all_zero_treated_as_missing() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+            usage: Some(Usage::default()),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("hello zero", &llm, &gate).await.unwrap();
+
+        let u = session.usage();
+        assert_eq!(u.estimated_calls, 1, "all-zero usage should be estimated");
+        assert!(u.total_tokens > 0, "estimate should replace zero usage");
     }
 
     /// estimate_usage 単体: 文字数 / ESTIMATE_CHARS_PER_TOKEN (切り上げ)。

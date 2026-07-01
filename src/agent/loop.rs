@@ -150,7 +150,13 @@ impl Session {
                     output.content = format!("{}\n[post-tool hook] {reason}", output.content);
                 }
 
-                println!("[{}] {}", name, truncate(&output.content, 400));
+                let tag = format!("[{name}]");
+                let tag = if output.is_error {
+                    crate::term::red(&tag)
+                } else {
+                    crate::term::cyan(&tag)
+                };
+                println!("{tag} {}", truncate(&output.content, 400));
                 self.history.push(Message::Tool {
                     tool_call_id: call.id,
                     content: output.content,
@@ -177,12 +183,31 @@ async fn stream_once(
 
     let mut last_done: Option<ChatResponse> = None;
     let mut stdout = std::io::stdout();
+
+    // 応答待ちインジケータ: 最初のトークンが来るまで dim の "…thinking" を出し、
+    // 到着時に行ごと消す。tty のときだけ（パイプに制御文字を混ぜない）。
+    let show_wait = crate::term::is_terminal();
+    if show_wait {
+        let _ = write!(stdout, "{}", crate::term::dim("…thinking"));
+        let _ = stdout.flush();
+    }
+    let mut cleared = false;
+    let mut clear_wait = |stdout: &mut std::io::Stdout| {
+        if show_wait && !cleared {
+            let _ = write!(stdout, "\r\x1b[2K"); // 行頭へ戻して行クリア
+            let _ = stdout.flush();
+            cleared = true;
+        }
+    };
+
     loop {
         tokio::select! {
-            res = &mut send_fut => { res?; break; }
+            // 正常/異常どちらの完了でもインジケータを消してから抜ける。
+            res = &mut send_fut => { clear_wait(&mut stdout); res?; break; }
             ev = rx.recv() => {
                 match ev {
                     Some(ChatEvent::TextDelta(s)) => {
+                        clear_wait(&mut stdout);
                         let _ = stdout.write_all(s.as_bytes());
                         let _ = stdout.flush();
                     }
@@ -192,6 +217,8 @@ async fn stream_once(
             }
         }
     }
+    // テキストが 1 つも来なかった場合もインジケータを消す。
+    clear_wait(&mut stdout);
     // ストリーム完了後にチャネルへ残った Done を回収
     while let Ok(ev) = rx.try_recv() {
         if let ChatEvent::Done(r) = ev {

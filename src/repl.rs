@@ -20,15 +20,21 @@ const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools"];
 pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
     println!(
-        "lodan {} — type /help for commands, /exit to quit",
-        env!("CARGO_PKG_VERSION")
+        "{} {} — type {} for commands, {} to quit",
+        crate::term::bold(&crate::term::cyan("lodan")),
+        env!("CARGO_PKG_VERSION"),
+        crate::term::cyan("/help"),
+        crate::term::cyan("/exit"),
     );
     let active = cfg.llm.active();
     println!(
-        "model: {} @ {} ({})",
-        active.model,
-        active.base_url,
-        cfg.llm.provider.as_str()
+        "{}",
+        crate::term::dim(&format!(
+            "model: {} @ {} ({})",
+            active.model,
+            active.base_url,
+            cfg.llm.provider.as_str()
+        ))
     );
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -136,7 +142,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                         let prompt = slash::expand(&cmd.body, args);
                         if let Err(e) = session.run_turn(&prompt, llm_client.as_ref(), &gate).await
                         {
-                            eprintln!("error: {e:#}");
+                            eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
                         }
                         persist(&mut recorder, &session);
                     } else if let Some(mcp_prompt) = mcp_prompts.get(head) {
@@ -146,7 +152,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                                 if let Err(e) =
                                     session.run_turn(&text, llm_client.as_ref(), &gate).await
                                 {
-                                    eprintln!("error: {e:#}");
+                                    eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
                                 }
                                 persist(&mut recorder, &session);
                             }
@@ -162,7 +168,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         }
 
         if let Err(e) = session.run_turn(line, llm_client.as_ref(), &gate).await {
-            eprintln!("error: {e:#}");
+            eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
         }
         persist(&mut recorder, &session);
     }
@@ -260,6 +266,17 @@ fn looks_like_slash_command(rest: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// ツール説明の 1 行目を最大 90 文字で返す（`/tools` の一覧表示用）。
+fn first_line(desc: &str) -> String {
+    let line = desc.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 90 {
+        let head: String = line.chars().take(89).collect();
+        format!("{head}…")
+    } else {
+        line.to_string()
+    }
+}
+
 fn handle_slash(
     cmd: &str,
     registry: &crate::tools::registry::ToolRegistry,
@@ -269,19 +286,35 @@ fn handle_slash(
     match cmd {
         "exit" | "quit" => SlashResult::Exit,
         "help" => {
-            println!("/exit /clear /tools /help");
-            for c in user_commands.values() {
-                if c.description.is_empty() {
-                    println!("/{}", c.name);
-                } else {
-                    println!("/{} — {}", c.name, c.description);
+            println!("{}", crate::term::bold("built-in:"));
+            for (name, desc) in [
+                ("/exit, /quit", "REPL を終了"),
+                ("/help", "このヘルプを表示"),
+                ("/clear", "画面をクリア"),
+                ("/tools", "利用可能なツール一覧"),
+            ] {
+                println!("  {} — {desc}", crate::term::cyan(name));
+            }
+            if !user_commands.is_empty() {
+                println!("{}", crate::term::bold("user commands:"));
+                for c in user_commands.values() {
+                    let name = crate::term::cyan(&format!("/{}", c.name));
+                    if c.description.is_empty() {
+                        println!("  {name}");
+                    } else {
+                        println!("  {name} — {}", c.description);
+                    }
                 }
             }
-            for p in mcp_prompts.values() {
-                if p.description().is_empty() {
-                    println!("/{}", p.full_name());
-                } else {
-                    println!("/{} — {}", p.full_name(), p.description());
+            if !mcp_prompts.is_empty() {
+                println!("{}", crate::term::bold("mcp prompts:"));
+                for p in mcp_prompts.values() {
+                    let name = crate::term::cyan(&format!("/{}", p.full_name()));
+                    if p.description().is_empty() {
+                        println!("  {name}");
+                    } else {
+                        println!("  {name} — {}", p.description());
+                    }
                 }
             }
             SlashResult::Handled
@@ -291,8 +324,9 @@ fn handle_slash(
             SlashResult::Handled
         }
         "tools" => {
-            for name in registry.names() {
-                println!("- {name}");
+            for spec in registry.tool_specs() {
+                let desc = first_line(spec.function.description);
+                println!("{} — {desc}", crate::term::cyan(spec.function.name));
             }
             SlashResult::Handled
         }

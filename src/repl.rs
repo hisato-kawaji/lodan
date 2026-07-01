@@ -16,7 +16,12 @@ use crate::slash::{self, SlashCommand};
 use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
-const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools", "compact", "cost"];
+const BUILTINS: &[&str] = &[
+    "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal",
+];
+
+/// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
+const GOAL_CLEAR_ALIASES: &[&str] = &["clear", "stop", "off", "reset", "none", "cancel"];
 
 pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
@@ -107,6 +112,10 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         None => new_session(&cwd, &cfg, &registry),
     };
 
+    // /goal の状態。上限到達などで未達のまま止まった goal は paused として残り、
+    // `/goal` (状態表示) と `/goal clear` (解除) の対象になる。
+    let mut goal_state: Option<crate::goal::Goal> = None;
+
     // SessionStart hook: 起動を通知する。ブロックされても起動は止めず警告のみ。
     let session_payload =
         serde_json::json!({ "hook_event_name": "SessionStart", "cwd": cwd.display().to_string() });
@@ -161,6 +170,21 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             // /cost も session を要するためここで処理する。
             if head == "cost" {
                 println!("{}", session.usage().describe());
+                continue;
+            }
+
+            // /goal も session/llm を要するためここで処理する。
+            if head == "goal" {
+                handle_goal(
+                    args,
+                    &mut goal_state,
+                    &mut session,
+                    llm_client.as_ref(),
+                    &cfg.llm.active().model,
+                    &gate,
+                    &mut recorder,
+                )
+                .await;
                 continue;
             }
 
@@ -274,6 +298,114 @@ fn resume_session(
     }
 }
 
+/// `/goal` builtin。引数なし = 状態表示、解除別名 = 解除、それ以外 = 条件設定＋
+/// 達成までの自律ループ開始。破壊的ツールは既存の承認ゲートをそのまま通る
+/// (自動承認したいときは `--yes` / `auto_approve`)。
+async fn handle_goal(
+    args: &str,
+    goal_state: &mut Option<crate::goal::Goal>,
+    session: &mut agent::Session,
+    llm: &dyn llm::LlmClient,
+    model: &str,
+    gate: &PermissionGate,
+    recorder: &mut Option<Recorder>,
+) {
+    use crate::goal::{Goal, GoalOutcome};
+
+    // 状態表示
+    if args.is_empty() {
+        match goal_state {
+            Some(g) => println!("goal (paused):\n{}", g.describe()),
+            None => println!("no active goal — set one with /goal <condition>"),
+        }
+        return;
+    }
+
+    // 解除
+    if GOAL_CLEAR_ALIASES.contains(&args) {
+        match goal_state.take() {
+            Some(g) => println!("goal cleared: {}", first_line(&g.condition)),
+            None => println!("no active goal to clear"),
+        }
+        return;
+    }
+
+    // 設定＋実行
+    let mut goal = match Goal::new(args) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("{}", crate::term::red_err(&format!("goal: {e:#}")));
+            return;
+        }
+    };
+    if let Some(old) = goal_state.take() {
+        println!("goal replaced: {}", first_line(&old.condition));
+    }
+    println!(
+        "{}",
+        crate::term::dim(&format!(
+            "[goal] started (limits: {} turns / {}s). destructive tools still ask for approval unless --yes",
+            goal.max_turns,
+            goal.max_duration.as_secs()
+        ))
+    );
+
+    let outcome = crate::goal::drive(&mut goal, session, llm, model, gate, |s| {
+        if let Some(rec) = recorder.as_mut()
+            && let Err(e) = rec.sync(s.history())
+        {
+            eprintln!("session: save failed: {e}");
+        }
+    })
+    .await;
+
+    match outcome {
+        GoalOutcome::Achieved { reason, turns } => {
+            println!(
+                "{}",
+                crate::term::bold(&crate::term::cyan(&format!(
+                    "[goal] achieved after {turns} turn(s): {reason}"
+                )))
+            );
+            // 達成した goal は解除する。
+        }
+        GoalOutcome::TurnLimit => {
+            println!(
+                "{}",
+                crate::term::red(&format!(
+                    "[goal] stopped: turn limit ({}) reached — /goal to inspect, /goal clear to drop",
+                    goal.max_turns
+                ))
+            );
+            *goal_state = Some(goal);
+        }
+        GoalOutcome::TimeLimit => {
+            println!(
+                "{}",
+                crate::term::red(&format!(
+                    "[goal] stopped: time limit ({}s) reached — /goal to inspect, /goal clear to drop",
+                    goal.max_duration.as_secs()
+                ))
+            );
+            *goal_state = Some(goal);
+        }
+        GoalOutcome::EvaluatorFailed(e) => {
+            eprintln!(
+                "{}",
+                crate::term::red_err(&format!("[goal] stopped: evaluator failed: {e:#}"))
+            );
+            *goal_state = Some(goal);
+        }
+        GoalOutcome::TurnFailed(e) => {
+            eprintln!(
+                "{}",
+                crate::term::red_err(&format!("[goal] stopped: turn failed: {e:#}"))
+            );
+            *goal_state = Some(goal);
+        }
+    }
+}
+
 /// ターン後に履歴を transcript へ追記する (レコーダ無効時は no-op)。
 fn persist(recorder: &mut Option<Recorder>, session: &agent::Session) {
     if let Some(rec) = recorder.as_mut()
@@ -329,6 +461,10 @@ fn handle_slash(
                 ("/tools", "利用可能なツール一覧"),
                 ("/compact [指示]", "会話履歴を要約して圧縮"),
                 ("/cost", "セッション累積のトークン使用量を表示"),
+                (
+                    "/goal <条件> | /goal | /goal clear",
+                    "条件達成までターンを自律継続 / 状態表示 / 解除",
+                ),
             ] {
                 println!("  {} — {desc}", crate::term::cyan(name));
             }

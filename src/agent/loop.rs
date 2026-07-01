@@ -447,8 +447,8 @@ impl CompactOutcome {
     }
 }
 
-/// 要約対象メッセージを 1 本のテキストへ整形する（要約 LLM への入力用）。
-fn render_for_summary(msgs: &[Message]) -> String {
+/// 要約対象メッセージを 1 本のテキストへ整形する（要約・goal 評価器 LLM への入力用）。
+pub(crate) fn render_for_summary(msgs: &[Message]) -> String {
     let mut out = String::new();
     for m in msgs {
         match m {

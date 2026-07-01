@@ -195,20 +195,20 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                     // 組み込みに無ければユーザ定義コマンド → MCP prompt の順に試す。
                     if let Some(cmd) = user_commands.get(head) {
                         let prompt = slash::expand(&cmd.body, args);
-                        if let Err(e) = session.run_turn(&prompt, llm_client.as_ref(), &gate).await
-                        {
-                            eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
-                        }
+                        run_turn_interruptible(&mut session, &prompt, llm_client.as_ref(), &gate)
+                            .await;
                         persist(&mut recorder, &session);
                     } else if let Some(mcp_prompt) = mcp_prompts.get(head) {
                         let positional: Vec<&str> = args.split_whitespace().collect();
                         match mcp_prompt.render(&positional).await {
                             Ok(text) if !text.trim().is_empty() => {
-                                if let Err(e) =
-                                    session.run_turn(&text, llm_client.as_ref(), &gate).await
-                                {
-                                    eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
-                                }
+                                run_turn_interruptible(
+                                    &mut session,
+                                    &text,
+                                    llm_client.as_ref(),
+                                    &gate,
+                                )
+                                .await;
                                 persist(&mut recorder, &session);
                             }
                             Ok(_) => eprintln!("mcp prompt /{head} returned no text"),
@@ -222,9 +222,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             }
         }
 
-        if let Err(e) = session.run_turn(line, llm_client.as_ref(), &gate).await {
-            eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
-        }
+        run_turn_interruptible(&mut session, line, llm_client.as_ref(), &gate).await;
         persist(&mut recorder, &session);
     }
 
@@ -350,14 +348,38 @@ async fn handle_goal(
         ))
     );
 
-    let outcome = crate::goal::drive(&mut goal, session, llm, model, gate, |s| {
+    // Ctrl-C で自律ループごと中断できるようにする (ターン途中なら履歴を修復)。
+    let outcome = {
+        let fut = crate::goal::drive(&mut goal, session, llm, model, gate, |s| {
+            if let Some(rec) = recorder.as_mut()
+                && let Err(e) = rec.sync(s.history())
+            {
+                eprintln!("session: save failed: {e}");
+            }
+        });
+        tokio::pin!(fut);
+        tokio::select! {
+            out = &mut fut => Some(out),
+            _ = wait_ctrl_c() => None,
+        }
+    };
+    let Some(outcome) = outcome else {
+        session.interrupt_repair();
         if let Some(rec) = recorder.as_mut()
-            && let Err(e) = rec.sync(s.history())
+            && let Err(e) = rec.sync(session.history())
         {
             eprintln!("session: save failed: {e}");
         }
-    })
-    .await;
+        println!();
+        println!(
+            "{}",
+            crate::term::red(
+                "[goal] interrupted by Ctrl-C — paused (/goal to inspect, /goal clear to drop)"
+            )
+        );
+        *goal_state = Some(goal);
+        return;
+    };
 
     match outcome {
         GoalOutcome::Achieved { reason, turns } => {
@@ -404,6 +426,45 @@ async fn handle_goal(
             *goal_state = Some(goal);
         }
     }
+}
+
+/// Ctrl-C (SIGINT) を待つ。ハンドラ登録に失敗したときは永久に pending にして
+/// select! の相手側 (実行中のターン) を邪魔しない。
+async fn wait_ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// run_turn を Ctrl-C で中断可能にして実行する。中断時は future を破棄して
+/// in-flight のストリーム/ツールをキャンセルし (foreground Bash の子プロセスは
+/// tokio の `output()` が kill する)、履歴の整合性を修復して true を返す。
+/// エラーはここで表示する。
+async fn run_turn_interruptible(
+    session: &mut agent::Session,
+    input: &str,
+    llm: &dyn llm::LlmClient,
+    gate: &PermissionGate,
+) -> bool {
+    let interrupted = {
+        let turn = session.run_turn(input, llm, gate);
+        tokio::pin!(turn);
+        tokio::select! {
+            res = &mut turn => {
+                if let Err(e) = res {
+                    eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
+                }
+                false
+            }
+            _ = wait_ctrl_c() => true,
+        }
+    };
+    if interrupted {
+        session.interrupt_repair();
+        println!();
+        println!("{}", crate::term::red("(turn interrupted by Ctrl-C)"));
+    }
+    interrupted
 }
 
 /// ターン後に履歴を transcript へ追記する (レコーダ無効時は no-op)。

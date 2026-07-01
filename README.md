@@ -165,6 +165,8 @@ lodan> /exit
 
 **端末装飾**: ツール出力・エラー・承認プロンプトを ANSI で色分けし、LLM 応答待ちは `…thinking` インジケータを表示する。stdout が tty でない（パイプ／リダイレクト）とき、または `NO_COLOR` 環境変数が設定されているときは着色・インジケータを一切出さない。
 
+**実行中ターンの中断（Ctrl-C）**: LLM ストリーミング・ツール実行の途中でも Ctrl-C で現在のターン（`/goal` の自律ループ含む）をキャンセルしてプロンプトへ戻れる。中断後は履歴の整合性を自動修復する — ツール実行途中なら未応答の tool_call に `[interrupted by user before completion]` を補填し、応答前なら中断マーカーの assistant メッセージを補う（strict な user/assistant 交互を要求するローカルモデル対策）。foreground の Bash 子プロセスは中断時に kill される（バックグラウンド実行 `run_in_background` のものは残る — `KillShell` で止める）。承認プロンプトの応答待ち中は割り込めない（`y`/`n` を入力してから反映される）。プロンプト入力中の Ctrl-C は従来どおり入力破棄のみ。
+
 破壊的ツール承認:
 - `y` 一度だけ許可
 - `n` 拒否（LLM には "user denied execution" が返り、別アプローチを促せる）
@@ -438,7 +440,8 @@ lodan> /goal cargo test が exit 0 で通る。または 10 ターンで諦め�
 - **暴走防止（ハード上限）**: 20 ターン / 30 分。到達すると必ず停止し、goal は paused として残る（`/goal` で確認、`/goal clear` で破棄）。
 - **評価器の出力がパース不能なときは安全側で停止する**（根拠のない自律継続はしない）。
 - **承認ポリシー**: 破壊的ツール（Write / Edit / Bash …）は goal 中も**既定で通常どおり承認プロンプトを出す**。完全自律にしたい場合のみ `--yes`（または `agent.auto_approve`）を明示する。
-- 制限: 実行中の Ctrl-C 中断は未対応（#42 P6）。評価器呼び出しは `/cost` の usage 計上外（SubAgentTool と同じ扱い、follow-up 候補）。`-p` 非対話・resume 復元はスコープ外。
+- **Ctrl-C で自律ループを中断できる**。中断した goal は paused として残る（`/goal` で確認、`/goal clear` で破棄）。
+- 制限: 評価器呼び出しは `/cost` の usage 計上外（SubAgentTool と同じ扱い、follow-up 候補）。`-p` 非対話・resume 復元はスコープ外。
 
 ## トークン会計（`/cost`）
 

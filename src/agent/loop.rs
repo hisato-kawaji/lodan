@@ -202,7 +202,8 @@ async fn stream_once(
 
     loop {
         tokio::select! {
-            res = &mut send_fut => { res?; break; }
+            // 正常/異常どちらの完了でもインジケータを消してから抜ける。
+            res = &mut send_fut => { clear_wait(&mut stdout); res?; break; }
             ev = rx.recv() => {
                 match ev {
                     Some(ChatEvent::TextDelta(s)) => {

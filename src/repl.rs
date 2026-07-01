@@ -142,7 +142,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                         let prompt = slash::expand(&cmd.body, args);
                         if let Err(e) = session.run_turn(&prompt, llm_client.as_ref(), &gate).await
                         {
-                            eprintln!("{}", crate::term::red(&format!("error: {e:#}")));
+                            eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
                         }
                         persist(&mut recorder, &session);
                     } else if let Some(mcp_prompt) = mcp_prompts.get(head) {
@@ -152,7 +152,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                                 if let Err(e) =
                                     session.run_turn(&text, llm_client.as_ref(), &gate).await
                                 {
-                                    eprintln!("{}", crate::term::red(&format!("error: {e:#}")));
+                                    eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
                                 }
                                 persist(&mut recorder, &session);
                             }
@@ -168,7 +168,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         }
 
         if let Err(e) = session.run_turn(line, llm_client.as_ref(), &gate).await {
-            eprintln!("{}", crate::term::red(&format!("error: {e:#}")));
+            eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
         }
         persist(&mut recorder, &session);
     }

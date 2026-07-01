@@ -199,6 +199,7 @@ mod tests {
             Ok(self.steps.get(i).cloned().unwrap_or(ChatResponse {
                 content: Some("(no more script)".into()),
                 tool_calls: vec![],
+                usage: None,
             }))
         }
 
@@ -241,6 +242,7 @@ mod tests {
             vec![ChatResponse {
                 content: Some("the answer is 42".into()),
                 tool_calls: vec![],
+                usage: None,
             }],
             tmp.path().to_path_buf(),
         );
@@ -259,10 +261,12 @@ mod tests {
                     "Grep",
                     &serde_json::json!({ "pattern": "needle", "path": tmp.path() }).to_string(),
                 )],
+                usage: None,
             },
             ChatResponse {
                 content: Some("found the needle".into()),
                 tool_calls: vec![],
+                usage: None,
             },
         ];
         let sub = subagent(steps, tmp.path().to_path_buf());
@@ -278,6 +282,7 @@ mod tests {
             .map(|_| ChatResponse {
                 content: None,
                 tool_calls: vec![tool_call("Grep", r#"{"pattern":"x","path":"."}"#)],
+                usage: None,
             })
             .collect();
         let sub = subagent(looping, tmp.path().to_path_buf());

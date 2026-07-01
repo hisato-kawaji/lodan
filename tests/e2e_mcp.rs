@@ -113,6 +113,7 @@ impl LlmClient for StubLlm {
         Ok(ChatResponse {
             content: Some("sampled-ok".into()),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 

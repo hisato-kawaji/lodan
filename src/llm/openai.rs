@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::messages::{Message, ToolCall, ToolCallFunction, ToolSpec};
 use crate::config::ProviderConfig;
-use crate::llm::{ChatEvent, ChatResponse, LlmClient};
+use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
 
 pub struct OpenAiClient {
     base_url: String,
@@ -45,11 +45,22 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     stream: bool,
+    /// ストリーミング時に最終チャンクへ usage を含めるよう要求する
+    /// (OpenAI / vLLM / llama.cpp が対応。非対応サーバは無視する)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Deserialize, Debug)]
 struct ChatResponseBody {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -101,6 +112,7 @@ impl LlmClient for OpenAiClient {
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens,
             stream: false,
+            stream_options: None,
         };
 
         let mut builder = self.http.post(&url).json(&req);
@@ -117,6 +129,7 @@ impl LlmClient for OpenAiClient {
 
         let body: ChatResponseBody = serde_json::from_str(&text)
             .with_context(|| format!("parsing chat response: {text}"))?;
+        let usage = body.usage.map(Usage::normalized);
         let choice = body
             .choices
             .into_iter()
@@ -141,6 +154,7 @@ impl LlmClient for OpenAiClient {
         Ok(ChatResponse {
             content: choice.message.content,
             tool_calls,
+            usage,
         })
     }
 
@@ -159,6 +173,9 @@ impl LlmClient for OpenAiClient {
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens: None,
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
         let mut builder = self.http.post(&url).json(&req);
@@ -175,6 +192,7 @@ impl LlmClient for OpenAiClient {
         let mut stream = resp.bytes_stream().eventsource();
         let mut text_buf = String::new();
         let mut calls: Vec<PartialCall> = Vec::new();
+        let mut usage: Option<Usage> = None;
 
         while let Some(event) = stream.next().await {
             let event = event.context("SSE chunk error")?;
@@ -185,6 +203,10 @@ impl LlmClient for OpenAiClient {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // usage は最終チャンク (choices 空) に載る。来たものを常に上書き採用。
+            if let Some(u) = chunk.usage {
+                usage = Some(u.normalized());
+            }
             for choice in chunk.choices {
                 if let Some(d) = choice.delta.content
                     && !d.is_empty()
@@ -240,6 +262,7 @@ impl LlmClient for OpenAiClient {
                 Some(text_buf)
             },
             tool_calls,
+            usage,
         };
         let _ = sink.send(ChatEvent::Done(resp));
         Ok(())
@@ -256,7 +279,11 @@ struct PartialCall {
 
 #[derive(Deserialize)]
 struct StreamChunk {
+    // include_usage の最終チャンクは choices が空配列 or 欠落し得る。
+    #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -299,5 +326,79 @@ fn arguments_to_string(v: serde_json::Value) -> String {
         serde_json::Value::String(s) => s,
         serde_json::Value::Null => "{}".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_stream_body_parses_usage() {
+        let body: ChatResponseBody = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"hi"}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.usage,
+            Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_usage_is_none() {
+        let body: ChatResponseBody =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"hi"}}]}"#).unwrap();
+        assert!(body.usage.is_none());
+    }
+
+    #[test]
+    fn normalized_fills_missing_total() {
+        // total_tokens を返さないサーバ (欠落 → serde default 0) を補完する。
+        let u: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":8,"completion_tokens":4}"#).unwrap();
+        assert_eq!(u.total_tokens, 0);
+        assert_eq!(u.normalized().total_tokens, 12);
+    }
+
+    #[test]
+    fn stream_final_usage_chunk_parses_with_empty_choices() {
+        // stream_options.include_usage の最終チャンク形式。
+        let chunk: StreamChunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
+        )
+        .unwrap();
+        assert!(chunk.choices.is_empty());
+        assert_eq!(chunk.usage.unwrap().total_tokens, 120);
+    }
+
+    #[test]
+    fn stream_request_includes_stream_options() {
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &[],
+            tool_choice: None,
+            max_tokens: None,
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["stream_options"]["include_usage"], true);
+
+        let req = ChatRequest {
+            stream: false,
+            stream_options: None,
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("stream_options").is_none());
     }
 }

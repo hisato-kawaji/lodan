@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use crate::agent::messages::Message;
 use crate::config::Config;
 use crate::hooks::{self, HookOutcome, Lifecycle};
-use crate::llm::{ChatEvent, ChatResponse, LlmClient};
+use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
 use crate::permission::PermissionGate;
 use crate::prompt;
 use crate::tools::registry::ToolRegistry;
@@ -17,6 +17,7 @@ pub struct Session {
     registry: Arc<ToolRegistry>,
     history: Vec<Message>,
     ctx: ToolCtx,
+    usage: SessionUsage,
 }
 
 impl Session {
@@ -45,12 +46,18 @@ impl Session {
             registry,
             history,
             ctx,
+            usage: SessionUsage::default(),
         }
     }
 
     /// 永続化のための会話履歴 (system を含む全メッセージ)。
     pub fn history(&self) -> &[Message] {
         &self.history
+    }
+
+    /// セッション累積のトークン使用量 (`/cost` 表示・自動圧縮の判断材料)。
+    pub fn usage(&self) -> &SessionUsage {
+        &self.usage
     }
 
     pub async fn run_turn(
@@ -79,6 +86,8 @@ impl Session {
             let specs = self.registry.tool_specs();
             let resp =
                 stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
+            let (u, estimated) = resolve_usage(&resp, &self.history);
+            self.usage.record(u, estimated);
 
             let tool_calls = resp.tool_calls.clone();
             self.history.push(Message::Assistant {
@@ -230,9 +239,17 @@ impl Session {
                  preserving continuity for the assistant.{focus}\n\n---\n{rendered}"
             ),
         };
+        let summary_input = [sys, usr];
         let resp = llm
-            .chat(&[sys, usr], &[], &self.cfg.llm.active().model, Some(1024))
+            .chat(
+                &summary_input,
+                &[],
+                &self.cfg.llm.active().model,
+                Some(1024),
+            )
             .await?;
+        let (u, estimated) = resolve_usage(&resp, &summary_input);
+        self.usage.record(u, estimated);
         let summary = resp.content.unwrap_or_default();
         if summary.trim().is_empty() {
             return Ok(CompactOutcome::Failed);
@@ -264,6 +281,107 @@ impl Session {
 
 /// System を除き、直近何ユーザターンを生のまま残すか。
 const KEEP_RECENT_USER_TURNS: usize = 2;
+
+/// usage 概算フォールバックの 1 トークンあたり文字数。英語 ~4 文字/トークン、
+/// 日本語 ~1-2 文字/トークンの間を取った粗い近似 (桁が合えば十分)。
+const ESTIMATE_CHARS_PER_TOKEN: u64 = 3;
+
+/// セッション累積のトークン使用量。`/cost` 表示と自動圧縮 (しきい値) の基盤。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionUsage {
+    pub llm_calls: u64,
+    /// サーバが usage を返さず文字数概算にフォールバックした呼び出し数。
+    pub estimated_calls: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// 直近呼び出しの prompt_tokens (= 現在のコンテキストサイズの近似)。
+    pub last_context_tokens: u64,
+}
+
+impl SessionUsage {
+    fn record(&mut self, u: Usage, estimated: bool) {
+        self.llm_calls += 1;
+        if estimated {
+            self.estimated_calls += 1;
+        }
+        self.prompt_tokens += u.prompt_tokens;
+        self.completion_tokens += u.completion_tokens;
+        self.total_tokens += u.total_tokens;
+        self.last_context_tokens = u.prompt_tokens;
+    }
+
+    /// `/cost` 用の表示文字列。料金はローカル/Sakana では出せないためトークン数のみ。
+    pub fn describe(&self) -> String {
+        if self.llm_calls == 0 {
+            return "no LLM calls yet".to_string();
+        }
+        let mut out = format!(
+            "tokens: {} total (prompt {} + completion {}) across {} LLM call(s)\nlast context: {} prompt tokens",
+            self.total_tokens,
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.llm_calls,
+            self.last_context_tokens,
+        );
+        if self.estimated_calls > 0 {
+            out.push_str(&format!(
+                "\nnote: {} call(s) lacked server usage; counted via ~{} chars/token estimate",
+                self.estimated_calls, ESTIMATE_CHARS_PER_TOKEN
+            ));
+        }
+        out
+    }
+}
+
+/// 応答の usage を返す。サーバが usage を返さなかった場合、または空の
+/// `usage: {}` (全ゼロ) を返した場合は、送信メッセージ列と応答本文から
+/// 文字数ベースで概算する (bool は概算フラグ)。
+fn resolve_usage(resp: &ChatResponse, prompt_messages: &[Message]) -> (Usage, bool) {
+    match resp.usage {
+        // normalized 済みなので total == 0 は全フィールドゼロ = 実質未報告。
+        Some(u) if u.total_tokens > 0 => (u, false),
+        _ => (estimate_usage(prompt_messages, resp), true),
+    }
+}
+
+/// 文字数ベースの粗いトークン概算。トークナイザ非依存で桁を合わせるのが目的。
+fn estimate_usage(prompt_messages: &[Message], resp: &ChatResponse) -> Usage {
+    let prompt_chars: u64 = prompt_messages.iter().map(message_chars).sum();
+    let mut completion_chars: u64 = resp.content.as_deref().map_or(0, |c| c.chars().count()) as u64;
+    for tc in &resp.tool_calls {
+        completion_chars +=
+            (tc.function.name.chars().count() + tc.function.arguments.chars().count()) as u64;
+    }
+    let prompt_tokens = prompt_chars.div_ceil(ESTIMATE_CHARS_PER_TOKEN);
+    let completion_tokens = completion_chars.div_ceil(ESTIMATE_CHARS_PER_TOKEN);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    }
+}
+
+fn message_chars(m: &Message) -> u64 {
+    let n = match m {
+        Message::System { content } | Message::User { content } | Message::Tool { content, .. } => {
+            content.chars().count()
+        }
+        Message::Assistant {
+            content,
+            tool_calls,
+        } => {
+            content.as_deref().map_or(0, |c| c.chars().count())
+                + tool_calls
+                    .iter()
+                    .map(|tc| {
+                        tc.function.name.chars().count() + tc.function.arguments.chars().count()
+                    })
+                    .sum::<usize>()
+        }
+    };
+    n as u64
+}
 
 /// `Session::compact` の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +526,7 @@ mod tests {
     /// 毎ターン同じ最終テキスト（tool_call 無し）を Done で返すモック。
     struct FinalTextLlm {
         text: String,
+        usage: Option<Usage>,
     }
 
     #[async_trait]
@@ -422,6 +541,7 @@ mod tests {
             Ok(ChatResponse {
                 content: Some(self.text.clone()),
                 tool_calls: vec![],
+                usage: self.usage,
             })
         }
 
@@ -435,6 +555,7 @@ mod tests {
             let _ = sink.send(ChatEvent::Done(ChatResponse {
                 content: Some(self.text.clone()),
                 tool_calls: vec![],
+                usage: self.usage,
             }));
             Ok(())
         }
@@ -458,6 +579,7 @@ mod tests {
         let mut session = session_with_stop_hook(None);
         let llm = FinalTextLlm {
             text: "done".into(),
+            usage: None,
         };
         let gate = PermissionGate::new(true);
         session.run_turn("hi", &llm, &gate).await.unwrap();
@@ -482,6 +604,7 @@ mod tests {
         let mut session = session_with_stop_hook(Some(cmd));
         let llm = FinalTextLlm {
             text: "done".into(),
+            usage: None,
         };
         let gate = PermissionGate::new(true);
 
@@ -504,6 +627,7 @@ mod tests {
         let mut session = session_with_stop_hook(None);
         let llm = FinalTextLlm {
             text: "done".into(),
+            usage: None,
         };
         let gate = PermissionGate::new(true);
         session.run_turn("first", &llm, &gate).await.unwrap();
@@ -518,6 +642,7 @@ mod tests {
         let mut session = session_with_stop_hook(None);
         let llm = FinalTextLlm {
             text: "SUMMARY".into(),
+            usage: None,
         };
         let gate = PermissionGate::new(true);
         for p in ["t1", "t2", "t3"] {
@@ -555,5 +680,107 @@ mod tests {
             !consecutive_users,
             "compaction must not create back-to-back user messages"
         );
+    }
+
+    /// サーバが usage を返すとき: そのまま累積され、estimated は増えない。
+    #[tokio::test]
+    async fn usage_from_server_accumulates() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+            }),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("one", &llm, &gate).await.unwrap();
+        session.run_turn("two", &llm, &gate).await.unwrap();
+
+        let u = session.usage();
+        assert_eq!(u.llm_calls, 2);
+        assert_eq!(u.estimated_calls, 0);
+        assert_eq!(u.prompt_tokens, 200);
+        assert_eq!(u.completion_tokens, 40);
+        assert_eq!(u.total_tokens, 240);
+        assert_eq!(u.last_context_tokens, 100);
+    }
+
+    /// usage 非対応サーバ (None): 文字数概算フォールバックで 0 より大きく累積される。
+    #[tokio::test]
+    async fn usage_fallback_estimates_when_server_omits() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+            usage: None,
+        };
+        let gate = PermissionGate::new(true);
+        session
+            .run_turn("hello estimate", &llm, &gate)
+            .await
+            .unwrap();
+
+        let u = session.usage();
+        assert_eq!(u.llm_calls, 1);
+        assert_eq!(u.estimated_calls, 1);
+        assert!(u.prompt_tokens > 0, "system prompt should yield tokens");
+        assert!(u.completion_tokens > 0);
+        assert_eq!(u.total_tokens, u.prompt_tokens + u.completion_tokens);
+    }
+
+    /// 空の `usage: {}` (全ゼロ) を返すサーバも未報告とみなし概算にフォールバックする。
+    #[tokio::test]
+    async fn usage_all_zero_treated_as_missing() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+            usage: Some(Usage::default()),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("hello zero", &llm, &gate).await.unwrap();
+
+        let u = session.usage();
+        assert_eq!(u.estimated_calls, 1, "all-zero usage should be estimated");
+        assert!(u.total_tokens > 0, "estimate should replace zero usage");
+    }
+
+    /// estimate_usage 単体: 文字数 / ESTIMATE_CHARS_PER_TOKEN (切り上げ)。
+    #[test]
+    fn estimate_usage_counts_chars() {
+        let history = [
+            Message::System {
+                content: "abcdef".into(), // 6 chars → 2 tokens
+            },
+            Message::User {
+                content: "abc".into(), // 3 chars → まとめて 9 chars = 3 tokens
+            },
+        ];
+        let resp = ChatResponse {
+            content: Some("abcd".into()), // 4 chars → 2 tokens (切り上げ)
+            tool_calls: vec![],
+            usage: None,
+        };
+        let u = estimate_usage(&history, &resp);
+        assert_eq!(u.prompt_tokens, 3);
+        assert_eq!(u.completion_tokens, 2);
+        assert_eq!(u.total_tokens, 5);
+    }
+
+    /// /compact の要約呼び出しも usage に計上される。
+    #[tokio::test]
+    async fn compact_records_usage() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "SUMMARY".into(),
+            usage: None,
+        };
+        let gate = PermissionGate::new(true);
+        for p in ["t1", "t2", "t3"] {
+            session.run_turn(p, &llm, &gate).await.unwrap();
+        }
+        let calls_before = session.usage().llm_calls;
+        session.compact(&llm, "").await.unwrap();
+        assert_eq!(session.usage().llm_calls, calls_before + 1);
     }
 }

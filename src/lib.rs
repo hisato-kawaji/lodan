@@ -7,6 +7,7 @@ pub mod frontmatter;
 pub mod goal;
 pub mod hooks;
 pub mod llm;
+pub mod loop_cmd;
 pub mod mcp;
 pub mod memory;
 pub mod permission;

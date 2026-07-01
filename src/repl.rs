@@ -17,7 +17,7 @@ use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
-    "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal",
+    "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
@@ -170,6 +170,20 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             // /cost も session を要するためここで処理する。
             if head == "cost" {
                 println!("{}", session.usage().describe());
+                continue;
+            }
+
+            // /loop も session/llm を要するためここで処理する。
+            if head == "loop" {
+                handle_loop(
+                    args,
+                    &user_commands,
+                    &mut session,
+                    llm_client.as_ref(),
+                    &gate,
+                    &mut recorder,
+                )
+                .await;
                 continue;
             }
 
@@ -428,6 +442,116 @@ async fn handle_goal(
     }
 }
 
+/// `/loop` builtin。書式: `/loop <interval> <prompt|/usercmd [args]>`。
+/// フォアグラウンドで固定間隔の反復を回す (REPL を占有、Ctrl-C で停止)。
+/// 破壊的ツールは /goal と同じく既存の承認ゲートをそのまま通る。
+async fn handle_loop(
+    args: &str,
+    user_commands: &BTreeMap<String, SlashCommand>,
+    session: &mut agent::Session,
+    llm: &dyn llm::LlmClient,
+    gate: &PermissionGate,
+    recorder: &mut Option<Recorder>,
+) {
+    use crate::loop_cmd::{LoopOutcome, LoopSpec, drive, parse_interval};
+
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let interval_tok = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+    let interval = match parse_interval(interval_tok) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                crate::term::red_err(&format!(
+                    "loop: {e:#}\nusage: /loop <interval> <prompt|/usercmd [args]> (e.g. /loop 5m run the tests)"
+                ))
+            );
+            return;
+        }
+    };
+
+    // 先頭が slash ならユーザ定義コマンドとして 1 度だけ展開し、以後は毎反復同じ
+    // プロンプトを再投入する (組み込み slash の反復は対象外)。
+    let prompt = if let Some(cmd_rest) = rest.strip_prefix('/') {
+        let mut cp = cmd_rest.splitn(2, char::is_whitespace);
+        let name = cp.next().unwrap_or("");
+        let cmd_args = cp.next().unwrap_or("").trim();
+        match user_commands.get(name) {
+            Some(cmd) => slash::expand(&cmd.body, cmd_args),
+            None => {
+                eprintln!(
+                    "{}",
+                    crate::term::red_err(&format!(
+                        "loop: unknown command /{name} (only user-defined commands can be looped)"
+                    ))
+                );
+                return;
+            }
+        }
+    } else {
+        rest.to_string()
+    };
+
+    let spec = match LoopSpec::new(interval, &prompt) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", crate::term::red_err(&format!("loop: {e:#}")));
+            return;
+        }
+    };
+    println!(
+        "{}",
+        crate::term::dim(&format!(
+            "[loop] started (limits: {} iterations / {}h). Ctrl-C to stop; destructive tools still ask for approval unless --yes",
+            spec.max_iterations,
+            spec.max_duration.as_secs() / 3600
+        ))
+    );
+
+    // Ctrl-C でループごと中断できるようにする (ターン途中なら履歴を修復)。
+    let outcome = {
+        let fut = drive(&spec, session, llm, gate, |s| {
+            if let Some(rec) = recorder.as_mut()
+                && let Err(e) = rec.sync(s.history())
+            {
+                eprintln!("session: save failed: {e}");
+            }
+        });
+        tokio::pin!(fut);
+        tokio::select! {
+            out = &mut fut => Some(out),
+            _ = wait_ctrl_c() => None,
+        }
+    };
+    match outcome {
+        None => {
+            session.interrupt_repair();
+            persist(recorder, session);
+            println!();
+            println!("{}", crate::term::red("[loop] interrupted by Ctrl-C"));
+        }
+        Some(LoopOutcome::IterationLimit { iterations }) => println!(
+            "{}",
+            crate::term::red(&format!(
+                "[loop] stopped: iteration limit reached ({iterations})"
+            ))
+        ),
+        Some(LoopOutcome::TimeLimit { iterations }) => println!(
+            "{}",
+            crate::term::red(&format!(
+                "[loop] stopped: time limit reached after {iterations} iteration(s)"
+            ))
+        ),
+        Some(LoopOutcome::TurnFailed { iterations, error }) => eprintln!(
+            "{}",
+            crate::term::red_err(&format!(
+                "[loop] stopped: turn failed after {iterations} completed iteration(s): {error:#}"
+            ))
+        ),
+    }
+}
+
 /// Ctrl-C (SIGINT) を待つ。ハンドラ登録に失敗したときは永久に pending にして
 /// select! の相手側 (実行中のターン) を邪魔しない。
 async fn wait_ctrl_c() {
@@ -523,6 +647,10 @@ fn handle_slash(
                 (
                     "/goal <条件> | /goal | /goal clear",
                     "条件達成までターンを自律継続 / 状態表示 / 解除",
+                ),
+                (
+                    "/loop <間隔> <プロンプト|/cmd>",
+                    "固定間隔で反復実行 (5s/5m/2h/1d、Ctrl-C で停止)",
                 ),
             ] {
                 println!("  {} — {desc}", crate::term::cyan(name));

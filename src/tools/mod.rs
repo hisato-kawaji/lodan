@@ -16,8 +16,10 @@ pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
 
-// MVP 外（スタブのみ。registry での登録行はコメントアウトされている）
 pub mod monitor;
+
+// バックグラウンドプロセスの共有ストア（Bash run_in_background ↔ Monitor）
+pub mod background;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -79,6 +81,8 @@ pub struct ToolCtx {
     pub cwd: PathBuf,
     pub read_tracker: Arc<Mutex<HashSet<PathBuf>>>,
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
+    /// `Bash` の run_in_background が登録し、`Monitor` が読むバックグラウンドプロセス。
+    pub bg: Arc<Mutex<background::BgStore>>,
 }
 
 impl ToolCtx {
@@ -87,6 +91,7 @@ impl ToolCtx {
             cwd,
             read_tracker: Arc::new(Mutex::new(HashSet::new())),
             todos: Arc::new(Mutex::new(Vec::new())),
+            bg: Arc::new(Mutex::new(background::BgStore::default())),
         }
     }
 

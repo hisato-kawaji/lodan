@@ -3,9 +3,6 @@ use std::sync::Arc;
 
 use crate::agent::messages::{ToolSpec, ToolSpecFunction};
 use crate::tools::{Tool, bash, edit, glob, grep, multi_edit, read, todo_write, write};
-
-// MVP 外（import はあえて残し、登録行で利用する想定でコメントアウト）
-#[allow(unused_imports)]
 use crate::tools::{ask_user_question, monitor, notebook_edit, web_fetch, web_search};
 
 pub struct ToolRegistry {
@@ -74,9 +71,7 @@ pub fn default_registry() -> ToolRegistry {
     r.register(Arc::new(web_fetch::WebFetch));
     r.register(Arc::new(web_search::WebSearch));
     r.register(Arc::new(ask_user_question::AskUserQuestion));
-
-    // --- MVP スコープ外: 登録は意図的に無効化 ---
-    // r.register(Arc::new(monitor::Monitor));
+    r.register(Arc::new(monitor::Monitor));
 
     r
 }
@@ -142,7 +137,7 @@ mod tests {
     #[test]
     fn default_registry_has_builtins() {
         let r = default_registry();
-        assert_eq!(r.len(), 12);
+        assert_eq!(r.len(), 13);
         for n in [
             "Read",
             "Write",
@@ -156,6 +151,7 @@ mod tests {
             "WebFetch",
             "WebSearch",
             "AskUserQuestion",
+            "Monitor",
         ] {
             assert!(r.get(n).is_some(), "missing {n}");
         }

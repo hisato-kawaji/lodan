@@ -184,6 +184,138 @@ impl Session {
             self.cfg.agent.max_iterations
         );
     }
+
+    /// 会話履歴を圧縮する。System と直近 `KEEP_RECENT_USER_TURNS` ユーザターンを残し、
+    /// それ以前を LLM 要約 1 メッセージに畳む。分割は **ユーザターン境界**
+    /// (`Message::User` の直前) に限定するので、Assistant の tool_calls と対応する
+    /// Tool 応答の対を跨いで切ることはない（run_turn は 1 ターンを完結させてから
+    /// 次の User を積むため、境界より前は常に完結したターン列になる）。
+    pub async fn compact(
+        &mut self,
+        llm: &dyn LlmClient,
+        instruction: &str,
+    ) -> Result<CompactOutcome> {
+        let user_idxs: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, Message::User { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if user_idxs.len() <= KEEP_RECENT_USER_TURNS {
+            return Ok(CompactOutcome::Skipped);
+        }
+        let boundary = user_idxs[user_idxs.len() - KEEP_RECENT_USER_TURNS];
+        // system(index 0) の直後から boundary 手前までが要約対象。
+        if boundary <= 1 {
+            return Ok(CompactOutcome::Skipped);
+        }
+
+        let before = self.history.len();
+        let rendered = render_for_summary(&self.history[1..boundary]);
+        let sys = Message::System {
+            content: "You compress a coding-assistant conversation into a compact summary that \
+                      preserves decisions made, file paths touched, command results, and any \
+                      open tasks. Output only the summary text."
+                .to_string(),
+        };
+        let focus = if instruction.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\nEmphasize: {instruction}")
+        };
+        let usr = Message::User {
+            content: format!(
+                "Summarize this earlier conversation so it can replace the raw messages while \
+                 preserving continuity for the assistant.{focus}\n\n---\n{rendered}"
+            ),
+        };
+        let resp = llm
+            .chat(&[sys, usr], &[], &self.cfg.llm.active().model, Some(1024))
+            .await?;
+        let summary = resp.content.unwrap_or_default();
+        if summary.trim().is_empty() {
+            return Ok(CompactOutcome::Failed);
+        }
+
+        // 置換: [system] + [summary(User)] + [boundary..]。
+        let kept = self.history.split_off(boundary);
+        let system = self.history.remove(0);
+        let mut new_history = Vec::with_capacity(kept.len() + 2);
+        new_history.push(system);
+        new_history.push(Message::User {
+            content: format!("[Summary of earlier conversation]\n{summary}"),
+        });
+        new_history.extend(kept);
+        let after = new_history.len();
+        self.history = new_history;
+        Ok(CompactOutcome::Compacted { before, after })
+    }
+}
+
+/// System を除き、直近何ユーザターンを生のまま残すか。
+const KEEP_RECENT_USER_TURNS: usize = 2;
+
+/// `Session::compact` の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactOutcome {
+    Compacted { before: usize, after: usize },
+    Skipped,
+    Failed,
+}
+
+impl CompactOutcome {
+    pub fn describe(&self) -> String {
+        match self {
+            CompactOutcome::Compacted { before, after } => {
+                format!("compacted history: {before} → {after} messages")
+            }
+            CompactOutcome::Skipped => {
+                "compact skipped: not enough history to summarize".to_string()
+            }
+            CompactOutcome::Failed => {
+                "compact failed: summarizer returned empty output".to_string()
+            }
+        }
+    }
+}
+
+/// 要約対象メッセージを 1 本のテキストへ整形する（要約 LLM への入力用）。
+fn render_for_summary(msgs: &[Message]) -> String {
+    let mut out = String::new();
+    for m in msgs {
+        match m {
+            Message::System { content } => {
+                out.push_str("SYSTEM: ");
+                out.push_str(content);
+            }
+            Message::User { content } => {
+                out.push_str("USER: ");
+                out.push_str(content);
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                out.push_str("ASSISTANT: ");
+                if let Some(c) = content {
+                    out.push_str(c);
+                }
+                for tc in tool_calls {
+                    out.push_str(&format!(
+                        " [tool_call {} {}]",
+                        tc.function.name, tc.function.arguments
+                    ));
+                }
+            }
+            Message::Tool { content, .. } => {
+                out.push_str("TOOL: ");
+                out.push_str(content);
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 async fn stream_once(
@@ -354,6 +486,56 @@ mod tests {
         assert!(
             injected,
             "a blocked Stop hook should inject its reason as a user turn"
+        );
+    }
+
+    /// ユーザターンが少ないうちは compact は Skipped。
+    #[tokio::test]
+    async fn compact_skips_when_history_short() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("first", &llm, &gate).await.unwrap();
+        // 1 ユーザターンのみ → KEEP_RECENT_USER_TURNS 以下。
+        let out = session.compact(&llm, "").await.unwrap();
+        assert_eq!(out, CompactOutcome::Skipped);
+    }
+
+    /// 3 ターン以上で compact すると System + 要約 + 直近が残り、件数が減る。
+    #[tokio::test]
+    async fn compact_folds_old_turns_into_summary() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "SUMMARY".into(),
+        };
+        let gate = PermissionGate::new(true);
+        for p in ["t1", "t2", "t3"] {
+            session.run_turn(p, &llm, &gate).await.unwrap();
+        }
+        let before = session.history().len();
+        let out = session.compact(&llm, "keep the file paths").await.unwrap();
+        match out {
+            CompactOutcome::Compacted {
+                before: b,
+                after: a,
+            } => {
+                assert_eq!(b, before);
+                assert!(a < b, "compaction should shrink history ({a} !< {b})");
+            }
+            other => panic!("expected Compacted, got {other:?}"),
+        }
+        let hist = session.history();
+        // 先頭は System、2 番目は要約ユーザメッセージ。
+        assert!(matches!(hist[0], Message::System { .. }));
+        assert!(
+            matches!(&hist[1], Message::User { content } if content.contains("Summary of earlier conversation"))
+        );
+        // 直近ターン (t3) は生のまま残る。
+        assert!(
+            hist.iter()
+                .any(|m| matches!(m, Message::User { content } if content == "t3"))
         );
     }
 }

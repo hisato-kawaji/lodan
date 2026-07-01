@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use tokio::sync::Notify;
+
 use super::background::{BgStatus, SharedBuf, append_capped};
 use super::{Tool, ToolCtx, ToolError, ToolOutput};
 
@@ -124,13 +126,25 @@ impl Bash {
             tokio::spawn(pump(err, buf));
         }
 
+        // KillShell からの kill 合図。wait タスクと共有する。
+        let kill = Arc::new(Notify::new());
+
         // 終了待ち → ステータス更新。child は wait タスクが所有し続けるので
-        // drop で殺されない（tokio の既定は kill_on_drop=false）。
+        // drop で殺されない（tokio の既定は kill_on_drop=false）。kill 合図が来たら
+        // child を終了させ、ステータスを Killed にする。
         let st = status.clone();
+        let kill_rx = kill.clone();
         tokio::spawn(async move {
-            let next = match child.wait().await {
-                Ok(s) => BgStatus::Exited(s.code().unwrap_or(-1)),
-                Err(e) => BgStatus::Failed(e.to_string()),
+            let next = tokio::select! {
+                res = child.wait() => match res {
+                    Ok(s) => BgStatus::Exited(s.code().unwrap_or(-1)),
+                    Err(e) => BgStatus::Failed(e.to_string()),
+                },
+                _ = kill_rx.notified() => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    BgStatus::Killed
+                }
             };
             if let Ok(mut g) = st.lock() {
                 *g = next;
@@ -142,7 +156,7 @@ impl Bash {
                 .bg
                 .lock()
                 .map_err(|_| ToolError::Other("background store poisoned".into()))?;
-            store.register(command.clone(), output, status)
+            store.register(command.clone(), output, status, kill)
         };
 
         Ok(ToolOutput::ok(format!(
@@ -281,6 +295,52 @@ mod tests {
     async fn monitor_unknown_id_is_error() {
         let ctx = ToolCtx::new(std::env::temp_dir());
         let out = crate::tools::monitor::Monitor
+            .execute(serde_json::json!({ "id": "bash_404" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("bash_404"));
+    }
+
+    /// 長寿命プロセスを起動 → KillShell → Monitor が killed を報告する。
+    #[tokio::test]
+    async fn background_run_is_killable() {
+        let ctx = ToolCtx::new(std::env::temp_dir());
+        Bash.execute(
+            serde_json::json!({ "command": "sleep 60", "run_in_background": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let killed = crate::tools::kill_shell::KillShell
+            .execute(serde_json::json!({ "id": "bash_1" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!killed.is_error, "{}", killed.content);
+        assert!(killed.content.contains("kill signal"), "{}", killed.content);
+
+        // wait タスクが Killed を書き込むまでポーリング。
+        let monitor = crate::tools::monitor::Monitor;
+        let mut killed_seen = false;
+        for _ in 0..100 {
+            let out = monitor
+                .execute(serde_json::json!({ "id": "bash_1" }), &ctx)
+                .await
+                .unwrap();
+            if out.content.contains("killed") {
+                killed_seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(killed_seen, "process was not reported killed");
+    }
+
+    #[tokio::test]
+    async fn kill_unknown_id_is_error() {
+        let ctx = ToolCtx::new(std::env::temp_dir());
+        let out = crate::tools::kill_shell::KillShell
             .execute(serde_json::json!({ "id": "bash_404" }), &ctx)
             .await
             .unwrap();

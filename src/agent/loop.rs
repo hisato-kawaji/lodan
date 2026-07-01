@@ -231,17 +231,17 @@ impl Session {
         }
     }
 
-    /// 会話履歴を圧縮する。System と直近 `KEEP_RECENT_USER_TURNS` ユーザターンを残し、
-    /// それ以前を LLM 要約 1 メッセージに畳む。分割は **ユーザターン境界**
-    /// (`Message::User` の直前) に限定するので、Assistant の tool_calls と対応する
-    /// Tool 応答の対を跨いで切ることはない（run_turn は 1 ターンを完結させてから
-    /// 次の User を積むため、境界より前は常に完結したターン列になる）。
     /// 中断 (Ctrl-C で run_turn の future を破棄) した後に履歴の整合性を直す。
     /// 詳細は `repair_interrupted_history` を参照。
     pub fn interrupt_repair(&mut self) {
         repair_interrupted_history(&mut self.history);
     }
 
+    /// 会話履歴を圧縮する。System と直近 `KEEP_RECENT_USER_TURNS` ユーザターンを残し、
+    /// それ以前を LLM 要約 1 メッセージに畳む。分割は **ユーザターン境界**
+    /// (`Message::User` の直前) に限定するので、Assistant の tool_calls と対応する
+    /// Tool 応答の対を跨いで切ることはない（run_turn は 1 ターンを完結させてから
+    /// 次の User を積むため、境界より前は常に完結したターン列になる）。
     pub async fn compact(
         &mut self,
         llm: &dyn LlmClient,

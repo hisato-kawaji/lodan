@@ -438,14 +438,13 @@ async fn wait_ctrl_c() {
 
 /// run_turn を Ctrl-C で中断可能にして実行する。中断時は future を破棄して
 /// in-flight のストリーム/ツールをキャンセルし (foreground Bash の子プロセスは
-/// tokio の `output()` が kill する)、履歴の整合性を修復して true を返す。
-/// エラーはここで表示する。
+/// `kill_on_drop` で終了する)、履歴の整合性を修復する。エラーはここで表示する。
 async fn run_turn_interruptible(
     session: &mut agent::Session,
     input: &str,
     llm: &dyn llm::LlmClient,
     gate: &PermissionGate,
-) -> bool {
+) {
     let interrupted = {
         let turn = session.run_turn(input, llm, gate);
         tokio::pin!(turn);
@@ -464,7 +463,6 @@ async fn run_turn_interruptible(
         println!();
         println!("{}", crate::term::red("(turn interrupted by Ctrl-C)"));
     }
-    interrupted
 }
 
 /// ターン後に履歴を transcript へ追記する (レコーダ無効時は no-op)。

@@ -405,7 +405,7 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 ## コンテキスト圧縮（`/compact`）
 
-`/compact [指示]` で会話履歴を圧縮する。System プロンプトと**直近 2 ユーザターン**を生のまま残し、それ以前を LLM 要約 1 メッセージに畳む（`[Summary of earlier conversation] ...`）。任意の指示（例: `/compact keep file paths`）を渡すと要約の重点を変えられる。
+`/compact [指示]` で会話履歴を圧縮する。System プロンプトと**直近 2 ユーザターン**を生のまま残し、それ以前を LLM 要約に畳む。要約（`[Summary of earlier conversation] ...`）は独立メッセージにせず**直近ターン先頭のユーザメッセージへ前置**する（user が 2 連続すると strict な user/assistant 交互を要求するローカルモデルでエラーになり得るため）。任意の指示（例: `/compact keep file paths`）を渡すと要約の重点を変えられる。
 
 - 分割は**ユーザターン境界**に限定するので、Assistant の `tool_calls` と対応する Tool 応答の対を跨いで切らない。
 - ユーザターンが 2 以下のときは何もしない（`skipped`）。要約 LLM が空を返したら `failed`。

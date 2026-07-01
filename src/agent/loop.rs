@@ -238,14 +238,23 @@ impl Session {
             return Ok(CompactOutcome::Failed);
         }
 
-        // 置換: [system] + [summary(User)] + [boundary..]。
-        let kept = self.history.split_off(boundary);
+        // 置換: [system] + [boundary..]。要約は独立 User にせず**直後の kept User
+        // 本文へ前置**する。独立させると user が 2 連続になり、strict な
+        // user/assistant 交互を要求するローカルモデル (llama.cpp/vLLM/ollama の
+        // Mistral/Llama テンプレ) がエラーになり得るため。
+        let mut kept = self.history.split_off(boundary);
         let system = self.history.remove(0);
-        let mut new_history = Vec::with_capacity(kept.len() + 2);
+        let block = format!("[Summary of earlier conversation]\n{summary}\n\n---\n");
+        match kept.first_mut() {
+            // boundary は必ず User なので通常はこちら。
+            Some(Message::User { content }) => {
+                *content = format!("{block}{content}");
+            }
+            // 想定外 (kept 先頭が User でない) 時のみ独立挿入でフォールバック。
+            _ => kept.insert(0, Message::User { content: block }),
+        }
+        let mut new_history = Vec::with_capacity(kept.len() + 1);
         new_history.push(system);
-        new_history.push(Message::User {
-            content: format!("[Summary of earlier conversation]\n{summary}"),
-        });
         new_history.extend(kept);
         let after = new_history.len();
         self.history = new_history;
@@ -536,6 +545,15 @@ mod tests {
         assert!(
             hist.iter()
                 .any(|m| matches!(m, Message::User { content } if content == "t3"))
+        );
+        // 要約は独立 User にせず前置したので User が 2 連続しない
+        // (strict alternation のローカルモデル対策)。
+        let consecutive_users = hist
+            .windows(2)
+            .any(|w| matches!((&w[0], &w[1]), (Message::User { .. }, Message::User { .. })));
+        assert!(
+            !consecutive_users,
+            "compaction must not create back-to-back user messages"
         );
     }
 }

@@ -16,7 +16,7 @@ use crate::slash::{self, SlashCommand};
 use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
-const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools"];
+const BUILTINS: &[&str] = &["exit", "quit", "help", "clear", "tools", "compact"];
 
 pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
@@ -142,6 +142,21 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let head = parts.next().unwrap_or("");
             let args = parts.next().unwrap_or("").trim();
+
+            // /compact は session/llm を要するため handle_slash ではなくここで処理する。
+            if head == "compact" {
+                match session.compact(llm_client.as_ref(), args).await {
+                    Ok(outcome) => println!("{}", crate::term::dim(&outcome.describe())),
+                    Err(e) => {
+                        eprintln!(
+                            "{}",
+                            crate::term::red_err(&format!("compact failed: {e:#}"))
+                        )
+                    }
+                }
+                persist(&mut recorder, &session);
+                continue;
+            }
 
             match handle_slash(head, &registry, &user_commands, &mcp_prompts) {
                 SlashResult::Exit => break,
@@ -306,6 +321,7 @@ fn handle_slash(
                 ("/help", "このヘルプを表示"),
                 ("/clear", "画面をクリア"),
                 ("/tools", "利用可能なツール一覧"),
+                ("/compact [指示]", "会話履歴を要約して圧縮"),
             ] {
                 println!("  {} — {desc}", crate::term::cyan(name));
             }

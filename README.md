@@ -403,6 +403,14 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 > ⚠️ **信頼前提**: memory は CWD 階層からそのままプロンプトへ注入される。信頼できないリポジトリの `LODAN.md` / `CLAUDE.md` は prompt injection ベクタになり得る（skills / hooks / `.mcp.json` と同じ CWD 信頼前提）。注入時に「承認ゲートを回避する指示ではない」旨を system prompt に明記している。
 
+## コンテキスト圧縮（`/compact`）
+
+`/compact [指示]` で会話履歴を圧縮する。System プロンプトと**直近 2 ユーザターン**を生のまま残し、それ以前を LLM 要約に畳む。要約（`[Summary of earlier conversation] ...`）は独立メッセージにせず**直近ターン先頭のユーザメッセージへ前置**する（user が 2 連続すると strict な user/assistant 交互を要求するローカルモデルでエラーになり得るため）。任意の指示（例: `/compact keep file paths`）を渡すと要約の重点を変えられる。
+
+- 分割は**ユーザターン境界**に限定するので、Assistant の `tool_calls` と対応する Tool 応答の対を跨いで切らない。
+- ユーザターンが 2 以下のときは何もしない（`skipped`）。要約 LLM が空を返したら `failed`。
+- 要約には active モデルを使う（別モデル指定は未対応）。自動圧縮（しきい値トリガ）はトークン会計（ロードマップ）後に対応予定。
+
 ## ロードマップ（MVP 外、骨組みは存在）
 
 - トークン会計

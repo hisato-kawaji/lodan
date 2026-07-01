@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::agent;
 use crate::config::Config;
+use crate::hooks::{self, HookOutcome, Lifecycle};
 use crate::llm;
 use crate::mcp;
 use crate::mcp::prompt::McpPrompt;
@@ -106,6 +107,15 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         None => new_session(&cwd, &cfg, &registry),
     };
 
+    // SessionStart hook: 起動を通知する。ブロックされても起動は止めず警告のみ。
+    let session_payload =
+        serde_json::json!({ "hook_event_name": "SessionStart", "cwd": cwd.display().to_string() });
+    if let Ok(HookOutcome::Block(reason)) =
+        hooks::runner::dispatch(Lifecycle::SessionStart, None, &session_payload, &cfg.hooks).await
+    {
+        eprintln!("session-start hook: {reason}");
+    }
+
     loop {
         let line = match rl.readline("lodan> ") {
             Ok(l) => l,
@@ -172,6 +182,10 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         }
         persist(&mut recorder, &session);
     }
+
+    // SessionEnd hook: 終了を通知する（ブロック不能・ベストエフォート）。
+    let end_payload = serde_json::json!({ "hook_event_name": "SessionEnd" });
+    let _ = hooks::runner::dispatch(Lifecycle::SessionEnd, None, &end_payload, &cfg.hooks).await;
 
     Ok(())
 }

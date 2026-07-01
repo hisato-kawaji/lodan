@@ -13,7 +13,7 @@
   - `WebFetch` は read-only な GET なので**非破壊**（ゲートを経ない）。⚠️ ただしフェッチ先 URL はモデルが決めるため、内部ネットワーク到達 (SSRF) やクエリ経由の情報送出があり得る。http/https のみ許可・タイムアウト・サイズ上限を課し、リダイレクトも各ホップを http/https に限定して最大 5 ホップに制限する。**ただしリダイレクト先の内部ホスト到達まではブロックしない**ため、実行環境を信頼する前提（hooks / `.mcp.json` と同じ）で使うこと
   - `WebSearch` も read-only（非破壊）。env `BRAVE_API_KEY` が要り、未設定ならエラーを返す。クエリは外部 (Brave) へ送られるため、上と同じ信頼前提で使うこと。エンドポイントは env `BRAVE_SEARCH_API_URL` で差し替え可能だが（テスト用）、こちらも http/https のみ許可する
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
-- **hooks**: `UserPromptSubmit` / `PreToolUse` / `PostToolUse` で外部コマンドを発火し、exit code でツール実行をブロック（後述）
+- **hooks**: `SessionStart` / `SessionEnd` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` で外部コマンドを発火し、exit code でツール実行やターン停止を制御（後述）
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
 - **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
 - **skills**: `.lodan/skills/<name>/SKILL.md` を読み込み、`Skill` ツールとしてモデルへ公開（後述）
@@ -280,14 +280,17 @@ src/
 ```toml
 # Bash 実行前にガードスクリプトを通す。non-zero で実行をブロック。
 [[hooks]]
-event = "PreToolUse"     # UserPromptSubmit | PreToolUse | PostToolUse
+event = "PreToolUse"     # SessionStart | SessionEnd | UserPromptSubmit | PreToolUse | PostToolUse | Stop
 matcher = "Bash"         # 省略可: ツール名一致（Pre/PostToolUse のみ）。空 / "*" で全ツール
 command = "./scripts/guard.sh"
 ```
 
-- **UserPromptSubmit**: ペイロード `{"prompt": "..."}`。ブロック時はそのターンを実行せず破棄。
+- **SessionStart**: `{"hook_event_name", "cwd"}`。REPL 起動時に発火。ブロックしても起動は止めず警告のみ。
+- **SessionEnd**: `{"hook_event_name"}`。REPL 終了時に発火（ベストエフォート、ブロック不可）。
+- **UserPromptSubmit**: `{"prompt"}`。ブロック時はそのターンを実行せず破棄。
 - **PreToolUse**: `{"tool_name", "tool_input"}`。ブロック時はツールを実行せず、理由をモデルへ返す。
 - **PostToolUse**: `{"tool_name", "tool_input", "tool_output"}`。実行後の観測用（取り消し不可、理由を表示）。
+- **Stop**: `{"hook_event_name", "last_message"}`。ターン終端（最終アシスタントテキスト）で発火。**ブロックすると停止せず、その理由をユーザー入力として注入し次ターンへ継続する**（暴走は `max_iterations` で停止）。「条件を満たすまで作業を続ける」系の自律ループの土台。
 
 hook の起動自体に失敗した場合は警告のみで続行（fail-open）、30 秒でタイムアウトします。
 

@@ -88,7 +88,22 @@ impl Session {
 
             if tool_calls.is_empty() {
                 println!();
-                return Ok(());
+                // Stop hook: 停止をブロックされたら reason をユーザ入力として注入し継続する。
+                // これが /goal（達成条件までターン継続）の土台になる。
+                let stop_payload = serde_json::json!({
+                    "hook_event_name": "Stop",
+                    "last_message": resp.content,
+                });
+                match hooks::runner::dispatch(Lifecycle::Stop, None, &stop_payload, &self.cfg.hooks)
+                    .await?
+                {
+                    HookOutcome::Continue => return Ok(()),
+                    HookOutcome::Block(reason) => {
+                        println!("{}", crate::term::dim(&format!("[stop hook] {reason}")));
+                        self.history.push(Message::User { content: reason });
+                        continue;
+                    }
+                }
             }
 
             // 改行を入れてツール出力との視認性を確保
@@ -235,5 +250,110 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let head: String = s.chars().take(n).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::messages::ToolSpec;
+    use crate::config::Config;
+    use crate::hooks::HookConfig;
+    use crate::llm::{ChatEvent, ChatResponse};
+    use crate::permission::PermissionGate;
+    use crate::tools::registry::default_registry;
+    use async_trait::async_trait;
+
+    /// 毎ターン同じ最終テキスト（tool_call 無し）を Done で返すモック。
+    struct FinalTextLlm {
+        text: String,
+    }
+
+    #[async_trait]
+    impl LlmClient for FinalTextLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: Some(self.text.clone()),
+                tool_calls: vec![],
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let _ = sink.send(ChatEvent::Done(ChatResponse {
+                content: Some(self.text.clone()),
+                tool_calls: vec![],
+            }));
+            Ok(())
+        }
+    }
+
+    fn session_with_stop_hook(cmd: Option<String>) -> Session {
+        let mut cfg = Config::default();
+        if let Some(command) = cmd {
+            cfg.hooks = vec![HookConfig {
+                event: Lifecycle::Stop,
+                matcher: String::new(),
+                command,
+            }];
+        }
+        Session::new(cfg, Arc::new(default_registry()))
+    }
+
+    /// Stop hook 無し → Stop は Continue → 1 ターンで終わる（reason 注入なし）。
+    #[tokio::test]
+    async fn stop_hook_absent_ends_turn() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("hi", &llm, &gate).await.unwrap();
+        let users = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .count();
+        assert_eq!(users, 1, "only the original user turn");
+    }
+
+    /// Stop hook が 1 度だけ block → reason がユーザ入力として注入され、次ターンで収束する。
+    #[tokio::test]
+    async fn stop_hook_block_injects_reason_then_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("stop_marker");
+        // 初回: marker 無 → 作成し block。2 回目: marker 有 → continue。
+        let cmd = format!(
+            "if [ -f '{m}' ]; then exit 0; else : > '{m}'; echo keep-going 1>&2; exit 1; fi",
+            m = marker.display()
+        );
+        let mut session = session_with_stop_hook(Some(cmd));
+        let llm = FinalTextLlm {
+            text: "done".into(),
+        };
+        let gate = PermissionGate::new(true);
+
+        session.run_turn("hi", &llm, &gate).await.unwrap();
+
+        assert!(marker.exists(), "stop hook should have fired");
+        let injected = session
+            .history()
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content.contains("keep-going")));
+        assert!(
+            injected,
+            "a blocked Stop hook should inject its reason as a user turn"
+        );
     }
 }

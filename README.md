@@ -110,16 +110,18 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 provider = "local"   # "local" または "sakana"
 
 [llm.local]
-base_url     = "http://localhost:11434/v1"
-model        = "qwen2.5-coder:7b"
-api_key      = ""
-timeout_secs = 120
+base_url       = "http://localhost:11434/v1"
+model          = "qwen2.5-coder:7b"
+api_key        = ""
+timeout_secs   = 120
+context_window = 32768   # モデルの文脈窓 (トークン)。自動圧縮のしきい値計算に使う。0 で自動圧縮無効
 
 [llm.sakana]
-base_url     = "https://api.sakana.ai/v1"
-model        = "fugu"      # または "fugu-ultra"
-api_key      = ""           # 空なら SAKANA_API_KEY env を使う
-timeout_secs = 120
+base_url       = "https://api.sakana.ai/v1"
+model          = "fugu"      # または "fugu-ultra"
+api_key        = ""           # 空なら SAKANA_API_KEY env を使う
+timeout_secs   = 120
+context_window = 32768
 
 [agent]
 max_iterations = 25
@@ -403,13 +405,21 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 > ⚠️ **信頼前提**: memory は CWD 階層からそのままプロンプトへ注入される。信頼できないリポジトリの `LODAN.md` / `CLAUDE.md` は prompt injection ベクタになり得る（skills / hooks / `.mcp.json` と同じ CWD 信頼前提）。注入時に「承認ゲートを回避する指示ではない」旨を system prompt に明記している。
 
-## コンテキスト圧縮（`/compact`）
+## コンテキスト圧縮（`/compact` ＋ 自動圧縮）
 
 `/compact [指示]` で会話履歴を圧縮する。System プロンプトと**直近 2 ユーザターン**を生のまま残し、それ以前を LLM 要約に畳む。要約（`[Summary of earlier conversation] ...`）は独立メッセージにせず**直近ターン先頭のユーザメッセージへ前置**する（user が 2 連続すると strict な user/assistant 交互を要求するローカルモデルでエラーになり得るため）。任意の指示（例: `/compact keep file paths`）を渡すと要約の重点を変えられる。
 
 - 分割は**ユーザターン境界**に限定するので、Assistant の `tool_calls` と対応する Tool 応答の対を跨いで切らない。
 - ユーザターンが 2 以下のときは何もしない（`skipped`）。要約 LLM が空を返したら `failed`。
-- 要約には active モデルを使う（別モデル指定は未対応）。自動圧縮（しきい値トリガ）はトークン会計の上に今後対応予定。
+- 要約には active モデルを使う（別モデル指定は未対応）。
+
+### 自動圧縮（しきい値トリガ）
+
+直近 LLM 呼び出しのコンテキストサイズ（`last_context_tokens`、トークン会計由来）が **`context_window` の 80%** に達すると、ターン終端で自動的に `/compact` 相当の圧縮を実行する（`[auto-compact] ...` と dim 表示）。
+
+- しきい値の分母は provider 設定の `context_window`（既定 32768）。**サービング側の実効窓**（例: ollama は既定 `num_ctx=4096`）と一致させること。`context_window = 0` で自動圧縮を無効化できる。
+- 圧縮に失敗（要約 LLM エラー等）してもターンは成功扱いで、次ターン終端に再試行する。
+- 履歴がまだ短い（ユーザターン 2 以下）ときは手動時と同じく `skipped`。
 
 ## トークン会計（`/cost`）
 
@@ -424,7 +434,7 @@ last context: 1200 prompt tokens
 - 非ストリームは応答 body の `usage`、ストリームは `stream_options: {"include_usage": true}` を付けて最終チャンクの `usage` から取得する（OpenAI / vLLM / llama.cpp 対応）。
 - `total_tokens` を返さないサーバは `prompt + completion` で補完する。
 - **usage 非対応サーバへのフォールバック**: usage が取れない呼び出しは文字数ベース（約 3 文字 / トークン）で概算し、`/cost` に概算だった呼び出し数を注記する。桁を合わせるのが目的の粗い近似。
-- `last context` は直近呼び出しの prompt_tokens で、現在のコンテキストサイズの近似。自動圧縮（しきい値トリガ）や `/goal` 状態行の基盤になる。
+- `last context` は直近呼び出しの prompt_tokens で、現在のコンテキストサイズの近似。自動圧縮のしきい値判定（前節）に使っている。
 - ローカル / Sakana では確定単価が無いため、料金換算はせずトークン数のみ表示する。
 - 累積はメモリ上のみ（transcript には保存しない）。`--resume` 後の `/cost` は 0 から数え直す。
 

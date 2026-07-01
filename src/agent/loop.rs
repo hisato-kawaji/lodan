@@ -106,7 +106,10 @@ impl Session {
                 match hooks::runner::dispatch(Lifecycle::Stop, None, &stop_payload, &self.cfg.hooks)
                     .await?
                 {
-                    HookOutcome::Continue => return Ok(()),
+                    HookOutcome::Continue => {
+                        self.maybe_auto_compact(llm).await;
+                        return Ok(());
+                    }
                     HookOutcome::Block(reason) => {
                         println!("{}", crate::term::dim(&format!("[stop hook] {reason}")));
                         self.history.push(Message::User { content: reason });
@@ -199,6 +202,37 @@ impl Session {
     /// (`Message::User` の直前) に限定するので、Assistant の tool_calls と対応する
     /// Tool 応答の対を跨いで切ることはない（run_turn は 1 ターンを完結させてから
     /// 次の User を積むため、境界より前は常に完結したターン列になる）。
+    /// 直近のコンテキストサイズがしきい値 (context_window の
+    /// `AUTO_COMPACT_THRESHOLD_PERCENT`%) に達したか。`context_window = 0` は無効。
+    pub fn should_auto_compact(&self) -> bool {
+        let window = self.cfg.llm.active().context_window;
+        window > 0
+            && self.usage.last_context_tokens * 100 >= window * AUTO_COMPACT_THRESHOLD_PERCENT
+    }
+
+    /// しきい値超過時の自動圧縮。ターン終端で呼ぶ。圧縮に失敗しても
+    /// ターン自体は成功扱いにする (次ターン終端で再試行される)。
+    async fn maybe_auto_compact(&mut self, llm: &dyn LlmClient) {
+        if !self.should_auto_compact() {
+            return;
+        }
+        let window = self.cfg.llm.active().context_window;
+        println!(
+            "{}",
+            crate::term::dim(&format!(
+                "[auto-compact] context ~{} tokens ≥ {}% of {} window",
+                self.usage.last_context_tokens, AUTO_COMPACT_THRESHOLD_PERCENT, window
+            ))
+        );
+        match self.compact(llm, "").await {
+            Ok(outcome) => println!("{}", crate::term::dim(&outcome.describe())),
+            Err(e) => println!(
+                "{}",
+                crate::term::red(&format!("auto-compact failed: {e:#}"))
+            ),
+        }
+    }
+
     pub async fn compact(
         &mut self,
         llm: &dyn LlmClient,
@@ -281,6 +315,9 @@ impl Session {
 
 /// System を除き、直近何ユーザターンを生のまま残すか。
 const KEEP_RECENT_USER_TURNS: usize = 2;
+
+/// 自動圧縮を発火するコンテキスト使用率 (context_window に対する %)。
+const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
 /// usage 概算フォールバックの 1 トークンあたり文字数。英語 ~4 文字/トークン、
 /// 日本語 ~1-2 文字/トークンの間を取った粗い近似 (桁が合えば十分)。
@@ -679,6 +716,72 @@ mod tests {
         assert!(
             !consecutive_users,
             "compaction must not create back-to-back user messages"
+        );
+    }
+
+    fn session_with_window(window: u64) -> Session {
+        let mut cfg = Config::default();
+        // 既定 provider は Local。
+        cfg.llm.local.context_window = window;
+        Session::new(cfg, Arc::new(default_registry()))
+    }
+
+    fn llm_with_prompt_tokens(prompt_tokens: u64) -> FinalTextLlm {
+        FinalTextLlm {
+            text: "SUMMARY".into(),
+            usage: Some(Usage {
+                prompt_tokens,
+                completion_tokens: 5,
+                total_tokens: prompt_tokens + 5,
+            }),
+        }
+    }
+
+    /// context_window = 0 は自動圧縮無効。どれだけ使っても発火しない。
+    #[tokio::test]
+    async fn auto_compact_disabled_when_window_zero() {
+        let mut session = session_with_window(0);
+        let llm = llm_with_prompt_tokens(1_000_000);
+        let gate = PermissionGate::new(true);
+        session.run_turn("hi", &llm, &gate).await.unwrap();
+        assert!(!session.should_auto_compact());
+    }
+
+    /// しきい値はちょうど 80% で発火 (>=)、その手前では発火しない。
+    #[tokio::test]
+    async fn auto_compact_threshold_boundary() {
+        let gate = PermissionGate::new(true);
+
+        let mut at = session_with_window(100);
+        at.run_turn("hi", &llm_with_prompt_tokens(80), &gate)
+            .await
+            .unwrap();
+        assert!(at.should_auto_compact(), "80/100 must trigger");
+
+        let mut below = session_with_window(100);
+        below
+            .run_turn("hi", &llm_with_prompt_tokens(79), &gate)
+            .await
+            .unwrap();
+        assert!(!below.should_auto_compact(), "79/100 must not trigger");
+    }
+
+    /// しきい値超過中にターンを重ねると、ターン終端の自動圧縮で要約に畳まれる。
+    #[tokio::test]
+    async fn auto_compact_fires_at_turn_end() {
+        let mut session = session_with_window(100);
+        let llm = llm_with_prompt_tokens(90);
+        let gate = PermissionGate::new(true);
+        // 1-2 ターン目はしきい値超過でも履歴不足で Skipped。3 ターン目で圧縮される。
+        for p in ["t1", "t2", "t3"] {
+            session.run_turn(p, &llm, &gate).await.unwrap();
+        }
+        assert!(
+            session.history().iter().any(|m| matches!(
+                m,
+                Message::User { content } if content.contains("Summary of earlier conversation")
+            )),
+            "turn end above threshold should auto-compact history"
         );
     }
 

@@ -47,6 +47,10 @@ pub struct ProviderConfig {
     pub model: String,
     pub api_key: String,
     pub timeout_secs: u64,
+    /// モデルのコンテキスト窓 (トークン)。自動圧縮のしきい値計算に使う。
+    /// `0` で自動圧縮を無効化。サービング側の実効窓 (例: ollama の `num_ctx`)
+    /// と合わせること。
+    pub context_window: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +88,9 @@ impl Default for ProviderConfig {
     }
 }
 
+/// context_window の既定値。qwen2.5-coder 系の 32k を採用 (モデルに合わせて要調整)。
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 32_768;
+
 impl ProviderConfig {
     pub fn default_local() -> Self {
         Self {
@@ -91,6 +98,7 @@ impl ProviderConfig {
             model: "qwen2.5-coder:7b".to_string(),
             api_key: String::new(),
             timeout_secs: 120,
+            context_window: DEFAULT_CONTEXT_WINDOW,
         }
     }
 
@@ -100,6 +108,7 @@ impl ProviderConfig {
             model: "fugu".to_string(),
             api_key: String::new(),
             timeout_secs: 120,
+            context_window: DEFAULT_CONTEXT_WINDOW,
         }
     }
 }
@@ -224,6 +233,8 @@ mod tests {
         assert_eq!(cfg.llm.sakana.base_url, "https://api.sakana.ai/v1");
         assert_eq!(cfg.llm.sakana.model, "fugu");
         assert!(cfg.llm.sakana.api_key.is_empty());
+        assert_eq!(cfg.llm.local.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(cfg.llm.sakana.context_window, DEFAULT_CONTEXT_WINDOW);
     }
 
     #[test]

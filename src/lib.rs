@@ -14,4 +14,5 @@ pub mod repl;
 pub mod session;
 pub mod skills;
 pub mod slash;
+pub mod term;
 pub mod tools;

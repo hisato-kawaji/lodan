@@ -44,12 +44,20 @@ impl PermissionGate {
         let stdin = io::stdin();
         let mut stdout = io::stdout().lock();
         loop {
-            let _ = writeln!(stdout, "[lodan] Allow {tool_name}: {summary}");
             let _ = writeln!(
                 stdout,
-                "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
+                "{} Allow {}: {summary}",
+                crate::term::yellow("[lodan]"),
+                crate::term::bold(tool_name),
             );
-            let _ = write!(stdout, "> ");
+            let _ = writeln!(
+                stdout,
+                "{}",
+                crate::term::dim(&format!(
+                    "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
+                ))
+            );
+            let _ = write!(stdout, "{} ", crate::term::yellow(">"));
             let _ = stdout.flush();
 
             let mut line = String::new();

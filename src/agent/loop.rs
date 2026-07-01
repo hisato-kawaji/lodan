@@ -231,6 +231,12 @@ impl Session {
         }
     }
 
+    /// 中断 (Ctrl-C で run_turn の future を破棄) した後に履歴の整合性を直す。
+    /// 詳細は `repair_interrupted_history` を参照。
+    pub fn interrupt_repair(&mut self) {
+        repair_interrupted_history(&mut self.history);
+    }
+
     /// 会話履歴を圧縮する。System と直近 `KEEP_RECENT_USER_TURNS` ユーザターンを残し、
     /// それ以前を LLM 要約 1 メッセージに畳む。分割は **ユーザターン境界**
     /// (`Message::User` の直前) に限定するので、Assistant の tool_calls と対応する
@@ -444,6 +450,54 @@ impl CompactOutcome {
                 "compact failed: summarizer returned empty output".to_string()
             }
         }
+    }
+}
+
+/// 中断で補填する応答の本文。モデルに「途中で切られた」ことを伝える。
+const INTERRUPT_NOTE: &str = "[interrupted by user before completion]";
+
+/// run_turn の future を途中で破棄すると履歴は次のどちらかの不整合で終わり得る:
+/// (a) User を積んだ直後 (ストリーム中) — 末尾が User のままで、次のターンで
+///     user が 2 連続になり strict alternation のローカルモデルが落ちる。
+/// (b) tool_calls つき Assistant を積んでツール実行中 — 対応する Tool 応答が
+///     欠けて tool_call_id の対が壊れる。
+/// これを (b) 未応答 tool_call への Tool 補填 → (a) 末尾 User への中断
+/// Assistant 補填、の順で修復する。完結した履歴には何もしない。
+pub(crate) fn repair_interrupted_history(history: &mut Vec<Message>) {
+    if let Some(i) = history
+        .iter()
+        .rposition(|m| matches!(m, Message::Assistant { .. }))
+    {
+        let ids: Vec<String> = match &history[i] {
+            Message::Assistant { tool_calls, .. } => {
+                tool_calls.iter().map(|tc| tc.id.clone()).collect()
+            }
+            _ => unreachable!("rposition matched Assistant"),
+        };
+        let answered: std::collections::HashSet<&str> = history[i + 1..]
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<String> = ids
+            .into_iter()
+            .filter(|id| !answered.contains(id.as_str()))
+            .collect();
+        for id in missing {
+            history.push(Message::Tool {
+                tool_call_id: id,
+                content: INTERRUPT_NOTE.to_string(),
+            });
+        }
+    }
+
+    if matches!(history.last(), Some(Message::User { .. })) {
+        history.push(Message::Assistant {
+            content: Some(INTERRUPT_NOTE.to_string()),
+            tool_calls: vec![],
+        });
     }
 }
 
@@ -871,6 +925,86 @@ mod tests {
         assert_eq!(u.prompt_tokens, 3);
         assert_eq!(u.completion_tokens, 2);
         assert_eq!(u.total_tokens, 5);
+    }
+
+    fn tool_call(id: &str) -> crate::agent::messages::ToolCall {
+        crate::agent::messages::ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::agent::messages::ToolCallFunction {
+                name: "Read".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    /// 末尾が User (ストリーム中の中断) → 中断 Assistant を補い user 2 連続を防ぐ。
+    #[test]
+    fn repair_appends_assistant_after_trailing_user() {
+        let mut h = vec![
+            Message::System {
+                content: "s".into(),
+            },
+            Message::User {
+                content: "u1".into(),
+            },
+        ];
+        repair_interrupted_history(&mut h);
+        assert_eq!(h.len(), 3);
+        assert!(
+            matches!(&h[2], Message::Assistant { content: Some(c), .. } if c.contains("interrupted"))
+        );
+    }
+
+    /// ツール実行中の中断 → 未応答 tool_call だけ Tool 応答が補填される。
+    #[test]
+    fn repair_fills_missing_tool_responses() {
+        let mut h = vec![
+            Message::System {
+                content: "s".into(),
+            },
+            Message::User {
+                content: "u".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("a"), tool_call("b")],
+            },
+            Message::Tool {
+                tool_call_id: "a".into(),
+                content: "done".into(),
+            },
+        ];
+        repair_interrupted_history(&mut h);
+        assert_eq!(h.len(), 5);
+        assert!(
+            matches!(&h[4], Message::Tool { tool_call_id, content } if tool_call_id == "b" && content.contains("interrupted"))
+        );
+        // 応答済みの "a" は重複補填されない。
+        let a_count = h
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { tool_call_id, .. } if tool_call_id == "a"))
+            .count();
+        assert_eq!(a_count, 1);
+    }
+
+    /// 完結した履歴には何もしない。
+    #[test]
+    fn repair_leaves_complete_history_untouched() {
+        let mut h = vec![
+            Message::System {
+                content: "s".into(),
+            },
+            Message::User {
+                content: "u".into(),
+            },
+            Message::Assistant {
+                content: Some("done".into()),
+                tool_calls: vec![],
+            },
+        ];
+        repair_interrupted_history(&mut h);
+        assert_eq!(h.len(), 3);
     }
 
     /// /compact の要約呼び出しも usage に計上される。

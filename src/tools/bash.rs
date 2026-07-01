@@ -63,6 +63,9 @@ impl Tool for Bash {
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(&command).current_dir(&ctx.cwd);
+        // foreground 実行はタイムアウトや Ctrl-C 中断で future を破棄したとき
+        // 子プロセスを残さない (tokio の既定は kill_on_drop=false)。
+        cmd.kill_on_drop(true);
 
         let fut = cmd.output();
         let output = match tokio::time::timeout(Duration::from_secs(timeout), fut).await {
@@ -251,6 +254,33 @@ mod tests {
         let out = decode_utf8_prefix(&mut carry);
         assert!(out.starts_with('\u{FFFD}'));
         assert_eq!(carry, vec![b'a']);
+    }
+
+    /// foreground のタイムアウトで future が破棄されたとき、kill_on_drop で
+    /// 子プロセスも終了する (Ctrl-C 中断による future 破棄も同じ経路)。
+    #[tokio::test]
+    async fn foreground_timeout_kills_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker");
+        let ctx = ToolCtx::new(tmp.path().to_path_buf());
+        let out = Bash
+            .execute(
+                serde_json::json!({
+                    "command": format!("sleep 2 && touch '{}'", marker.display()),
+                    "timeout_secs": 1
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("timed out"), "{}", out.content);
+        // 子が生きていれば sleep 2 の後に marker を作る。kill されていれば作られない。
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(
+            !marker.exists(),
+            "child survived the timeout; kill_on_drop should have killed it"
+        );
     }
 
     /// バックグラウンド実行 → Monitor で終了まで読み切れることを確認する。

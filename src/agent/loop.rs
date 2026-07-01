@@ -197,11 +197,6 @@ impl Session {
         );
     }
 
-    /// 会話履歴を圧縮する。System と直近 `KEEP_RECENT_USER_TURNS` ユーザターンを残し、
-    /// それ以前を LLM 要約 1 メッセージに畳む。分割は **ユーザターン境界**
-    /// (`Message::User` の直前) に限定するので、Assistant の tool_calls と対応する
-    /// Tool 応答の対を跨いで切ることはない（run_turn は 1 ターンを完結させてから
-    /// 次の User を積むため、境界より前は常に完結したターン列になる）。
     /// 直近のコンテキストサイズがしきい値 (context_window の
     /// `AUTO_COMPACT_THRESHOLD_PERCENT`%) に達したか。`context_window = 0` は無効。
     pub fn should_auto_compact(&self) -> bool {
@@ -224,6 +219,9 @@ impl Session {
                 self.usage.last_context_tokens, AUTO_COMPACT_THRESHOLD_PERCENT, window
             ))
         );
+        // compact() 内の要約呼び出しで last_context_tokens は要約プロンプト分に
+        // 上書きされるが、次ターンの stream_once が本来の値で再上書きするため
+        // 連続発火にはならない。
         match self.compact(llm, "").await {
             Ok(outcome) => println!("{}", crate::term::dim(&outcome.describe())),
             Err(e) => println!(
@@ -233,6 +231,11 @@ impl Session {
         }
     }
 
+    /// 会話履歴を圧縮する。System と直近 `KEEP_RECENT_USER_TURNS` ユーザターンを残し、
+    /// それ以前を LLM 要約 1 メッセージに畳む。分割は **ユーザターン境界**
+    /// (`Message::User` の直前) に限定するので、Assistant の tool_calls と対応する
+    /// Tool 応答の対を跨いで切ることはない（run_turn は 1 ターンを完結させてから
+    /// 次の User を積むため、境界より前は常に完結したターン列になる）。
     pub async fn compact(
         &mut self,
         llm: &dyn LlmClient,

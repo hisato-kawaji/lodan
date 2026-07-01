@@ -393,7 +393,8 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 - 連結順は **外側（汎用）→ 内側（具体）**。各エントリに `# Memory: <path>` ヘッダが付く。
 - 合計 32 KiB を上限に、超過分は文字境界で打ち切る（`...[memory truncated]...`）。
-- 中身が空（空白のみ）のファイルは無視。`$HOME` より上の system 領域は読まない。
+- 中身が空（空白のみ）のファイルは無視する。
+- cwd が `$HOME` 配下なら遡上は `$HOME` で打ち切る。cwd が home 外（例 `/opt/proj`）の場合は filesystem root まで遡る（Claude Code と同じ挙動）。
 
 > ⚠️ **信頼前提**: memory は CWD 階層からそのままプロンプトへ注入される。信頼できないリポジトリの `LODAN.md` / `CLAUDE.md` は prompt injection ベクタになり得る（skills / hooks / `.mcp.json` と同じ CWD 信頼前提）。注入時に「承認ゲートを回避する指示ではない」旨を system prompt に明記している。
 

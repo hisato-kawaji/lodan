@@ -105,6 +105,8 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| args.to_string()),
+        // 計画本文は直前に表示済みなので、プロンプトには要旨だけ出す。
+        "ExitPlanMode" => "approve the plan above and exit plan mode".to_string(),
         _ => args.to_string(),
     }
 }

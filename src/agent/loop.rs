@@ -106,8 +106,15 @@ impl Session {
         self.history.push(Message::User { content });
 
         for _ in 0..self.cfg.agent.max_iterations {
+            // Plan 中は read-only specs に ExitPlanMode (承認要求の擬似ツール) を
+            // 加える。Normal では不可視。モードはターン途中でも切り替わり得る
+            // (ExitPlanMode 承認直後) ため、毎イテレーション組み直す。
             let specs = match self.mode {
-                Mode::Plan => self.registry.read_only_tool_specs(),
+                Mode::Plan => {
+                    let mut s = self.registry.read_only_tool_specs();
+                    s.push(exit_plan_mode_spec());
+                    s
+                }
                 Mode::Normal => self.registry.tool_specs(),
             };
             let resp =
@@ -152,38 +159,44 @@ impl Session {
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
 
-                let mut output = match self.registry.get(&name) {
-                    None => ToolOutput::error(format!("unknown tool: {name}")),
-                    // specs から隠していても呼ばれ得るので実行側でも防ぐ (多層防御)。
-                    Some(tool) if self.mode == Mode::Plan && tool.is_destructive() => {
-                        ToolOutput::error(format!(
-                            "plan mode: destructive tool '{name}' is disabled. Investigate with \
+                let mut output = if name == EXIT_PLAN_MODE {
+                    // registry 外の擬似ツール。計画提示→ユーザ承認→モード遷移を
+                    // ここで完結させる (PreToolUse hook は通さない)。
+                    self.handle_exit_plan_mode(&args, gate)
+                } else {
+                    match self.registry.get(&name) {
+                        None => ToolOutput::error(format!("unknown tool: {name}")),
+                        // specs から隠していても呼ばれ得るので実行側でも防ぐ (多層防御)。
+                        Some(tool) if self.mode == Mode::Plan && tool.is_destructive() => {
+                            ToolOutput::error(format!(
+                                "plan mode: destructive tool '{name}' is disabled. Investigate with \
                              read-only tools and present a plan; the user approves it with /accept."
-                        ))
-                    }
-                    Some(tool) => {
-                        let pre_payload =
-                            serde_json::json!({ "tool_name": name, "tool_input": args });
-                        match hooks::runner::dispatch(
-                            Lifecycle::PreToolUse,
-                            Some(&name),
-                            &pre_payload,
-                            &self.cfg.hooks,
-                        )
-                        .await?
-                        {
-                            HookOutcome::Block(reason) => {
-                                ToolOutput::error(format!("blocked by hook: {reason}"))
-                            }
-                            HookOutcome::Continue => {
-                                let approved =
-                                    !tool.is_destructive() || gate.allow(tool.name(), &args);
-                                if !approved {
-                                    ToolOutput::error("user denied execution")
-                                } else {
-                                    match tool.execute(args.clone(), &self.ctx).await {
-                                        Ok(o) => o,
-                                        Err(e) => ToolOutput::error(format!("tool error: {e}")),
+                            ))
+                        }
+                        Some(tool) => {
+                            let pre_payload =
+                                serde_json::json!({ "tool_name": name, "tool_input": args });
+                            match hooks::runner::dispatch(
+                                Lifecycle::PreToolUse,
+                                Some(&name),
+                                &pre_payload,
+                                &self.cfg.hooks,
+                            )
+                            .await?
+                            {
+                                HookOutcome::Block(reason) => {
+                                    ToolOutput::error(format!("blocked by hook: {reason}"))
+                                }
+                                HookOutcome::Continue => {
+                                    let approved =
+                                        !tool.is_destructive() || gate.allow(tool.name(), &args);
+                                    if !approved {
+                                        ToolOutput::error("user denied execution")
+                                    } else {
+                                        match tool.execute(args.clone(), &self.ctx).await {
+                                            Ok(o) => o,
+                                            Err(e) => ToolOutput::error(format!("tool error: {e}")),
+                                        }
                                     }
                                 }
                             }
@@ -268,6 +281,43 @@ impl Session {
     /// 詳細は `repair_interrupted_history` を参照。
     pub fn interrupt_repair(&mut self) {
         repair_interrupted_history(&mut self.history);
+    }
+
+    /// ExitPlanMode 擬似ツールの処理。計画を表示してユーザ承認を取り、
+    /// 承認なら Normal へ遷移して実行続行を、拒否なら Plan 維持で修正を
+    /// モデルに指示する。承認は既存の PermissionGate を使う (`--yes` /
+    /// auto_approve なら自動承認、"always" 応答で以後の計画も自動承認)。
+    fn handle_exit_plan_mode(
+        &mut self,
+        args: &serde_json::Value,
+        gate: &PermissionGate,
+    ) -> ToolOutput {
+        if self.mode != Mode::Plan {
+            return ToolOutput::error(
+                "ExitPlanMode is only available in plan mode (the session is in normal mode)",
+            );
+        }
+        let plan = args.get("plan").and_then(|v| v.as_str()).unwrap_or("");
+        if plan.trim().is_empty() {
+            return ToolOutput::error("ExitPlanMode requires a non-empty 'plan' argument");
+        }
+
+        println!("{}", crate::term::bold("--- proposed plan ---"));
+        println!("{plan}");
+        println!("{}", crate::term::bold("---------------------"));
+
+        if gate.allow(EXIT_PLAN_MODE, args) {
+            self.mode = Mode::Normal;
+            ToolOutput::ok(
+                "Plan approved by the user. Plan mode exited — all tools are available again; \
+                 proceed to execute the plan.",
+            )
+        } else {
+            ToolOutput::error(
+                "The user rejected the plan. Stay in plan mode: ask what should change or \
+                 revise the plan, then call ExitPlanMode again.",
+            )
+        }
     }
 
     /// 会話履歴を圧縮する。System と直近 `KEEP_RECENT_USER_TURNS` ユーザターンを残し、
@@ -492,8 +542,34 @@ const INTERRUPT_NOTE: &str = "[interrupted by user before completion]";
 /// Plan モード中に毎ユーザ入力へ前置する指示。
 const PLAN_MODE_PREFIX: &str = "[plan mode] You are in plan mode: investigate with the available \
     read-only tools and produce a concrete step-by-step plan. Do NOT attempt to modify files or \
-    run commands — destructive tools are disabled. End your reply with the plan for the user to \
-    review; they will approve it with /accept before execution.";
+    run commands — destructive tools are disabled. When the plan is complete, call the \
+    ExitPlanMode tool with the plan to request the user's approval (they can also approve \
+    manually with /accept).";
+
+/// Plan モード中のみ specs へ加える承認要求の擬似ツール名。registry には登録しない。
+pub(crate) const EXIT_PLAN_MODE: &str = "ExitPlanMode";
+
+/// ExitPlanMode の spec (Plan モード中のみ LLM へ提示)。
+fn exit_plan_mode_spec() -> crate::agent::messages::ToolSpec<'static> {
+    crate::agent::messages::ToolSpec {
+        kind: "function",
+        function: crate::agent::messages::ToolSpecFunction {
+            name: EXIT_PLAN_MODE,
+            description: "Present the finished plan to the user and request approval to exit \
+                          plan mode and start executing. Call only when the plan is complete.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "The complete step-by-step plan (markdown)"
+                    }
+                },
+                "required": ["plan"]
+            }),
+        },
+    }
+}
 
 /// run_turn の future を途中で破棄すると履歴は次のどちらかの不整合で終わり得る:
 /// (a) User を積んだ直後 (ストリーム中) — 末尾が User のままで、次のターンで
@@ -918,13 +994,14 @@ mod tests {
         }
     }
 
-    /// 初回だけ Write の tool_call を返し、以後は最終テキストを返すモック。
-    struct WriteThenDoneLlm {
+    /// 初回だけ指定の tool_call を返し、以後は最終テキストを返すモック。
+    struct CallThenDoneLlm {
+        call: crate::agent::messages::ToolCall,
         called: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
-    impl LlmClient for WriteThenDoneLlm {
+    impl LlmClient for CallThenDoneLlm {
         async fn chat(
             &self,
             _h: &[Message],
@@ -946,7 +1023,7 @@ mod tests {
             let resp = if first {
                 ChatResponse {
                     content: None,
-                    tool_calls: vec![tool_call_named("w1", "Write")],
+                    tool_calls: vec![self.call.clone()],
                     usage: None,
                 }
             } else {
@@ -959,6 +1036,81 @@ mod tests {
             let _ = sink.send(ChatEvent::Done(resp));
             Ok(())
         }
+    }
+
+    /// ExitPlanMode は Plan 中のみ specs に現れる。
+    #[tokio::test]
+    async fn exit_plan_mode_spec_visible_only_in_plan() {
+        let mut session = session_with_stop_hook(None);
+        let llm = SpecRecordingLlm {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let gate = PermissionGate::new(true);
+
+        session.set_mode(Mode::Plan);
+        session.run_turn("plan it", &llm, &gate).await.unwrap();
+        session.set_mode(Mode::Normal);
+        session.run_turn("do it", &llm, &gate).await.unwrap();
+
+        let seen = llm.seen.lock().unwrap();
+        assert!(seen[0].contains(&EXIT_PLAN_MODE.to_string()));
+        assert!(!seen[1].contains(&EXIT_PLAN_MODE.to_string()));
+    }
+
+    /// 承認 (auto_approve) されると Normal へ遷移し、実行続行の指示が返る。
+    #[tokio::test]
+    async fn exit_plan_mode_approved_switches_to_normal() {
+        let mut session = session_with_stop_hook(None);
+        let llm = CallThenDoneLlm {
+            call: tool_call_with_args("p1", EXIT_PLAN_MODE, r#"{"plan": "1. do X\n2. do Y"}"#),
+            called: false.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.set_mode(Mode::Plan);
+        session.run_turn("plan ready", &llm, &gate).await.unwrap();
+
+        assert_eq!(session.mode(), Mode::Normal, "approval must exit plan mode");
+        assert!(session.history().iter().any(|m| matches!(
+            m,
+            Message::Tool { content, .. } if content.contains("approved")
+        )));
+    }
+
+    /// Normal 中に呼ばれた ExitPlanMode はエラー応答でモードも変わらない。
+    #[tokio::test]
+    async fn exit_plan_mode_outside_plan_errors() {
+        let mut session = session_with_stop_hook(None);
+        let llm = CallThenDoneLlm {
+            call: tool_call_with_args("p1", EXIT_PLAN_MODE, r#"{"plan": "whatever"}"#),
+            called: false.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("hi", &llm, &gate).await.unwrap();
+
+        assert_eq!(session.mode(), Mode::Normal);
+        assert!(session.history().iter().any(|m| matches!(
+            m,
+            Message::Tool { content, .. } if content.contains("only available in plan mode")
+        )));
+    }
+
+    /// plan 引数が空ならエラーで Plan のまま。
+    #[tokio::test]
+    async fn exit_plan_mode_requires_plan_argument() {
+        let mut session = session_with_stop_hook(None);
+        let llm = CallThenDoneLlm {
+            call: tool_call_with_args("p1", EXIT_PLAN_MODE, "{}"),
+            called: false.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.set_mode(Mode::Plan);
+        session.run_turn("plan ready", &llm, &gate).await.unwrap();
+
+        assert_eq!(session.mode(), Mode::Plan, "missing plan must not exit");
+        assert!(session.history().iter().any(|m| matches!(
+            m,
+            Message::Tool { content, .. } if content.contains("non-empty 'plan'")
+        )));
     }
 
     /// Plan 中は破壊的ツールが LLM の specs から消え、Normal へ戻すと復活する。
@@ -995,7 +1147,8 @@ mod tests {
     #[tokio::test]
     async fn plan_mode_blocks_destructive_execution() {
         let mut session = session_with_stop_hook(None);
-        let llm = WriteThenDoneLlm {
+        let llm = CallThenDoneLlm {
+            call: tool_call_named("w1", "Write"),
             called: false.into(),
         };
         // auto-approve でもモードチェックが先に効くことを確認する。
@@ -1129,12 +1282,20 @@ mod tests {
     }
 
     fn tool_call_named(id: &str, name: &str) -> crate::agent::messages::ToolCall {
+        tool_call_with_args(id, name, "{}")
+    }
+
+    fn tool_call_with_args(
+        id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> crate::agent::messages::ToolCall {
         crate::agent::messages::ToolCall {
             id: id.to_string(),
             kind: "function".to_string(),
             function: crate::agent::messages::ToolCallFunction {
                 name: name.to_string(),
-                arguments: "{}".to_string(),
+                arguments: arguments.to_string(),
             },
         }
     }

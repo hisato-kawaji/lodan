@@ -18,3 +18,4 @@ pub mod skills;
 pub mod slash;
 pub mod term;
 pub mod tools;
+pub mod undo;

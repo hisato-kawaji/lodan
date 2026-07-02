@@ -18,6 +18,7 @@ use crate::tools::registry::default_registry;
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
     "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop", "plan", "accept",
+    "undo",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
@@ -174,6 +175,15 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             // /cost も session を要するためここで処理する。
             if head == "cost" {
                 println!("{}", session.usage().describe());
+                continue;
+            }
+
+            // /undo は直近ターンのファイル変更を巻き戻す (session を要する)。
+            if head == "undo" {
+                match session.undo_last_turn() {
+                    Some(report) => println!("{}", report.describe()),
+                    None => println!("nothing to undo (no recorded file changes)"),
+                }
                 continue;
             }
 
@@ -692,6 +702,10 @@ fn handle_slash(
                 (
                     "/plan | /accept",
                     "プランモード進入 (read-only 調査・計画のみ) / 承認して通常モードへ",
+                ),
+                (
+                    "/undo",
+                    "直近ターンのファイル変更を巻き戻す (Bash の副作用は対象外)",
                 ),
             ] {
                 println!("  {} — {desc}", crate::term::cyan(name));

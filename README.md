@@ -161,7 +161,7 @@ hi を書きました。
 lodan> /exit
 ```
 
-組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
+組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept` `/undo`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
 
 **端末装飾**: ツール出力・エラー・承認プロンプトを ANSI で色分けし、LLM 応答待ちは `…thinking` インジケータを表示する。stdout が tty でない（パイプ／リダイレクト）とき、または `NO_COLOR` 環境変数が設定されているときは着色・インジケータを一切出さない。
 
@@ -442,6 +442,23 @@ lodan> /goal cargo test が exit 0 で通る。または 10 ターンで諦め�
 - **承認ポリシー**: 破壊的ツール（Write / Edit / Bash …）は goal 中も**既定で通常どおり承認プロンプトを出す**。完全自律にしたい場合のみ `--yes`（または `agent.auto_approve`）を明示する。
 - **Ctrl-C で自律ループを中断できる**。中断した goal は paused として残る（`/goal` で確認、`/goal clear` で破棄）。
 - 制限: 評価器呼び出しは `/cost` の usage 計上外（SubAgentTool と同じ扱い、follow-up 候補）。`-p` 非対話・resume 復元はスコープ外。
+
+## ファイル変更の巻き戻し（`/undo`）
+
+ターン中のファイル変更を**ターン単位で巻き戻す**（#37 の MVP）。ファイル系ツール（Write / Edit / MultiEdit / NotebookEdit）の実行直前に変更前スナップショット（そのターンで最初に触る時点の内容）を取り、`/undo` で直近ターンぶんをまとめて復元する。
+
+```text
+lodan> /undo
+undo (turn 12):
+  restored /path/to/src/main.rs
+  removed  /path/to/new_file.txt
+```
+
+- 復元規則: ターン開始時に存在したファイルは**当時の内容へ書き戻し**、ターン中に新規作成されたファイルは**削除**。同一ターンに複数回変更しても first-touch の内容へ戻る。
+- 繰り返し `/undo` すると 1 ターンずつ遡る（保持は直近 10 ターン、redo なし。`/undo` 自体の変更は記録しない）。
+- Ctrl-C で中断したターンの変更も記録されているので `/undo` で戻せる。
+- **対象外（重要）**: `Bash` の副作用（コマンド実行・git 操作・ネットワーク等）は一般に巻き戻せないため記録しない。4 MiB 超のファイルはスナップショットせず、undo 時に `skipped` として報告する。
+- 承認ゲートで拒否した実行は変更が起きないため記録されない。
 
 ## プランモード（`/plan` / `/accept`）
 

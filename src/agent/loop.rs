@@ -28,6 +28,10 @@ pub struct Session {
     ctx: ToolCtx,
     usage: SessionUsage,
     mode: Mode,
+    /// ターン単位のファイル変更 undo 台帳 (`/undo`)。
+    undo: crate::undo::UndoLog,
+    /// run_turn ごとに増える通し番号 (undo 台帳のターン識別に使う)。
+    turn_seq: u64,
 }
 
 impl Session {
@@ -58,6 +62,8 @@ impl Session {
             ctx,
             usage: SessionUsage::default(),
             mode: Mode::default(),
+            undo: crate::undo::UndoLog::default(),
+            turn_seq: 0,
         }
     }
 
@@ -97,6 +103,7 @@ impl Session {
             println!("prompt blocked by hook: {reason}");
             return Ok(());
         }
+        self.turn_seq += 1;
         // Plan 中はモデルに「調査と計画のみ」を毎ターン明示する (system prompt は
         // モード切替で作り直さないため、入力への前置で伝える)。
         let content = match self.mode {
@@ -206,6 +213,8 @@ impl Session {
                                     if !approved {
                                         ToolOutput::error("user denied execution")
                                     } else {
+                                        // 実行が確定してから変更前を退避する (/undo 用)。
+                                        self.snapshot_for_undo(&name, &args);
                                         match tool.execute(args.clone(), &self.ctx).await {
                                             Ok(o) => o,
                                             Err(e) => ToolOutput::error(format!("tool error: {e}")),
@@ -294,6 +303,31 @@ impl Session {
     /// 詳細は `repair_interrupted_history` を参照。
     pub fn interrupt_repair(&mut self) {
         repair_interrupted_history(&mut self.history);
+    }
+
+    /// ファイル系ツールの実行直前に変更前スナップショットを取る (`/undo` 用)。
+    /// path はツール本体 (write.rs 等) と同じ規則で解決する: 絶対ならそのまま、
+    /// 相対なら ctx.cwd 基準。
+    fn snapshot_for_undo(&mut self, tool_name: &str, args: &serde_json::Value) {
+        if !UNDOABLE_FILE_TOOLS.contains(&tool_name) {
+            return;
+        }
+        let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let abs = std::path::PathBuf::from(path);
+        let abs = if abs.is_absolute() {
+            abs
+        } else {
+            self.ctx.cwd.join(abs)
+        };
+        self.undo.record_before(self.turn_seq, &abs);
+    }
+
+    /// 直近ターンのファイル変更を巻き戻す (`/undo`)。記録が無ければ None。
+    /// Bash など非可逆な副作用は対象外 (undo 台帳に載らない)。
+    pub fn undo_last_turn(&mut self) -> Option<crate::undo::UndoReport> {
+        self.undo.undo_last()
     }
 
     /// ExitPlanMode 擬似ツールの処理。計画を表示してユーザ承認を取り、
@@ -561,6 +595,10 @@ const PLAN_MODE_PREFIX: &str = "[plan mode] You are in plan mode: investigate wi
 
 /// Plan モード中のみ specs へ加える承認要求の擬似ツール名。registry には登録しない。
 pub(crate) const EXIT_PLAN_MODE: &str = "ExitPlanMode";
+
+/// `/undo` の巻き戻し対象 (args の `path` を変更前退避するファイル系ツール)。
+/// Bash 等の副作用は巻き戻せないため対象外。
+const UNDOABLE_FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// ExitPlanMode の spec (Plan モード中のみ LLM へ提示)。
 fn exit_plan_mode_spec() -> crate::agent::messages::ToolSpec<'static> {
@@ -1240,6 +1278,41 @@ mod tests {
             .collect();
         assert!(users[0].starts_with("[plan mode]") && users[0].contains("investigate"));
         assert_eq!(users[1], "execute");
+    }
+
+    /// run_turn の Write が undo 台帳に載り、undo_last_turn で巻き戻せる。
+    #[tokio::test]
+    async fn undo_reverts_write_from_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("made.txt");
+        let args = format!(r#"{{"path": "{}", "content": "hello"}}"#, target.display());
+        let mut session = session_with_stop_hook(None);
+        let llm = CallThenDoneLlm::one(tool_call_with_args("w1", "Write", &args));
+        let gate = PermissionGate::new(true);
+        session.run_turn("write it", &llm, &gate).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+
+        let report = session.undo_last_turn().unwrap();
+        assert_eq!(report.removed.len(), 1);
+        assert!(!target.exists(), "undo must remove the created file");
+        assert!(session.undo_last_turn().is_none(), "log is consumed");
+    }
+
+    /// Bash の副作用は undo 対象外 (台帳に載らない)。
+    #[tokio::test]
+    async fn undo_ignores_bash_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("via_bash.txt");
+        let args = format!(r#"{{"command": ": > '{}'"}}"#, target.display());
+        let mut session = session_with_stop_hook(None);
+        let llm = CallThenDoneLlm::one(tool_call_with_args("b1", "Bash", &args));
+        let gate = PermissionGate::new(true);
+        session.run_turn("touch it", &llm, &gate).await.unwrap();
+        assert!(target.exists(), "bash should have created the file");
+        assert!(
+            session.undo_last_turn().is_none(),
+            "bash side effects must not be recorded as undoable"
+        );
     }
 
     /// サーバが usage を返すとき: そのまま累積され、estimated は増えない。

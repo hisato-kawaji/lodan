@@ -3,4 +3,4 @@ pub mod messages;
 pub mod subagent;
 
 pub(crate) use r#loop::render_for_summary;
-pub use r#loop::{Session, SessionUsage};
+pub use r#loop::{Mode, Session, SessionUsage};

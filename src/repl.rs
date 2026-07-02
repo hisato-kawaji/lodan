@@ -17,7 +17,7 @@ use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
-    "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop",
+    "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop", "plan", "accept",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
@@ -126,7 +126,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }
 
     loop {
-        let line = match rl.readline("lodan> ") {
+        let prompt = match session.mode() {
+            agent::Mode::Plan => "lodan (plan)> ",
+            agent::Mode::Normal => "lodan> ",
+        };
+        let line = match rl.readline(prompt) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
                 println!("(Ctrl-C, type /exit to quit)");
@@ -170,6 +174,39 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             // /cost も session を要するためここで処理する。
             if head == "cost" {
                 println!("{}", session.usage().describe());
+                continue;
+            }
+
+            // /plan・/accept はプランモードの切替 (session を要する)。
+            if head == "plan" {
+                match session.mode() {
+                    agent::Mode::Plan => println!("already in plan mode (/accept to leave)"),
+                    agent::Mode::Normal => {
+                        session.set_mode(agent::Mode::Plan);
+                        println!(
+                            "{}",
+                            crate::term::dim(
+                                "[plan] entered plan mode — destructive tools are disabled. \
+                                 Investigate & plan, then /accept to approve and execute"
+                            )
+                        );
+                    }
+                }
+                continue;
+            }
+            if head == "accept" {
+                match session.mode() {
+                    agent::Mode::Plan => {
+                        session.set_mode(agent::Mode::Normal);
+                        println!(
+                            "{}",
+                            crate::term::dim(
+                                "[plan] accepted — back to normal mode, destructive tools re-enabled"
+                            )
+                        );
+                    }
+                    agent::Mode::Normal => println!("not in plan mode (/plan to enter)"),
+                }
                 continue;
             }
 
@@ -651,6 +688,10 @@ fn handle_slash(
                 (
                     "/loop <間隔> <プロンプト|/cmd>",
                     "固定間隔で反復実行 (5s/5m/2h/1d、Ctrl-C で停止)",
+                ),
+                (
+                    "/plan | /accept",
+                    "プランモード進入 (read-only 調査・計画のみ) / 承認して通常モードへ",
                 ),
             ] {
                 println!("  {} — {desc}", crate::term::cyan(name));

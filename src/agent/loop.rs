@@ -12,12 +12,22 @@ use crate::prompt;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{ToolCtx, ToolOutput};
 
+/// セッションの動作モード。Plan 中は破壊的ツールを LLM から不可視にし、
+/// 呼ばれても実行しない (調査と計画提示のみ)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Normal,
+    Plan,
+}
+
 pub struct Session {
     cfg: Config,
     registry: Arc<ToolRegistry>,
     history: Vec<Message>,
     ctx: ToolCtx,
     usage: SessionUsage,
+    mode: Mode,
 }
 
 impl Session {
@@ -47,7 +57,16 @@ impl Session {
             history,
             ctx,
             usage: SessionUsage::default(),
+            mode: Mode::default(),
         }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
     }
 
     /// 永続化のための会話履歴 (system を含む全メッセージ)。
@@ -78,12 +97,19 @@ impl Session {
             println!("prompt blocked by hook: {reason}");
             return Ok(());
         }
-        self.history.push(Message::User {
-            content: user_input.to_string(),
-        });
+        // Plan 中はモデルに「調査と計画のみ」を毎ターン明示する (system prompt は
+        // モード切替で作り直さないため、入力への前置で伝える)。
+        let content = match self.mode {
+            Mode::Plan => format!("{PLAN_MODE_PREFIX}\n\n{user_input}"),
+            Mode::Normal => user_input.to_string(),
+        };
+        self.history.push(Message::User { content });
 
         for _ in 0..self.cfg.agent.max_iterations {
-            let specs = self.registry.tool_specs();
+            let specs = match self.mode {
+                Mode::Plan => self.registry.read_only_tool_specs(),
+                Mode::Normal => self.registry.tool_specs(),
+            };
             let resp =
                 stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
             let (u, estimated) = resolve_usage(&resp, &self.history);
@@ -128,6 +154,13 @@ impl Session {
 
                 let mut output = match self.registry.get(&name) {
                     None => ToolOutput::error(format!("unknown tool: {name}")),
+                    // specs から隠していても呼ばれ得るので実行側でも防ぐ (多層防御)。
+                    Some(tool) if self.mode == Mode::Plan && tool.is_destructive() => {
+                        ToolOutput::error(format!(
+                            "plan mode: destructive tool '{name}' is disabled. Investigate with \
+                             read-only tools and present a plan; the user approves it with /accept."
+                        ))
+                    }
                     Some(tool) => {
                         let pre_payload =
                             serde_json::json!({ "tool_name": name, "tool_input": args });
@@ -455,6 +488,12 @@ impl CompactOutcome {
 
 /// 中断で補填する応答の本文。モデルに「途中で切られた」ことを伝える。
 const INTERRUPT_NOTE: &str = "[interrupted by user before completion]";
+
+/// Plan モード中に毎ユーザ入力へ前置する指示。
+const PLAN_MODE_PREFIX: &str = "[plan mode] You are in plan mode: investigate with the available \
+    read-only tools and produce a concrete step-by-step plan. Do NOT attempt to modify files or \
+    run commands — destructive tools are disabled. End your reply with the plan for the user to \
+    review; they will approve it with /accept before execution.";
 
 /// run_turn の future を途中で破棄すると履歴は次のどちらかの不整合で終わり得る:
 /// (a) User を積んだ直後 (ストリーム中) — 末尾が User のままで、次のターンで
@@ -842,6 +881,164 @@ mod tests {
         );
     }
 
+    /// LLM に渡ったツール名リストをターンごとに記録するモック。
+    struct SpecRecordingLlm {
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for SpecRecordingLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("not used")
+        }
+
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            t: &[ToolSpec<'_>],
+            _m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(t.iter().map(|s| s.function.name.to_string()).collect());
+            let _ = sink.send(ChatEvent::Done(ChatResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+            }));
+            Ok(())
+        }
+    }
+
+    /// 初回だけ Write の tool_call を返し、以後は最終テキストを返すモック。
+    struct WriteThenDoneLlm {
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl LlmClient for WriteThenDoneLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("not used")
+        }
+
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let first = !self.called.swap(true, std::sync::atomic::Ordering::SeqCst);
+            let resp = if first {
+                ChatResponse {
+                    content: None,
+                    tool_calls: vec![tool_call_named("w1", "Write")],
+                    usage: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                }
+            };
+            let _ = sink.send(ChatEvent::Done(resp));
+            Ok(())
+        }
+    }
+
+    /// Plan 中は破壊的ツールが LLM の specs から消え、Normal へ戻すと復活する。
+    #[tokio::test]
+    async fn plan_mode_hides_destructive_specs() {
+        let mut session = session_with_stop_hook(None);
+        let llm = SpecRecordingLlm {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let gate = PermissionGate::new(true);
+
+        session.set_mode(Mode::Plan);
+        session.run_turn("plan it", &llm, &gate).await.unwrap();
+        session.set_mode(Mode::Normal);
+        session.run_turn("do it", &llm, &gate).await.unwrap();
+
+        let seen = llm.seen.lock().unwrap();
+        let plan_specs = &seen[0];
+        let normal_specs = &seen[1];
+        for destructive in ["Write", "Edit", "Bash"] {
+            assert!(
+                !plan_specs.contains(&destructive.to_string()),
+                "plan specs must hide {destructive}: {plan_specs:?}"
+            );
+            assert!(
+                normal_specs.contains(&destructive.to_string()),
+                "normal specs must include {destructive}: {normal_specs:?}"
+            );
+        }
+        assert!(plan_specs.contains(&"Read".to_string()));
+    }
+
+    /// specs から隠していても呼ばれた破壊的ツールは実行されずエラー応答になる。
+    #[tokio::test]
+    async fn plan_mode_blocks_destructive_execution() {
+        let mut session = session_with_stop_hook(None);
+        let llm = WriteThenDoneLlm {
+            called: false.into(),
+        };
+        // auto-approve でもモードチェックが先に効くことを確認する。
+        let gate = PermissionGate::new(true);
+        session.set_mode(Mode::Plan);
+        session
+            .run_turn("write something", &llm, &gate)
+            .await
+            .unwrap();
+
+        let blocked = session.history().iter().any(|m| {
+            matches!(m, Message::Tool { content, .. } if content.contains("plan mode") && content.contains("Write"))
+        });
+        assert!(blocked, "Write should be rejected with a plan-mode error");
+    }
+
+    /// Plan 中のユーザ入力には plan 指示が前置され、Normal では素のまま。
+    #[tokio::test]
+    async fn plan_mode_wraps_user_input() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+            usage: None,
+        };
+        let gate = PermissionGate::new(true);
+
+        session.set_mode(Mode::Plan);
+        session.run_turn("investigate", &llm, &gate).await.unwrap();
+        session.set_mode(Mode::Normal);
+        session.run_turn("execute", &llm, &gate).await.unwrap();
+
+        let users: Vec<&str> = session
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(users[0].starts_with("[plan mode]") && users[0].contains("investigate"));
+        assert_eq!(users[1], "execute");
+    }
+
     /// サーバが usage を返すとき: そのまま累積され、estimated は増えない。
     #[tokio::test]
     async fn usage_from_server_accumulates() {
@@ -928,11 +1125,15 @@ mod tests {
     }
 
     fn tool_call(id: &str) -> crate::agent::messages::ToolCall {
+        tool_call_named(id, "Read")
+    }
+
+    fn tool_call_named(id: &str, name: &str) -> crate::agent::messages::ToolCall {
         crate::agent::messages::ToolCall {
             id: id.to_string(),
             kind: "function".to_string(),
             function: crate::agent::messages::ToolCallFunction {
-                name: "Read".to_string(),
+                name: name.to_string(),
                 arguments: "{}".to_string(),
             },
         }

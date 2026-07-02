@@ -161,7 +161,7 @@ hi を書きました。
 lodan> /exit
 ```
 
-組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
+組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
 
 **端末装飾**: ツール出力・エラー・承認プロンプトを ANSI で色分けし、LLM 応答待ちは `…thinking` インジケータを表示する。stdout が tty でない（パイプ／リダイレクト）とき、または `NO_COLOR` 環境変数が設定されているときは着色・インジケータを一切出さない。
 
@@ -442,6 +442,25 @@ lodan> /goal cargo test が exit 0 で通る。または 10 ターンで諦め�
 - **承認ポリシー**: 破壊的ツール（Write / Edit / Bash …）は goal 中も**既定で通常どおり承認プロンプトを出す**。完全自律にしたい場合のみ `--yes`（または `agent.auto_approve`）を明示する。
 - **Ctrl-C で自律ループを中断できる**。中断した goal は paused として残る（`/goal` で確認、`/goal clear` で破棄）。
 - 制限: 評価器呼び出しは `/cost` の usage 計上外（SubAgentTool と同じ扱い、follow-up 候補）。`-p` 非対話・resume 復元はスコープ外。
+
+## プランモード（`/plan` / `/accept`）
+
+Claude Code のプランモード移植（MVP）。**読み取り専用ツールだけで調査・計画し、ユーザ承認後に実行へ移る**。
+
+```text
+lodan> /plan
+[plan] entered plan mode — destructive tools are disabled. Investigate & plan, then /accept to approve and execute
+lodan (plan)> 認証まわりをリファクタしたい。方針を立てて
+...（Read/Grep/Glob 等で調査 → 計画を提示）...
+lodan (plan)> /accept
+[plan] accepted — back to normal mode, destructive tools re-enabled
+lodan> 計画どおり進めて
+```
+
+- `/plan` で進入（プロンプトが `lodan (plan)>` に変わる）、`/accept` で承認して通常モードへ復帰。
+- Plan 中は破壊的ツール（Write / Edit / Bash / MultiEdit / NotebookEdit、MCP ツール含む）を**二重に抑止**する: (1) LLM へ渡すツール一覧から除外（不可視化）、(2) それでも呼ばれたら実行せずエラー応答（多層防御・承認ゲートより先に効く）。読み取り系（Read / Grep / Glob / SubAgent 等）はそのまま使える。
+- Plan 中の各ユーザ入力には「調査と計画のみ・変更禁止・/accept で承認」の指示が前置され、モデルに毎ターン伝わる。
+- モードはセッション内のみ（transcript には残るが `--resume` 後は Normal から）。
 
 ## 反復実行（`/loop`）
 

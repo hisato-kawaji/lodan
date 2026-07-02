@@ -43,8 +43,18 @@ impl ToolRegistry {
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec<'_>> {
+        self.specs(|_| true)
+    }
+
+    /// 破壊的ツールを除いた specs (プランモードで LLM から不可視にする用)。
+    pub fn read_only_tool_specs(&self) -> Vec<ToolSpec<'_>> {
+        self.specs(|t| !t.is_destructive())
+    }
+
+    fn specs(&self, keep: impl Fn(&dyn Tool) -> bool) -> Vec<ToolSpec<'_>> {
         self.tools
             .values()
+            .filter(|t| keep(t.as_ref()))
             .map(|t| ToolSpec {
                 kind: "function",
                 function: ToolSpecFunction {
@@ -157,5 +167,26 @@ mod tests {
         ] {
             assert!(r.get(n).is_some(), "missing {n}");
         }
+    }
+
+    /// read_only_tool_specs は破壊的ツールを除き、読み取り系は残す。
+    #[test]
+    fn read_only_specs_exclude_destructive() {
+        let r = default_registry();
+        let names: Vec<&str> = r
+            .read_only_tool_specs()
+            .iter()
+            .map(|s| s.function.name)
+            .collect();
+        for destructive in ["Write", "Edit", "Bash", "MultiEdit", "NotebookEdit"] {
+            assert!(
+                !names.contains(&destructive),
+                "{destructive} must be hidden"
+            );
+        }
+        for read_only in ["Read", "Grep", "Glob"] {
+            assert!(names.contains(&read_only), "{read_only} must remain");
+        }
+        assert!(names.len() < r.tool_specs().len());
     }
 }

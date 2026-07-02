@@ -149,6 +149,11 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;
+    /// 副作用を持つ (ファイル変更・コマンド実行・外部への書き込み等) なら true。
+    /// **承認ゲート (PermissionGate) とプランモードの両方がこのフラグに依存する**:
+    /// true にし忘れると「承認なしで実行され、plan モードでも呼べる」ツールになる。
+    /// 新規ツールを足すときは必ず判断して明示すること (既定 false は歴史的経緯。
+    /// 安全既定への反転は follow-up issue 参照)。
     fn is_destructive(&self) -> bool {
         false
     }

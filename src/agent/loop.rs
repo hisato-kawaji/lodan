@@ -307,7 +307,8 @@ impl Session {
 
     /// ファイル系ツールの実行直前に変更前スナップショットを取る (`/undo` 用)。
     /// path はツール本体 (write.rs 等) と同じ規則で解決する: 絶対ならそのまま、
-    /// 相対なら ctx.cwd 基準。
+    /// 相対なら ctx.cwd 基準。実行が失敗してもスナップショットは台帳に残るが、
+    /// 変更前と同じ内容を書き戻すだけなので undo しても無害。
     fn snapshot_for_undo(&mut self, tool_name: &str, args: &serde_json::Value) {
         if !UNDOABLE_FILE_TOOLS.contains(&tool_name) {
             return;

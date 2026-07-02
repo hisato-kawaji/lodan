@@ -154,15 +154,28 @@ impl Session {
             // 改行を入れてツール出力との視認性を確保
             println!();
 
+            // ExitPlanMode 承認でモードが Plan → Normal に変わった後、同一バッチの
+            // 残り tool_call を実行すると plan ガードを素通りしてしまうため、
+            // 残りは実行せずスキップ応答を返す (tool_call_id の対は維持)。
+            let mut plan_just_approved = false;
             for call in tool_calls {
                 let name = call.function.name.clone();
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
 
-                let mut output = if name == EXIT_PLAN_MODE {
+                let mut output = if plan_just_approved {
+                    ToolOutput::error(format!(
+                        "skipped '{name}': the plan was approved earlier in this same response. \
+                         Re-issue this tool call in your next response now that plan mode is exited."
+                    ))
+                } else if name == EXIT_PLAN_MODE {
                     // registry 外の擬似ツール。計画提示→ユーザ承認→モード遷移を
                     // ここで完結させる (PreToolUse hook は通さない)。
-                    self.handle_exit_plan_mode(&args, gate)
+                    let out = self.handle_exit_plan_mode(&args, gate);
+                    if !out.is_error {
+                        plan_just_approved = true;
+                    }
+                    out
                 } else {
                     match self.registry.get(&name) {
                         None => ToolOutput::error(format!("unknown tool: {name}")),
@@ -994,10 +1007,19 @@ mod tests {
         }
     }
 
-    /// 初回だけ指定の tool_call を返し、以後は最終テキストを返すモック。
+    /// 初回だけ指定の tool_call 群を返し、以後は最終テキストを返すモック。
     struct CallThenDoneLlm {
-        call: crate::agent::messages::ToolCall,
+        calls: Vec<crate::agent::messages::ToolCall>,
         called: std::sync::atomic::AtomicBool,
+    }
+
+    impl CallThenDoneLlm {
+        fn one(call: crate::agent::messages::ToolCall) -> Self {
+            Self {
+                calls: vec![call],
+                called: false.into(),
+            }
+        }
     }
 
     #[async_trait]
@@ -1023,7 +1045,7 @@ mod tests {
             let resp = if first {
                 ChatResponse {
                     content: None,
-                    tool_calls: vec![self.call.clone()],
+                    tool_calls: self.calls.clone(),
                     usage: None,
                 }
             } else {
@@ -1061,10 +1083,11 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_approved_switches_to_normal() {
         let mut session = session_with_stop_hook(None);
-        let llm = CallThenDoneLlm {
-            call: tool_call_with_args("p1", EXIT_PLAN_MODE, r#"{"plan": "1. do X\n2. do Y"}"#),
-            called: false.into(),
-        };
+        let llm = CallThenDoneLlm::one(tool_call_with_args(
+            "p1",
+            EXIT_PLAN_MODE,
+            r#"{"plan": "1. do X\n2. do Y"}"#,
+        ));
         let gate = PermissionGate::new(true);
         session.set_mode(Mode::Plan);
         session.run_turn("plan ready", &llm, &gate).await.unwrap();
@@ -1076,14 +1099,47 @@ mod tests {
         )));
     }
 
+    /// 同一バッチ [ExitPlanMode, Write] では、承認後の残り tool_call を実行せず
+    /// スキップ応答にする (plan ガード素通り防止)。
+    #[tokio::test]
+    async fn exit_plan_mode_skips_rest_of_batch_after_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("should_not_exist.txt");
+        let write_args = format!(r#"{{"path": "{}", "content": "x"}}"#, target.display());
+        let mut session = session_with_stop_hook(None);
+        let llm = CallThenDoneLlm {
+            calls: vec![
+                tool_call_with_args("p1", EXIT_PLAN_MODE, r#"{"plan": "1. write file"}"#),
+                tool_call_with_args("w1", "Write", &write_args),
+            ],
+            called: false.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.set_mode(Mode::Plan);
+        session.run_turn("plan ready", &llm, &gate).await.unwrap();
+
+        assert_eq!(session.mode(), Mode::Normal);
+        assert!(
+            !target.exists(),
+            "Write in the same batch as the approval must not execute"
+        );
+        // Write への応答は「スキップ・再発行せよ」で tool_call_id 対は維持される。
+        assert!(session.history().iter().any(|m| matches!(
+            m,
+            Message::Tool { tool_call_id, content }
+                if tool_call_id == "w1" && content.contains("Re-issue")
+        )));
+    }
+
     /// Normal 中に呼ばれた ExitPlanMode はエラー応答でモードも変わらない。
     #[tokio::test]
     async fn exit_plan_mode_outside_plan_errors() {
         let mut session = session_with_stop_hook(None);
-        let llm = CallThenDoneLlm {
-            call: tool_call_with_args("p1", EXIT_PLAN_MODE, r#"{"plan": "whatever"}"#),
-            called: false.into(),
-        };
+        let llm = CallThenDoneLlm::one(tool_call_with_args(
+            "p1",
+            EXIT_PLAN_MODE,
+            r#"{"plan": "whatever"}"#,
+        ));
         let gate = PermissionGate::new(true);
         session.run_turn("hi", &llm, &gate).await.unwrap();
 
@@ -1098,10 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn exit_plan_mode_requires_plan_argument() {
         let mut session = session_with_stop_hook(None);
-        let llm = CallThenDoneLlm {
-            call: tool_call_with_args("p1", EXIT_PLAN_MODE, "{}"),
-            called: false.into(),
-        };
+        let llm = CallThenDoneLlm::one(tool_call_with_args("p1", EXIT_PLAN_MODE, "{}"));
         let gate = PermissionGate::new(true);
         session.set_mode(Mode::Plan);
         session.run_turn("plan ready", &llm, &gate).await.unwrap();
@@ -1147,10 +1200,7 @@ mod tests {
     #[tokio::test]
     async fn plan_mode_blocks_destructive_execution() {
         let mut session = session_with_stop_hook(None);
-        let llm = CallThenDoneLlm {
-            call: tool_call_named("w1", "Write"),
-            called: false.into(),
-        };
+        let llm = CallThenDoneLlm::one(tool_call_named("w1", "Write"));
         // auto-approve でもモードチェックが先に効くことを確認する。
         let gate = PermissionGate::new(true);
         session.set_mode(Mode::Plan);

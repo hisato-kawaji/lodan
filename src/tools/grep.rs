@@ -31,6 +31,11 @@ impl Tool for Grep {
         })
     }
 
+    fn is_destructive(&self) -> bool {
+        // read-only: 検索のみ
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

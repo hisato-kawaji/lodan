@@ -27,6 +27,11 @@ impl Tool for Read {
         })
     }
 
+    fn is_destructive(&self) -> bool {
+        // read-only: ファイルを読むだけ
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

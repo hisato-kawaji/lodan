@@ -1,6 +1,11 @@
 use anyhow::Result;
-use rustyline::DefaultEditor;
+use rustyline::Editor;
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -24,8 +29,77 @@ const BUILTINS: &[&str] = &[
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
 const GOAL_CLEAR_ALIASES: &[&str] = &["clear", "stop", "off", "reset", "none", "cancel"];
 
+/// rustyline の補完ヘルパ (#42 P7)。行頭の `/…` は slash コマンド名を、
+/// それ以外の語は FilenameCompleter でパスを補完する。
+struct ReplHelper {
+    /// 補完対象のコマンド名 (組み込み + ユーザ定義 + MCP prompt)。
+    commands: Vec<String>,
+    files: FilenameCompleter,
+}
+
+impl ReplHelper {
+    fn new(mut commands: Vec<String>) -> Self {
+        commands.sort();
+        Self {
+            commands,
+            files: FilenameCompleter::new(),
+        }
+    }
+}
+
+/// 行頭 slash コマンドの補完候補。カーソルが最初のトークン内
+/// (`/` 直後〜空白前) にあるときだけ Some を返す。前方一致なしでも
+/// Some(空) を返す — コマンド位置でパス補完へフォールバックすると
+/// `/zzz` が `/usr` 等に化けて紛らわしいため意図的に補完なしとする。
+fn slash_candidates(line: &str, pos: usize, commands: &[String]) -> Option<Vec<String>> {
+    let head = line.get(..pos)?;
+    let rest = head.strip_prefix('/')?;
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(
+        commands
+            .iter()
+            .filter(|c| c.starts_with(rest))
+            .map(|c| format!("/{c}"))
+            .collect(),
+    )
+}
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if let Some(cands) = slash_candidates(line, pos, &self.commands) {
+            let pairs = cands
+                .into_iter()
+                .map(|c| Pair {
+                    display: c.clone(),
+                    replacement: c,
+                })
+                .collect();
+            // 行頭 `/` ごと置換する。
+            return Ok((0, pairs));
+        }
+        self.files.complete(line, pos, ctx)
+    }
+}
+
+impl Hinter for ReplHelper {
+    type Hint = String;
+}
+
+impl Highlighter for ReplHelper {}
+impl Validator for ReplHelper {}
+impl rustyline::Helper for ReplHelper {}
+
 pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
-    let mut rl = DefaultEditor::new()?;
+    let mut rl: Editor<ReplHelper, DefaultHistory> = Editor::new()?;
     println!(
         "{} {} — type {} for commands, {} to quit",
         crate::term::bold(&crate::term::cyan("lodan")),
@@ -88,6 +162,15 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         .collect();
     // Keep clients alive for the full session; Drop kills subprocesses.
     let _mcp_clients = mcp_outcome.clients;
+
+    // 補完対象が出揃ったところで helper を装着する (#42 P7)。
+    let completion_names: Vec<String> = BUILTINS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(user_commands.keys().cloned())
+        .chain(mcp_prompts.keys().cloned())
+        .collect();
+    rl.set_helper(Some(ReplHelper::new(completion_names)));
 
     // サブエージェント (Task): 読み取り専用ツールで調査を委譲する。
     // LLM クライアントが要るため default_registry ではなくここで登録する。
@@ -772,6 +855,38 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
 #[cfg(test)]
 mod tests {
     use super::looks_like_slash_command;
+    use super::slash_candidates;
+
+    fn cmds() -> Vec<String> {
+        ["help", "goal", "loop", "plan", "review"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn slash_completion_matches_prefix() {
+        let c = slash_candidates("/pl", 3, &cmds()).unwrap();
+        assert_eq!(c, vec!["/plan"]);
+        let c = slash_candidates("/", 1, &cmds()).unwrap();
+        assert_eq!(c.len(), 5, "bare slash lists all commands");
+    }
+
+    #[test]
+    fn slash_completion_only_in_first_token() {
+        // 引数位置 (空白の後) はパス補完へフォールバックする。
+        assert!(slash_candidates("/loop 5m /rev", 13, &cmds()).is_none());
+        // slash で始まらない行は対象外。
+        assert!(slash_candidates("hello", 5, &cmds()).is_none());
+        assert!(slash_candidates("", 0, &cmds()).is_none());
+    }
+
+    #[test]
+    fn slash_completion_respects_cursor_position() {
+        // カーソルが `/pl` の直後にある場合のみその位置までで判定する。
+        let c = slash_candidates("/pl 残りは無視", 3, &cmds()).unwrap();
+        assert_eq!(c, vec!["/plan"]);
+    }
 
     #[test]
     fn known_commands_match() {

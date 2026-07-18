@@ -130,6 +130,12 @@ fn input_needs_more(input: &str) -> bool {
 /// - 継続行入力: 各行末の `\` を除いて改行で連結
 /// - 単一行入力はそのまま
 fn normalize_input(input: &str) -> String {
+    // 単一行はそのまま。対話入力では行末 `\` は Validator が継続させるので
+    // 単一行のまま確定しないが、パイプ入力 (非対話) では Validator を通らず
+    // ここへ来るため、末尾 `\` を黙って食わないようにする (pr-review #59)。
+    if !input.contains('\n') {
+        return input.to_string();
+    }
     let first = input.lines().next().unwrap_or("");
     if first.trim_start().starts_with("```") {
         let mut lines: Vec<&str> = input.lines().skip(1).collect();
@@ -962,6 +968,8 @@ mod tests {
         assert_eq!(normalize_input("plain single line"), "plain single line");
         // フェンス内の行末バックスラッシュはそのまま残る (中身は無加工)。
         assert_eq!(normalize_input("```\nkeep \\\n```"), "keep \\");
+        // パイプ入力の単一行は末尾 \ も含め無加工 (pr-review #59)。
+        assert_eq!(normalize_input("ls dir\\"), "ls dir\\");
     }
 
     #[test]

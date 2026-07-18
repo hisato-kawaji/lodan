@@ -95,8 +95,55 @@ impl Hinter for ReplHelper {
 }
 
 impl Highlighter for ReplHelper {}
-impl Validator for ReplHelper {}
+
+/// 複数行入力 (#42 P8)。Enter 時に入力が「未完」なら改行を挿入して
+/// 編集を継続する: ``` フェンスが閉じていない、または行末が `\`。
+impl Validator for ReplHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        use rustyline::validate::ValidationResult;
+        Ok(if input_needs_more(ctx.input()) {
+            ValidationResult::Incomplete
+        } else {
+            ValidationResult::Valid(None)
+        })
+    }
+}
+
 impl rustyline::Helper for ReplHelper {}
+
+/// 入力が未完 (継続入力が必要) か。
+/// - 先頭行が ``` で始まる: 2 行目以降に閉じ ``` 行が現れるまで未完
+/// - それ以外: 末尾が `\` なら未完 (継続行)
+fn input_needs_more(input: &str) -> bool {
+    let first = input.lines().next().unwrap_or("");
+    if first.trim_start().starts_with("```") {
+        return !input.lines().skip(1).any(|l| l.trim() == "```");
+    }
+    input.ends_with('\\')
+}
+
+/// 確定した複数行入力を正規化する。
+/// - フェンス入力: 先頭の ```(言語タグ可) 行と最後の閉じ ``` 行を外して中身のみ
+/// - 継続行入力: 各行末の `\` を除いて改行で連結
+/// - 単一行入力はそのまま
+fn normalize_input(input: &str) -> String {
+    let first = input.lines().next().unwrap_or("");
+    if first.trim_start().starts_with("```") {
+        let mut lines: Vec<&str> = input.lines().skip(1).collect();
+        if let Some(pos) = lines.iter().rposition(|l| l.trim() == "```") {
+            lines.remove(pos);
+        }
+        return lines.join("\n");
+    }
+    input
+        .lines()
+        .map(|l| l.strip_suffix('\\').unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl: Editor<ReplHelper, DefaultHistory> = Editor::new()?;
@@ -226,11 +273,17 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             }
             Err(e) => return Err(e.into()),
         };
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let _ = rl.add_history_entry(raw);
+        // 複数行入力 (#42 P8): フェンス外し・継続行の連結を済ませてから処理する。
+        let line = normalize_input(raw);
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line
             .strip_prefix('/')
@@ -879,6 +932,36 @@ mod tests {
         // slash で始まらない行は対象外。
         assert!(slash_candidates("hello", 5, &cmds()).is_none());
         assert!(slash_candidates("", 0, &cmds()).is_none());
+    }
+
+    #[test]
+    fn multiline_fence_needs_more_until_closed() {
+        use super::input_needs_more;
+        assert!(input_needs_more("```"));
+        assert!(input_needs_more("```python\nx = 1"));
+        assert!(!input_needs_more("```python\nx = 1\n```"));
+        assert!(!input_needs_more("```\ncode\n``` "), "trailing space ok");
+    }
+
+    #[test]
+    fn multiline_backslash_continues() {
+        use super::input_needs_more;
+        assert!(input_needs_more("line1\\"));
+        assert!(!input_needs_more("line1"));
+        assert!(!input_needs_more("line1\\\nline2"));
+    }
+
+    #[test]
+    fn normalize_strips_fence_and_joins_continuations() {
+        use super::normalize_input;
+        assert_eq!(
+            normalize_input("```python\nx = 1\ny = 2\n```"),
+            "x = 1\ny = 2"
+        );
+        assert_eq!(normalize_input("a\\\nb"), "a\nb");
+        assert_eq!(normalize_input("plain single line"), "plain single line");
+        // フェンス内の行末バックスラッシュはそのまま残る (中身は無加工)。
+        assert_eq!(normalize_input("```\nkeep \\\n```"), "keep \\");
     }
 
     #[test]

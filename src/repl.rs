@@ -48,7 +48,9 @@ impl ReplHelper {
 }
 
 /// 行頭 slash コマンドの補完候補。カーソルが最初のトークン内
-/// (`/` 直後〜空白前) にあるときだけ Some を返す。
+/// (`/` 直後〜空白前) にあるときだけ Some を返す。前方一致なしでも
+/// Some(空) を返す — コマンド位置でパス補完へフォールバックすると
+/// `/zzz` が `/usr` 等に化けて紛らわしいため意図的に補完なしとする。
 fn slash_candidates(line: &str, pos: usize, commands: &[String]) -> Option<Vec<String>> {
     let head = line.get(..pos)?;
     let rest = head.strip_prefix('/')?;

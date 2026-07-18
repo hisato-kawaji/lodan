@@ -63,6 +63,9 @@ pub fn yellow(s: &str) -> String {
 pub fn cyan(s: &str) -> String {
     paint("36", s)
 }
+pub fn green(s: &str) -> String {
+    paint("32", s)
+}
 
 /// stderr 向けの赤（`eprintln!` に使う。stderr の tty 判定で着色可否を決める）。
 pub fn red_err(s: &str) -> String {

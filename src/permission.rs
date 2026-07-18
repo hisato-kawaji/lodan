@@ -50,6 +50,9 @@ impl PermissionGate {
                 crate::term::yellow("[lodan]"),
                 crate::term::bold(tool_name),
             );
+            if let Some(p) = preview(tool_name, args) {
+                let _ = writeln!(stdout, "{p}");
+            }
             let _ = writeln!(
                 stdout,
                 "{}",
@@ -100,15 +103,105 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .map(|s| format!("`{s}`"))
             .unwrap_or_else(|| args.to_string()),
-        "Write" | "Edit" => args
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => args
             .get("path")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(rel_path)
             .unwrap_or_else(|| args.to_string()),
         // 計画本文は直前に表示済みなので、プロンプトには要旨だけ出す。
         "ExitPlanMode" => "approve the plan above and exit plan mode".to_string(),
         _ => args.to_string(),
     }
+}
+
+/// cwd 配下のパスは相対表示にする (#42 P5)。cwd 外・取得失敗時はそのまま。
+fn rel_path(path: &str) -> String {
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(rel) = std::path::Path::new(path).strip_prefix(&cwd)
+        && !rel.as_os_str().is_empty()
+    {
+        return rel.display().to_string();
+    }
+    path.to_string()
+}
+
+/// プレビュー 1 ブロックあたりの最大行数。
+const PREVIEW_MAX_LINES: usize = 8;
+/// MultiEdit で個別プレビューする最大 edit 数。
+const PREVIEW_MAX_EDITS: usize = 3;
+
+/// 承認プロンプトの下に出す変更内容プレビュー (#42 P5)。
+/// Edit/MultiEdit は old→new の差分風表示、Write は書き込む内容の先頭。
+/// 対象外のツールは None。
+fn preview(tool: &str, args: &serde_json::Value) -> Option<String> {
+    let as_str = |key: &str| args.get(key).and_then(|v| v.as_str());
+    match tool {
+        "Edit" => Some(diff_block(
+            as_str("old_string").unwrap_or(""),
+            as_str("new_string").unwrap_or(""),
+        )),
+        "MultiEdit" => {
+            let edits = args.get("edits")?.as_array()?;
+            let mut out = String::new();
+            for (i, e) in edits.iter().take(PREVIEW_MAX_EDITS).enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                let g = |k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("");
+                out.push_str(&diff_block(g("old_string"), g("new_string")));
+            }
+            if edits.len() > PREVIEW_MAX_EDITS {
+                out.push_str(&crate::term::dim(&format!(
+                    "\n  … (+{} more edits)",
+                    edits.len() - PREVIEW_MAX_EDITS
+                )));
+            }
+            Some(out)
+        }
+        "Write" => {
+            let content = as_str("content")?;
+            let mut out = String::new();
+            for (i, line) in content.lines().take(PREVIEW_MAX_LINES).enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&crate::term::green(&format!("  + {line}")));
+            }
+            let total = content.lines().count();
+            if total > PREVIEW_MAX_LINES {
+                out.push_str(&crate::term::dim(&format!(
+                    "\n  … (+{} more lines, {} bytes)",
+                    total - PREVIEW_MAX_LINES,
+                    content.len()
+                )));
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// old→new の差分風ブロック (`- old` 赤 / `+ new` 緑、各ブロック行数上限つき)。
+fn diff_block(old: &str, new: &str) -> String {
+    let mut out = String::new();
+    let mut push_side = |text: &str, sign: char, color: fn(&str) -> String| {
+        let total = text.lines().count();
+        for line in text.lines().take(PREVIEW_MAX_LINES) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&color(&format!("  {sign} {line}")));
+        }
+        if total > PREVIEW_MAX_LINES {
+            out.push_str(&crate::term::dim(&format!(
+                "\n  … (+{} more {sign} lines)",
+                total - PREVIEW_MAX_LINES
+            )));
+        }
+    };
+    push_side(old, '-', crate::term::red);
+    push_side(new, '+', crate::term::green);
+    out
 }
 
 #[cfg(test)]
@@ -141,5 +234,62 @@ mod tests {
             .always_commands
             .insert("ls -la".to_string());
         assert!(g.allow("Bash", &serde_json::json!({"command":"ls -la"})));
+    }
+
+    #[test]
+    fn edit_preview_shows_diff() {
+        let p = preview(
+            "Edit",
+            &serde_json::json!({"path": "/x", "old_string": "a\nb", "new_string": "c"}),
+        )
+        .unwrap();
+        assert!(p.contains("- a") && p.contains("- b"), "{p}");
+        assert!(p.contains("+ c"), "{p}");
+    }
+
+    #[test]
+    fn write_preview_shows_head_and_caps() {
+        let content: String = (0..20).map(|i| format!("l{i}\n")).collect();
+        let p = preview(
+            "Write",
+            &serde_json::json!({"path": "/x", "content": content}),
+        )
+        .unwrap();
+        assert!(p.contains("+ l0") && p.contains("+ l7"), "{p}");
+        assert!(!p.contains("+ l8"), "{p}");
+        assert!(p.contains("+12 more lines"), "{p}");
+    }
+
+    #[test]
+    fn multi_edit_preview_caps_edits() {
+        let edits: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({"old_string": format!("o{i}"), "new_string": format!("n{i}")})
+            })
+            .collect();
+        let p = preview(
+            "MultiEdit",
+            &serde_json::json!({"path": "/x", "edits": edits}),
+        )
+        .unwrap();
+        assert!(p.contains("- o0") && p.contains("+ n2"), "{p}");
+        assert!(!p.contains("o3"), "only PREVIEW_MAX_EDITS edits shown: {p}");
+        assert!(p.contains("+2 more edits"), "{p}");
+    }
+
+    #[test]
+    fn bash_has_no_preview() {
+        assert!(preview("Bash", &serde_json::json!({"command": "ls"})).is_none());
+    }
+
+    /// cwd 配下は相対表示、cwd 外は絶対のまま。
+    #[test]
+    fn summarize_relativizes_cwd_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("src/main.rs");
+        let s = summarize("Edit", &serde_json::json!({"path": abs.to_str().unwrap()}));
+        assert_eq!(s, "src/main.rs");
+        let s2 = summarize("Write", &serde_json::json!({"path": "/etc/hosts"}));
+        assert_eq!(s2, "/etc/hosts");
     }
 }

@@ -251,7 +251,7 @@ impl Session {
                 } else {
                     crate::term::cyan(&tag)
                 };
-                println!("{tag} {}", truncate(&output.content, 400));
+                println!("{tag} {}", display_tool_output(&name, &output));
                 self.history.push(Message::Tool {
                     tool_call_id: call.id,
                     content: output.content,
@@ -764,13 +764,80 @@ async fn stream_once(
     last_done.ok_or_else(|| anyhow::anyhow!("stream ended without Done event"))
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(n).collect();
-        format!("{head}…")
+/// 端末表示に使うツール出力の最大行数。
+const DISPLAY_MAX_LINES: usize = 8;
+/// 端末表示に使うツール出力の最大文字数。
+const DISPLAY_MAX_CHARS: usize = 600;
+
+/// ツール出力の端末表示を整形する (#42 P4)。LLM へ渡す content は無加工のまま、
+/// **表示だけ**をツール別に要約する:
+/// - `Read`: content は「ヘッダ行 + ファイル全文エコー」なのでヘッダ行のみ表示
+/// - `Bash`: 截断しても末尾の exit ステータスを落とさない
+/// - 共通: 先頭 `DISPLAY_MAX_LINES` 行 / `DISPLAY_MAX_CHARS` 文字で行単位に切り、
+///   切った量 (+行数, 総バイト数) を明示する
+fn display_tool_output(name: &str, output: &ToolOutput) -> String {
+    // 注記のバイト数はモデルへ渡す raw content 基準にする。
+    let total_bytes = output.content.len();
+    let content = output.content.trim_end();
+    if !output.is_error && name == "Read" {
+        let header = content.lines().next().unwrap_or("");
+        let body_bytes = content.len().saturating_sub(header.len());
+        if body_bytes == 0 {
+            return header.to_string();
+        }
+        return format!("{header} — sent to model ({body_bytes} bytes not echoed)");
     }
+    let (clipped, truncated) =
+        clip_lines(content, DISPLAY_MAX_LINES, DISPLAY_MAX_CHARS, total_bytes);
+    if truncated && !output.is_error && name == "Bash" {
+        // Bash の content は "--- exit ---\n<code>" で終わる。截断で結果 (成否) が
+        // 見えなくなるのを防ぐ。
+        if let Some(pos) = content.rfind("--- exit ---") {
+            let code = content[pos..].lines().nth(1).unwrap_or("?").trim();
+            return format!("{clipped}\n(exit {code})");
+        }
+    }
+    clipped
+}
+
+/// 先頭 `max_lines` 行かつ `max_chars` 文字に収める。切ったときは
+/// 「何行省いたか・総バイト数 (`total_bytes` = raw content 基準)」の注記を
+/// 末尾に付け、truncated=true を返す。截断判定はループの打ち切りで行う
+/// (バイト長比較だと CRLF 入力で誤検知するため)。
+fn clip_lines(s: &str, max_lines: usize, max_chars: usize, total_bytes: usize) -> (String, bool) {
+    let total_lines = s.lines().count();
+    let mut out = String::new();
+    let mut taken = 0usize;
+    let mut used_chars = 0usize;
+    let mut truncated = false;
+    for line in s.lines() {
+        let line_chars = line.chars().count();
+        if taken >= max_lines || (taken > 0 && used_chars + line_chars > max_chars) {
+            // ここに来た = まだ残り行があるのに打ち切った。
+            truncated = true;
+            break;
+        }
+        if taken > 0 {
+            out.push('\n');
+        }
+        if line_chars > max_chars {
+            // 1 行だけで上限を超えるケースは文字単位で切る。
+            out.extend(line.chars().take(max_chars));
+            taken += 1;
+            truncated = true;
+            break;
+        }
+        out.push_str(line);
+        used_chars += line_chars;
+        taken += 1;
+    }
+    if truncated {
+        let omitted = total_lines.saturating_sub(taken);
+        out.push_str(&format!(
+            "\n… (+{omitted} more lines, {total_bytes} bytes total)"
+        ));
+    }
+    (out, truncated)
 }
 
 #[cfg(test)]
@@ -1314,6 +1381,81 @@ mod tests {
             session.undo_last_turn().is_none(),
             "bash side effects must not be recorded as undoable"
         );
+    }
+
+    /// Read の表示はヘッダ行のみ (ファイル内容を端末へエコーしない)。
+    #[test]
+    fn display_read_shows_header_only() {
+        let out =
+            ToolOutput::ok("path.rs (100 lines, showing 1..100)\n     1\tfn main() {}\n     2\t}");
+        let s = display_tool_output("Read", &out);
+        assert!(s.starts_with("path.rs (100 lines"));
+        assert!(!s.contains("fn main"), "file content must not be echoed");
+        assert!(s.contains("not echoed"));
+    }
+
+    /// 長い出力は行単位で切り、省いた行数と raw content の総バイト数を明示する。
+    #[test]
+    fn display_clips_long_output_with_note() {
+        let content: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        let total = content.len(); // 注記はモデルへ渡す raw content 基準
+        let out = ToolOutput::ok(content);
+        let s = display_tool_output("Grep", &out);
+        assert!(s.contains("line 0") && s.contains("line 7"));
+        assert!(!s.contains("line 8"), "only DISPLAY_MAX_LINES lines shown");
+        assert!(s.contains("+42 more lines"));
+        assert!(s.contains(&format!("{total} bytes total")));
+    }
+
+    /// CRLF 入力でも非截断なら注記を出さない (バイト長比較の誤検知対策)。
+    #[test]
+    fn display_crlf_short_output_has_no_note() {
+        let out = ToolOutput::ok("a\r\nb\r\nc");
+        let s = display_tool_output("Grep", &out);
+        assert!(
+            !s.contains("more lines"),
+            "no spurious truncation note: {s}"
+        );
+    }
+
+    /// ヘッダ行のみの Read 出力は "(0 bytes not echoed)" を出さない。
+    #[test]
+    fn display_read_single_line_has_no_zero_note() {
+        let out = ToolOutput::ok("empty.txt (0 lines, showing 1..1)");
+        let s = display_tool_output("Read", &out);
+        assert_eq!(s, "empty.txt (0 lines, showing 1..1)");
+    }
+
+    /// Bash は截断されても exit ステータスが表示に残る。
+    #[test]
+    fn display_bash_keeps_exit_code_when_truncated() {
+        let mut content = String::from("$ mycmd\n--- stdout ---\n");
+        for i in 0..30 {
+            content.push_str(&format!("out {i}\n"));
+        }
+        content.push_str("--- stderr ---\n\n--- exit ---\n0\n");
+        let out = ToolOutput::ok(content);
+        let s = display_tool_output("Bash", &out);
+        assert!(s.contains("… (+"), "should be truncated");
+        assert!(
+            s.contains("(exit 0)"),
+            "exit status must survive truncation"
+        );
+    }
+
+    /// 短い出力はそのまま表示する。
+    #[test]
+    fn display_short_output_unchanged() {
+        let out = ToolOutput::ok("wrote /tmp/x (5 bytes)");
+        assert_eq!(display_tool_output("Write", &out), "wrote /tmp/x (5 bytes)");
+    }
+
+    /// エラー時は Read でも本文を表示する (要点がエラー内容のため)。
+    #[test]
+    fn display_error_read_is_not_elided() {
+        let out = ToolOutput::error("read failed: no such file: /x");
+        let s = display_tool_output("Read", &out);
+        assert!(s.contains("no such file"));
     }
 
     /// サーバが usage を返すとき: そのまま累積され、estimated は増えない。

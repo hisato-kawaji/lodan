@@ -34,6 +34,11 @@ impl Tool for TodoWrite {
         })
     }
 
+    fn is_destructive(&self) -> bool {
+        // セッション内メモリの todo 状態のみ更新 (ファイル変更なし)
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

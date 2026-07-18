@@ -40,6 +40,11 @@ impl Tool for WebFetch {
         })
     }
 
+    fn is_destructive(&self) -> bool {
+        // read-only: HTTP GET のみ (外部への書き込みなし)
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

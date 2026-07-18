@@ -169,6 +169,57 @@ mod tests {
         }
     }
 
+    /// 全 built-in の destructive 分類を明示的に固定する (#52)。
+    /// 既定が true になったため、分類が変わると承認要否と plan モード可視性が
+    /// 変わる。新規ツール追加時はこの表を意図して更新すること。
+    #[test]
+    fn destructive_classification_is_pinned() {
+        let r = default_registry();
+        let mut destructive: Vec<&str> = Vec::new();
+        let mut read_only: Vec<&str> = Vec::new();
+        for name in r.names() {
+            if r.get(name).unwrap().is_destructive() {
+                destructive.push(name);
+            } else {
+                read_only.push(name);
+            }
+        }
+        assert_eq!(
+            destructive,
+            vec![
+                "Bash",
+                "Edit",
+                "KillShell",
+                "MultiEdit",
+                "NotebookEdit",
+                "Write"
+            ]
+        );
+        assert_eq!(
+            read_only,
+            vec![
+                "AskUserQuestion",
+                "Glob",
+                "Grep",
+                "Monitor",
+                "Read",
+                "TodoWrite",
+                "WebFetch",
+                "WebSearch"
+            ]
+        );
+    }
+
+    /// 既定 (オーバーライドなし) は安全側 = destructive 扱い (#52)。
+    #[test]
+    fn default_is_destructive_for_unclassified_tools() {
+        let d = Dyn {
+            n: "unclassified".into(),
+            d: "no is_destructive override".into(),
+        };
+        assert!(d.is_destructive(), "unclassified tools must be safe-side");
+    }
+
     /// read_only_tool_specs は破壊的ツールを除き、読み取り系は残す。
     #[test]
     fn read_only_specs_exclude_destructive() {

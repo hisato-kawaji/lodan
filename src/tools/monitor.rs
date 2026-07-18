@@ -28,6 +28,11 @@ impl Tool for Monitor {
         })
     }
 
+    fn is_destructive(&self) -> bool {
+        // read-only: バックグラウンド出力の閲覧のみ
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

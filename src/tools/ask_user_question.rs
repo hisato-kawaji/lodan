@@ -35,6 +35,11 @@ impl Tool for AskUserQuestion {
         })
     }
 
+    fn is_destructive(&self) -> bool {
+        // 対話のみ: 副作用なし
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

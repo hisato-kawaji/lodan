@@ -29,6 +29,11 @@ impl Tool for Glob {
         })
     }
 
+    fn is_destructive(&self) -> bool {
+        // read-only: パス列挙のみ
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

@@ -51,6 +51,9 @@ pub struct ProviderConfig {
     /// `0` で自動圧縮を無効化。サービング側の実効窓 (例: ollama の `num_ctx`)
     /// と合わせること。
     pub context_window: u64,
+    /// サンプリング温度。None (既定) はリクエストに含めずサーバ既定に従う。
+    /// 小型ローカルモデルはツールコール整形が崩れやすいため 0.1-0.2 を推奨 (#61)。
+    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +102,7 @@ impl ProviderConfig {
             api_key: String::new(),
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            temperature: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl ProviderConfig {
             api_key: String::new(),
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            temperature: None,
         }
     }
 }

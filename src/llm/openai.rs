@@ -17,6 +17,8 @@ use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
 pub struct OpenAiClient {
     base_url: String,
     api_key: String,
+    /// None はリクエストに含めない (サーバ既定)。#61: 小型モデルの整形安定用。
+    temperature: Option<f32>,
     http: reqwest::Client,
 }
 
@@ -29,6 +31,7 @@ impl OpenAiClient {
         Ok(Self {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
+            temperature: cfg.temperature,
             http,
         })
     }
@@ -44,6 +47,8 @@ struct ChatRequest<'a> {
     tool_choice: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     stream: bool,
     /// ストリーミング時に最終チャンクへ usage を含めるよう要求する
     /// (OpenAI / vLLM / llama.cpp が対応。非対応サーバは無視する)。
@@ -111,6 +116,7 @@ impl LlmClient for OpenAiClient {
             tools,
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens,
+            temperature: self.temperature,
             stream: false,
             stream_options: None,
         };
@@ -172,6 +178,7 @@ impl LlmClient for OpenAiClient {
             tools,
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens: None,
+            temperature: self.temperature,
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
@@ -385,6 +392,7 @@ mod tests {
             tools: &[],
             tool_choice: None,
             max_tokens: None,
+            temperature: None,
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
@@ -400,5 +408,32 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("stream_options").is_none());
+    }
+
+    /// temperature は None なら省略・Some なら数値で入る (#61)。
+    #[test]
+    fn request_temperature_omitted_unless_set() {
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &[],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+            stream_options: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(
+            json.get("temperature").is_none(),
+            "unset temperature must not appear in the request"
+        );
+
+        let req = ChatRequest {
+            temperature: Some(0.2),
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!((json["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
     }
 }

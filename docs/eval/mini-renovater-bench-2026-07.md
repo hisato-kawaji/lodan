@@ -50,6 +50,18 @@ printf 'FROM qwen3.5:9b\nPARAMETER num_ctx 16384\n' > Modelfile && ollama create
 MODEL=qwen35-9b-16k PROVIDER=local LABEL=qwen3.5-9b TIMEOUT=720 bash mini_renovater_bench.sh
 ```
 
+## 考察 — なぜ軽量ローカルモデルは失敗したか
+
+ollama サーバログ(モデル別ツールコールパーサ `qwen35.go` / `gemma4.go` の WARN)に決定的な証拠が残っていた。
+
+1. **ツールコール整形の破綻(最大要因)**: qwen3.5 は呼び出しの XML を閉じられない(`XML syntax error: unexpected EOF`)。gemma4 は Edit 引数のコード文字列に思考の独り言(`# Wait, rglob is what I need`)や制御トークン(`<|tool_call><|channel>thought`)が混入し、ollama の repair 機構でも JSON 修復不能。パース不能の呼び出しはテキスト扱い・ストリーム異常として現れる — スコアカードの「no tools FAIL」と「SSE chunk error」(gemma 10 ステージ中 4 つ)の正体。数百行のファイルを 1 つの構造化引数として無傷で出し続ける能力がこのサイズ帯には足りない。
+2. **計画だけ述べて実行しない**: qwen-ext S3 は計画文のみ・tool_calls ゼロで 51s 終了(ReAct の典型的小型モデル失敗)。
+3. **自己修正スラッシング**: qwen-ext S1 は renovater.py を 7 回書き直し + 綴り違いの renovator.py を生成。長い生成中に自分の識別子への一貫性が保てない。
+4. **思考トークンの浪費(qwen3.5)**: base 版 S2-S4 は方向性の正しい作業中 TIMEOUT。ただし延長版では 1-3 の破綻が先に来るため、根本は速度でない。
+5. **破綻確率の累積**: 単発小タスク(fugu 10/10 の粒度)は呼び出し 1-2 回で成立するが、本ベンチは長大 Write × 多段呼び出し × 5 ステージで、呼び出しごとの整形成功率の積が実質ゼロに落ちる。温度未指定(ollama 既定 ~0.8)の揺れが S1 の PASS/FAIL フリップ(分散)として現れた。
+
+**検証可能な改善仮説**: 温度 0.1-0.2 固定(Modelfile)/ 引数を小さくする誘導(小さな Edit の積み重ね・heredoc)/ ステージ細分化 / 品質未測定のまま中断した qwen3-coder:30b の再測定。
+
 ## 運用上の教訓(ローカルモデルをベンチする人へ)
 
 - **cold start**: 大型モデルの初回ロードが lodan の `timeout_secs`(既定 120)を超え全滅する。ハーネスは (a) 作業 cwd の `.lodan/config.toml` で 600s に引き上げ、(b) ベンチ前に `keep_alive` 付きでプリウォームする。

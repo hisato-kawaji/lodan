@@ -112,6 +112,11 @@ impl Session {
         };
         self.history.push(Message::User { content });
 
+        // #61: 小型ローカルモデル対策の状態 (いずれもターン内スコープ)。
+        // 壊れツールコール再要求の回数と、直前のツール呼び出し (重複検知用)。
+        let mut malformed_retries = 0u32;
+        let mut last_call: Option<(String, String)> = None;
+
         for _ in 0..self.cfg.agent.max_iterations {
             // Plan 中は read-only specs に ExitPlanMode (承認要求の擬似ツール) を
             // 加える。Normal では不可視。モードはターン途中でも切り替わり得る
@@ -137,6 +142,27 @@ impl Session {
 
             if tool_calls.is_empty() {
                 println!();
+                // #61: ツール呼び出しがテキストとして漏れてきた (サーバ側でパース
+                // できず素通しになった) 痕跡があれば、正しい形式での再発行を求めて
+                // ターンを継続する。誤検知してもナッジが 1 回入るだけで無害。
+                if malformed_retries < MAX_MALFORMED_RETRIES
+                    && resp
+                        .content
+                        .as_deref()
+                        .is_some_and(looks_like_malformed_tool_call)
+                {
+                    malformed_retries += 1;
+                    println!(
+                        "{}",
+                        crate::term::dim(
+                            "[lodan] malformed tool-call markup detected — asking the model to re-issue"
+                        )
+                    );
+                    self.history.push(Message::User {
+                        content: MALFORMED_CALL_NOTE.to_string(),
+                    });
+                    continue;
+                }
                 // Stop hook: 停止をブロックされたら reason をユーザ入力として注入し継続する。
                 // これが /goal（達成条件までターン継続）の土台になる。
                 let stop_payload = serde_json::json!({
@@ -184,6 +210,12 @@ impl Session {
                     }
                     out
                 } else {
+                    // #61: 直前と同一の read-only 呼び出しは結果が変わらないため
+                    // 実行せず、別の行動を促す (gemma 系の同一 Read 反復対策)。
+                    // Bash 再実行など破壊系の正当な繰り返しは対象外。
+                    let dup_of_last = last_call
+                        .as_ref()
+                        .is_some_and(|(n, a)| *n == name && *a == call.function.arguments);
                     match self.registry.get(&name) {
                         None => ToolOutput::error(format!("unknown tool: {name}")),
                         // specs から隠していても呼ばれ得るので実行側でも防ぐ (多層防御)。
@@ -191,6 +223,12 @@ impl Session {
                             ToolOutput::error(format!(
                                 "plan mode: destructive tool '{name}' is disabled. Investigate with \
                              read-only tools and present a plan; the user approves it with /accept."
+                            ))
+                        }
+                        Some(tool) if dup_of_last && !tool.is_destructive() => {
+                            ToolOutput::error(format!(
+                                "identical read-only call to '{name}' repeated — the result is \
+                                 unchanged. Use the previous result and take a different next action."
                             ))
                         }
                         Some(tool) => {
@@ -252,6 +290,7 @@ impl Session {
                     crate::term::cyan(&tag)
                 };
                 println!("{tag} {}", display_tool_output(&name, &output));
+                last_call = Some((name.clone(), call.function.arguments.clone()));
                 self.history.push(Message::Tool {
                     tool_call_id: call.id,
                     content: output.content,
@@ -600,6 +639,47 @@ pub(crate) const EXIT_PLAN_MODE: &str = "ExitPlanMode";
 /// `/undo` の巻き戻し対象 (args の `path` を変更前退避するファイル系ツール)。
 /// Bash 等の副作用は巻き戻せないため対象外。
 const UNDOABLE_FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// #61: 壊れツールコール再要求のターン内上限 (無限ループ防止)。
+const MAX_MALFORMED_RETRIES: u32 = 2;
+
+/// #61: 壊れツールコール検知時に注入する修正指示。
+const MALFORMED_CALL_NOTE: &str = "[lodan] Your previous reply contained tool-call markup as \
+    plain text, so nothing was executed. Re-issue the action as a proper tool call via the \
+    tools API — do not write the call inside your message text.";
+
+/// ツール呼び出しがテキストへ漏れた痕跡か (#61)。小型ローカルモデルは呼び出しの
+/// XML/JSON をサーバ側でパースできない形で出力しがちで、その場合 OpenAI 互換 API
+/// からは「tool_calls なしの普通のテキスト」として届く。ollama ログで実際に観測した
+/// マーカー (qwen 系の `<function=`、gemma 系の `call:Name{`、制御トークン
+/// `<|tool_call`) を対象にする。誤検知しても修正指示が 1 回入るだけで無害。
+pub(crate) fn looks_like_malformed_tool_call(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<function=",
+        "<function>",
+        "</function>",
+        "<tool_call",
+        "</tool_call",
+        "<|tool_call",
+    ];
+    if MARKERS.iter().any(|m| text.contains(m)) {
+        return true;
+    }
+    // gemma 系の "call:Edit{…}" 形式: `call:` の直後が大文字で始まり、
+    // 近傍に `{` が現れるものだけを対象にする ("call: me later" は対象外)。
+    let mut start = 0;
+    while let Some(pos) = text[start..].find("call:") {
+        let after = start + pos + "call:".len();
+        let rest = &text[after..];
+        if rest.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && rest.chars().take(40).any(|c| c == '{')
+        {
+            return true;
+        }
+        start = after;
+    }
+    false
+}
 
 /// ExitPlanMode の spec (Plan モード中のみ LLM へ提示)。
 fn exit_plan_mode_spec() -> crate::agent::messages::ToolSpec<'static> {
@@ -1346,6 +1426,159 @@ mod tests {
             .collect();
         assert!(users[0].starts_with("[plan mode]") && users[0].contains("investigate"));
         assert_eq!(users[1], "execute");
+    }
+
+    /// テキスト応答を順に返すモック (tool_calls なし)。尽きたら最後を繰り返す。
+    struct TextSeqLlm {
+        texts: Vec<String>,
+        idx: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for TextSeqLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("not used")
+        }
+
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let i = self
+                .idx
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .min(self.texts.len() - 1);
+            let _ = sink.send(ChatEvent::Done(ChatResponse {
+                content: Some(self.texts[i].clone()),
+                tool_calls: vec![],
+                usage: None,
+            }));
+            Ok(())
+        }
+    }
+
+    /// 実観測マーカー (qwen の <function= / gemma の call:Name{ / 制御トークン) を
+    /// 検知し、日常文は誤検知しない。
+    #[test]
+    fn malformed_tool_call_markers_detected() {
+        assert!(looks_like_malformed_tool_call(
+            "I'll write it: <function=Write>{\"path\":\"x\"}</function>"
+        ));
+        assert!(looks_like_malformed_tool_call(
+            "call:Edit{\"new_string\":\"def f():\"}"
+        ));
+        assert!(looks_like_malformed_tool_call("<|tool_call|>Read"));
+        assert!(!looks_like_malformed_tool_call(
+            "I'll call the function later."
+        ));
+        assert!(!looks_like_malformed_tool_call(
+            "please call: me maybe {later}"
+        ));
+        assert!(!looks_like_malformed_tool_call("plain answer"));
+    }
+
+    /// 壊れツールコールのテキスト応答 → 修正指示を注入して継続し、次で収束する。
+    #[tokio::test]
+    async fn malformed_text_reply_triggers_reissue() {
+        let llm = TextSeqLlm {
+            texts: vec!["call:Write{\"path\":\"a.txt\"}".into(), "done".into()],
+            idx: 0.into(),
+        };
+        let mut session = session_with_stop_hook(None);
+        let gate = PermissionGate::new(true);
+        session.run_turn("go", &llm, &gate).await.unwrap();
+        let notes = session
+            .history()
+            .iter()
+            .filter(
+                |m| matches!(m, Message::User { content } if content.contains("Re-issue the action")),
+            )
+            .count();
+        assert_eq!(notes, 1, "one corrective note should be injected");
+    }
+
+    /// 常に壊れた応答でも再要求は 2 回まで、ターンは正常終了する。
+    #[tokio::test]
+    async fn malformed_reissue_capped_at_two() {
+        let llm = TextSeqLlm {
+            texts: vec!["<function=Write>{\"path\":\"x\"}".into()],
+            idx: 0.into(),
+        };
+        let mut session = session_with_stop_hook(None);
+        let gate = PermissionGate::new(true);
+        session.run_turn("go", &llm, &gate).await.unwrap();
+        let notes = session
+            .history()
+            .iter()
+            .filter(
+                |m| matches!(m, Message::User { content } if content.contains("Re-issue the action")),
+            )
+            .count();
+        assert_eq!(notes, MAX_MALFORMED_RETRIES as usize);
+    }
+
+    /// 直前と同一の read-only 呼び出しは実行されず、別行動を促す応答になる。
+    #[tokio::test]
+    async fn duplicate_readonly_call_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "hello dup").unwrap();
+        let args = format!(r#"{{"path": "{}"}}"#, f.display());
+        let llm = CallThenDoneLlm {
+            calls: vec![
+                tool_call_with_args("r1", "Read", &args),
+                tool_call_with_args("r2", "Read", &args),
+            ],
+            called: false.into(),
+        };
+        let mut session = session_with_stop_hook(None);
+        let gate = PermissionGate::new(true);
+        session.run_turn("read twice", &llm, &gate).await.unwrap();
+
+        let first_executed = session.history().iter().any(|m| matches!(
+            m,
+            Message::Tool { tool_call_id, content } if tool_call_id == "r1" && content.contains("hello dup")
+        ));
+        let second_skipped = session.history().iter().any(|m| matches!(
+            m,
+            Message::Tool { tool_call_id, content } if tool_call_id == "r2" && content.contains("repeated")
+        ));
+        assert!(first_executed, "first read must execute normally");
+        assert!(second_skipped, "identical second read must be skipped");
+    }
+
+    /// 破壊系 (Bash/Write 等) の同一呼び出し反復は正当なので止めない。
+    #[tokio::test]
+    async fn duplicate_destructive_call_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("out.txt");
+        let args = format!(r#"{{"path": "{}", "content": "x"}}"#, f.display());
+        let llm = CallThenDoneLlm {
+            calls: vec![
+                tool_call_with_args("w1", "Write", &args),
+                tool_call_with_args("w2", "Write", &args),
+            ],
+            called: false.into(),
+        };
+        let mut session = session_with_stop_hook(None);
+        let gate = PermissionGate::new(true);
+        session.run_turn("write twice", &llm, &gate).await.unwrap();
+
+        assert!(f.exists());
+        let skipped = session
+            .history()
+            .iter()
+            .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("repeated")));
+        assert!(!skipped, "destructive repeats must not be blocked");
     }
 
     /// run_turn の Write が undo 台帳に載り、undo_last_turn で巻き戻せる。

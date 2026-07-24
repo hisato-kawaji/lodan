@@ -100,6 +100,14 @@ cargo run --release -- \
 
 lodan が「LLM が応答するだけでツールが起きない」場合は、まず量子化を Q5_K_M 以上に上げるか、Llama-3.1-8B-Instruct のような instruction-following が強いモデルに切り替えると良い。
 
+### 小型ローカルモデル向けのロバスト化
+
+小型モデルはツール呼び出しの XML/JSON を崩しがち(サーバ側でパース不能 → ただのテキストとして届く)なため、lodan は次の 3 つの対策を内蔵している:
+
+- **温度制御**: provider 設定の `temperature`(既定は未送信 = サーバ既定)。整形の破綻・綴りブレ・実行ごとの分散を抑えるには `0.1`〜`0.2` を推奨。
+- **壊れツールコールの再要求**: tool_calls が空なのに応答テキストへ呼び出しの痕跡(`<function=`、`call:Name{…}`、`<|tool_call` 等)が漏れている場合、「正しい tool call として再発行せよ」と自動で注入してターンを継続する(1 ターン 2 回まで)。
+- **重複呼び出しの抑止**: 直前と完全同一(名前 + 引数)の **read-only** 呼び出しは実行せず「結果は不変。別の行動を」と返す(同一ファイルを延々 Read するループ対策)。Bash 再実行など破壊系の正当な繰り返しは対象外。
+
 ## 設定
 
 階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
@@ -115,6 +123,7 @@ model          = "qwen2.5-coder:7b"
 api_key        = ""
 timeout_secs   = 120
 context_window = 32768   # モデルの文脈窓 (トークン)。自動圧縮のしきい値計算に使う。0 で自動圧縮無効
+# temperature  = 0.2     # 未設定ならリクエストに含めない (サーバ既定)。小型モデルは 0.1-0.2 推奨
 
 [llm.sakana]
 base_url       = "https://api.sakana.ai/v1"

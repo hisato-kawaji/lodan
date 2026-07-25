@@ -116,6 +116,9 @@ impl Session {
         // 壊れツールコール再要求の回数と、直前のツール呼び出し (重複検知用)。
         let mut malformed_retries = 0u32;
         let mut last_call: Option<(String, String)> = None;
+        // #63: 終了前自己検証ナッジの状態 (ターン内でツールを使ったか / 注入済みか)。
+        let mut used_tools = false;
+        let mut finish_nudged = false;
 
         for _ in 0..self.cfg.agent.max_iterations {
             // Plan 中は read-only specs に ExitPlanMode (承認要求の擬似ツール) を
@@ -163,6 +166,22 @@ impl Session {
                     });
                     continue;
                 }
+                // #63: 終了前自己検証ナッジ (opt-in、1 ターン 1 回)。ターンが終わろうと
+                // する最初の応答で、「未実行なら実行を」「実行済みなら元の依頼と照合を」
+                // と促して継続させる。2 回目の終了試行はそのまま通す。
+                if self.cfg.agent.finish_nudge && !finish_nudged {
+                    finish_nudged = true;
+                    let note = if used_tools {
+                        FINISH_NUDGE_VERIFY
+                    } else {
+                        FINISH_NUDGE_ACT
+                    };
+                    println!("{}", crate::term::dim("[lodan] finish nudge"));
+                    self.history.push(Message::User {
+                        content: note.to_string(),
+                    });
+                    continue;
+                }
                 // Stop hook: 停止をブロックされたら reason をユーザ入力として注入し継続する。
                 // これが /goal（達成条件までターン継続）の土台になる。
                 let stop_payload = serde_json::json!({
@@ -186,6 +205,7 @@ impl Session {
 
             // 改行を入れてツール出力との視認性を確保
             println!();
+            used_tools = true;
 
             // ExitPlanMode 承認でモードが Plan → Normal に変わった後、同一バッチの
             // 残り tool_call を実行すると plan ガードを素通りしてしまうため、
@@ -642,6 +662,17 @@ const UNDOABLE_FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEd
 
 /// #61: 壊れツールコール再要求のターン内上限 (無限ループ防止)。
 const MAX_MALFORMED_RETRIES: u32 = 2;
+
+/// #63: 終了前ナッジ (ターン内ツール未使用のとき) — plan-only 停止対策。
+const FINISH_NUDGE_ACT: &str = "[lodan] You are about to finish without executing anything. If \
+    the request requires action, do it NOW using the tools (do not describe the plan again). If \
+    the request truly needs no action, reply with your final answer.";
+
+/// #63: 終了前ナッジ (ツール使用済みのとき) — 要件の実装漏れ対策。
+const FINISH_NUDGE_VERIFY: &str = "[lodan] Before you finish: re-read the original request and \
+    check that EVERY stated requirement is implemented and verified (run the verification \
+    command if one was given, and confirm required files/outputs actually exist). If anything \
+    is missing or unverified, continue working now; otherwise give your final answer.";
 
 /// #61: 壊れツールコール検知時に注入する修正指示。
 const MALFORMED_CALL_NOTE: &str = "[lodan] Your previous reply contained tool-call markup as \
@@ -1579,6 +1610,99 @@ mod tests {
             .iter()
             .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("repeated")));
         assert!(!skipped, "destructive repeats must not be blocked");
+    }
+
+    fn session_with_finish_nudge() -> Session {
+        let mut cfg = Config::default();
+        cfg.agent.finish_nudge = true;
+        Session::new(cfg, Arc::new(default_registry()))
+    }
+
+    /// 既定 (finish_nudge=false) ではナッジは注入されない。
+    #[tokio::test]
+    async fn finish_nudge_off_by_default() {
+        let mut session = session_with_stop_hook(None);
+        let llm = FinalTextLlm {
+            text: "done".into(),
+            usage: None,
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("hi", &llm, &gate).await.unwrap();
+        assert!(
+            !session
+                .history()
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content.starts_with("[lodan]"))),
+            "no nudges when disabled"
+        );
+    }
+
+    /// ツール未使用でターンが終わろうとしたら「今実行せよ」ナッジが 1 回入る。
+    #[tokio::test]
+    async fn finish_nudge_prompts_action_when_no_tools() {
+        let mut session = session_with_finish_nudge();
+        let llm = TextSeqLlm {
+            texts: vec!["I plan to create the file.".into(), "done".into()],
+            idx: 0.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("make it", &llm, &gate).await.unwrap();
+        let acts = session
+            .history()
+            .iter()
+            .filter(
+                |m| matches!(m, Message::User { content } if content.contains("without executing anything")),
+            )
+            .count();
+        assert_eq!(acts, 1, "action nudge exactly once");
+    }
+
+    /// ツール使用後の終了時は「元の依頼と照合せよ」ナッジに切り替わる。
+    #[tokio::test]
+    async fn finish_nudge_verifies_after_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "x").unwrap();
+        let args = format!(r#"{{"path": "{}"}}"#, f.display());
+        let mut session = session_with_finish_nudge();
+        let llm = CallThenDoneLlm::one(tool_call_with_args("r1", "Read", &args));
+        let gate = PermissionGate::new(true);
+        session.run_turn("read it", &llm, &gate).await.unwrap();
+
+        let verifies = session
+            .history()
+            .iter()
+            .filter(
+                |m| matches!(m, Message::User { content } if content.contains("re-read the original request")),
+            )
+            .count();
+        let acts = session
+            .history()
+            .iter()
+            .filter(
+                |m| matches!(m, Message::User { content } if content.contains("without executing anything")),
+            )
+            .count();
+        assert_eq!(verifies, 1, "verify nudge exactly once");
+        assert_eq!(acts, 0, "action nudge must not fire after tool use");
+    }
+
+    /// 常にテキストだけ返すモデルでもナッジは 1 回で打ち止め (2 回目の終了は通す)。
+    #[tokio::test]
+    async fn finish_nudge_fires_at_most_once() {
+        let mut session = session_with_finish_nudge();
+        let llm = TextSeqLlm {
+            texts: vec!["just talking".into()],
+            idx: 0.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("hi", &llm, &gate).await.unwrap();
+        let nudges = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content.starts_with("[lodan]")))
+            .count();
+        assert_eq!(nudges, 1);
     }
 
     /// run_turn の Write が undo 台帳に載り、undo_last_turn で巻き戻せる。

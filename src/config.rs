@@ -61,6 +61,10 @@ pub struct ProviderConfig {
 pub struct AgentConfig {
     pub max_iterations: usize,
     pub auto_approve: bool,
+    /// ターン終了直前に 1 回だけ自己検証を促す (#63)。小型ローカルモデルの
+    /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
+    /// (良行儀なモデルに余計な LLM ラウンドトリップを課さない)。
+    pub finish_nudge: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,6 +127,7 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 25,
             auto_approve: false,
+            finish_nudge: false,
         }
     }
 }

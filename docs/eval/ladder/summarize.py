@@ -23,7 +23,12 @@ CONFIG_ORDER = ["base", "temp", "mitig", "nudge"]
 
 
 def load(path: Path, label: str | None) -> list[dict]:
-    rows = []
+    """結果を読み、key の重複は後勝ちで畳む。
+
+    実行中のハーネスを kill すると、生き残った子シェルと再開後の実行が同じ key を
+    二重に追記することがある。二重計上を防ぐため、最後の測定を採用する。
+    """
+    rows: dict[str, dict] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -34,14 +39,34 @@ def load(path: Path, label: str | None) -> list[dict]:
             continue
         if label and row.get("label") != label:
             continue
-        rows.append(row)
-    return rows
+        rows[row.get("key") or str(len(rows))] = row
+    return list(rows.values())
 
 
 def pct(numerator: float, denominator: float) -> str:
     if not denominator:
         return "-"
     return f"{100 * numerator / denominator:.0f}%"
+
+
+def duration(row: dict) -> int:
+    """秒。単調時計 (lodan 側 turn_end.ms) を優先する。
+
+    ハーネスが記録する `secs` は壁時計なので、実行中にマシンがスリープすると
+    実作業と無関係に膨らむ (実測で 372s の作業が 35,793s と記録された)。
+    """
+    active = (row.get("metrics") or {}).get("active_ms") or 0
+    return round(active / 1000) if active else row["secs"]
+
+
+def slept(row: dict) -> bool:
+    """壁時計が単調時計から大きく乖離した = 途中でスリープした疑いがある。"""
+    active = (row.get("metrics") or {}).get("active_ms") or 0
+    return bool(active) and row["secs"] > 2 * (active / 1000) + 120
+
+
+def median(values: list[int]) -> int:
+    return sorted(values)[len(values) // 2]
 
 
 def config_key(name: str) -> tuple[int, str]:
@@ -103,7 +128,6 @@ def summarize_ablation(rows: list[dict]) -> str:
     for cfg in sorted(buckets, key=config_key):
         runs = buckets[cfg]
         m = [r.get("metrics") or {} for r in runs]
-        secs = sorted(r["secs"] for r in runs)
         body.append(
             [
                 cfg,
@@ -115,7 +139,7 @@ def summarize_ablation(rows: list[dict]) -> str:
                 str(sum(x.get("malformed_retries", 0) for x in m)),
                 str(sum(x.get("dup_suppressed", 0) for x in m)),
                 str(sum(x.get("finish_nudges", 0) for x in m)),
-                str(secs[len(secs) // 2]),
+                str(median([duration(r) for r in runs])),
             ]
         )
     return table(header, body)
@@ -135,7 +159,6 @@ def summarize_tasks(rows: list[dict]) -> str:
         for r in runs:
             for name in (r.get("failed_checks") or "").split():
                 failed[name] += 1
-        secs = sorted(r["secs"] for r in runs)
         worst = ", ".join(
             f"{n}×{c}" for n, c in sorted(failed.items(), key=lambda kv: -kv[1])[:4]
         )
@@ -146,7 +169,7 @@ def summarize_tasks(rows: list[dict]) -> str:
                 f"{sum(1 for r in runs if r['status'] == 'pass')}/{len(runs)}",
                 pct(sum(r["checks_passed"] for r in runs), sum(r["checks_total"] for r in runs)),
                 worst or "-",
-                str(secs[len(secs) // 2]),
+                str(median([duration(r) for r in runs])),
             ]
         )
     return table(header, body)
@@ -168,12 +191,26 @@ def main() -> int:
 
     labels = sorted({r["label"] for r in rows})
     print(f"# ladder results — {', '.join(labels)} ({len(rows)} runs)\n")
+    if len(labels) > 1:
+        # config ごとにモデルの構成比が違うと ablation 表が交絡する。
+        print(
+            "> 複数モデルを混ぜて集計しています。config 比較は `--label <model>` で\n"
+            "> モデルを固定してから読むこと (config ごとに実行したモデルの構成が\n"
+            "> 違うと、config の差ではなくモデルの差を見ることになります)。\n"
+        )
     print("## レベル別到達率 (run 合格率 / チェック通過率)\n")
     print(summarize_levels(rows))
     print("\n## ablation\n")
     print(summarize_ablation(rows))
     print("\n## タスク別\n")
     print(summarize_tasks(rows))
+
+    # スリープを跨いだ実行は壁時計が無意味になるので明示する (判定自体は有効)。
+    suspicious = [r for r in rows if slept(r)]
+    if suspicious:
+        print("\n## 注記: 壁時計が単調時計から乖離した実行 (途中でスリープ)\n")
+        for r in suspicious:
+            print(f"- {r['key']}: 壁時計 {r['secs']}s / 実作業 {duration(r)}s")
     return 0
 
 

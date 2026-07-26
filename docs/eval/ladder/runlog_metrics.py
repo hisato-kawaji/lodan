@@ -47,6 +47,9 @@ def collect(path: Path) -> dict:
         "dup_suppressed": reasons.get("dup_readonly", 0),
         "denied": reasons.get("denied", 0),
         "compactions": by_event.get("compact", 0),
+        # ターン所要の合計。lodan 側は単調時計 (Rust Instant) で測っているため、
+        # 実行中にマシンがスリープしても伸びない。壁時計の secs より信頼できる。
+        "active_ms": sum(e.get("ms", 0) for e in turn_ends),
         "iterations": sum(e.get("iterations", 0) for e in turn_ends),
         "hit_max_iterations": sum(1 for e in turn_ends if e.get("reason") == "max_iterations"),
         "prompt_tokens": sum(e.get("prompt_tokens", 0) for e in llm_rows),

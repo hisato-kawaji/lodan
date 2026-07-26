@@ -120,7 +120,21 @@ impl Session {
         let mut used_tools = false;
         let mut finish_nudged = false;
 
+        // 評価ハーネス向けの計測 (runlog 無効時はいずれも no-op)。
+        let turn_started = std::time::Instant::now();
+        let mut iterations = 0usize;
+        let mut tool_calls_total = 0usize;
+        crate::runlog::record(
+            "turn_start",
+            serde_json::json!({
+                "turn": self.turn_seq,
+                "mode": match self.mode { Mode::Plan => "plan", Mode::Normal => "normal" },
+                "input_chars": user_input.chars().count(),
+            }),
+        );
+
         for _ in 0..self.cfg.agent.max_iterations {
+            iterations += 1;
             // Plan 中は read-only specs に ExitPlanMode (承認要求の擬似ツール) を
             // 加える。Normal では不可視。モードはターン途中でも切り替わり得る
             // (ExitPlanMode 承認直後) ため、毎イテレーション組み直す。
@@ -136,6 +150,18 @@ impl Session {
                 stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
             let (u, estimated) = resolve_usage(&resp, &self.history);
             self.usage.record(u, estimated);
+            crate::runlog::record(
+                "llm_response",
+                serde_json::json!({
+                    "turn": self.turn_seq,
+                    "iter": iterations,
+                    "text_chars": resp.content.as_deref().map(str::len).unwrap_or(0),
+                    "tool_calls": resp.tool_calls.iter().map(|c| c.function.name.as_str()).collect::<Vec<_>>(),
+                    "prompt_tokens": u.prompt_tokens,
+                    "completion_tokens": u.completion_tokens,
+                    "estimated": estimated,
+                }),
+            );
 
             let tool_calls = resp.tool_calls.clone();
             self.history.push(Message::Assistant {
@@ -148,7 +174,8 @@ impl Session {
                 // #61: ツール呼び出しがテキストとして漏れてきた (サーバ側でパース
                 // できず素通しになった) 痕跡があれば、正しい形式での再発行を求めて
                 // ターンを継続する。誤検知してもナッジが 1 回入るだけで無害。
-                if malformed_retries < MAX_MALFORMED_RETRIES
+                if self.cfg.agent.malformed_retry
+                    && malformed_retries < MAX_MALFORMED_RETRIES
                     && resp
                         .content
                         .as_deref()
@@ -160,6 +187,14 @@ impl Session {
                         crate::term::dim(
                             "[lodan] malformed tool-call markup detected — asking the model to re-issue"
                         )
+                    );
+                    crate::runlog::record(
+                        "malformed_retry",
+                        serde_json::json!({
+                            "turn": self.turn_seq,
+                            "iter": iterations,
+                            "n": malformed_retries,
+                        }),
                     );
                     self.history.push(Message::User {
                         content: MALFORMED_CALL_NOTE.to_string(),
@@ -177,6 +212,14 @@ impl Session {
                         FINISH_NUDGE_ACT
                     };
                     println!("{}", crate::term::dim("[lodan] finish nudge"));
+                    crate::runlog::record(
+                        "finish_nudge",
+                        serde_json::json!({
+                            "turn": self.turn_seq,
+                            "iter": iterations,
+                            "kind": if used_tools { "verify" } else { "act" },
+                        }),
+                    );
                     self.history.push(Message::User {
                         content: note.to_string(),
                     });
@@ -193,10 +236,21 @@ impl Session {
                 {
                     HookOutcome::Continue => {
                         self.maybe_auto_compact(llm).await;
+                        record_turn_end(
+                            self.turn_seq,
+                            iterations,
+                            tool_calls_total,
+                            "final",
+                            turn_started,
+                        );
                         return Ok(());
                     }
                     HookOutcome::Block(reason) => {
                         println!("{}", crate::term::dim(&format!("[stop hook] {reason}")));
+                        crate::runlog::record(
+                            "stop_hook_block",
+                            serde_json::json!({ "turn": self.turn_seq, "iter": iterations }),
+                        );
                         self.history.push(Message::User { content: reason });
                         continue;
                     }
@@ -216,7 +270,13 @@ impl Session {
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
 
+                // 何が起きたかを 1 語で記録する (ablation で緩和策の発火回数を数える)。
+                let mut reason = TOOL_REASON_OK;
+                let call_started = std::time::Instant::now();
+                tool_calls_total += 1;
+
                 let mut output = if plan_just_approved {
+                    reason = "skipped_after_plan";
                     ToolOutput::error(format!(
                         "skipped '{name}': the plan was approved earlier in this same response. \
                          Re-issue this tool call in your next response now that plan mode is exited."
@@ -233,19 +293,25 @@ impl Session {
                     // #61: 直前と同一の read-only 呼び出しは結果が変わらないため
                     // 実行せず、別の行動を促す (gemma 系の同一 Read 反復対策)。
                     // Bash 再実行など破壊系の正当な繰り返しは対象外。
-                    let dup_of_last = last_call
-                        .as_ref()
-                        .is_some_and(|(n, a)| *n == name && *a == call.function.arguments);
+                    let dup_of_last = self.cfg.agent.dup_suppress
+                        && last_call
+                            .as_ref()
+                            .is_some_and(|(n, a)| *n == name && *a == call.function.arguments);
                     match self.registry.get(&name) {
-                        None => ToolOutput::error(format!("unknown tool: {name}")),
+                        None => {
+                            reason = "unknown_tool";
+                            ToolOutput::error(format!("unknown tool: {name}"))
+                        }
                         // specs から隠していても呼ばれ得るので実行側でも防ぐ (多層防御)。
                         Some(tool) if self.mode == Mode::Plan && tool.is_destructive() => {
+                            reason = "plan_blocked";
                             ToolOutput::error(format!(
                                 "plan mode: destructive tool '{name}' is disabled. Investigate with \
                              read-only tools and present a plan; the user approves it with /accept."
                             ))
                         }
                         Some(tool) if dup_of_last && !tool.is_destructive() => {
+                            reason = "dup_readonly";
                             ToolOutput::error(format!(
                                 "identical read-only call to '{name}' repeated — the result is \
                                  unchanged. Use the previous result and take a different next action."
@@ -262,20 +328,25 @@ impl Session {
                             )
                             .await?
                             {
-                                HookOutcome::Block(reason) => {
-                                    ToolOutput::error(format!("blocked by hook: {reason}"))
+                                HookOutcome::Block(hook_reason) => {
+                                    reason = "hook_blocked";
+                                    ToolOutput::error(format!("blocked by hook: {hook_reason}"))
                                 }
                                 HookOutcome::Continue => {
                                     let approved =
                                         !tool.is_destructive() || gate.allow(tool.name(), &args);
                                     if !approved {
+                                        reason = "denied";
                                         ToolOutput::error("user denied execution")
                                     } else {
                                         // 実行が確定してから変更前を退避する (/undo 用)。
                                         self.snapshot_for_undo(&name, &args);
                                         match tool.execute(args.clone(), &self.ctx).await {
                                             Ok(o) => o,
-                                            Err(e) => ToolOutput::error(format!("tool error: {e}")),
+                                            Err(e) => {
+                                                reason = "tool_error";
+                                                ToolOutput::error(format!("tool error: {e}"))
+                                            }
                                         }
                                     }
                                 }
@@ -310,6 +381,23 @@ impl Session {
                     crate::term::cyan(&tag)
                 };
                 println!("{tag} {}", display_tool_output(&name, &output));
+                // ツール自身がエラー出力を返した場合はループ側の分類が付かないので補う。
+                if reason == TOOL_REASON_OK && output.is_error {
+                    reason = "tool_reported_error";
+                }
+                crate::runlog::record(
+                    "tool_result",
+                    serde_json::json!({
+                        "turn": self.turn_seq,
+                        "iter": iterations,
+                        "name": name,
+                        "outcome": if output.is_error { "error" } else { "ok" },
+                        "reason": reason,
+                        "ms": call_started.elapsed().as_millis() as u64,
+                        "args_bytes": call.function.arguments.len(),
+                        "output_bytes": output.content.len(),
+                    }),
+                );
                 last_call = Some((name.clone(), call.function.arguments.clone()));
                 self.history.push(Message::Tool {
                     tool_call_id: call.id,
@@ -318,6 +406,13 @@ impl Session {
             }
         }
 
+        record_turn_end(
+            self.turn_seq,
+            iterations,
+            tool_calls_total,
+            "max_iterations",
+            turn_started,
+        );
         bail!(
             "hit max_iterations ({}) without final assistant text",
             self.cfg.agent.max_iterations
@@ -350,11 +445,23 @@ impl Session {
         // 上書きされるが、次ターンの stream_once が本来の値で再上書きするため
         // 連続発火にはならない。
         match self.compact(llm, "").await {
-            Ok(outcome) => println!("{}", crate::term::dim(&outcome.describe())),
-            Err(e) => println!(
-                "{}",
-                crate::term::red(&format!("auto-compact failed: {e:#}"))
-            ),
+            Ok(outcome) => {
+                println!("{}", crate::term::dim(&outcome.describe()));
+                crate::runlog::record(
+                    "compact",
+                    serde_json::json!({ "turn": self.turn_seq, "outcome": outcome.label() }),
+                );
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    crate::term::red(&format!("auto-compact failed: {e:#}"))
+                );
+                crate::runlog::record(
+                    "compact",
+                    serde_json::json!({ "turn": self.turn_seq, "outcome": "error" }),
+                );
+            }
         }
     }
 
@@ -628,6 +735,15 @@ pub enum CompactOutcome {
 }
 
 impl CompactOutcome {
+    /// runlog 用の 1 語ラベル。
+    pub fn label(&self) -> &'static str {
+        match self {
+            CompactOutcome::Compacted { .. } => "compacted",
+            CompactOutcome::Skipped => "skipped",
+            CompactOutcome::Failed => "failed",
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             CompactOutcome::Compacted { before, after } => {
@@ -641,6 +757,29 @@ impl CompactOutcome {
             }
         }
     }
+}
+
+/// runlog の `tool_result.reason` 既定値 (ループ側の介入なしに実行された)。
+const TOOL_REASON_OK: &str = "ok";
+
+/// ターン終了イベントを記録する (正常終了と max_iterations の両方から呼ぶ)。
+fn record_turn_end(
+    turn: u64,
+    iterations: usize,
+    tool_calls: usize,
+    reason: &str,
+    started: std::time::Instant,
+) {
+    crate::runlog::record(
+        "turn_end",
+        serde_json::json!({
+            "turn": turn,
+            "iterations": iterations,
+            "tool_calls": tool_calls,
+            "reason": reason,
+            "ms": started.elapsed().as_millis() as u64,
+        }),
+    );
 }
 
 /// 中断で補填する応答の本文。モデルに「途中で切られた」ことを伝える。
@@ -1557,6 +1696,27 @@ mod tests {
         assert_eq!(notes, MAX_MALFORMED_RETRIES as usize);
     }
 
+    /// ablation: malformed_retry=false なら壊れ応答でも再要求せずターンを終える。
+    #[tokio::test]
+    async fn malformed_reissue_disabled_by_flag() {
+        let llm = TextSeqLlm {
+            texts: vec!["call:Write{\"path\":\"a.txt\"}".into(), "done".into()],
+            idx: 0.into(),
+        };
+        let mut cfg = Config::default();
+        cfg.agent.malformed_retry = false;
+        let mut session = Session::new(cfg, Arc::new(default_registry()));
+        let gate = PermissionGate::new(true);
+        session.run_turn("go", &llm, &gate).await.unwrap();
+        assert!(
+            !session
+                .history()
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content.contains("Re-issue the action"))),
+            "no corrective note when the mitigation is off"
+        );
+    }
+
     /// 直前と同一の read-only 呼び出しは実行されず、別行動を促す応答になる。
     #[tokio::test]
     async fn duplicate_readonly_call_skipped() {
@@ -1610,6 +1770,34 @@ mod tests {
             .iter()
             .any(|m| matches!(m, Message::Tool { content, .. } if content.contains("repeated")));
         assert!(!skipped, "destructive repeats must not be blocked");
+    }
+
+    /// ablation: dup_suppress=false なら同一 read-only 呼び出しも素通しで実行する。
+    #[tokio::test]
+    async fn duplicate_readonly_suppression_disabled_by_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "hello dup").unwrap();
+        let args = format!(r#"{{"path": "{}"}}"#, f.display());
+        let llm = CallThenDoneLlm {
+            calls: vec![
+                tool_call_with_args("r1", "Read", &args),
+                tool_call_with_args("r2", "Read", &args),
+            ],
+            called: false.into(),
+        };
+        let mut cfg = Config::default();
+        cfg.agent.dup_suppress = false;
+        let mut session = Session::new(cfg, Arc::new(default_registry()));
+        let gate = PermissionGate::new(true);
+        session.run_turn("read twice", &llm, &gate).await.unwrap();
+
+        let executed = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { content, .. } if content.contains("hello dup")))
+            .count();
+        assert_eq!(executed, 2, "both reads execute when suppression is off");
     }
 
     fn session_with_finish_nudge() -> Session {

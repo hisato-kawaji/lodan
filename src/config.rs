@@ -65,6 +65,12 @@ pub struct AgentConfig {
     /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
     /// (良行儀なモデルに余計な LLM ラウンドトリップを課さない)。
     pub finish_nudge: bool,
+    /// テキストとして漏れたツールコールを検知して正しい形式での再発行を求める
+    /// (#61)。既定 true。無効化できるのは ablation で寄与を測るため。
+    pub malformed_retry: bool,
+    /// 直前と同一の read-only 呼び出しを実行せず別の行動を促す (#61)。
+    /// 既定 true。無効化できるのは ablation で寄与を測るため。
+    pub dup_suppress: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -128,6 +134,8 @@ impl Default for AgentConfig {
             max_iterations: 25,
             auto_approve: false,
             finish_nudge: false,
+            malformed_retry: true,
+            dup_suppress: true,
         }
     }
 }
@@ -183,34 +191,56 @@ impl Config {
         Ok(cfg)
     }
 
-    /// CLI/env overrides. `base_url` / `model` / `api_key` act on the
-    /// currently-active provider so users can flip provider once and tweak
+    /// CLI/env overrides. `base_url` / `model` / `api_key` / `temperature` act on
+    /// the currently-active provider so users can flip provider once and tweak
     /// per-call without rewriting their config.
-    pub fn apply_overrides(
-        &mut self,
-        provider: Option<Provider>,
-        base_url: Option<String>,
-        model: Option<String>,
-        api_key: Option<String>,
-        auto_approve: bool,
-    ) {
-        if let Some(p) = provider {
+    pub fn apply_overrides(&mut self, o: Overrides) {
+        if let Some(p) = o.provider {
             self.llm.provider = p;
         }
         let active = self.llm.active_mut();
-        if let Some(v) = base_url {
+        if let Some(v) = o.base_url {
             active.base_url = v;
         }
-        if let Some(v) = model {
+        if let Some(v) = o.model {
             active.model = v;
         }
-        if let Some(v) = api_key {
+        if let Some(v) = o.api_key {
             active.api_key = v;
         }
-        if auto_approve {
+        if let Some(v) = o.temperature {
+            active.temperature = Some(v);
+        }
+        if o.auto_approve {
             self.agent.auto_approve = true;
         }
+        if let Some(v) = o.finish_nudge {
+            self.agent.finish_nudge = v;
+        }
+        if let Some(v) = o.malformed_retry {
+            self.agent.malformed_retry = v;
+        }
+        if let Some(v) = o.dup_suppress {
+            self.agent.dup_suppress = v;
+        }
     }
+}
+
+/// 設定ファイルより優先される実行時の上書き。`None` は「上書きしない」。
+/// 真偽値を `Option<bool>` にしているのは、設定ファイルで有効にした緩和策を
+/// 評価実行から明示的に切れるようにするため (ablation)。
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub provider: Option<Provider>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub temperature: Option<f32>,
+    /// `true` のときだけ有効化する (既存 `--yes` の意味を保つ)。
+    pub auto_approve: bool,
+    pub finish_nudge: Option<bool>,
+    pub malformed_retry: Option<bool>,
+    pub dup_suppress: Option<bool>,
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -258,28 +288,58 @@ mod tests {
     #[test]
     fn overrides_target_active_provider_only() {
         let mut cfg = Config::default();
-        cfg.apply_overrides(
-            Some(Provider::Sakana),
-            Some("https://example.test/v1".into()),
-            Some("fugu-ultra".into()),
-            Some("sk-test".into()),
-            false,
-        );
+        cfg.apply_overrides(Overrides {
+            provider: Some(Provider::Sakana),
+            base_url: Some("https://example.test/v1".into()),
+            model: Some("fugu-ultra".into()),
+            api_key: Some("sk-test".into()),
+            temperature: Some(0.2),
+            ..Default::default()
+        });
         assert_eq!(cfg.llm.sakana.base_url, "https://example.test/v1");
         assert_eq!(cfg.llm.sakana.model, "fugu-ultra");
         assert_eq!(cfg.llm.sakana.api_key, "sk-test");
+        assert_eq!(cfg.llm.sakana.temperature, Some(0.2));
         // local block is untouched
         assert_eq!(cfg.llm.local.base_url, "http://localhost:11434/v1");
         assert_eq!(cfg.llm.local.model, "qwen2.5-coder:7b");
         assert!(cfg.llm.local.api_key.is_empty());
+        assert_eq!(cfg.llm.local.temperature, None);
     }
 
     #[test]
     fn auto_approve_flag_only_when_true() {
         let mut cfg = Config::default();
-        cfg.apply_overrides(None, None, None, None, false);
+        cfg.apply_overrides(Overrides::default());
         assert!(!cfg.agent.auto_approve);
-        cfg.apply_overrides(None, None, None, None, true);
+        cfg.apply_overrides(Overrides {
+            auto_approve: true,
+            ..Default::default()
+        });
         assert!(cfg.agent.auto_approve);
+    }
+
+    #[test]
+    fn mitigations_default_on_and_are_overridable_both_ways() {
+        let mut cfg = Config::default();
+        assert!(cfg.agent.malformed_retry);
+        assert!(cfg.agent.dup_suppress);
+        assert!(!cfg.agent.finish_nudge);
+
+        // 指定なしの上書きは既定を変えない。
+        cfg.apply_overrides(Overrides::default());
+        assert!(cfg.agent.malformed_retry);
+        assert!(cfg.agent.dup_suppress);
+
+        // ablation で明示的に切れる / 入れられる。
+        cfg.apply_overrides(Overrides {
+            malformed_retry: Some(false),
+            dup_suppress: Some(false),
+            finish_nudge: Some(true),
+            ..Default::default()
+        });
+        assert!(!cfg.agent.malformed_retry);
+        assert!(!cfg.agent.dup_suppress);
+        assert!(cfg.agent.finish_nudge);
     }
 }

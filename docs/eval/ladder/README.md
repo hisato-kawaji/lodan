@@ -98,3 +98,10 @@ checks() {                # check <名前> <シェルコマンド>; exit 0 で�
   Modelfile 派生 (`FROM x` + `PARAMETER num_ctx 8192`) で固定してから測る
 - 長時間の実行は `nohup` + `caffeinate -is -w <pid>` で切り離す。中断しても
   `results.jsonl` から再開できる
+- **実行時間上限はモデルごとに較正する**。`T_L0`/`T_L1`/`T_L2` を全モデル共通に
+  すると、遅いモデルでは能力ではなく上限の短さで timeout が量産される。
+  疑わしいときは `metrics.llm_calls` を見る — **`status=timeout` かつ
+  `llm_calls=0` は「最初の応答すら返っていない」**ので、能力の判定材料にはならない
+- 固定オーバーヘッドは 1 呼び出しあたり **1.8k-2.4k トークン**ある (system prompt +
+  14 ツール定義)。L0 の依頼本文は 20 トークン程度なので、短いタスクほど
+  prefill が支配的になる。遅いモデルの上限はこれを見込んで決める

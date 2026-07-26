@@ -1,0 +1,4 @@
+# 実行結果はリポジトリに含めない (レポートに要約を書く)。
+results.jsonl
+runs/
+__pycache__/

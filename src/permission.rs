@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use crate::permission_rules::{RuleSet, Verdict};
 
 #[derive(Debug, Default)]
 pub struct SessionPolicy {
@@ -10,10 +13,26 @@ pub struct SessionPolicy {
 
 pub struct PermissionGate {
     auto_approve: bool,
-    /// 尋ねる相手がいない (ヘッドレス実行)。承認が要る呼び出しは尋ねずに拒否する。
+    /// 尋ねる相手がいない (ヘッドレス実行) か、`dont-ask` モード。承認が要る呼び出しは尋ねずに拒否する。
     non_interactive: bool,
+    /// `accept-edits` モード: ファイル編集ツールは尋ねずに通す。
+    accept_edits: bool,
+    rules: RuleSet,
+    /// 相対パターンのルールを解決する基準。
+    cwd: PathBuf,
     policy: Mutex<SessionPolicy>,
 }
+
+/// ゲートの結論。尋ねる必要があれば `decide` の中で尋ね終えている。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    /// モデルへ返す理由つき。
+    Deny(String),
+}
+
+/// `accept-edits` モードで尋ねずに通すツール。
+const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 const DENIED_BY_USER: &str = "user denied execution";
 const DENIED_NON_INTERACTIVE: &str = "denied: this is a non-interactive run and nobody can approve \
@@ -25,8 +44,31 @@ impl PermissionGate {
         Self {
             auto_approve,
             non_interactive: false,
+            accept_edits: false,
+            rules: RuleSet::default(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             policy: Mutex::new(SessionPolicy::default()),
         }
+    }
+
+    /// 設定からゲートを組む。`interactive` は尋ねる相手がいるか (REPL = true、`-p` = false)。
+    /// ルールが 1 つでも解釈できなければエラー — 権限の設定を黙って読み飛ばさない。
+    pub fn from_config(
+        cfg: &crate::config::Config,
+        cwd: &Path,
+        interactive: bool,
+    ) -> anyhow::Result<Self> {
+        use crate::config::PermissionMode;
+        let p = &cfg.permissions;
+        let mode = p.mode;
+        Ok(Self {
+            auto_approve: cfg.agent.auto_approve || mode == PermissionMode::Bypass,
+            non_interactive: !interactive || mode == PermissionMode::DontAsk,
+            accept_edits: mode == PermissionMode::AcceptEdits,
+            rules: RuleSet::parse(&p.allow, &p.deny, &p.ask)?,
+            cwd: cwd.to_path_buf(),
+            policy: Mutex::new(SessionPolicy::default()),
+        })
     }
 
     /// プロンプトを出さないゲート。stdin はプロンプト本文に使われ得るので、承認待ちで
@@ -38,34 +80,69 @@ impl PermissionGate {
         }
     }
 
-    /// 拒否したときにモデルへ返す文面。
-    pub fn denial_message(&self) -> &'static str {
+    /// 破壊的な呼び出しとして承認を求める (ExitPlanMode など、ツール以外の承認用)。
+    pub fn allow(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        self.decide(tool_name, args, true) == Decision::Allow
+    }
+
+    /// 呼び出しを通すか決める。必要なら尋ねる。
+    pub fn decide(&self, tool_name: &str, args: &serde_json::Value, destructive: bool) -> Decision {
+        if let Some(decision) = self.decide_quietly(tool_name, args, destructive) {
+            return decision;
+        }
         if self.non_interactive {
-            DENIED_NON_INTERACTIVE
+            return Decision::Deny(DENIED_NON_INTERACTIVE.to_string());
+        }
+        if self.prompt(tool_name, args) {
+            Decision::Allow
         } else {
-            DENIED_BY_USER
+            Decision::Deny(DENIED_BY_USER.to_string())
         }
     }
 
-    pub fn allow(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+    /// 尋ねずに決まるならその結論、尋ねる必要があるなら `None`。
+    /// 並列の先行実行はこれが `Allow` の呼び出しだけを対象にする (尋ねながら並列にはできないし、
+    /// deny ルールに当たる Read を先に読んでしまってもいけない)。
+    ///
+    /// 順序: **deny ルール** → bypass → ask ルール → allow ルール → セッション中の「常に許可」→
+    /// 既定 (read-only は通す / accept-edits の編集は通す / それ以外は尋ねる)。
+    pub fn decide_quietly(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+    ) -> Option<Decision> {
+        let verdict = self.rules.evaluate(tool_name, args, &self.cwd);
+        // deny は `--yes` にも勝つ。「全部通す」と「これだけは絶対に通さない」を両立させるため。
+        if let Some(Verdict::Deny(rule)) = &verdict {
+            return Some(Decision::Deny(format!(
+                "denied by permission rule `{rule}`. Do not retry this call or work around it; \
+                 use another approach or report that it is blocked."
+            )));
+        }
         if self.auto_approve {
-            return true;
+            return Some(Decision::Allow);
+        }
+        match verdict {
+            Some(Verdict::Ask) => return None,
+            Some(Verdict::Allow) => return Some(Decision::Allow),
+            Some(Verdict::Deny(_)) | None => {}
         }
         if let Ok(p) = self.policy.lock() {
             if p.always_tools.contains(tool_name) {
-                return true;
+                return Some(Decision::Allow);
             }
             if tool_name == "Bash"
                 && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
                 && p.always_commands.contains(cmd)
             {
-                return true;
+                return Some(Decision::Allow);
             }
         }
-        if self.non_interactive {
-            return false;
+        if !destructive || (self.accept_edits && EDIT_TOOLS.contains(&tool_name)) {
+            return Some(Decision::Allow);
         }
-        self.prompt(tool_name, args)
+        None
     }
 
     fn prompt(&self, tool_name: &str, args: &serde_json::Value) -> bool {
@@ -266,6 +343,136 @@ fn diff_block(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate_with(
+        mode: crate::config::PermissionMode,
+        allow: &[&str],
+        deny: &[&str],
+        ask: &[&str],
+    ) -> PermissionGate {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.mode = mode;
+        cfg.permissions.allow = allow.iter().map(|s| s.to_string()).collect();
+        cfg.permissions.deny = deny.iter().map(|s| s.to_string()).collect();
+        cfg.permissions.ask = ask.iter().map(|s| s.to_string()).collect();
+        PermissionGate::from_config(&cfg, Path::new("/work"), true).unwrap()
+    }
+
+    fn bash(cmd: &str) -> serde_json::Value {
+        serde_json::json!({ "command": cmd })
+    }
+
+    #[test]
+    fn defaults_let_read_only_through_and_ask_about_the_rest() {
+        use crate::config::PermissionMode::Default;
+        let gate = gate_with(Default, &[], &[], &[]);
+        let read = serde_json::json!({ "path": "src/lib.rs" });
+        assert_eq!(
+            gate.decide_quietly("Read", &read, false),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("ls"), true),
+            None,
+            "would prompt"
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_beats_everything_including_bypass_and_read_only() {
+        use crate::config::PermissionMode::Bypass;
+        let gate = gate_with(
+            Bypass,
+            &["Bash(*)"],
+            &["Bash(git push *)", "Read(.env)"],
+            &[],
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("ls"), true),
+            Some(Decision::Allow)
+        );
+        let pushed = gate.decide_quietly("Bash", &bash("git push origin main"), true);
+        assert!(
+            matches!(&pushed, Some(Decision::Deny(why)) if why.contains("Bash(git push *)")),
+            "{pushed:?}"
+        );
+        let env = gate.decide_quietly("Read", &serde_json::json!({ "path": "config/.env" }), false);
+        assert!(
+            matches!(env, Some(Decision::Deny(_))),
+            "deny applies to read-only tools too"
+        );
+    }
+
+    #[test]
+    fn allow_rules_skip_the_prompt_and_ask_rules_force_it() {
+        use crate::config::PermissionMode::Default;
+        let gate = gate_with(
+            Default,
+            &["Bash(cargo *)", "Read"],
+            &[],
+            &["Bash(cargo publish*)", "Read(secrets/**)"],
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("cargo test"), true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("cargo publish"), true),
+            None
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("cargo test && rm -rf target"), true),
+            None
+        );
+        // ask は read-only にも効く。
+        let secret = serde_json::json!({ "path": "secrets/key.pem" });
+        assert_eq!(gate.decide_quietly("Read", &secret, false), None);
+    }
+
+    #[test]
+    fn accept_edits_covers_file_edits_but_not_bash() {
+        use crate::config::PermissionMode::AcceptEdits;
+        let gate = gate_with(AcceptEdits, &[], &["Edit(Cargo.lock)"], &[]);
+        let edit = |p: &str| serde_json::json!({ "path": p });
+        assert_eq!(
+            gate.decide_quietly("Edit", &edit("src/lib.rs"), true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            gate.decide_quietly("Write", &edit("notes.md"), true),
+            Some(Decision::Allow)
+        );
+        assert!(matches!(
+            gate.decide_quietly("Edit", &edit("Cargo.lock"), true),
+            Some(Decision::Deny(_))
+        ));
+        assert_eq!(gate.decide_quietly("Bash", &bash("ls"), true), None);
+    }
+
+    #[test]
+    fn dont_ask_denies_what_would_have_prompted_but_honours_allow_rules() {
+        use crate::config::PermissionMode::DontAsk;
+        let gate = gate_with(DontAsk, &["Bash(git status)"], &[], &[]);
+        assert_eq!(
+            gate.decide("Bash", &bash("git status"), true),
+            Decision::Allow
+        );
+        let denied = gate.decide("Bash", &bash("rm -rf build"), true);
+        assert!(
+            matches!(&denied, Decision::Deny(why) if why.contains("non-interactive")),
+            "{denied:?}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_rule_is_a_startup_error_not_a_silent_no_op() {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.deny = vec!["Bash(rm *".into()];
+        let err = PermissionGate::from_config(&cfg, Path::new("/work"), true)
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("Bash(rm *"), "{err:#}");
+    }
 
     fn answer(input: &str, enter_means_yes: bool) -> bool {
         let gate = PermissionGate::new(false);

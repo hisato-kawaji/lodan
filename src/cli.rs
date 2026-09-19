@@ -68,6 +68,18 @@ pub struct Cli {
     )]
     pub fallback_provider: Option<Provider>,
 
+    /// How calls that need approval are handled: default, accept-edits, plan, dont-ask, bypass (= --yes)
+    #[arg(long, env = "LODAN_PERMISSION_MODE", value_enum)]
+    pub permission_mode: Option<crate::config::PermissionMode>,
+
+    /// Add an allow rule, e.g. --allowed-tools "Bash(git status)" (repeatable; see README for the syntax)
+    #[arg(long = "allowed-tools", value_name = "RULE")]
+    pub allowed_tools: Vec<String>,
+
+    /// Add a deny rule, e.g. --disallowed-tools "Read(**/.env)" (repeatable; deny wins even with --yes)
+    #[arg(long = "disallowed-tools", value_name = "RULE")]
+    pub disallowed_tools: Vec<String>,
+
     /// Run consecutive parallel-safe tool calls (Read/Grep/Glob/WebFetch/WebSearch/Task) concurrently
     #[arg(long, env = "LODAN_PARALLEL_TOOLS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub parallel_tools: Option<bool>,
@@ -144,6 +156,9 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,
         parallel_tools: args.parallel_tools,
+        permission_mode: args.permission_mode,
+        allowed_tools: args.allowed_tools,
+        disallowed_tools: args.disallowed_tools,
         tool_profile: args.tool_profile,
         tools: args.tools,
     };

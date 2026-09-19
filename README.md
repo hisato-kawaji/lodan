@@ -213,12 +213,13 @@ timeout_secs = 30
 - `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
 - `LODAN_TOOL_PROFILE` / `LODAN_TOOLS` (カンマ区切り)
 - `LODAN_PARALLEL_TOOLS` (真偽値。既定 true)
+- `LODAN_PERMISSION_MODE` (`default` | `accept-edits` | `plan` | `dont-ask` | `bypass`)
 - `LODAN_LOG_JSONL` (実行トレース JSONL の出力先)
 - `SAKANA_API_KEY` (provider=sakana のときに `api_key` が空ならフォールバック)
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 
@@ -288,6 +289,54 @@ lodan -p "続きをやって" --resume last
 - slash コマンド（`/compact` など）は解釈しない。プロンプトはそのままモデルに渡る
 - hooks（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SessionEnd）、MCP、skills、プロジェクトメモリ、セッション保存は REPL と同じ
 
+## 権限ルールとモード
+
+既定では、破壊的ツール (Write / Edit / Bash …) は実行前に尋ね、read-only のツールはそのまま通る。`[permissions]` でこれを宣言的に変えられる。
+
+```toml
+[permissions]
+mode  = "default"          # default / accept-edits / plan / dont-ask / bypass
+allow = ["Bash(git status)", "Bash(cargo *)", "Edit(src/**)", "WebFetch(domain:docs.rs)"]
+ask   = ["Bash(cargo publish*)"]
+deny  = ["Read(**/.env)", "Read(~/.ssh/**)", "Bash(git push --force*)", "Bash(rm -rf *)"]
+```
+
+**評価順は deny → ask → allow → 既定**。
+
+- **deny は何にでも勝つ**: read-only のツールにも (`Read(**/.env)`)、`--yes` / `bypass` にも効く。「基本は全部通すが、これだけは絶対に通さない」が書ける。拒否されるとモデルには `denied by permission rule …` と、回り道をするなという指示が返る
+- **ask** は必ず尋ねる (allow より優先、read-only にも効く)。**allow** は尋ねずに通す
+- ルールはユーザ設定 → プロジェクト設定 → `--config` の間で**連結**される。プロジェクト設定はユーザ設定の deny を消せない。`--allowed-tools <RULE>` / `--disallowed-tools <RULE>` (繰り返し可) も足すだけで、置き換えない
+- 解釈できないルールが 1 つでもあれば**起動時にエラー**。権限の設定を黙って読み飛ばさない
+
+**ルールの構文** (Claude Code の `permissions` と同じ `Tool` / `Tool(pattern)`):
+
+| 例 | 意味 |
+|---|---|
+| `Bash` / `WebSearch` | そのツールの全呼び出し |
+| `Bash(git status)` | 完全一致 |
+| `Bash(git diff *)` | `*` は任意の文字列 |
+| `Bash(npm run test:*)` | `npm run test` そのもの、または後に引数が続くもの (`npm run testing` には一致しない) |
+| `Read(src/**)` / `Edit(*.md)` | パスの glob。相対パターンは cwd 基準。`/` の無いパターンはどの階層のファイル名にも一致 (gitignore と同じ)。対象: Read / Write / Edit / MultiEdit / NotebookEdit / Glob / Grep |
+| `Write(/etc/**)` / `Read(~/.ssh/**)` | 絶対パス / ホーム基準 |
+| `WebFetch(domain:docs.rs)` | ホスト名 (サブドメインを含む) |
+| `mcp__github` / `mcp__github__create_issue` | その MCP サーバの全ツール / 1 つだけ |
+
+**Bash の複合コマンド**: `Bash(git *)` を allow していても `git status && rm -rf /` は通らない。コマンドを `&&` `||` `;` `|` `&` と改行で分割し、**全ての部分が allow に一致したときだけ**通す。`$(…)`・バッククォート・プロセス置換・リダイレクト (`>` `<`) を含むコマンドは中身を追い切れないので、allow には決して一致させず尋ねる。deny は逆に、コマンド全体か**いずれかの部分**が一致すれば効く。
+
+**パス**: `src/../.env` のような `..` は畳んでから照合する。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。
+
+**モード** (`[permissions] mode` / `--permission-mode` / `LODAN_PERMISSION_MODE`):
+
+| mode | 挙動 |
+|---|---|
+| `default` | 破壊的ツールは尋ねる |
+| `accept-edits` | ファイル編集 (Write / Edit / MultiEdit / NotebookEdit) は尋ねずに通す。Bash などは尋ねる |
+| `plan` | plan モードで開始する |
+| `dont-ask` | 尋ねない。尋ねるはずだった呼び出しは拒否する。無人実行で「allow に書いたものだけ通す」ときに使う (`-p` は常にこの挙動) |
+| `bypass` | 尋ねずに全て通す。`--yes` と同じ。**deny ルールは効く** |
+
+限界: ルールは lodan のツール呼び出しを見ているだけで、OS レベルの隔離ではない。allow した Bash コマンドが内部で何をするか (`cargo test` がテストコードから何を実行するか) までは制御できない。サンドボックスは #75。
+
 ## ツール呼び出しの並列実行
 
 モデルが 1 つの応答で複数のツールを呼んだとき、**並列可能なツールが 2 つ以上連続する区間**は同時に実行する(`[agent] parallel_tools`、既定 true。`--parallel-tools=false` / `LODAN_PARALLEL_TOOLS` で無効化)。API 級のモデルは 1 応答で Read や Grep を何本も出すので、待ち時間が直列に積まれなくなる。独立した調査を複数の `Task` に分けた場合も同時に走る。
@@ -296,7 +345,8 @@ lodan -p "続きをやって" --resume last
 - 破壊的ツールや並列不可のツールが挟まると、そこで区間が切れる: `[Read, Read, Edit, Read]` は最初の 2 つだけが同時
 - **結果の順序は変わらない**。表示・PostToolUse hook・runlog・モデルへ返す tool 応答は、逐次実行のときと同じ呼び出し順
 - PreToolUse hook は区間内でも順番どおり 1 つずつ通り、ブロックされた呼び出しは実行されない。ただし hook の**噛み合い方は変わる**: 逐次では `pre1 → 実行1 → post1 → pre2 → …` だったものが、区間内では `pre1 → pre2 → (実行1 ∥ 実行2) → post1 → post2` になる。「1 つ目の PostToolUse が終わってから 2 つ目の PreToolUse」を前提にした hook を使っているなら `parallel_tools = false` にすること
-- 同時に走らせるのは **4 個まで**。それより長い区間は 4 個ずつの組に分けて順に実行する。`Task` は承認を通らないので、上限が無いとモデルが並べた数だけ子エージェントの LLM ループが同時に走り、トークン消費が黙って膨らむ
+- 先行実行するのは、**尋ねずに「通す」と決まる呼び出しだけ**。deny ルールに当たる Read は実行されず、ask ルールに当たるものは 1 つずつ尋ねる
+- 同時に走らせるのは **4 個まで** (5 連続なら 4 個を同時に、残り 1 個は逐次で。`parallel` は実際に同時実行したものだけ true)。それより長い区間は 4 個ずつの組に分けて順に実行する。`Task` は承認を通らないので、上限が無いとモデルが並べた数だけ子エージェントの LLM ループが同時に走り、トークン消費が黙って膨らむ
 - 直前と同一の呼び出し(重複抑止の対象)と、`ExitPlanMode` より後ろの呼び出し(承認されるとスキップされる決まり)は先行実行しない
 - `tool_result` イベントの `parallel` で、同時実行されたかが分かる。`ms` は実際の実行時間
 
@@ -379,7 +429,8 @@ mcp: 1 server(s), 11 tool(s), 2 prompt(s), 1 resource(s) registered
 src/
 ├── main.rs / cli.rs / config.rs / repl.rs
 ├── prompt.rs            # system prompt 生成
-├── permission.rs        # 4 択ゲート
+├── permission.rs        # 承認ゲート (4 択プロンプト / モード / ルールの適用)
+├── permission_rules.rs  # `[permissions]` の allow / deny / ask ルール (構文・Bash の複合コマンド分割・パス照合)
 ├── agent/
 │   ├── messages.rs      # OpenAI Chat スキーマ準拠の Message / ToolCall
 │   ├── loop.rs          # run_turn(): chat_stream → tool dispatch → 反復

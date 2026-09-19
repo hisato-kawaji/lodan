@@ -89,9 +89,12 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
     }
 
     let runtime = Runtime::build(&cfg, Notices::Stderr).await?;
-    let gate = PermissionGate::non_interactive(cfg.agent.auto_approve);
+    let gate = PermissionGate::from_config(&cfg, &runtime.cwd, false)?;
     let (mut session, mut recorder) =
         runtime.open_session(&cfg, resume.as_deref(), Notices::Stderr);
+    if cfg.permissions.mode == crate::config::PermissionMode::Plan {
+        session.set_mode(crate::agent::Mode::Plan);
+    }
 
     let start_payload = serde_json::json!({
         "hook_event_name": "SessionStart",

@@ -190,10 +190,13 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         .collect();
     rl.set_helper(Some(ReplHelper::new(completion_names)));
 
-    let gate = PermissionGate::new(cfg.agent.auto_approve);
+    let gate = PermissionGate::from_config(&cfg, &runtime.cwd, true)?;
 
     let (mut session, mut recorder) =
         runtime.open_session(&cfg, resume.as_deref(), Notices::Stdout);
+    if cfg.permissions.mode == crate::config::PermissionMode::Plan {
+        session.set_mode(agent::Mode::Plan);
+    }
 
     // /goal の状態。上限到達などで未達のまま止まった goal は paused として残り、
     // `/goal` (状態表示) と `/goal clear` (解除) の対象になる。

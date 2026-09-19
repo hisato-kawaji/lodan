@@ -240,6 +240,16 @@ mod tests {
         )
     }
 
+    #[test]
+    fn task_opts_into_parallel_execution_and_is_not_destructive() {
+        // Task は runtime.rs で登録されるため、registry.rs の一覧テストには現れない。
+        // 並列可の宣言のうち影響が最も大きい (子の LLM ループが同時に走る) ので、ここで固定する。
+        // 同時数の上限は agent::loop の MAX_PARALLEL_TOOL_CALLS。
+        let tool = subagent(Vec::new(), PathBuf::from("."));
+        assert!(crate::tools::Tool::parallel_safe(&tool));
+        assert!(!crate::tools::Tool::is_destructive(&tool));
+    }
+
     #[tokio::test]
     async fn returns_final_text_without_tools() {
         let tmp = tempfile::tempdir().unwrap();

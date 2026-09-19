@@ -209,6 +209,7 @@ timeout_secs = 30
 - `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
 - `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
 - `LODAN_TOOL_PROFILE` / `LODAN_TOOLS` (カンマ区切り)
+- `LODAN_PARALLEL_TOOLS` (真偽値。既定 true)
 - `LODAN_LOG_JSONL` (実行トレース JSONL の出力先)
 - `SAKANA_API_KEY` (provider=sakana のときに `api_key` が空ならフォールバック)
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
@@ -291,7 +292,8 @@ lodan -p "続きをやって" --resume last
 - 並列にするのは、ツール自身が `parallel_safe()` を宣言したものだけ: **Read / Grep / Glob / WebFetch / WebSearch / Task**。read-only でも、共有状態を書く TodoWrite、stdin を取り合う AskUserQuestion、読み取り位置を持つ Monitor は対象外。MCP ツールと破壊的ツール(Write / Edit / Bash …)は常に 1 つずつ、承認も 1 つずつ
 - 破壊的ツールや並列不可のツールが挟まると、そこで区間が切れる: `[Read, Read, Edit, Read]` は最初の 2 つだけが同時
 - **結果の順序は変わらない**。表示・PostToolUse hook・runlog・モデルへ返す tool 応答は、逐次実行のときと同じ呼び出し順
-- PreToolUse hook は区間内でも順番どおり 1 つずつ通り、ブロックされた呼び出しは実行されない
+- PreToolUse hook は区間内でも順番どおり 1 つずつ通り、ブロックされた呼び出しは実行されない。ただし hook の**噛み合い方は変わる**: 逐次では `pre1 → 実行1 → post1 → pre2 → …` だったものが、区間内では `pre1 → pre2 → (実行1 ∥ 実行2) → post1 → post2` になる。「1 つ目の PostToolUse が終わってから 2 つ目の PreToolUse」を前提にした hook を使っているなら `parallel_tools = false` にすること
+- 同時に走らせるのは **4 個まで**。それより長い区間は 4 個ずつの組に分けて順に実行する。`Task` は承認を通らないので、上限が無いとモデルが並べた数だけ子エージェントの LLM ループが同時に走り、トークン消費が黙って膨らむ
 - 直前と同一の呼び出し(重複抑止の対象)と、`ExitPlanMode` より後ろの呼び出し(承認されるとスキップされる決まり)は先行実行しない
 - `tool_result` イベントの `parallel` で、同時実行されたかが分かる。`ms` は実際の実行時間
 

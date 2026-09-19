@@ -347,13 +347,14 @@ impl Session {
                             ))
                         }
                         Some(_) if prefetched.contains_key(&call_index) => {
-                            ran_parallel = true;
                             match prefetched.remove(&call_index) {
+                                // hook が止めた呼び出しは実行していないので、並列扱いにしない。
                                 Some(Prefetched::HookBlocked(hook_reason)) => {
                                     reason = "hook_blocked";
                                     ToolOutput::error(format!("blocked by hook: {hook_reason}"))
                                 }
                                 Some(Prefetched::Ran { result, ms }) => {
+                                    ran_parallel = true;
                                     parallel_ms = Some(ms);
                                     match result {
                                         Ok(o) => o,
@@ -518,8 +519,14 @@ impl Session {
             let end = (start..calls.len())
                 .find(|&i| !eligible[i])
                 .unwrap_or(calls.len());
-            if end - start >= 2 {
-                self.run_parallel_span(calls, start..end, &mut out).await?;
+            // 区間が長くても同時に走らせるのは MAX_PARALLEL_TOOL_CALLS 個まで。残りは次の組に回す
+            // (端数の 1 個は先行実行せず、逐次ループに任せる)。
+            let mut chunk_start = start;
+            while end - chunk_start >= 2 {
+                let chunk_end = end.min(chunk_start + MAX_PARALLEL_TOOL_CALLS);
+                self.run_parallel_span(calls, chunk_start..chunk_end, &mut out)
+                    .await?;
+                chunk_start = chunk_end;
             }
             start = end;
         }
@@ -913,6 +920,12 @@ impl CompactOutcome {
 
 /// runlog の `tool_result.reason` 既定値 (ループ側の介入なしに実行された)。
 const TOOL_REASON_OK: &str = "ok";
+
+/// 1 度に同時実行するツール呼び出しの上限。Task は承認ゲートを通らない (非破壊) ので、
+/// モデルが 1 応答に `Task` を 10 個並べると、子エージェントの LLM ループが 10 本同時に走って
+/// トークン消費が黙って 10 倍になる。WebFetch も同じホストへ一斉に飛ぶと 429 を招く。
+/// 上限を超えた分は、前の組が終わってから次の組として同時実行する。
+const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 
 /// `prefetch_parallel` が先に済ませた呼び出しの結果。
 enum Prefetched {
@@ -1929,6 +1942,30 @@ mod tests {
                 ("c2".to_string(), "Par 3".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_long_span_runs_in_capped_groups() {
+        let (mut session, stats) = probe_session(Config::default());
+        let calls: Vec<(&str, u32)> = (1..=(MAX_PARALLEL_TOOL_CALLS as u32 * 2 + 1))
+            .map(|n| ("Par", n))
+            .collect();
+        let llm = batch(&calls);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.max_active.load(AtomicOrdering::SeqCst),
+            MAX_PARALLEL_TOOL_CALLS
+        );
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), calls.len());
+        let order: Vec<String> = tool_replies(&session)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let expected: Vec<String> = (0..calls.len()).map(|i| format!("c{i}")).collect();
+        assert_eq!(order, expected);
     }
 
     #[tokio::test]

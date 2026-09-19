@@ -762,6 +762,42 @@ mod tests {
     }
 
     #[test]
+    fn fallback_parses_round_trips_and_is_overridable() {
+        assert_eq!(Config::default().llm.fallback, None);
+        let (mut cfg, origins) = from_layers(vec![layer(
+            "user.toml",
+            "[llm]\nprovider = \"kimi\"\nfallback = \"sakura\"\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.llm.fallback, Some(Provider::Sakura));
+        assert_eq!(
+            origins["llm.fallback"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
+
+        // `lodan config` の出力を貼り戻しても fallback が残る (None のときはキーごと出ない)。
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.llm.fallback, Some(Provider::Sakura));
+        assert!(
+            !toml::to_string_pretty(&Config::default())
+                .unwrap()
+                .contains("fallback")
+        );
+
+        let mut origins = Origins::new();
+        cfg.apply_overrides_tracked(
+            Overrides {
+                fallback: Some(Provider::Sakana),
+                ..Default::default()
+            },
+            &mut origins,
+        );
+        assert_eq!(cfg.llm.fallback, Some(Provider::Sakana));
+        assert_eq!(origins["llm.fallback"], Origin::Override);
+    }
+
+    #[test]
     fn config_output_round_trips() {
         // `lodan config` の出力をそのまま config.toml に貼れること。
         let mut cfg = Config::default();

@@ -44,23 +44,27 @@ impl FallbackClient {
 
     fn announce(&self, primary_error: &anyhow::Error) {
         tracing::warn!(
-            "primary LLM provider is unavailable ({primary_error:#}); falling back to {} ({})",
+            "primary LLM provider is unavailable ({primary_error:#}); trying {} ({})",
             self.fallback_name,
             self.fallback_model
-        );
-        crate::runlog::record(
-            "provider_fallback",
-            serde_json::json!({
-                "to": self.fallback_name,
-                "model": self.fallback_model,
-                "why": format!("{primary_error:#}"),
-            }),
         );
     }
 
     /// fallback の結果を確定する。成功したら以後は fallback に固定し、失敗したら
     /// primary の失敗も残す (どちらも落ちていると分かるように)。
+    ///
+    /// runlog のイベントは結果が出てから 1 回だけ、`switched` つきで記録する。試す前に
+    /// 記録すると、両方落ちている間は呼び出しのたびに「切り替えた」と数えられてしまう。
     fn settle<T>(&self, result: Result<T>, primary_error: anyhow::Error) -> Result<T> {
+        crate::runlog::record(
+            "provider_fallback",
+            serde_json::json!({
+                "to": self.fallback_name,
+                "model": self.fallback_model,
+                "switched": result.is_ok(),
+                "why": format!("{primary_error:#}"),
+            }),
+        );
         match result {
             Ok(v) => {
                 self.switched.store(true, Ordering::Relaxed);

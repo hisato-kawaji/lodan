@@ -29,6 +29,18 @@ pub struct OpenAiClient {
 /// 黙ったサーバ相手に `timeout_secs` を丸ごと使ってから再試行するのは割に合わない。
 const ERROR_BODY_READ_LIMIT: Duration = Duration::from_secs(5);
 
+/// エラーメッセージに載せるレスポンスボディの上限 (文字数)。ボディはそのまま stderr・
+/// runlog・`stream-json` の stdout に出るので、サーバが返した巨大な HTML や、エコーされた
+/// リクエスト内容を丸ごと流さない。
+const ERROR_BODY_MAX_CHARS: usize = 500;
+
+fn clip_body(body: &str) -> String {
+    match body.char_indices().nth(ERROR_BODY_MAX_CHARS) {
+        Some((cut, _)) => format!("{}… ({} bytes total)", &body[..cut], body.len()),
+        None => body.to_string(),
+    }
+}
+
 /// 利用者にまだ何も見せていない一時的な失敗。fallback provider が拾える (`llm::is_transient`)。
 fn transient(message: String) -> anyhow::Error {
     TransientLlmError(message).into()
@@ -36,8 +48,16 @@ fn transient(message: String) -> anyhow::Error {
 
 /// `source()` をたどって原因を 1 行にする。reqwest の Display は種類 (`error decoding
 /// response body`) で止まり、切断なのか UTF-8 破損なのかが分からないため。
-fn error_chain(e: &dyn std::error::Error) -> String {
+///
+/// URL は落とす。reqwest は送信エラーに ` for url (…)` を付けるが、`base_url` に資格情報を
+/// 埋め込む構成 (`https://user:pass@host/…` やクエリのトークン) では、それが runlog と
+/// `stream-json` の stdout に流れてしまう。接続先は設定を見れば分かる。
+fn error_chain(e: &reqwest::Error) -> String {
     let mut out = e.to_string();
+    if let Some(url) = e.url() {
+        out = out.replace(&format!(" for url ({url})"), "");
+    }
+    let e: &dyn std::error::Error = e;
     let mut source = e.source();
     while let Some(s) = source {
         out.push_str(": ");
@@ -188,6 +208,7 @@ impl OpenAiClient {
                         .ok()
                         .and_then(Result::ok)
                         .unwrap_or_default();
+                    let body = clip_body(&body);
                     if !is_retryable_status(status) {
                         return Err(anyhow!("LLM HTTP {status}: {body}"));
                     }
@@ -215,7 +236,7 @@ impl OpenAiClient {
                         error_chain(&e)
                     )));
                 }
-                Err(e) => return Err(e).context("sending chat request"),
+                Err(e) => return Err(e.without_url()).context("sending chat request"),
             }
         }
     }
@@ -716,6 +737,47 @@ mod tests {
         let err = client(&url, 2).chat(&[], &[], "m", None).await.unwrap_err();
         assert!(format!("{err:#}").contains("429"), "{err:#}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "1 try + 2 retries");
+    }
+
+    #[tokio::test]
+    async fn errors_carry_neither_the_request_url_nor_an_unbounded_body() {
+        // 誰も listen していないポート。base_url に埋めた資格情報がエラー文に出ないこと。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let secret_url = format!("http://user:hunter2@127.0.0.1:{port}/v1");
+        let err = client(&secret_url, 0)
+            .chat(&[], &[], "m", None)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("127.0.0.1"),
+            "{text}"
+        );
+        assert!(text.contains("sending chat request"), "{text}");
+
+        let huge = "x".repeat(50_000);
+        let (url, _) = scripted_server(vec![http("500 Internal Server Error", "", &huge)]).await;
+        let text = format!(
+            "{:#}",
+            client(&url, 0).chat(&[], &[], "m", None).await.unwrap_err()
+        );
+        assert!(
+            text.len() < 1_000,
+            "body must be clipped, got {} chars",
+            text.len()
+        );
+        assert!(text.contains("50000 bytes total"), "{text}");
+    }
+
+    #[test]
+    fn clip_body_cuts_on_a_char_boundary() {
+        let body = "あ".repeat(ERROR_BODY_MAX_CHARS + 10);
+        let clipped = clip_body(&body);
+        assert!(clipped.starts_with(&"あ".repeat(ERROR_BODY_MAX_CHARS)));
+        assert!(clipped.contains("bytes total"));
+        assert_eq!(clip_body("short"), "short");
     }
 
     #[tokio::test]

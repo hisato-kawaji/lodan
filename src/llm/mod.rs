@@ -88,9 +88,16 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
 
 pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
     let primary = build_for(cfg.llm.provider, cfg)?;
-    let Some(fallback) = cfg.llm.fallback.filter(|f| *f != cfg.llm.provider) else {
+    let Some(fallback) = cfg.llm.fallback else {
         return Ok(primary);
     };
+    if fallback == cfg.llm.provider {
+        tracing::warn!(
+            "llm.fallback is the same as llm.provider ({}); ignoring it",
+            fallback.as_str()
+        );
+        return Ok(primary);
+    }
     // fallback は保険。キーが無いなどで組めなくても、primary での実行は止めない。
     match build_for(fallback, cfg) {
         Ok(client) => Ok(Arc::new(fallback::FallbackClient::new(

@@ -5,7 +5,7 @@
 ## 特徴
 
 - **ランタイム非依存**: OpenAI 互換の Chat Completions + tool calling を話せる任意のサーバーに接続可能（Ollama / llama.cpp `--jinja` / vLLM / LM Studio など）
-- **マルチプロバイダ**: ローカル LLM と Sakana AI (`fugu` / `fugu-ultra`) を環境変数で随時切り替え
+- **マルチプロバイダ**: ローカル LLM / Sakana AI (`fugu` / `fugu-ultra`) / さくらのAI Engine (`gpt-oss-120b` ほか) を環境変数で随時切り替え
 - **MCP クライアント (stdio / HTTP + tools / prompts / resources)**: `.mcp.json` を CWD に置くと MCP サーバ（ローカル stdio / リモート Streamable HTTP）へ接続し、公開 tools を取り込み、prompts は `/mcp__<server>__<prompt>`、resources は `mcp__<server>__read_resource` で扱える
 - **ストリーミング**: SSE でアシスタント本文をリアルタイム表示
 - **コアツール**: `Read` / `Write` / `Edit` / `Bash`（`run_in_background` で detached 実行も可） / `Grep` / `Glob` / `TodoWrite` / `MultiEdit` / `NotebookEdit`（.ipynb セル編集） / `WebFetch`（http(s) GET → テキスト化） / `WebSearch`（Brave Search API） / `AskUserQuestion`（選択式の質問） / `Monitor`（バックグラウンドプロセスの増分出力・状態取得） / `KillShell`（バックグラウンドプロセスの終了） / `Task`（調査用サブエージェント）
@@ -64,6 +64,36 @@ cargo run --release -- --provider sakana --model fugu-ultra
 LODAN_PROVIDER=sakana LODAN_MODEL=fugu cargo run --release
 ```
 
+## クイックスタート (さくらのAI Engine)
+
+さくらのAI Engine も OpenAI 互換なので `--provider sakura` で切り替わる。API キーは `.env` または `SAKURA_API_KEY` から拾われる。
+
+```bash
+echo 'SAKURA_API_KEY=...' >> .env
+
+# 既定モデル
+cargo run --release -- --provider sakura
+# モデル指定 (利用可能な一覧は GET /v1/models)
+cargo run --release -- --provider sakura --model preview/Kimi-K2.7-Code
+```
+
+tool calling は `gpt-oss-120b` / `preview/Kimi-K2.7-Code` / `preview/Qwen3.6-35B-A3B` で動作確認済み。
+
+## クイックスタート (Moonshot AI / Kimi)
+
+Moonshot AI の公式 API も OpenAI 互換なので `--provider kimi` で切り替わる。既定モデルは `kimi-k3`。API キーは `.env` または `KIMI_API_KEY` から拾われる。
+
+```bash
+echo 'KIMI_API_KEY=...' >> .env
+
+cargo run --release -- --provider kimi
+```
+
+- K3 は常に思考モードで 1 応答が長いため、既定の `timeout_secs` は 600
+- K3 は `temperature` が 1 固定で、それ以外を送ると 400 になる。`[llm.kimi]` に `temperature` を書かないこと
+`llm-jp-3.1-8x13b-instruct4` はサーバ側が auto tool choice 無効のため、lodan からは利用できない
+(`"auto" tool choice requires --enable-auto-tool-choice` が 400 で返る)。
+
 ## クイックスタート (llama.cpp)
 
 ```bash
@@ -116,7 +146,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 ```toml
 # ~/.config/lodan/config.toml
 [llm]
-provider = "local"   # "local" または "sakana"
+provider = "local"   # "local" / "sakana" / "sakura" / "kimi"
 
 [llm.local]
 base_url       = "http://localhost:11434/v1"
@@ -133,6 +163,20 @@ api_key        = ""           # 空なら SAKANA_API_KEY env を使う
 timeout_secs   = 120
 context_window = 32768
 
+[llm.sakura]
+base_url       = "https://api.ai.sakura.ad.jp/v1"
+model          = "gpt-oss-120b"
+api_key        = ""           # 空なら SAKURA_API_KEY env を使う
+timeout_secs   = 120
+context_window = 32768
+
+[llm.kimi]
+base_url       = "https://api.moonshot.ai/v1"
+model          = "kimi-k3"
+api_key        = ""           # 空なら KIMI_API_KEY env を使う
+timeout_secs   = 600
+context_window = 32768
+
 [agent]
 max_iterations  = 25
 auto_approve    = false
@@ -147,11 +191,13 @@ timeout_secs = 30
 `--base-url` / `--model` / `--api-key` および対応する `LODAN_*` env は **現在 active な provider** の設定を上書きする (provider を `--provider` で切り替えれば反対側を触らずに済む)。
 
 環境変数:
-- `LODAN_PROVIDER` (`local` | `sakana`)
+- `LODAN_PROVIDER` (`local` | `sakana` | `sakura` | `kimi`)
 - `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
 - `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
 - `LODAN_LOG_JSONL` (実行トレース JSONL の出力先)
 - `SAKANA_API_KEY` (provider=sakana のときに `api_key` が空ならフォールバック)
+- `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
+- `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
 CLI フラグ: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]`
 
@@ -285,7 +331,9 @@ src/
 ├── llm/
 │   ├── mod.rs           # trait LlmClient + provider 分岐 (build_client)
 │   ├── openai.rs        # ローカル/汎用 OpenAI 互換クライアント
-│   └── sakana.rs        # Sakana AI (Fugu) adapter (内部で OpenAiClient に委譲)
+│   ├── kimi.rs          # Moonshot AI (Kimi) adapter (内部で OpenAiClient に委譲)
+│   ├── sakana.rs        # Sakana AI (Fugu) adapter (内部で OpenAiClient に委譲)
+│   └── sakura.rs        # さくらのAI Engine adapter (内部で OpenAiClient に委譲)
 ├── tools/
 │   ├── mod.rs           # trait Tool, ToolCtx, ToolOutput
 │   ├── registry.rs      # 既定 14 ツール登録
@@ -535,7 +583,7 @@ last context: 1200 prompt tokens
 - `total_tokens` を返さないサーバは `prompt + completion` で補完する。
 - **usage 非対応サーバへのフォールバック**: usage が取れない呼び出しは文字数ベース（約 3 文字 / トークン）で概算し、`/cost` に概算だった呼び出し数を注記する。桁を合わせるのが目的の粗い近似。
 - `last context` は直近呼び出しの prompt_tokens で、現在のコンテキストサイズの近似。自動圧縮のしきい値判定（前節）に使っている。
-- ローカル / Sakana では確定単価が無いため、料金換算はせずトークン数のみ表示する。
+- ローカル / Sakana / さくらのAI では確定単価が無いため、料金換算はせずトークン数のみ表示する。
 - 累積はメモリ上のみ（transcript には保存しない）。`--resume` 後の `/cost` は 0 から数え直す。
 
 ## ロードマップ（MVP 外、骨組みは存在）

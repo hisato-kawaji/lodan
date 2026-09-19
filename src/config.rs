@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 
 use crate::hooks::HookConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Provider {
+    #[default]
     Local,
     Sakana,
+    Sakura,
+    Kimi,
 }
 
 impl Provider {
@@ -18,6 +21,8 @@ impl Provider {
         match self {
             Provider::Local => "local",
             Provider::Sakana => "sakana",
+            Provider::Sakura => "sakura",
+            Provider::Kimi => "kimi",
         }
     }
 }
@@ -32,12 +37,76 @@ pub struct Config {
     pub hooks: Vec<HookConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LlmConfig {
     pub provider: Provider,
     pub local: ProviderConfig,
     pub sakana: ProviderConfig,
+    pub sakura: ProviderConfig,
+    pub kimi: ProviderConfig,
+}
+
+/// `[llm.*]` ブロックの部分指定。未指定フィールドは**そのプロバイダの**既定を残す。
+/// `ProviderConfig` をそのまま `#[serde(default)]` で読むと全スロットが
+/// `default_local()` にフォールバックし、`timeout_secs` だけ書いたブロックが
+/// `base_url` をローカルへ巻き戻してしまう (リモート provider が黙って
+/// localhost を叩く)。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct ProviderOverlay {
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    timeout_secs: Option<u64>,
+    context_window: Option<u64>,
+    temperature: Option<f32>,
+}
+
+impl ProviderOverlay {
+    fn apply(self, mut base: ProviderConfig) -> ProviderConfig {
+        if let Some(v) = self.base_url {
+            base.base_url = v;
+        }
+        if let Some(v) = self.model {
+            base.model = v;
+        }
+        if let Some(v) = self.api_key {
+            base.api_key = v;
+        }
+        if let Some(v) = self.timeout_secs {
+            base.timeout_secs = v;
+        }
+        if let Some(v) = self.context_window {
+            base.context_window = v;
+        }
+        if let Some(v) = self.temperature {
+            base.temperature = Some(v);
+        }
+        base
+    }
+}
+
+impl<'de> Deserialize<'de> for LlmConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Raw {
+            provider: Provider,
+            local: ProviderOverlay,
+            sakana: ProviderOverlay,
+            sakura: ProviderOverlay,
+            kimi: ProviderOverlay,
+        }
+
+        let raw = Raw::deserialize(d)?;
+        Ok(Self {
+            provider: raw.provider,
+            local: raw.local.apply(ProviderConfig::default_local()),
+            sakana: raw.sakana.apply(ProviderConfig::default_sakana()),
+            sakura: raw.sakura.apply(ProviderConfig::default_sakura()),
+            kimi: raw.kimi.apply(ProviderConfig::default_kimi()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +160,8 @@ impl Default for LlmConfig {
             provider: Provider::Local,
             local: ProviderConfig::default_local(),
             sakana: ProviderConfig::default_sakana(),
+            sakura: ProviderConfig::default_sakura(),
+            kimi: ProviderConfig::default_kimi(),
         }
     }
 }
@@ -103,6 +174,9 @@ impl Default for ProviderConfig {
 
 /// context_window の既定値。qwen2.5-coder 系の 32k を採用 (モデルに合わせて要調整)。
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 32_768;
+
+/// Kimi の既定 timeout。reasoning_effort 既定 (max) の思考込みで 120 秒を超え得る。
+const KIMI_TIMEOUT_SECS: u64 = 600;
 
 impl ProviderConfig {
     pub fn default_local() -> Self {
@@ -122,6 +196,32 @@ impl ProviderConfig {
             model: "fugu".to_string(),
             api_key: String::new(),
             timeout_secs: 120,
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            temperature: None,
+        }
+    }
+
+    /// さくらのAI Engine。OpenAI 互換で、既定は tool calling を確認済みの
+    /// `gpt-oss-120b` (preview/* のモデルは予告なく入れ替わるため既定にしない)。
+    pub fn default_sakura() -> Self {
+        Self {
+            base_url: "https://api.ai.sakura.ad.jp/v1".to_string(),
+            model: "gpt-oss-120b".to_string(),
+            api_key: String::new(),
+            timeout_secs: 120,
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            temperature: None,
+        }
+    }
+
+    /// Moonshot AI の Kimi。K3 は常に思考するため 1 応答が長く、timeout を広めに取る。
+    /// `temperature` は 1 以外を送ると 400 になる (サーバ固定) ので既定どおり省略すること。
+    pub fn default_kimi() -> Self {
+        Self {
+            base_url: "https://api.moonshot.ai/v1".to_string(),
+            model: "kimi-k3".to_string(),
+            api_key: String::new(),
+            timeout_secs: KIMI_TIMEOUT_SECS,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
         }
@@ -151,6 +251,8 @@ impl LlmConfig {
         match self.provider {
             Provider::Local => &self.local,
             Provider::Sakana => &self.sakana,
+            Provider::Sakura => &self.sakura,
+            Provider::Kimi => &self.kimi,
         }
     }
 
@@ -158,6 +260,8 @@ impl LlmConfig {
         match self.provider {
             Provider::Local => &mut self.local,
             Provider::Sakana => &mut self.sakana,
+            Provider::Sakura => &mut self.sakura,
+            Provider::Kimi => &mut self.kimi,
         }
     }
 }
@@ -273,8 +377,12 @@ mod tests {
         assert_eq!(cfg.llm.sakana.base_url, "https://api.sakana.ai/v1");
         assert_eq!(cfg.llm.sakana.model, "fugu");
         assert!(cfg.llm.sakana.api_key.is_empty());
+        assert_eq!(cfg.llm.sakura.base_url, "https://api.ai.sakura.ad.jp/v1");
+        assert_eq!(cfg.llm.sakura.model, "gpt-oss-120b");
+        assert!(cfg.llm.sakura.api_key.is_empty());
         assert_eq!(cfg.llm.local.context_window, DEFAULT_CONTEXT_WINDOW);
         assert_eq!(cfg.llm.sakana.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(cfg.llm.sakura.context_window, DEFAULT_CONTEXT_WINDOW);
     }
 
     #[test]
@@ -283,6 +391,8 @@ mod tests {
         assert_eq!(cfg.llm.active().base_url, "http://localhost:11434/v1");
         cfg.llm.provider = Provider::Sakana;
         assert_eq!(cfg.llm.active().base_url, "https://api.sakana.ai/v1");
+        cfg.llm.provider = Provider::Sakura;
+        assert_eq!(cfg.llm.active().base_url, "https://api.ai.sakura.ad.jp/v1");
     }
 
     #[test]
@@ -305,6 +415,43 @@ mod tests {
         assert_eq!(cfg.llm.local.model, "qwen2.5-coder:7b");
         assert!(cfg.llm.local.api_key.is_empty());
         assert_eq!(cfg.llm.local.temperature, None);
+        // so is sakura
+        assert_eq!(cfg.llm.sakura.base_url, "https://api.ai.sakura.ad.jp/v1");
+        assert!(cfg.llm.sakura.api_key.is_empty());
+    }
+
+    #[test]
+    fn partial_provider_block_keeps_that_providers_defaults() {
+        // ラダーのハーネスが書く形。timeout だけ上書きして他は各既定を保つ。
+        let cfg: Config = toml::from_str(
+            "[llm.local]\ntimeout_secs = 900\n\n[llm.sakana]\ntimeout_secs = 900\n\n[llm.sakura]\ntimeout_secs = 900\n\n[llm.kimi]\ntimeout_secs = 900\n",
+        )
+        .expect("partial provider blocks should parse");
+
+        assert_eq!(cfg.llm.local.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.llm.sakana.base_url, "https://api.sakana.ai/v1");
+        assert_eq!(cfg.llm.sakana.model, "fugu");
+        assert_eq!(cfg.llm.sakura.base_url, "https://api.ai.sakura.ad.jp/v1");
+        assert_eq!(cfg.llm.sakura.model, "gpt-oss-120b");
+        assert_eq!(cfg.llm.kimi.base_url, "https://api.moonshot.ai/v1");
+        assert_eq!(cfg.llm.kimi.model, "kimi-k3");
+        for p in [
+            &cfg.llm.local,
+            &cfg.llm.sakana,
+            &cfg.llm.sakura,
+            &cfg.llm.kimi,
+        ] {
+            assert_eq!(p.timeout_secs, 900);
+            assert_eq!(p.context_window, DEFAULT_CONTEXT_WINDOW);
+        }
+    }
+
+    #[test]
+    fn empty_config_falls_back_to_all_defaults() {
+        let cfg: Config = toml::from_str("").expect("empty config should parse");
+        assert_eq!(cfg.llm.provider, Provider::Local);
+        assert_eq!(cfg.llm.sakura.base_url, "https://api.ai.sakura.ad.jp/v1");
+        assert_eq!(cfg.llm.sakana.base_url, "https://api.sakana.ai/v1");
     }
 
     #[test]

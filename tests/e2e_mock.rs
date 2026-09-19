@@ -4,11 +4,10 @@
 //! `Session` at it, runs the "demo" prompt, and asserts that all six MVP
 //! tools fired in order and the final file content is correct.
 
-use std::net::{TcpListener, TcpStream};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use lodan::agent::Session;
 use lodan::config::Config;
@@ -28,13 +27,6 @@ impl Drop for MockServer {
     }
 }
 
-fn pick_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
 fn fixtures_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -42,29 +34,32 @@ fn fixtures_path() -> PathBuf {
         .join("mock_llm.py")
 }
 
+/// mock をポート 0 で起動し、実際に bind されたポートを stdout の 1 行目から受け取る。
+/// 空きポートを先に選んで渡す方式は、並列で走る他のテストと番号を取り合う
+/// (詳細は tests/e2e_headless.rs の start_mock)。
 fn start_mock(demo_dir: &Path) -> MockServer {
-    let port = pick_port();
-    let script = fixtures_path();
-    let child = Command::new("python3")
-        .arg(&script)
-        .arg(port.to_string())
+    let mut child = Command::new("python3")
+        .arg(fixtures_path())
+        .arg("0")
         .arg(demo_dir.to_str().expect("utf8 demo_dir"))
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn python3 mock_llm.py (is python3 on PATH?)");
-
-    // child を即 MockServer に包む。タイムアウト panic でも Drop が kill+wait するため
+    let stdout = child.stdout.take().expect("piped stdout");
+    // child を即 MockServer に包む。以降で panic しても Drop が kill+wait するため
     // 子プロセスが zombie として取り残されない。
-    let server = MockServer { child, port };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return server;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("mock server did not become ready on port {port}");
+    let mut server = MockServer { child, port: 0 };
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read the PORT line from mock_llm.py");
+    server.port = line
+        .trim()
+        .strip_prefix("PORT ")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("mock_llm.py did not announce its port (got {line:?})"));
+    server
 }
 
 /// JSONL 行を読み、指定 event の行だけ返す。

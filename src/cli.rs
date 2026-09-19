@@ -59,6 +59,15 @@ pub struct Cli {
     #[arg(long, env = "LODAN_DUP_SUPPRESS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub dup_suppress: Option<bool>,
 
+    /// Provider to fall back to when the primary is temporarily unavailable (5xx / 429 / connect errors after retries)
+    #[arg(
+        long,
+        env = "LODAN_FALLBACK_PROVIDER",
+        value_enum,
+        value_name = "PROVIDER"
+    )]
+    pub fallback_provider: Option<Provider>,
+
     /// Run consecutive parallel-safe tool calls (Read/Grep/Glob/WebFetch/WebSearch/Task) concurrently
     #[arg(long, env = "LODAN_PARALLEL_TOOLS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub parallel_tools: Option<bool>,
@@ -125,6 +134,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
     };
     let overrides = crate::config::Overrides {
         provider: args.provider,
+        fallback: args.fallback_provider,
         base_url: args.base_url,
         model: args.model,
         api_key: args.api_key,

@@ -14,6 +14,7 @@
 //! | `turn_start` | `turn`, `mode`, `input_chars` |
 //! | `llm_response` | `turn`, `iter`, `text_chars`, `tool_calls`, `prompt_tokens`, `completion_tokens`, `estimated` |
 //! | `api_retry` | `attempt`, `max_retries`, `why` (`HTTP 503` / `connect error` / `stream interrupted`), `delay_ms` |
+//! | `provider_fallback` | primary が一時的に使えず fallback provider を試した。`to`, `model`, `switched` (fallback が成功して以後そちらに固定したか), `why` |
 //! | `malformed_retry` | `turn`, `iter`, `n` |
 //! | `finish_nudge` | `turn`, `iter`, `kind` (`act` / `verify`) |
 //! | `stop_hook_block` | `turn`, `iter` |

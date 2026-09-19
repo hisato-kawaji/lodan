@@ -1,3 +1,4 @@
+pub mod fallback;
 pub mod kimi;
 pub mod openai;
 pub mod sakana;
@@ -72,11 +73,54 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<()>;
 }
 
+/// 時間を置くか、別の provider に投げれば通り得る失敗。再試行を使い切った接続エラー /
+/// 408 / 429 / 5xx、本文を出す前のストリーム断、タイムアウトがこれで返る。
+/// **利用者にまだ何も見せていない**ことを含意する (fallback が同じ sink を使い回せる根拠)。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TransientLlmError(pub String);
+
+/// `e` が (context を重ねた後でも) 一時的な失敗か。
+pub fn is_transient(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<TransientLlmError>().is_some())
+}
+
 pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
-    match cfg.llm.provider {
-        Provider::Local => Ok(Arc::new(openai::OpenAiClient::new(&cfg.llm.local)?)),
-        Provider::Sakana => Ok(Arc::new(sakana::SakanaClient::new(&cfg.llm.sakana)?)),
-        Provider::Sakura => Ok(Arc::new(sakura::SakuraClient::new(&cfg.llm.sakura)?)),
-        Provider::Kimi => Ok(Arc::new(kimi::KimiClient::new(&cfg.llm.kimi)?)),
+    let primary = build_for(cfg.llm.provider, cfg)?;
+    let Some(fallback) = cfg.llm.fallback else {
+        return Ok(primary);
+    };
+    if fallback == cfg.llm.provider {
+        tracing::warn!(
+            "llm.fallback is the same as llm.provider ({}); ignoring it",
+            fallback.as_str()
+        );
+        return Ok(primary);
     }
+    // fallback は保険。キーが無いなどで組めなくても、primary での実行は止めない。
+    match build_for(fallback, cfg) {
+        Ok(client) => Ok(Arc::new(fallback::FallbackClient::new(
+            primary,
+            client,
+            fallback.as_str(),
+            cfg.llm.get(fallback).model.clone(),
+        ))),
+        Err(e) => {
+            tracing::warn!(
+                "llm.fallback = {} is unusable, continuing without it: {e:#}",
+                fallback.as_str()
+            );
+            Ok(primary)
+        }
+    }
+}
+
+fn build_for(provider: Provider, cfg: &Config) -> Result<Arc<dyn LlmClient>> {
+    Ok(match provider {
+        Provider::Local => Arc::new(openai::OpenAiClient::new(&cfg.llm.local)?),
+        Provider::Sakana => Arc::new(sakana::SakanaClient::new(&cfg.llm.sakana)?),
+        Provider::Sakura => Arc::new(sakura::SakuraClient::new(&cfg.llm.sakura)?),
+        Provider::Kimi => Arc::new(kimi::KimiClient::new(&cfg.llm.kimi)?),
+    })
 }

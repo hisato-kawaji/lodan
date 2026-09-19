@@ -9,6 +9,10 @@ emits a final summary. Otherwise it returns a greeting.
 Supports both stream=false (single JSON) and stream=true (SSE).
 
 Usage: mock_llm.py <port> [<demo_dir>]
+
+Pass port 0 to let the OS choose. The port actually bound is printed on the first
+line of stdout ("PORT <n>"), so a test harness never has to guess a free port and
+race other tests for it.
 """
 import json
 import sys
@@ -166,7 +170,11 @@ def make_handler(demo_dir):
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     demo_dir = sys.argv[2] if len(sys.argv) > 2 else "/tmp/lodan-mock"
+    server = HTTPServer(("127.0.0.1", port), make_handler(demo_dir))
+    port = server.server_port
+    # The socket is already listening here, so whoever reads this line can connect.
+    print(f"PORT {port}", flush=True)
     sys.stderr.write(
         f"[mock] listening on http://127.0.0.1:{port} demo_dir={demo_dir}\n"
     )
-    HTTPServer(("127.0.0.1", port), make_handler(demo_dir)).serve_forever()
+    server.serve_forever()

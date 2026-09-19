@@ -136,6 +136,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 - **温度制御**: provider 設定の `temperature`(既定は未送信 = サーバ既定)。整形の破綻・綴りブレ・実行ごとの分散を抑えるには `0.1`〜`0.2` を推奨。
 - **壊れツールコールの再要求**: tool_calls が空なのに応答テキストへ呼び出しの痕跡(`<function=`、`call:Name{…}`、`<|tool_call` 等)が漏れている場合、「正しい tool call として再発行せよ」と自動で注入してターンを継続する(1 ターン 2 回まで)。
 - **重複呼び出しの抑止**: 直前と完全同一(名前 + 引数)の **read-only** 呼び出しは実行せず「結果は不変。別の行動を」と返す(同一ファイルを延々 Read するループ対策)。Bash 再実行など破壊系の正当な繰り返しは対象外。
+- **ツールプロファイル**(`[agent] tool_profile`、`--tool-profile`、`LODAN_TOOL_PROFILE`): ツール定義は**毎リクエスト全量が送られる**ので、小型モデルでは固定費がそのまま所要時間になる(ラダーのベースラインで 1.8k〜2.4k tok/呼び出し)。`core` は Read / Write / Edit / Bash / Grep / Glob の 6 個だけを見せ、定義の JSON は 6,643 → 2,437 バイト(-63%)。`readonly` は破壊的でないツールだけ。`tools = [...]`(`--tools Read,Grep,...`)で明示リストも指定できる。隠したツールは登録に残るので、モデルが名前を覚えていて呼んできても実行はされず「このプロファイルでは無効。使えるのは …」と返る(`--yes` でも通らない)。Task / Skill / MCP のツールも `core` では隠れる点に注意。起動時の `tools` イベント(`--log-jsonl` / `stream-json`)に、見せているツールと定義のバイト数が残る
 - **終了前自己検証ナッジ**(`[agent] finish_nudge = true`、既定 false): ターンが終わろうとする最初の応答で 1 回だけ、ツール未使用なら「計画を述べ直さず今実行せよ」、使用済みなら「元の依頼を読み直し全要件の実装・検証を確認せよ」と促して継続させる。「計画だけ述べて終了」「長い自己編集中の要件脱落」対策(#63)。良行儀なモデルには余計なラウンドトリップになるため opt-in。
 
 ## 設定
@@ -193,6 +194,8 @@ auto_approve    = false
 finish_nudge    = false   # 終了前自己検証ナッジ (#63)
 malformed_retry = true    # テキストに漏れたツールコールの再要求 (#61)
 dup_suppress    = true    # 直前と同一の read-only 呼び出しの抑止 (#61)
+tool_profile    = "full"  # モデルに見せるツール: full / core (6 個) / readonly
+tools           = []      # 明示リスト。空でなければ tool_profile より優先 (例: ["Read", "Grep", "TodoWrite"])
 
 [tools.bash]
 timeout_secs = 30
@@ -204,12 +207,13 @@ timeout_secs = 30
 - `LODAN_PROVIDER` (`local` | `sakana` | `sakura` | `kimi`)
 - `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
 - `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
+- `LODAN_TOOL_PROFILE` / `LODAN_TOOLS` (カンマ区切り)
 - `LODAN_LOG_JSONL` (実行トレース JSONL の出力先)
 - `SAKANA_API_KEY` (provider=sakana のときに `api_key` が空ならフォールバック)
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 

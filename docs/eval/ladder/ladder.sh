@@ -70,6 +70,8 @@ flags_for_config() {
     temp)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false" ;;
     mitig) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=false" ;;
     nudge) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=true" ;;
+    # temp と同条件でツール定義だけを 6 個に絞る (#72)。temp との差がプロファイルの寄与。
+    core)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --tool-profile core" ;;
     *) echo "unknown config: $1" >&2; return 1 ;;
   esac
 }

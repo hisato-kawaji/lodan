@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::agent::messages::{ToolSpec, ToolSpecFunction};
@@ -7,7 +7,13 @@ use crate::tools::{ask_user_question, kill_shell, monitor, notebook_edit, web_fe
 
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// モデルに見せるツール名。`None` は全部。隠したツールも登録は残すので、呼ばれたときに
+    /// 「存在しない」ではなく「このプロファイルでは無効」と答えられる。
+    visible: Option<BTreeSet<String>>,
 }
+
+/// `tool_profile = "core"` でモデルに見せるツール。
+pub const CORE_TOOLS: &[&str] = &["Read", "Write", "Edit", "Bash", "Grep", "Glob"];
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -19,7 +25,56 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: BTreeMap::new(),
+            visible: None,
         }
+    }
+
+    /// 設定に従ってモデルに見せるツールを絞る。全ツールの登録が済んでから呼ぶこと。
+    /// 明示リストにある未登録の名前は無視して返す (呼び出し側が警告できるように)。
+    pub fn apply_profile(
+        &mut self,
+        profile: crate::config::ToolProfile,
+        explicit: &[String],
+    ) -> Vec<String> {
+        use crate::config::ToolProfile;
+        let mut unknown = Vec::new();
+        self.visible = if !explicit.is_empty() {
+            let (known, missing): (Vec<_>, Vec<_>) = explicit
+                .iter()
+                .cloned()
+                .partition(|n| self.tools.contains_key(n));
+            unknown = missing;
+            Some(known.into_iter().collect())
+        } else {
+            match profile {
+                ToolProfile::Full => None,
+                ToolProfile::Core => Some(
+                    CORE_TOOLS
+                        .iter()
+                        .filter(|n| self.tools.contains_key(**n))
+                        .map(|n| n.to_string())
+                        .collect(),
+                ),
+                ToolProfile::Readonly => Some(
+                    self.tools
+                        .values()
+                        .filter(|t| !t.is_destructive())
+                        .map(|t| t.name().to_string())
+                        .collect(),
+                ),
+            }
+        };
+        unknown
+    }
+
+    /// モデルに見せているか。未登録の名前は false。
+    pub fn is_visible(&self, name: &str) -> bool {
+        self.tools.contains_key(name) && self.visible.as_ref().is_none_or(|v| v.contains(name))
+    }
+
+    /// 登録済みの全ツール数 (隠したものを含む)。
+    pub fn registered_len(&self) -> usize {
+        self.tools.len()
     }
 
     pub fn register(&mut self, t: Arc<dyn Tool>) {
@@ -30,12 +85,18 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// モデルに見せているツール名。
     pub fn names(&self) -> Vec<&str> {
-        self.tools.keys().map(|s| s.as_str()).collect()
+        self.tools
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|n| self.is_visible(n))
+            .collect()
     }
 
+    /// モデルに見せているツール数。
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.names().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -54,7 +115,7 @@ impl ToolRegistry {
     fn specs(&self, keep: impl Fn(&dyn Tool) -> bool) -> Vec<ToolSpec<'_>> {
         self.tools
             .values()
-            .filter(|t| keep(t.as_ref()))
+            .filter(|t| self.is_visible(t.name()) && keep(t.as_ref()))
             .map(|t| ToolSpec {
                 kind: "function",
                 function: ToolSpecFunction {
@@ -101,6 +162,84 @@ pub fn read_only_registry() -> ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec_names(r: &ToolRegistry) -> Vec<String> {
+        r.tool_specs()
+            .iter()
+            .map(|s| s.function.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn full_profile_shows_everything() {
+        let mut r = default_registry();
+        assert!(
+            r.apply_profile(crate::config::ToolProfile::Full, &[])
+                .is_empty()
+        );
+        assert_eq!(r.len(), r.registered_len());
+    }
+
+    #[test]
+    fn core_profile_shows_exactly_the_six_core_tools() {
+        let mut r = default_registry();
+        r.apply_profile(crate::config::ToolProfile::Core, &[]);
+        let mut expected: Vec<String> = CORE_TOOLS.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(spec_names(&r), expected);
+        assert_eq!(
+            r.names(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        // 隠しただけで、登録は残っている (呼ばれたら「無効」と答えるため)。
+        assert!(r.get("WebFetch").is_some());
+        assert!(!r.is_visible("WebFetch"));
+        assert_eq!(r.registered_len(), default_registry().registered_len());
+    }
+
+    #[test]
+    fn readonly_profile_hides_every_destructive_tool() {
+        let mut r = default_registry();
+        r.apply_profile(crate::config::ToolProfile::Readonly, &[]);
+        for name in r.names() {
+            assert!(!r.get(name).unwrap().is_destructive(), "{name}");
+        }
+        assert!(r.is_visible("Read") && !r.is_visible("Bash"));
+    }
+
+    #[test]
+    fn an_explicit_list_wins_over_the_profile_and_reports_unknown_names() {
+        let mut r = default_registry();
+        let unknown = r.apply_profile(
+            crate::config::ToolProfile::Core,
+            &["Read".into(), "TodoWrite".into(), "NoSuchTool".into()],
+        );
+        assert_eq!(unknown, ["NoSuchTool"]);
+        assert_eq!(spec_names(&r), ["Read", "TodoWrite"]);
+    }
+
+    #[test]
+    fn plan_mode_specs_respect_the_profile_too() {
+        let mut r = default_registry();
+        r.apply_profile(crate::config::ToolProfile::Core, &[]);
+        let names: Vec<String> = r
+            .read_only_tool_specs()
+            .iter()
+            .map(|s| s.function.name.to_string())
+            .collect();
+        assert_eq!(names, ["Glob", "Grep", "Read"]);
+    }
+
+    #[test]
+    fn core_profile_at_least_halves_the_tool_spec_payload() {
+        // #72 の受け入れ条件。毎リクエスト送る JSON の大きさで比べる。
+        let bytes = |r: &ToolRegistry| serde_json::to_string(&r.tool_specs()).unwrap().len();
+        let full = bytes(&default_registry());
+        let mut core = default_registry();
+        core.apply_profile(crate::config::ToolProfile::Core, &[]);
+        let core = bytes(&core);
+        assert!(core * 2 <= full, "core = {core} bytes, full = {full} bytes");
+    }
     use async_trait::async_trait;
     use serde_json::json;
 

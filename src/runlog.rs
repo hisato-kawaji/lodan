@@ -10,6 +10,7 @@
 //! | event | 主なフィールド |
 //! |---|---|
 //! | `run_start` | `version`, `provider`, `model`, `cwd` |
+//! | `tools` | 起動時に 1 回。`profile`, `explicit`, `visible` (モデルに見せるツール名), `registered`, `spec_bytes` (毎リクエスト送るツール定義の JSON バイト数) |
 //! | `turn_start` | `turn`, `mode`, `input_chars` |
 //! | `llm_response` | `turn`, `iter`, `text_chars`, `tool_calls`, `prompt_tokens`, `completion_tokens`, `estimated` |
 //! | `api_retry` | `attempt`, `max_retries`, `why` (`HTTP 503` / `connect error` / `stream interrupted`), `delay_ms` |

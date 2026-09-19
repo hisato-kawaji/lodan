@@ -30,6 +30,7 @@
 | `temp` | `--temperature 0.2` | 温度固定だけ |
 | `mitig` | `+ --malformed-retry --dup-suppress` | v2 (#61) |
 | `nudge` | `+ --finish-nudge` | v4 (#63) |
+| `core` | `temp` + `--tool-profile core` | ツール定義を 6 個に絞る (#72)。**`temp` と比べる** (既定の `CONFIGS` には含めない) |
 
 ## 使い方
 

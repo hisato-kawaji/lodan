@@ -101,6 +101,29 @@ impl Runtime {
             registry.register(Arc::new(crate::skills::SkillTool::new(user_skills)));
         }
 
+        // 全ツールの登録が済んだところで、モデルに見せる範囲を絞る (#72)。
+        for name in registry.apply_profile(cfg.agent.tool_profile, &cfg.agent.tools) {
+            eprintln!("tools: '{name}' is listed in agent.tools but no such tool is registered");
+        }
+        let spec_bytes = serde_json::to_string(&registry.tool_specs()).map_or(0, |s| s.len());
+        crate::runlog::record(
+            "tools",
+            serde_json::json!({
+                "profile": cfg.agent.tool_profile.as_str(),
+                "explicit": !cfg.agent.tools.is_empty(),
+                "visible": registry.names(),
+                "registered": registry.registered_len(),
+                "spec_bytes": spec_bytes,
+            }),
+        );
+        if registry.len() < registry.registered_len() {
+            notices.say(&format!(
+                "tools: {} of {} visible to the model ({spec_bytes} bytes of tool specs)",
+                registry.len(),
+                registry.registered_len()
+            ));
+        }
+
         Ok(Self {
             cwd,
             llm,

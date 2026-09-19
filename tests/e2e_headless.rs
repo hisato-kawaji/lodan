@@ -389,3 +389,45 @@ fn a_usage_error_is_exit_code_2_and_distinct_from_max_iterations() {
     assert_eq!(out.status.code(), Some(2), "clap's usage-error code");
     assert!(stdout(&out).is_empty());
 }
+
+#[test]
+fn tool_profile_core_is_reported_and_shrinks_the_tool_specs() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock(home.path());
+    let tools_event = |args: &[&str]| -> serde_json::Value {
+        let out = lodan(home.path(), server.port, args, Stdin::OpenAndSilent);
+        assert!(out.status.success());
+        stdout(&out)
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["event"] == "tools")
+            .expect("a tools event")
+    };
+    let full = tools_event(&["-p", "hi", "--output-format", "stream-json"]);
+    let core = tools_event(&[
+        "-p",
+        "hi",
+        "--output-format",
+        "stream-json",
+        "--tool-profile",
+        "core",
+    ]);
+
+    assert_eq!(core["profile"], "core");
+    assert_eq!(
+        core["visible"],
+        serde_json::json!(["Bash", "Edit", "Glob", "Grep", "Read", "Write"])
+    );
+    assert_eq!(
+        full["registered"], core["registered"],
+        "hidden tools stay registered"
+    );
+    let (full_bytes, core_bytes) = (
+        full["spec_bytes"].as_u64().unwrap(),
+        core["spec_bytes"].as_u64().unwrap(),
+    );
+    assert!(
+        core_bytes * 2 <= full_bytes,
+        "core = {core_bytes}, full = {full_bytes}"
+    );
+}

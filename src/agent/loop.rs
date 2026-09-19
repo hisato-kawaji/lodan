@@ -91,6 +91,24 @@ impl Session {
         llm: &dyn LlmClient,
         gate: &PermissionGate,
     ) -> Result<()> {
+        // `turn_end` は Drop で出す。`?` による早期 return と、Ctrl-C で future ごと
+        // drop される経路 (repl の run_turn_interruptible) の両方で `turn_start` と
+        // 対になるようにするため。
+        let mut end = TurnEnd::new();
+        let res = self.run_turn_inner(user_input, llm, gate, &mut end).await;
+        if res.is_err() && end.reason == TURN_END_ABORTED {
+            end.reason = TURN_END_ERROR;
+        }
+        res
+    }
+
+    async fn run_turn_inner(
+        &mut self,
+        user_input: &str,
+        llm: &dyn LlmClient,
+        gate: &PermissionGate,
+        end: &mut TurnEnd,
+    ) -> Result<()> {
         let prompt_payload = serde_json::json!({ "prompt": user_input });
         if let HookOutcome::Block(reason) = hooks::runner::dispatch(
             Lifecycle::UserPromptSubmit,
@@ -121,9 +139,7 @@ impl Session {
         let mut finish_nudged = false;
 
         // 評価ハーネス向けの計測 (runlog 無効時はいずれも no-op)。
-        let turn_started = std::time::Instant::now();
-        let mut iterations = 0usize;
-        let mut tool_calls_total = 0usize;
+        end.arm(self.turn_seq);
         crate::runlog::record(
             "turn_start",
             serde_json::json!({
@@ -134,7 +150,8 @@ impl Session {
         );
 
         for _ in 0..self.cfg.agent.max_iterations {
-            iterations += 1;
+            end.iterations += 1;
+            let iterations = end.iterations;
             // Plan 中は read-only specs に ExitPlanMode (承認要求の擬似ツール) を
             // 加える。Normal では不可視。モードはターン途中でも切り替わり得る
             // (ExitPlanMode 承認直後) ため、毎イテレーション組み直す。
@@ -155,7 +172,7 @@ impl Session {
                 serde_json::json!({
                     "turn": self.turn_seq,
                     "iter": iterations,
-                    "text_chars": resp.content.as_deref().map(str::len).unwrap_or(0),
+                    "text_chars": resp.content.as_deref().map(|t| t.chars().count()).unwrap_or(0),
                     "tool_calls": resp.tool_calls.iter().map(|c| c.function.name.as_str()).collect::<Vec<_>>(),
                     "prompt_tokens": u.prompt_tokens,
                     "completion_tokens": u.completion_tokens,
@@ -236,13 +253,7 @@ impl Session {
                 {
                     HookOutcome::Continue => {
                         self.maybe_auto_compact(llm).await;
-                        record_turn_end(
-                            self.turn_seq,
-                            iterations,
-                            tool_calls_total,
-                            "final",
-                            turn_started,
-                        );
+                        end.reason = TURN_END_FINAL;
                         return Ok(());
                     }
                     HookOutcome::Block(reason) => {
@@ -273,7 +284,7 @@ impl Session {
                 // 何が起きたかを 1 語で記録する (ablation で緩和策の発火回数を数える)。
                 let mut reason = TOOL_REASON_OK;
                 let call_started = std::time::Instant::now();
-                tool_calls_total += 1;
+                end.tool_calls += 1;
 
                 let mut output = if plan_just_approved {
                     reason = "skipped_after_plan";
@@ -406,13 +417,7 @@ impl Session {
             }
         }
 
-        record_turn_end(
-            self.turn_seq,
-            iterations,
-            tool_calls_total,
-            "max_iterations",
-            turn_started,
-        );
+        end.reason = TURN_END_MAX_ITERATIONS;
         bail!(
             "hit max_iterations ({}) without final assistant text",
             self.cfg.agent.max_iterations
@@ -762,24 +767,61 @@ impl CompactOutcome {
 /// runlog の `tool_result.reason` 既定値 (ループ側の介入なしに実行された)。
 const TOOL_REASON_OK: &str = "ok";
 
-/// ターン終了イベントを記録する (正常終了と max_iterations の両方から呼ぶ)。
-fn record_turn_end(
-    turn: u64,
+const TURN_END_FINAL: &str = "final";
+const TURN_END_MAX_ITERATIONS: &str = "max_iterations";
+/// `?` でターンが失敗した (LLM 呼び出し・hook 実行のエラーなど)。
+const TURN_END_ERROR: &str = "error";
+/// future が完了前に drop された (Ctrl-C 中断)。
+const TURN_END_ABORTED: &str = "aborted";
+
+/// `turn_start` と対になる `turn_end` を Drop で必ず 1 回記録するガード。
+/// `arm` 前 (UserPromptSubmit hook にブロックされた等) は何も出さない。
+struct TurnEnd {
+    turn: Option<u64>,
     iterations: usize,
     tool_calls: usize,
-    reason: &str,
+    reason: &'static str,
     started: std::time::Instant,
-) {
-    crate::runlog::record(
-        "turn_end",
-        serde_json::json!({
+}
+
+impl TurnEnd {
+    fn new() -> Self {
+        Self {
+            turn: None,
+            iterations: 0,
+            tool_calls: 0,
+            reason: TURN_END_ABORTED,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// `turn_start` を記録する時点で呼ぶ。経過時間の起点もここに置き直す。
+    fn arm(&mut self, turn: u64) {
+        self.turn = Some(turn);
+        self.started = std::time::Instant::now();
+    }
+}
+
+impl TurnEnd {
+    /// 記録するフィールド。`arm` 前は `None` (イベントを出さない)。
+    fn fields(&self) -> Option<serde_json::Value> {
+        let turn = self.turn?;
+        Some(serde_json::json!({
             "turn": turn,
-            "iterations": iterations,
-            "tool_calls": tool_calls,
-            "reason": reason,
-            "ms": started.elapsed().as_millis() as u64,
-        }),
-    );
+            "iterations": self.iterations,
+            "tool_calls": self.tool_calls,
+            "reason": self.reason,
+            "ms": self.started.elapsed().as_millis() as u64,
+        }))
+    }
+}
+
+impl Drop for TurnEnd {
+    fn drop(&mut self) {
+        if let Some(fields) = self.fields() {
+            crate::runlog::record("turn_end", fields);
+        }
+    }
 }
 
 /// 中断で補填する応答の本文。モデルに「途中で切られた」ことを伝える。
@@ -1093,6 +1135,27 @@ fn clip_lines(s: &str, max_lines: usize, max_chars: usize, total_bytes: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_end_is_silent_until_armed() {
+        // UserPromptSubmit hook にブロックされたターンは turn_start を出さないので
+        // turn_end も出さない。
+        assert!(TurnEnd::new().fields().is_none());
+    }
+
+    #[test]
+    fn turn_end_defaults_to_aborted_once_armed() {
+        // 明示的に reason を立てないまま drop される = future ごと捨てられた中断経路。
+        let mut end = TurnEnd::new();
+        end.arm(3);
+        end.iterations = 2;
+        end.tool_calls = 5;
+        let f = end.fields().unwrap();
+        assert_eq!(f["turn"], 3);
+        assert_eq!(f["iterations"], 2);
+        assert_eq!(f["tool_calls"], 5);
+        assert_eq!(f["reason"], TURN_END_ABORTED);
+    }
     use crate::agent::messages::ToolSpec;
     use crate::config::Config;
     use crate::hooks::HookConfig;

@@ -48,15 +48,15 @@ pub struct Cli {
     pub temperature: Option<f32>,
 
     /// Nudge the model to self-verify once before finishing (#63)
-    #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub finish_nudge: Option<bool>,
 
     /// Ask the model to re-issue tool calls that leaked as text (#61)
-    #[arg(long, env = "LODAN_MALFORMED_RETRY", num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "LODAN_MALFORMED_RETRY", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub malformed_retry: Option<bool>,
 
     /// Skip a read-only tool call identical to the immediately preceding one (#61)
-    #[arg(long, env = "LODAN_DUP_SUPPRESS", num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "LODAN_DUP_SUPPRESS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub dup_suppress: Option<bool>,
 
     #[command(subcommand)]
@@ -126,4 +126,26 @@ fn list_sessions() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn bool_flag_without_value_does_not_swallow_subcommand() {
+        let cli = Cli::try_parse_from(["lodan", "--finish-nudge", "repl"]).unwrap();
+        assert_eq!(cli.finish_nudge, Some(true));
+        assert!(matches!(cli.cmd, Some(Command::Repl)));
+    }
+
+    #[test]
+    fn bool_flag_takes_explicit_value_with_equals() {
+        let cli =
+            Cli::try_parse_from(["lodan", "--dup-suppress=false", "--malformed-retry=1"]).unwrap();
+        assert_eq!(cli.dup_suppress, Some(false));
+        assert_eq!(cli.malformed_retry, Some(true));
+        assert_eq!(cli.finish_nudge, None);
+    }
 }

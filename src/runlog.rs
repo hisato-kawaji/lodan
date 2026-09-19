@@ -2,7 +2,7 @@
 //!
 //! 評価ハーネスが指標を機械的に取れるようにするための出力で、stdout の表示形式に
 //! 依存せずターン数・ツール呼び出しの成否と所要時間・整形破綻や緩和策の発火回数を
-//! 数えられる。無効時は完全な no-op、書き込みに失敗しても実行は止めない
+//! 数えられる。無効時は何も出力せず、書き込みに失敗しても実行は止めない
 //! (同じ失敗を毎行叫ばないよう警告は 1 度だけ)。
 //!
 //! 1 行 1 イベントで、全イベントが `ts_ms` と `event` を持つ:
@@ -17,7 +17,10 @@
 //! | `stop_hook_block` | `turn`, `iter` |
 //! | `tool_result` | `turn`, `iter`, `name`, `outcome` (`ok` / `error`), `reason`, `ms`, `args_bytes`, `output_bytes` |
 //! | `compact` | `turn`, `outcome` |
-//! | `turn_end` | `turn`, `iterations`, `tool_calls`, `reason`, `ms` |
+//! | `turn_end` | `turn`, `iterations`, `tool_calls`, `reason` (`final` / `max_iterations` / `error` / `aborted`), `ms` |
+//!
+//! `turn_end` は `turn_start` と必ず対になる (エラー終了は `error`、Ctrl-C 中断は `aborted`)。
+//! `input_chars` / `text_chars` はどちらも Unicode スカラ値の個数で、バイト数ではない。
 
 use std::io::Write;
 use std::path::Path;

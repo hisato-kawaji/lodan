@@ -134,8 +134,11 @@ timeout_secs   = 120
 context_window = 32768
 
 [agent]
-max_iterations = 25
-auto_approve   = false
+max_iterations  = 25
+auto_approve    = false
+finish_nudge    = false   # 終了前自己検証ナッジ (#63)
+malformed_retry = true    # テキストに漏れたツールコールの再要求 (#61)
+dup_suppress    = true    # 直前と同一の read-only 呼び出しの抑止 (#61)
 
 [tools.bash]
 timeout_secs = 30
@@ -146,9 +149,13 @@ timeout_secs = 30
 環境変数:
 - `LODAN_PROVIDER` (`local` | `sakana`)
 - `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
+- `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
+- `LODAN_LOG_JSONL` (実行トレース JSONL の出力先)
 - `SAKANA_API_KEY` (provider=sakana のときに `api_key` が空ならフォールバック)
 
-CLI フラグ: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes`
+CLI フラグ: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]`
+
+真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 
 `$CWD/.env` は起動時に自動ロード (dotenvy)。コミット対象外 (`.gitignore` 済)。
 

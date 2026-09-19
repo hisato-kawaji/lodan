@@ -67,10 +67,20 @@ fn start_mock(demo_dir: &Path) -> MockServer {
     panic!("mock server did not become ready on port {port}");
 }
 
+/// JSONL 行を読み、指定 event の行だけ返す。
+fn events_named<'a>(lines: &'a [serde_json::Value], event: &str) -> Vec<&'a serde_json::Value> {
+    lines.iter().filter(|v| v["event"] == event).collect()
+}
+
 #[tokio::test]
 async fn demo_runs_all_six_tools_via_streaming() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let demo_dir = tmp.path().to_path_buf();
+
+    // 実行トレースも同じ流れで検証する (この test binary で唯一の test なので
+    // プロセス唯一の sink を初期化して競合しない)。
+    let log_path = tmp.path().join("run.jsonl");
+    lodan::runlog::init(&log_path).expect("init runlog");
 
     let server = start_mock(&demo_dir);
 
@@ -96,5 +106,44 @@ async fn demo_runs_all_six_tools_via_streaming() {
     assert_eq!(
         content, "hello world",
         "Edit should rewrite hi -> hello world"
+    );
+
+    let body = std::fs::read_to_string(&log_path).expect("read run log");
+    let lines: Vec<serde_json::Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad jsonl line {l:?}: {e}")))
+        .collect();
+
+    let starts = events_named(&lines, "turn_start");
+    assert_eq!(starts.len(), 1, "one turn_start per run_turn");
+    assert_eq!(starts[0]["mode"], "normal");
+
+    assert!(
+        !events_named(&lines, "llm_response").is_empty(),
+        "each LLM round trip is recorded"
+    );
+
+    // ツール実行は 1 呼び出し 1 行で、全て成功しているはず。
+    let tools = events_named(&lines, "tool_result");
+    let names: Vec<&str> = tools.iter().filter_map(|v| v["name"].as_str()).collect();
+    for expected in ["Write", "Read", "Edit", "Glob", "Grep", "Bash"] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+    for t in &tools {
+        assert_eq!(t["outcome"], "ok", "unexpected tool failure: {t}");
+        assert_eq!(t["reason"], "ok");
+        assert!(t["ms"].is_u64() && t["output_bytes"].is_u64());
+    }
+
+    let ends = events_named(&lines, "turn_end");
+    assert_eq!(ends.len(), 1, "one turn_end per run_turn");
+    assert_eq!(ends[0]["reason"], "final");
+    assert_eq!(
+        ends[0]["tool_calls"].as_u64().unwrap() as usize,
+        tools.len(),
+        "turn_end tool_calls should match recorded tool_result rows"
     );
 }

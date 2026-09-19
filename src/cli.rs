@@ -39,6 +39,26 @@ pub struct Cli {
     #[arg(long, value_name = "ID")]
     pub resume: Option<String>,
 
+    /// Append a machine-readable JSONL run log (turns, tool calls, timings) to PATH
+    #[arg(long, env = "LODAN_LOG_JSONL", value_name = "PATH")]
+    pub log_jsonl: Option<std::path::PathBuf>,
+
+    /// Override sampling temperature for the active provider (0.1-0.2 steadies small local models)
+    #[arg(long, env = "LODAN_TEMPERATURE")]
+    pub temperature: Option<f32>,
+
+    /// Nudge the model to self-verify once before finishing (#63)
+    #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub finish_nudge: Option<bool>,
+
+    /// Ask the model to re-issue tool calls that leaked as text (#61)
+    #[arg(long, env = "LODAN_MALFORMED_RETRY", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub malformed_retry: Option<bool>,
+
+    /// Skip a read-only tool call identical to the immediately preceding one (#61)
+    #[arg(long, env = "LODAN_DUP_SUPPRESS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub dup_suppress: Option<bool>,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }
@@ -55,13 +75,33 @@ pub enum Command {
 
 pub async fn dispatch(args: Cli) -> Result<()> {
     let mut cfg = Config::load(args.config.as_deref())?;
-    cfg.apply_overrides(
-        args.provider,
-        args.base_url,
-        args.model,
-        args.api_key,
-        args.yes,
-    );
+    cfg.apply_overrides(crate::config::Overrides {
+        provider: args.provider,
+        base_url: args.base_url,
+        model: args.model,
+        api_key: args.api_key,
+        temperature: args.temperature,
+        auto_approve: args.yes,
+        finish_nudge: args.finish_nudge,
+        malformed_retry: args.malformed_retry,
+        dup_suppress: args.dup_suppress,
+    });
+
+    // 計測が本編を壊さないよう、ログを開けなくても実行は続ける。
+    if let Some(path) = args.log_jsonl.as_deref() {
+        match crate::runlog::init(path) {
+            Ok(()) => crate::runlog::record(
+                "run_start",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "provider": cfg.llm.provider.as_str(),
+                    "model": cfg.llm.active().model,
+                    "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
+                }),
+            ),
+            Err(e) => eprintln!("runlog: disabled ({e})"),
+        }
+    }
 
     match args.cmd.unwrap_or(Command::Repl) {
         Command::Repl => repl::run(cfg, args.resume).await,
@@ -86,4 +126,26 @@ fn list_sessions() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn bool_flag_without_value_does_not_swallow_subcommand() {
+        let cli = Cli::try_parse_from(["lodan", "--finish-nudge", "repl"]).unwrap();
+        assert_eq!(cli.finish_nudge, Some(true));
+        assert!(matches!(cli.cmd, Some(Command::Repl)));
+    }
+
+    #[test]
+    fn bool_flag_takes_explicit_value_with_equals() {
+        let cli =
+            Cli::try_parse_from(["lodan", "--dup-suppress=false", "--malformed-retry=1"]).unwrap();
+        assert_eq!(cli.dup_suppress, Some(false));
+        assert_eq!(cli.malformed_retry, Some(true));
+        assert_eq!(cli.finish_nudge, None);
+    }
 }

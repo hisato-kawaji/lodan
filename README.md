@@ -18,7 +18,6 @@
 - **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
 - **skills**: `.lodan/skills/<name>/SKILL.md` を読み込み、`Skill` ツールとしてモデルへ公開（後述）
 - **プロジェクトメモリ**: cwd 階層の `LODAN.md`（無ければ `CLAUDE.md`）と `~/.lodan/LODAN.md` を読み、system prompt へ注入（後述）
-- **拡張機構の枠だけ用意**: skills 等のモジュールは骨組みのみ存在し、現状はコメントアウトで非接続
 
 ## 必要環境
 
@@ -141,7 +140,13 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 ## 設定
 
-階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
+階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `--config <path>` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
+
+ユーザ設定の場所は OS の流儀に従う (`directories` crate): Linux は `~/.config/lodan/config.toml`、**macOS は `~/Library/Application Support/lodan/config.toml`**。以下 `~/.config/lodan/` と書いている箇所は macOS では後者に読み替えること。
+
+設定ファイルは**フィールド単位で重なる**。後段のファイルは自分が書いたキーだけを上書きし、書かなかったキーは前段の値が残る (プロジェクト側に `[agent] max_iterations = 40` だけ書いても、ユーザ設定の provider は消えない)。`[[hooks]]` だけは上書きではなく**連結**で、ユーザ設定 → プロジェクト設定 → `--config` の順に全て発火する。
+
+`lodan config` は合成後の設定を表示する。`lodan config --show-origin` を付けると、設定ファイルに書かれた各キーがどのファイル由来かも出る (載らないキーは既定値か env / CLI フラグ)。
 
 ```toml
 # ~/.config/lodan/config.toml
@@ -327,7 +332,7 @@ src/
 ├── agent/
 │   ├── messages.rs      # OpenAI Chat スキーマ準拠の Message / ToolCall
 │   ├── loop.rs          # run_turn(): chat_stream → tool dispatch → 反復
-│   └── subagent.rs      # MVP 外（スタブ）
+│   └── subagent.rs      # Task ツール (read-only サブエージェント)
 ├── llm/
 │   ├── mod.rs           # trait LlmClient + provider 分岐 (build_client)
 │   ├── openai.rs        # ローカル/汎用 OpenAI 互換クライアント
@@ -345,7 +350,13 @@ src/
 ├── hooks/                                                # 外部コマンド hook ディスパッチ
 ├── slash/                                                # ユーザー定義 slash コマンド
 ├── session.rs                                            # セッション永続化 (transcript / resume)
-├── mcp/   skills/                                         # MVP 外スタブ
+├── mcp/                                                  # MCP クライアント (stdio / HTTP、tools / prompts / resources / roots / sampling)
+├── skills/                                               # SKILL.md のロードと Skill ツール
+├── memory/                                               # LODAN.md / CLAUDE.md 階層ロード
+├── goal/   loop_cmd/                                     # /goal・/loop
+├── undo.rs                                               # /undo (ターン単位のファイル変更ロールバック)
+├── runlog.rs                                             # 実行トレース JSONL (--log-jsonl)
+├── term.rs                                               # ANSI 色・tty 判定
 ```
 
 ## hooks
@@ -586,11 +597,9 @@ last context: 1200 prompt tokens
 - ローカル / Sakana / さくらのAI / Kimi では単価を持たないため、料金換算はせずトークン数のみ表示する。
 - 累積はメモリ上のみ（transcript には保存しない）。`--resume` 後の `/cost` は 0 から数え直す。
 
-## ロードマップ（MVP 外、骨組みは存在）
+## ロードマップ
 
-- 中断時の副作用ロールバック
-
-各ファイルは `src/{mcp,tools/...}` に存在し、`unimplemented!()` で待機中。`agent/loop.rs` の該当呼び出しは `// MVP 外` でコメントアウトされており、肉付け箇所が一目で分かる作りです。
+未実装の機能は issue で追跡しています: [#85 (2026-09 Claude Code / Codex ギャップ)](https://github.com/hisato-kawaji/lodan/issues/85)、[#65 (小型ローカルモデル向けハーネス強化)](https://github.com/hisato-kawaji/lodan/issues/65)、[#38 (画像入力 / `@file` / rewind)](https://github.com/hisato-kawaji/lodan/issues/38)。
 
 ## テスト
 

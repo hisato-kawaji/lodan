@@ -40,9 +40,30 @@ impl PermissionGate {
     }
 
     fn prompt(&self, tool_name: &str, args: &serde_json::Value) -> bool {
-        let summary = summarize(tool_name, args);
+        use std::io::IsTerminal;
         let stdin = io::stdin();
-        let mut stdout = io::stdout().lock();
+        // Enter だけで yes になるのは、人が端末で答えているときだけ。パイプされた入力の
+        // 空行は答えではない (`printf 'do it\n\n' | lodan` が無承認で通ってしまう)。
+        let enter_means_yes = stdin.is_terminal();
+        self.prompt_with(
+            tool_name,
+            args,
+            &mut stdin.lock(),
+            &mut io::stdout().lock(),
+            enter_means_yes,
+        )
+    }
+
+    /// `prompt` の本体。入出力を差し替えられるようにしてある (テスト用)。
+    fn prompt_with(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        input: &mut dyn BufRead,
+        stdout: &mut dyn Write,
+        enter_means_yes: bool,
+    ) -> bool {
+        let summary = summarize(tool_name, args);
         loop {
             let _ = writeln!(
                 stdout,
@@ -64,11 +85,12 @@ impl PermissionGate {
             let _ = stdout.flush();
 
             let mut line = String::new();
-            if nobody_answered(&stdin.lock().read_line(&mut line)) {
+            if nobody_answered(&input.read_line(&mut line)) {
                 let _ = writeln!(stdout, "(no input — denied)");
                 return false;
             }
             match line.trim() {
+                "" if !enter_means_yes => continue,
                 "y" | "Y" | "" => return true,
                 "n" | "N" => return false,
                 "a" | "A" => {
@@ -215,6 +237,46 @@ fn diff_block(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn answer(input: &str, enter_means_yes: bool) -> bool {
+        let gate = PermissionGate::new(false);
+        let args = serde_json::json!({ "command": "rm -rf build" });
+        let mut out = Vec::new();
+        gate.prompt_with(
+            "Bash",
+            &args,
+            &mut input.as_bytes(),
+            &mut out,
+            enter_means_yes,
+        )
+    }
+
+    #[test]
+    fn a_prompt_nobody_answers_is_denied() {
+        // プロンプトをパイプで渡した実行: 承認の時点で stdin は EOF。
+        assert!(!answer("", true));
+        assert!(!answer("", false));
+    }
+
+    #[test]
+    fn enter_is_yes_only_at_a_terminal() {
+        assert!(answer("\n", true));
+        // パイプの空行は答えではない。読み飛ばして EOF に達したら拒否。
+        assert!(!answer("\n\n", false));
+        // 空行の後に明示的な答えがあればそれに従う。
+        assert!(answer("\ny\n", false));
+        assert!(!answer("\nn\n", false));
+    }
+
+    #[test]
+    fn explicit_answers_work_from_a_pipe() {
+        assert!(answer("y\n", false));
+        assert!(!answer("n\n", false));
+        assert!(
+            answer("garbage\ny\n", false),
+            "unrecognised input re-prompts"
+        );
+    }
 
     #[test]
     fn eof_is_not_an_answer_but_an_empty_line_is() {

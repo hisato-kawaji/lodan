@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::messages::{Message, ToolCall, ToolCallFunction, ToolSpec};
 use crate::config::ProviderConfig;
-use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
+use crate::llm::{ChatEvent, ChatResponse, LlmClient, TransientLlmError, Usage};
 
 pub struct OpenAiClient {
     base_url: String,
@@ -23,6 +23,48 @@ pub struct OpenAiClient {
     /// ストリームの無通信許容時間。None は無効。
     stream_idle_timeout: Option<Duration>,
     http: reqwest::Client,
+}
+
+/// 再試行可能なステータスに付いてくるエラーボディを読む上限。ボディは表示用でしかないのに、
+/// 黙ったサーバ相手に `timeout_secs` を丸ごと使ってから再試行するのは割に合わない。
+const ERROR_BODY_READ_LIMIT: Duration = Duration::from_secs(5);
+
+/// エラーメッセージに載せるレスポンスボディの上限 (文字数)。ボディはそのまま stderr・
+/// runlog・`stream-json` の stdout に出るので、サーバが返した巨大な HTML や、エコーされた
+/// リクエスト内容を丸ごと流さない。
+const ERROR_BODY_MAX_CHARS: usize = 500;
+
+fn clip_body(body: &str) -> String {
+    match body.char_indices().nth(ERROR_BODY_MAX_CHARS) {
+        Some((cut, _)) => format!("{}… ({} bytes total)", &body[..cut], body.len()),
+        None => body.to_string(),
+    }
+}
+
+/// 利用者にまだ何も見せていない一時的な失敗。fallback provider が拾える (`llm::is_transient`)。
+fn transient(message: String) -> anyhow::Error {
+    TransientLlmError(message).into()
+}
+
+/// `source()` をたどって原因を 1 行にする。reqwest の Display は種類 (`error decoding
+/// response body`) で止まり、切断なのか UTF-8 破損なのかが分からないため。
+///
+/// URL は落とす。reqwest は送信エラーに ` for url (…)` を付けるが、`base_url` に資格情報を
+/// 埋め込む構成 (`https://user:pass@host/…` やクエリのトークン) では、それが runlog と
+/// `stream-json` の stdout に流れてしまう。接続先は設定を見れば分かる。
+fn error_chain(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    if let Some(url) = e.url() {
+        out = out.replace(&format!(" for url ({url})"), "");
+    }
+    let e: &dyn std::error::Error = e;
+    let mut source = e.source();
+    while let Some(s) = source {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        source = s.source();
+    }
+    out
 }
 
 /// 再試行待ちの上限。`Retry-After` がこれより長くても待たない (対話が固まるため)。
@@ -161,16 +203,40 @@ impl OpenAiClient {
                 Ok(resp) => {
                     let status = resp.status();
                     let after = retry_after(&resp);
-                    let body = resp.text().await.unwrap_or_default();
-                    if is_retryable_status(status)
-                        && budget.wait(&format!("HTTP {status}"), after).await
+                    let body = tokio::time::timeout(ERROR_BODY_READ_LIMIT, resp.text())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    let body = clip_body(&body);
+                    if !is_retryable_status(status) {
+                        return Err(anyhow!("LLM HTTP {status}: {body}"));
+                    }
+                    if budget.wait(&format!("HTTP {status}"), after).await {
+                        continue;
+                    }
+                    return Err(transient(format!("LLM HTTP {status}: {body}")));
+                }
+                Err(e) if e.is_connect() => {
+                    if budget
+                        .wait(&format!("connect error: {}", error_chain(&e)), None)
+                        .await
                     {
                         continue;
                     }
-                    return Err(anyhow!("LLM HTTP {status}: {body}"));
+                    return Err(transient(format!(
+                        "sending chat request: {}",
+                        error_chain(&e)
+                    )));
                 }
-                Err(e) if e.is_connect() && budget.wait("connect error", None).await => continue,
-                Err(e) => return Err(e).context("sending chat request"),
+                // 再試行はしないが (同じ待ちを繰り返すだけ)、別の provider なら通り得る。
+                Err(e) if e.is_timeout() => {
+                    return Err(transient(format!(
+                        "sending chat request: {}",
+                        error_chain(&e)
+                    )));
+                }
+                Err(e) => return Err(e.without_url()).context("sending chat request"),
             }
         }
     }
@@ -270,17 +336,26 @@ impl LlmClient for OpenAiClient {
                 Err(e)
                     if !e.is_timeout()
                         && budget
-                            .wait(&format!("response body interrupted: {e}"), None)
+                            .wait(
+                                &format!("response body interrupted: {}", error_chain(&e)),
+                                None,
+                            )
                             .await =>
                 {
                     continue;
                 }
-                Err(e) => return Err(e).context("reading chat response"),
+                // 非ストリームでは利用者にまだ何も見せていない。
+                Err(e) => {
+                    return Err(transient(format!(
+                        "reading chat response: {}",
+                        error_chain(&e)
+                    )));
+                }
             }
         };
 
         let body: ChatResponseBody = serde_json::from_str(&text)
-            .with_context(|| format!("parsing chat response: {text}"))?;
+            .with_context(|| format!("parsing chat response: {}", clip_body(&text)))?;
         let usage = body.usage.map(Usage::normalized);
         let choice = body
             .choices
@@ -345,11 +420,13 @@ impl LlmClient for OpenAiClient {
                 Err(f)
                     if f.retryable()
                         && budget
-                            .wait(&format!("stream interrupted: {}", f.error), None)
+                            .wait(&format!("stream interrupted: {:#}", f.error), None)
                             .await =>
                 {
                     continue;
                 }
+                // 本文を出す前の断は fallback が拾える。出した後は拾わせない (二重表示)。
+                Err(f) if !f.emitted_text => return Err(transient(format!("{:#}", f.error))),
                 Err(f) => return Err(f.error),
             }
         };
@@ -422,7 +499,15 @@ impl OpenAiClient {
                     return Err(StreamFailure {
                         emitted_text: !text_buf.is_empty(),
                         request_timed_out,
-                        error: anyhow::Error::new(e).context("SSE chunk error"),
+                        // eventsource の Error は source() を実装していないので、`{:#}` では
+                        // 「Transport error: error decoding response body」で止まる。
+                        // 転送エラーは中の reqwest エラーを自前でたどって原因まで出す。
+                        error: match &e {
+                            eventsource_stream::EventStreamError::Transport(t) => {
+                                anyhow!("SSE chunk error: {}", error_chain(t))
+                            }
+                            _ => anyhow::Error::new(e).context("SSE chunk error"),
+                        },
                     });
                 }
             };
@@ -660,6 +745,131 @@ mod tests {
         let err = client(&url, 2).chat(&[], &[], "m", None).await.unwrap_err();
         assert!(format!("{err:#}").contains("429"), "{err:#}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "1 try + 2 retries");
+    }
+
+    #[tokio::test]
+    async fn errors_carry_neither_the_request_url_nor_an_unbounded_body() {
+        // 誰も listen していないポート。base_url に埋めた資格情報がエラー文に出ないこと。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let secret_url = format!("http://user:hunter2@127.0.0.1:{port}/v1");
+        let err = client(&secret_url, 0)
+            .chat(&[], &[], "m", None)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("127.0.0.1"),
+            "{text}"
+        );
+        assert!(text.contains("sending chat request"), "{text}");
+
+        let huge = "x".repeat(50_000);
+        let (url, _) = scripted_server(vec![http("500 Internal Server Error", "", &huge)]).await;
+        let text = format!(
+            "{:#}",
+            client(&url, 0).chat(&[], &[], "m", None).await.unwrap_err()
+        );
+        assert!(
+            text.len() < 1_000,
+            "body must be clipped, got {} chars",
+            text.len()
+        );
+        assert!(text.contains("50000 bytes total"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_success_body_is_clipped_in_the_error() {
+        // 200 で巨大な HTML を返すプロキシ。パース失敗のエラーに本文を丸ごと載せない。
+        let html = format!("<html>{}</html>", "y".repeat(50_000));
+        let (url, _) = scripted_server(vec![http("200 OK", "", &html)]).await;
+        let text = format!(
+            "{:#}",
+            client(&url, 0).chat(&[], &[], "m", None).await.unwrap_err()
+        );
+        assert!(
+            text.contains("parsing chat response"),
+            "{}",
+            &text[..200.min(text.len())]
+        );
+        assert!(text.len() < 1_500, "got {} chars", text.len());
+    }
+
+    #[test]
+    fn clip_body_cuts_on_a_char_boundary() {
+        let body = "あ".repeat(ERROR_BODY_MAX_CHARS + 10);
+        let clipped = clip_body(&body);
+        assert!(clipped.starts_with(&"あ".repeat(ERROR_BODY_MAX_CHARS)));
+        assert!(clipped.contains("bytes total"));
+        assert_eq!(clip_body("short"), "short");
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_are_transient_but_client_errors_are_not() {
+        use crate::llm::is_transient;
+        let (url, _) = scripted_server(vec![http("503 Service Unavailable", "", "busy")]).await;
+        let err = client(&url, 1).chat(&[], &[], "m", None).await.unwrap_err();
+        assert!(is_transient(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("503"));
+
+        let (url, _) = scripted_server(vec![http("401 Unauthorized", "", "bad key")]).await;
+        let err = client(&url, 1).chat(&[], &[], "m", None).await.unwrap_err();
+        assert!(
+            !is_transient(&err),
+            "another provider cannot fix a bad key: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_after_text_is_not_transient() {
+        use crate::llm::is_transient;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len() + 100
+        );
+        let (url, _) = scripted_server(vec![cut]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = client(&url, 0)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap_err();
+        assert!(
+            !is_transient(&err),
+            "text was shown; a fallback would print it twice"
+        );
+
+        // 本文を出す前の断は一時的な失敗。
+        let head_only = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 100\r\nconnection: close\r\n\r\n".to_string();
+        let (url, _) = scripted_server(vec![head_only]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = client(&url, 0)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap_err();
+        assert!(is_transient(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_error_body_does_not_eat_the_request_timeout() {
+        // 503 のヘッダだけ返して本文を送らないサーバ。ボディ読みで timeout_secs (既定 120s) を
+        // 待たずに、上限 (5s) で切り上げて再試行へ進む。
+        let head =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 500\r\nconnection: close\r\n\r\n";
+        let (url, hits) =
+            scripted_server(vec![format!("{STALL}{head}"), http("200 OK", "", OK_JSON)]).await;
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            client(&url, 3).chat(&[], &[], "m", None),
+        )
+        .await
+        .expect("must not wait out timeout_secs")
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("hi"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[tokio::test]

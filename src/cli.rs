@@ -91,7 +91,21 @@ pub enum Command {
 
 /// 戻り値はプロセスの終了コード。
 pub async fn dispatch(args: Cli) -> Result<i32> {
-    let (mut cfg, mut origins) = Config::load_with_origins(args.config.as_deref())?;
+    let headless_format = args.print.is_some().then_some(args.output_format);
+    let stream_json = headless_format == Some(crate::headless::OutputFormat::StreamJson);
+
+    let loaded = Config::load_with_origins(args.config.as_deref());
+    let (mut cfg, mut origins) = match (loaded, headless_format) {
+        (Ok(loaded), _) => loaded,
+        // ヘッドレスでは設定の読み込み失敗も、頼まれた形式の結果として stdout に出す。
+        (Err(e), Some(format)) => {
+            if stream_json {
+                let _ = crate::runlog::init_with(None, true);
+            }
+            return Ok(crate::headless::report_startup_failure(format, &e));
+        }
+        (Err(e), None) => return Err(e),
+    };
     let overrides = crate::config::Overrides {
         provider: args.provider,
         base_url: args.base_url,
@@ -106,40 +120,39 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
     cfg.apply_overrides_tracked(overrides, &mut origins);
 
     // 計測が本編を壊さないよう、ログを開けなくても実行は続ける。
-    let stream_json =
-        args.print.is_some() && args.output_format == crate::headless::OutputFormat::StreamJson;
     if args.log_jsonl.is_some() || stream_json {
-        match crate::runlog::init_with(args.log_jsonl.as_deref(), stream_json) {
-            Ok(()) => crate::runlog::record(
-                "run_start",
-                serde_json::json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "provider": cfg.llm.provider.as_str(),
-                    "model": cfg.llm.active().model,
-                    "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
-                }),
-            ),
-            Err(e) => {
-                eprintln!("runlog: disabled ({e})");
-                // ログファイルを開けなくても、stream-json の stdout は契約なので生かす。
-                if stream_json {
-                    let _ = crate::runlog::init_with(None, true);
-                }
+        if let Err(e) = crate::runlog::init_with(args.log_jsonl.as_deref(), stream_json) {
+            eprintln!("runlog: disabled ({e})");
+            // ログファイルを開けなくても、stream-json の stdout は契約なので生かす。
+            if stream_json {
+                let _ = crate::runlog::init_with(None, true);
             }
         }
+        // どの経路で sink が立っても、イベント列は run_start から始まる。
+        crate::runlog::record(
+            "run_start",
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "provider": cfg.llm.provider.as_str(),
+                "model": cfg.llm.active().model,
+                "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
+            }),
+        );
     }
 
     if let Some(prompt) = args.print {
+        let format = args.output_format;
         if args.cmd.is_some() {
-            anyhow::bail!("-p cannot be combined with a subcommand");
+            let e = anyhow::anyhow!("-p cannot be combined with a subcommand");
+            return Ok(crate::headless::report_startup_failure(format, &e));
         }
         let opts = crate::headless::Options {
             prompt,
             read_stdin: args.stdin,
-            format: args.output_format,
+            format,
             resume: args.resume,
         };
-        return crate::headless::run(cfg, opts).await;
+        return Ok(crate::headless::run(cfg, opts).await);
     }
 
     match args.cmd.unwrap_or(Command::Repl) {

@@ -271,7 +271,7 @@ lodan -p "続きをやって" --resume last
   - `text`（既定）: 最終応答の本文だけ
   - `json`: `{"type":"result","is_error","exit_code","result","error","session_id","usage":{…}}` を 1 行
   - `stream-json`: `--log-jsonl` と**同じイベント列**（`src/runlog.rs` の表）を stdout に流し、最後に `result` イベント。`--log-jsonl` と併用すればファイルにも同じものが残る
-- **終了コード**: `0` 成功 / `1` エラー / `2` 最終応答に至らず `max_iterations` を使い切った / `130` SIGINT
+- **終了コード**: `0` 成功 / `1` エラー（起動時の失敗を含む。`json` / `stream-json` ではこの場合も結果オブジェクトを出す）/ `2` 引数の誤り（clap。stdout は空）/ `3` 最終応答に至らず `max_iterations` を使い切った / `130` SIGINT
 - **承認**: 尋ねる相手がいないので、`--yes` が無ければ破壊的ツール（Write / Edit / Bash …）は**尋ねずに拒否**され、モデルには「非対話実行なので再試行するな」と返る。ハングしない。`AskUserQuestion` も同様に即エラーを返す
 - **stdin**: プロンプト引数があるときは stdin を**読まない**。CI や親プロセスから継承した stdin は端末でなくても閉じられないことがあり、EOF 待ちで固まるため。引数に stdin を足したいときは `--stdin` を明示する（上限 10 MiB）
 - slash コマンド（`/compact` など）は解釈しない。プロンプトはそのままモデルに渡る

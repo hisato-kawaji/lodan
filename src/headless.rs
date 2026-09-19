@@ -29,8 +29,9 @@ pub enum OutputFormat {
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
+// 2 は clap が引数エラーに使う (`--output-format yaml` など)。呼び出し側が区別できるよう空けておく。
 /// 最終応答に至らないまま `agent.max_iterations` を使い切った。
-pub const EXIT_MAX_ITERATIONS: i32 = 2;
+pub const EXIT_MAX_ITERATIONS: i32 = 3;
 /// SIGINT (128 + 2)。
 pub const EXIT_INTERRUPTED: i32 = 130;
 
@@ -47,13 +48,33 @@ pub struct Options {
     pub resume: Option<String>,
 }
 
-/// 1 ターン実行し、終了コードを返す。
-pub async fn run(cfg: Config, opts: Options) -> Result<i32> {
+/// 1 ターン実行し、終了コードを返す。ターンに入る前の失敗 (stdin の読み取り・API キー無し・
+/// MCP 起動など) も、指定された形式の結果として stdout に出す — 呼び出し側は「json を
+/// 頼んだのに stdout が空」を解釈できない。
+pub async fn run(cfg: Config, opts: Options) -> i32 {
     crate::term::route_display_to_stderr();
+    let format = opts.format;
+    let report = match run_turn(cfg, opts).await {
+        Ok(report) => report,
+        Err(e) => Report::startup_failure(&e),
+    };
+    report.emit(format);
+    report.exit_code
+}
+
+/// `run` に入る前 (設定の読み込みなど) で失敗したときの出口。形式は `run` と同じ。
+pub fn report_startup_failure(format: OutputFormat, error: &anyhow::Error) -> i32 {
+    crate::term::route_display_to_stderr();
+    let report = Report::startup_failure(error);
+    report.emit(format);
+    report.exit_code
+}
+
+async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
     let Options {
         prompt: prompt_arg,
         read_stdin,
-        format,
+        format: _,
         resume,
     } = opts;
 
@@ -82,6 +103,9 @@ pub async fn run(cfg: Config, opts: Options) -> Result<i32> {
         eprintln!("session-start hook: {reason}");
     }
 
+    // このターンで増えた分だけを最終応答の候補にする (`--resume` では履歴の末尾が
+    // 前回の応答なので、何も足されなかったターンがそれを拾ってしまう)。
+    let history_before = session.history().len();
     let outcome = {
         let turn = session.run_turn(&prompt, runtime.llm.as_ref(), &gate);
         tokio::pin!(turn);
@@ -105,14 +129,18 @@ pub async fn run(cfg: Config, opts: Options) -> Result<i32> {
     let end_payload = serde_json::json!({ "hook_event_name": "SessionEnd" });
     let _ = hooks::runner::dispatch(Lifecycle::SessionEnd, None, &end_payload, &cfg.hooks).await;
 
-    let report = Report::new(
+    Ok(Report::new(
         &outcome,
-        final_text(session.history()),
+        final_text(added_this_turn(session.history(), history_before)),
         recorder.as_ref().map(|r| r.id().to_string()),
         session.usage(),
-    );
-    report.emit(format);
-    Ok(report.exit_code)
+    ))
+}
+
+/// ターン開始時点より後ろの履歴。自動圧縮で履歴が開始時点より短くなっていたら、圧縮は
+/// 末尾を残すので全体を見てよい。
+fn added_this_turn(history: &[Message], len_before: usize) -> &[Message] {
+    history.get(len_before..).unwrap_or(history)
 }
 
 enum Outcome {
@@ -186,6 +214,16 @@ impl Report {
         usage: &crate::agent::r#loop::SessionUsage,
     ) -> Self {
         let (exit_code, result, error) = match outcome {
+            // 例: UserPromptSubmit hook がプロンプトをブロックした。成功扱いで空を返すと
+            // 呼び出し側は「空の回答」と区別できない。
+            Outcome::Done if text.is_none() => (
+                EXIT_ERROR,
+                None,
+                Some(
+                    "the turn ended without a final answer (was the prompt blocked by a hook?)"
+                        .to_string(),
+                ),
+            ),
             Outcome::Done => (EXIT_OK, text, None),
             Outcome::Interrupted => (EXIT_INTERRUPTED, None, Some("interrupted".to_string())),
             Outcome::Failed(e) => {
@@ -212,6 +250,16 @@ impl Report {
         }
     }
 
+    fn startup_failure(error: &anyhow::Error) -> Self {
+        Self {
+            exit_code: EXIT_ERROR,
+            result: None,
+            error: Some(format!("{error:#}")),
+            session_id: None,
+            usage: serde_json::Value::Null,
+        }
+    }
+
     fn fields(&self) -> serde_json::Value {
         serde_json::json!({
             "is_error": self.exit_code != EXIT_OK,
@@ -227,6 +275,9 @@ impl Report {
         if let Some(e) = &self.error {
             eprintln!("{}", crate::term::red_err(&format!("error: {e}")));
         }
+        // 形式によらず runlog には残す (`--log-jsonl` だけを付けた text / json 実行でも
+        // ファイルに結果が入る)。
+        crate::runlog::record("result", self.fields());
         match format {
             OutputFormat::Text => {
                 if let Some(text) = &self.result {
@@ -238,8 +289,8 @@ impl Report {
                 obj["type"] = "result".into();
                 println!("{obj}");
             }
-            // sink が stdout へエコーする (cli::dispatch が init_with で設定済み)。
-            OutputFormat::StreamJson => crate::runlog::record("result", self.fields()),
+            // 上の record が stdout へのエコーを兼ねる (cli::dispatch が sink を設定済み)。
+            OutputFormat::StreamJson => {}
         }
     }
 }
@@ -291,6 +342,29 @@ mod tests {
         assert_eq!(final_text(&[]), None);
     }
 
+    #[test]
+    fn a_turn_that_adds_nothing_does_not_inherit_the_previous_answer() {
+        let resumed = [
+            Message::User {
+                content: "earlier".into(),
+            },
+            Message::Assistant {
+                content: Some("earlier answer".into()),
+                tool_calls: Vec::new(),
+            },
+        ];
+        assert_eq!(final_text(added_this_turn(&resumed, resumed.len())), None);
+        assert_eq!(
+            final_text(added_this_turn(&resumed, 0)).as_deref(),
+            Some("earlier answer")
+        );
+        // 自動圧縮で開始時点より短くなった履歴は全体を見る。
+        assert_eq!(
+            final_text(added_this_turn(&resumed, 10)).as_deref(),
+            Some("earlier answer")
+        );
+    }
+
     fn usage() -> crate::agent::r#loop::SessionUsage {
         crate::agent::r#loop::SessionUsage::default()
     }
@@ -314,6 +388,12 @@ mod tests {
 
         let cut = Report::new(&Outcome::Interrupted, None, None, &usage());
         assert_eq!(cut.exit_code, EXIT_INTERRUPTED);
+
+        let silent = Report::new(&Outcome::Done, None, None, &usage());
+        assert_eq!(
+            silent.exit_code, EXIT_ERROR,
+            "no answer is not a successful empty answer"
+        );
 
         let ok = Report::new(
             &Outcome::Done,

@@ -1,7 +1,7 @@
 //! ヘッドレス実行 (`lodan -p`) の end-to-end。実バイナリを起動して **stdout を検証する** —
 //! stdout は呼び出し側との契約で、`Session` を直接叩くテストからは見えない。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -59,12 +59,13 @@ fn lodan(home: &Path, port: u16, args: &[&str], stdin: Stdin) -> Output {
     let cwd = home.join("work");
     std::fs::create_dir_all(&cwd).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_lodan"))
-        .args(["--provider", "local", "--base-url"])
-        .arg(format!("http://127.0.0.1:{port}/v1"))
         .args(args)
         .current_dir(&cwd)
         .env_clear()
         .env("HOME", home)
+        // 接続先は env で渡す。テスト側が `--provider` などのフラグで上書きできるように。
+        .env("LODAN_PROVIDER", "local")
+        .env("LODAN_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -79,10 +80,16 @@ fn lodan(home: &Path, port: u16, args: &[&str], stdin: Stdin) -> Output {
         pipe.write_all(data.as_bytes()).unwrap();
     }
 
+    // 出力は走っている間に別スレッドで吸い出す。終了後にまとめて読むと、パイプの容量
+    // (64 KiB 前後) を超えて書く子が書き込みで固まり、「時間内に終了しなかった」という
+    // 見当違いの失敗になる。
+    let out_reader = drain(child.stdout.take().unwrap());
+    let err_reader = drain(child.stderr.take().unwrap());
+
     let deadline = Instant::now() + RUN_LIMIT;
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -90,9 +97,21 @@ fn lodan(home: &Path, port: u16, args: &[&str], stdin: Stdin) -> Output {
             panic!("lodan {args:?} did not exit within {RUN_LIMIT:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
     drop(held_stdin);
-    child.wait_with_output().unwrap()
+    Output {
+        status,
+        stdout: out_reader.join().unwrap(),
+        stderr: err_reader.join().unwrap(),
+    }
+}
+
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
 }
 
 fn stdout(out: &Output) -> String {
@@ -253,7 +272,7 @@ fn an_unreachable_server_is_exit_code_1_with_an_error_result() {
 }
 
 #[test]
-fn running_out_of_iterations_is_exit_code_2() {
+fn running_out_of_iterations_is_exit_code_3() {
     let home = tempfile::tempdir().unwrap();
     let demo = home.path().join("demo");
     std::fs::create_dir_all(&demo).unwrap();
@@ -267,8 +286,94 @@ fn running_out_of_iterations_is_exit_code_2() {
         &["--yes", "-p", "run the demo", "--output-format", "json"],
         Stdin::OpenAndSilent,
     );
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
-    assert_eq!(v["exit_code"], 2);
+    assert_eq!(v["exit_code"], 3);
     assert!(v["error"].as_str().unwrap().contains("max_iterations"));
+}
+
+#[test]
+fn a_startup_failure_still_answers_in_the_requested_format() {
+    // API キーの無い provider は LLM クライアントの構築で失敗する = ターンに入る前。
+    // eval ハーネスで最もありがちな設定ミスなので、json を頼んだ呼び出し側には json で返す。
+    let home = tempfile::tempdir().unwrap();
+    let out = lodan(
+        home.path(),
+        1,
+        &["--provider", "kimi", "-p", "hi", "--output-format", "json"],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert_eq!(text.lines().count(), 1, "stdout: {text:?}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["is_error"], true);
+    assert!(v["error"].as_str().unwrap().contains("KIMI_API_KEY"), "{v}");
+}
+
+#[test]
+fn a_broken_config_file_is_reported_as_a_stream_json_result() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg_dir = home.path().join("work/.lodan");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[agent]\nmax_iterations = \"many\"\n",
+    )
+    .unwrap();
+    let out = lodan(
+        home.path(),
+        1,
+        &["-p", "hi", "--output-format", "stream-json"],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let last: serde_json::Value =
+        serde_json::from_str(stdout(&out).lines().last().expect("a result line")).unwrap();
+    assert_eq!(last["event"], "result");
+    assert_eq!(last["is_error"], true);
+    assert!(
+        last["error"].as_str().unwrap().contains("config.toml"),
+        "{last}"
+    );
+}
+
+#[test]
+fn log_jsonl_gets_the_result_event_in_text_mode_too() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock(home.path());
+    let log = home.path().join("run.jsonl");
+    let out = lodan(
+        home.path(),
+        server.port,
+        &["-p", "hi", "--log-jsonl", log.to_str().unwrap()],
+        Stdin::OpenAndSilent,
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&out),
+        format!("{GREETING}\n"),
+        "the log must not leak onto stdout"
+    );
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(events.first().unwrap()["event"], "run_start");
+    assert_eq!(events.last().unwrap()["event"], "result");
+    assert_eq!(events.last().unwrap()["result"], GREETING);
+}
+
+#[test]
+fn a_usage_error_is_exit_code_2_and_distinct_from_max_iterations() {
+    let home = tempfile::tempdir().unwrap();
+    let out = lodan(
+        home.path(),
+        1,
+        &["-p", "hi", "--output-format", "yaml"],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(2), "clap's usage-error code");
+    assert!(stdout(&out).is_empty());
 }

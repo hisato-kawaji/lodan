@@ -266,7 +266,15 @@ impl LlmClient for OpenAiClient {
             let resp = self.send(&req, &mut budget).await?;
             match resp.text().await {
                 Ok(text) => break text,
-                Err(_) if budget.wait("response body interrupted", None).await => continue,
+                // `timeout_secs` は本文の読み込みまで含む。使い切った失敗は送り直さない。
+                Err(e)
+                    if !e.is_timeout()
+                        && budget
+                            .wait(&format!("response body interrupted: {e}"), None)
+                            .await =>
+                {
+                    continue;
+                }
                 Err(e) => return Err(e).context("reading chat response"),
             }
         };
@@ -334,7 +342,12 @@ impl LlmClient for OpenAiClient {
                 // 本文を 1 文字でも流した後にやり直すと、利用者には同じ文が二重に見える。
                 // 何も出していない断だけを送り直す (ツールコールの断片は sink に流して
                 // いないので捨てて構わない)。
-                Err(f) if !f.emitted_text && budget.wait("stream interrupted", None).await => {
+                Err(f)
+                    if f.retryable()
+                        && budget
+                            .wait(&format!("stream interrupted: {}", f.error), None)
+                            .await =>
+                {
                     continue;
                 }
                 Err(f) => return Err(f.error),
@@ -391,6 +404,7 @@ impl OpenAiClient {
                     Err(_) => {
                         return Err(StreamFailure {
                             emitted_text: !text_buf.is_empty(),
+                            request_timed_out: false,
                             error: anyhow!("LLM stream idle for {}s", idle.as_secs()),
                         });
                     }
@@ -401,8 +415,13 @@ impl OpenAiClient {
             let event = match event {
                 Ok(event) => event,
                 Err(e) => {
+                    let request_timed_out = matches!(
+                        &e,
+                        eventsource_stream::EventStreamError::Transport(t) if t.is_timeout()
+                    );
                     return Err(StreamFailure {
                         emitted_text: !text_buf.is_empty(),
+                        request_timed_out,
                         error: anyhow::Error::new(e).context("SSE chunk error"),
                     });
                 }
@@ -466,7 +485,17 @@ struct StreamParts {
 /// ストリーム途中の失敗。`emitted_text` が false なら利用者には何も見えていない。
 struct StreamFailure {
     emitted_text: bool,
+    /// リクエスト全体の `timeout_secs` を使い切った (idle timeout とは別物)。
+    request_timed_out: bool,
     error: anyhow::Error,
+}
+
+impl StreamFailure {
+    /// 送り直してよいか。表示済みの本文があれば二重表示になり、`timeout_secs` 切れは
+    /// 同じ待ちを繰り返すだけなので、どちらも再試行しない。
+    fn retryable(&self) -> bool {
+        !self.emitted_text && !self.request_timed_out
+    }
 }
 
 #[derive(Default)]
@@ -736,6 +765,44 @@ mod tests {
         )
     }
 
+    /// STALL サーバ相手のテストが、退行時に 30 秒ぶら下がらないようにする上限。
+    async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .expect("timed out: the client kept waiting on a stalled server")
+    }
+
+    fn short_timeout_client(base_url: &str) -> OpenAiClient {
+        let mut cfg = ProviderConfig::default_local();
+        cfg.base_url = base_url.to_string();
+        cfg.retry_base_ms = 1;
+        cfg.timeout_secs = 1;
+        OpenAiClient::new(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_timeout_while_reading_body_is_not_retried() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n\r\n";
+        let (url, hits) =
+            scripted_server(vec![format!("{STALL}{head}"), http("200 OK", "", OK_JSON)]).await;
+        let res = within(short_timeout_client(&url).chat(&[], &[], "m", None)).await;
+        assert!(res.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "timeout_secs was spent; do not spend it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_mid_stream_is_not_retried() {
+        let (url, hits) = scripted_server(vec![format!("{STALL}{SSE_HEAD}"), sse_ok("ok")]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let res = within(short_timeout_client(&url).chat_stream(&[], &[], "m", tx)).await;
+        assert!(res.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
     fn idle_client(base_url: &str) -> OpenAiClient {
         let mut cfg = ProviderConfig::default_local();
         cfg.base_url = base_url.to_string();
@@ -748,8 +815,7 @@ mod tests {
     async fn idle_stream_before_any_text_is_retried() {
         let (url, hits) = scripted_server(vec![format!("{STALL}{SSE_HEAD}"), sse_ok("ok")]).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        idle_client(&url)
-            .chat_stream(&[], &[], "m", tx)
+        within(idle_client(&url).chat_stream(&[], &[], "m", tx))
             .await
             .unwrap();
         assert!(matches!(rx.recv().await, Some(ChatEvent::TextDelta(d)) if d == "ok"));
@@ -762,8 +828,7 @@ mod tests {
         let (url, hits) =
             scripted_server(vec![format!("{STALL}{SSE_HEAD}{partial}"), sse_ok("ok")]).await;
         let (tx, _rx) = mpsc::unbounded_channel();
-        let err = idle_client(&url)
-            .chat_stream(&[], &[], "m", tx)
+        let err = within(idle_client(&url).chat_stream(&[], &[], "m", tx))
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("idle"), "{err:#}");

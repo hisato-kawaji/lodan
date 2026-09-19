@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod frontmatter;
 pub mod goal;
+pub mod headless;
 pub mod hooks;
 pub mod llm;
 pub mod loop_cmd;

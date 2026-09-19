@@ -209,7 +209,7 @@ timeout_secs = 30
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 
@@ -253,6 +253,29 @@ lodan> /exit
 - `n` 拒否（LLM には "user denied execution" が返り、別アプローチを促せる）
 - `a` セッション中はこのツールを常時許可
 - `e` Bash の場合のみ、その完全一致コマンドを常時許可
+
+## ヘッドレス実行（`-p`）
+
+REPL を開かずに 1 ターンだけ実行して終了する。スクリプト・CI・評価ハーネス向け。
+
+```bash
+lodan -p "src/config.rs の役割を 3 行で"                  # 最終応答だけが stdout に出る
+git diff | lodan -p "このdiffをレビューして" --stdin        # 指示 + stdin のデータ
+echo "READMEを要約して" | lodan -p                         # 引数なし: stdin がプロンプト本体
+lodan -p "テストを直して" --yes --output-format json       # 結果を JSON 1 行で
+lodan -p "..." --output-format stream-json | jq -c .       # 進行をイベント列で
+lodan -p "続きをやって" --resume last
+```
+
+- **stdout は契約**。人間向けの表示（ストリーム本文・ツール出力の要約・`session:` などの通知・エラー）は全て **stderr** に出る
+  - `text`（既定）: 最終応答の本文だけ
+  - `json`: `{"type":"result","is_error","exit_code","result","error","session_id","usage":{…}}` を 1 行
+  - `stream-json`: `--log-jsonl` と**同じイベント列**（`src/runlog.rs` の表）を stdout に流し、最後に `result` イベント。`--log-jsonl` と併用すればファイルにも同じものが残る
+- **終了コード**: `0` 成功 / `1` エラー / `2` 最終応答に至らず `max_iterations` を使い切った / `130` SIGINT
+- **承認**: 尋ねる相手がいないので、`--yes` が無ければ破壊的ツール（Write / Edit / Bash …）は**尋ねずに拒否**され、モデルには「非対話実行なので再試行するな」と返る。ハングしない。`AskUserQuestion` も同様に即エラーを返す
+- **stdin**: プロンプト引数があるときは stdin を**読まない**。CI や親プロセスから継承した stdin は端末でなくても閉じられないことがあり、EOF 待ちで固まるため。引数に stdin を足したいときは `--stdin` を明示する（上限 10 MiB）
+- slash コマンド（`/compact` など）は解釈しない。プロンプトはそのままモデルに渡る
+- hooks（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SessionEnd）、MCP、skills、プロジェクトメモリ、セッション保存は REPL と同じ
 
 ## MCP サーバ接続 (stdio / HTTP + tools / prompts / resources)
 
@@ -360,6 +383,8 @@ src/
 ├── memory/                                               # LODAN.md / CLAUDE.md 階層ロード
 ├── goal/   loop_cmd/                                     # /goal・/loop
 ├── undo.rs                                               # /undo (ターン単位のファイル変更ロールバック)
+├── runtime.rs                                            # REPL / ヘッドレス共通の起動処理 (LLM・ツール登録・セッション)
+├── headless.rs                                           # `-p` 非対話実行 (text / json / stream-json、終了コード)
 ├── runlog.rs                                             # 実行トレース JSONL (--log-jsonl)
 ├── term.rs                                               # ANSI 色・tty 判定
 ```

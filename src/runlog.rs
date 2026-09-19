@@ -18,6 +18,7 @@
 //! | `stop_hook_block` | `turn`, `iter` |
 //! | `tool_result` | `turn`, `iter`, `name`, `outcome` (`ok` / `error`), `reason`, `ms`, `args_bytes`, `output_bytes` |
 //! | `compact` | `turn`, `outcome` |
+//! | `result` | ヘッドレス実行 (`-p`) の最後に 1 回。`is_error`, `exit_code`, `result`, `error`, `session_id`, `usage` |
 //! | `turn_end` | `turn`, `iterations`, `tool_calls`, `reason` (`final` / `max_iterations` / `error` / `aborted`), `ms` |
 //!
 //! `turn_end` は `turn_start` と必ず対になる (エラー終了は `error`、Ctrl-C 中断は `aborted`)。
@@ -37,7 +38,10 @@ static SINK: OnceLock<RunLog> = OnceLock::new();
 
 /// JSONL の追記先。
 pub struct RunLog {
-    out: Mutex<std::fs::File>,
+    /// 追記先のファイル。`stream-json` だけを使う実行では無い。
+    out: Mutex<Option<std::fs::File>>,
+    /// 同じ行を stdout にも流す (ヘッドレスの `--output-format stream-json`)。
+    echo_stdout: bool,
     /// 書き込み失敗の警告済みフラグ (毎行の出力を避ける)。
     warned: AtomicBool,
 }
@@ -57,9 +61,25 @@ impl RunLog {
             .open(path)
             .with_context(|| format!("opening run log {}", path.display()))?;
         Ok(Self {
-            out: Mutex::new(file),
+            out: Mutex::new(Some(file)),
+            echo_stdout: false,
             warned: AtomicBool::new(false),
         })
+    }
+
+    /// stdout にだけ流す sink (ファイル無し)。
+    pub fn stdout_only() -> Self {
+        Self {
+            out: Mutex::new(None),
+            echo_stdout: true,
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    /// 同じ行を stdout にも流すようにする。
+    pub fn with_stdout_echo(mut self) -> Self {
+        self.echo_stdout = true;
+        self
     }
 
     /// 1 イベントを追記する。失敗しても呼び出し元へは伝えない (計測が実行を壊さない)。
@@ -70,10 +90,17 @@ impl RunLog {
             // 書き込み中に panic したスレッドがいた場合でも記録は続ける。
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Err(e) = guard.write_all(line.as_bytes())
+        if let Some(file) = guard.as_mut()
+            && let Err(e) = file.write_all(line.as_bytes())
             && !self.warned.swap(true, Ordering::Relaxed)
         {
             eprintln!("runlog: write failed, further errors suppressed ({e})");
+        }
+        if self.echo_stdout {
+            // ファイルと同じロックの内側で書くので、行が混ざらない。
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(line.as_bytes());
+            let _ = stdout.flush();
         }
     }
 }
@@ -81,6 +108,19 @@ impl RunLog {
 /// グローバル sink を初期化する。2 回目以降の呼び出しは無視される。
 pub fn init(path: &Path) -> Result<()> {
     let log = RunLog::create(path)?;
+    let _ = SINK.set(log);
+    Ok(())
+}
+
+/// ファイル (任意) と stdout へのエコー (任意) を指定してグローバル sink を初期化する。
+/// どちらも無ければ何もしない。2 回目以降の呼び出しは無視される。
+pub fn init_with(path: Option<&Path>, echo_stdout: bool) -> Result<()> {
+    let log = match (path, echo_stdout) {
+        (Some(p), true) => RunLog::create(p)?.with_stdout_echo(),
+        (Some(p), false) => RunLog::create(p)?,
+        (None, true) => RunLog::stdout_only(),
+        (None, false) => return Ok(()),
+    };
     let _ = SINK.set(log);
     Ok(())
 }

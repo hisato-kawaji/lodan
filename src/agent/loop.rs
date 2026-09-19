@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -118,7 +118,7 @@ impl Session {
         )
         .await?
         {
-            println!("prompt blocked by hook: {reason}");
+            crate::say!("prompt blocked by hook: {reason}");
             return Ok(());
         }
         self.turn_seq += 1;
@@ -187,7 +187,7 @@ impl Session {
             });
 
             if tool_calls.is_empty() {
-                println!();
+                crate::say!();
                 // #61: ツール呼び出しがテキストとして漏れてきた (サーバ側でパース
                 // できず素通しになった) 痕跡があれば、正しい形式での再発行を求めて
                 // ターンを継続する。誤検知してもナッジが 1 回入るだけで無害。
@@ -199,7 +199,7 @@ impl Session {
                         .is_some_and(looks_like_malformed_tool_call)
                 {
                     malformed_retries += 1;
-                    println!(
+                    crate::say!(
                         "{}",
                         crate::term::dim(
                             "[lodan] malformed tool-call markup detected — asking the model to re-issue"
@@ -228,7 +228,7 @@ impl Session {
                     } else {
                         FINISH_NUDGE_ACT
                     };
-                    println!("{}", crate::term::dim("[lodan] finish nudge"));
+                    crate::say!("{}", crate::term::dim("[lodan] finish nudge"));
                     crate::runlog::record(
                         "finish_nudge",
                         serde_json::json!({
@@ -257,7 +257,7 @@ impl Session {
                         return Ok(());
                     }
                     HookOutcome::Block(reason) => {
-                        println!("{}", crate::term::dim(&format!("[stop hook] {reason}")));
+                        crate::say!("{}", crate::term::dim(&format!("[stop hook] {reason}")));
                         crate::runlog::record(
                             "stop_hook_block",
                             serde_json::json!({ "turn": self.turn_seq, "iter": iterations }),
@@ -269,7 +269,7 @@ impl Session {
             }
 
             // 改行を入れてツール出力との視認性を確保
-            println!();
+            crate::say!();
             used_tools = true;
 
             // ExitPlanMode 承認でモードが Plan → Normal に変わった後、同一バッチの
@@ -348,7 +348,7 @@ impl Session {
                                         !tool.is_destructive() || gate.allow(tool.name(), &args);
                                     if !approved {
                                         reason = "denied";
-                                        ToolOutput::error("user denied execution")
+                                        ToolOutput::error(gate.denial_message())
                                     } else {
                                         // 実行が確定してから変更前を退避する (/undo 用)。
                                         self.snapshot_for_undo(&name, &args);
@@ -381,7 +381,7 @@ impl Session {
                 {
                     // 実行後なので取り消せない。理由をツール出力へ追記し、
                     // history 経由でモデルへフィードバックする。
-                    println!("post-tool hook: {reason}");
+                    crate::say!("post-tool hook: {reason}");
                     output.content = format!("{}\n[post-tool hook] {reason}", output.content);
                 }
 
@@ -391,7 +391,7 @@ impl Session {
                 } else {
                     crate::term::cyan(&tag)
                 };
-                println!("{tag} {}", display_tool_output(&name, &output));
+                crate::say!("{tag} {}", display_tool_output(&name, &output));
                 // ツール自身がエラー出力を返した場合はループ側の分類が付かないので補う。
                 if reason == TOOL_REASON_OK && output.is_error {
                     reason = "tool_reported_error";
@@ -418,10 +418,7 @@ impl Session {
         }
 
         end.reason = TURN_END_MAX_ITERATIONS;
-        bail!(
-            "hit max_iterations ({}) without final assistant text",
-            self.cfg.agent.max_iterations
-        );
+        Err(MaxIterationsError(self.cfg.agent.max_iterations).into())
     }
 
     /// 直近のコンテキストサイズがしきい値 (context_window の
@@ -439,7 +436,7 @@ impl Session {
             return;
         }
         let window = self.cfg.llm.active().context_window;
-        println!(
+        crate::say!(
             "{}",
             crate::term::dim(&format!(
                 "[auto-compact] context ~{} tokens ≥ {}% of {} window",
@@ -451,14 +448,14 @@ impl Session {
         // 連続発火にはならない。
         match self.compact(llm, "").await {
             Ok(outcome) => {
-                println!("{}", crate::term::dim(&outcome.describe()));
+                crate::say!("{}", crate::term::dim(&outcome.describe()));
                 crate::runlog::record(
                     "compact",
                     serde_json::json!({ "turn": self.turn_seq, "outcome": outcome.label() }),
                 );
             }
             Err(e) => {
-                println!(
+                crate::say!(
                     "{}",
                     crate::term::red(&format!("auto-compact failed: {e:#}"))
                 );
@@ -521,9 +518,9 @@ impl Session {
             return ToolOutput::error("ExitPlanMode requires a non-empty 'plan' argument");
         }
 
-        println!("{}", crate::term::bold("--- proposed plan ---"));
-        println!("{plan}");
-        println!("{}", crate::term::bold("---------------------"));
+        crate::say!("{}", crate::term::bold("--- proposed plan ---"));
+        crate::say!("{plan}");
+        crate::say!("{}", crate::term::bold("---------------------"));
 
         if gate.allow(EXIT_PLAN_MODE, args) {
             self.mode = Mode::Normal;
@@ -767,6 +764,12 @@ impl CompactOutcome {
 /// runlog の `tool_result.reason` 既定値 (ループ側の介入なしに実行された)。
 const TOOL_REASON_OK: &str = "ok";
 
+/// 最終応答に至らないまま `agent.max_iterations` を使い切った。呼び出し側 (ヘッドレスの
+/// 終了コード) が他の失敗と区別できるよう、文字列ではなく型で返す。
+#[derive(Debug, thiserror::Error)]
+#[error("hit max_iterations ({0}) without final assistant text")]
+pub struct MaxIterationsError(pub usize);
+
 const TURN_END_FINAL: &str = "final";
 const TURN_END_MAX_ITERATIONS: &str = "max_iterations";
 /// `?` でターンが失敗した (LLM 呼び出し・hook 実行のエラーなど)。
@@ -1004,6 +1007,11 @@ async fn stream_once(
     tools: &[crate::agent::messages::ToolSpec<'_>],
     model: &str,
 ) -> Result<ChatResponse> {
+    if crate::term::display_to_stderr() {
+        // 機械可読な stdout を汚さない。待機インジケータは対話用なので出さない。
+        let mut stderr = std::io::stderr();
+        return stream_once_to(llm, history, tools, model, &mut stderr, false).await;
+    }
     let mut stdout = std::io::stdout();
     let show_wait = crate::term::is_terminal();
     stream_once_to(llm, history, tools, model, &mut stdout, show_wait).await

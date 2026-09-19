@@ -59,6 +59,18 @@ pub struct Cli {
     #[arg(long, env = "LODAN_DUP_SUPPRESS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub dup_suppress: Option<bool>,
 
+    /// Run one turn non-interactively and exit. Without PROMPT, the prompt is read from stdin
+    #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, default_missing_value = "")]
+    pub print: Option<String>,
+
+    /// With -p PROMPT: also read stdin to EOF and append it (`cat log | lodan -p "summarize" --stdin`)
+    #[arg(long, requires = "print")]
+    pub stdin: bool,
+
+    /// What -p writes to stdout: the final answer, one JSON result, or JSONL events
+    #[arg(long, value_enum, default_value_t, requires = "print")]
+    pub output_format: crate::headless::OutputFormat,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }
@@ -77,7 +89,8 @@ pub enum Command {
     Sessions,
 }
 
-pub async fn dispatch(args: Cli) -> Result<()> {
+/// 戻り値はプロセスの終了コード。
+pub async fn dispatch(args: Cli) -> Result<i32> {
     let (mut cfg, mut origins) = Config::load_with_origins(args.config.as_deref())?;
     let overrides = crate::config::Overrides {
         provider: args.provider,
@@ -93,8 +106,10 @@ pub async fn dispatch(args: Cli) -> Result<()> {
     cfg.apply_overrides_tracked(overrides, &mut origins);
 
     // 計測が本編を壊さないよう、ログを開けなくても実行は続ける。
-    if let Some(path) = args.log_jsonl.as_deref() {
-        match crate::runlog::init(path) {
+    let stream_json =
+        args.print.is_some() && args.output_format == crate::headless::OutputFormat::StreamJson;
+    if args.log_jsonl.is_some() || stream_json {
+        match crate::runlog::init_with(args.log_jsonl.as_deref(), stream_json) {
             Ok(()) => crate::runlog::record(
                 "run_start",
                 serde_json::json!({
@@ -104,20 +119,39 @@ pub async fn dispatch(args: Cli) -> Result<()> {
                     "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
                 }),
             ),
-            Err(e) => eprintln!("runlog: disabled ({e})"),
+            Err(e) => {
+                eprintln!("runlog: disabled ({e})");
+                // ログファイルを開けなくても、stream-json の stdout は契約なので生かす。
+                if stream_json {
+                    let _ = crate::runlog::init_with(None, true);
+                }
+            }
         }
     }
 
+    if let Some(prompt) = args.print {
+        if args.cmd.is_some() {
+            anyhow::bail!("-p cannot be combined with a subcommand");
+        }
+        let opts = crate::headless::Options {
+            prompt,
+            read_stdin: args.stdin,
+            format: args.output_format,
+            resume: args.resume,
+        };
+        return crate::headless::run(cfg, opts).await;
+    }
+
     match args.cmd.unwrap_or(Command::Repl) {
-        Command::Repl => repl::run(cfg, args.resume).await,
+        Command::Repl => repl::run(cfg, args.resume).await.map(|()| 0),
         Command::Config { show_origin } => {
             println!("{}", toml::to_string_pretty(&cfg)?);
             if show_origin {
                 print!("{}", describe_origins(&origins));
             }
-            Ok(())
+            Ok(0)
         }
-        Command::Sessions => list_sessions(),
+        Command::Sessions => list_sessions().map(|()| 0),
     }
 }
 

@@ -16,5 +16,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = lodan::cli::Cli::parse();
-    lodan::cli::dispatch(args).await
+    let code = lodan::cli::dispatch(args).await?;
+    if code != 0 {
+        // ここまでで Runtime (MCP サブプロセス等) は drop 済み。
+        std::process::exit(code);
+    }
+    Ok(())
 }

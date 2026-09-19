@@ -64,7 +64,8 @@ impl PermissionGate {
             let _ = stdout.flush();
 
             let mut line = String::new();
-            if stdin.lock().read_line(&mut line).is_err() {
+            if nobody_answered(&stdin.lock().read_line(&mut line)) {
+                let _ = writeln!(stdout, "(no input — denied)");
                 return false;
             }
             match line.trim() {
@@ -94,6 +95,13 @@ impl PermissionGate {
             }
         }
     }
+}
+
+/// 読み取りが「答えなし」だったか。EOF は 0 バイトの成功として返るので、エラーだけを
+/// 見ていると空行 (= Enter = yes) と区別できず、プロンプトをパイプで渡した実行で
+/// 破壊的ツールが無承認で通ってしまう。
+fn nobody_answered(read: &io::Result<usize>) -> bool {
+    matches!(read, Ok(0) | Err(_))
 }
 
 fn summarize(tool: &str, args: &serde_json::Value) -> String {
@@ -207,6 +215,15 @@ fn diff_block(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eof_is_not_an_answer_but_an_empty_line_is() {
+        // EOF: read_line は Ok(0)。誰も答えていないので拒否する。
+        assert!(nobody_answered(&Ok(0)));
+        assert!(nobody_answered(&Err(io::Error::other("closed"))));
+        // Enter だけの行は "\n" の 1 バイト。従来どおり yes として扱う。
+        assert!(!nobody_answered(&Ok(1)));
+    }
 
     #[test]
     fn auto_approve_short_circuits() {

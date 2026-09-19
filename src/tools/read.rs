@@ -32,6 +32,11 @@ impl Tool for Read {
         false
     }
 
+    /// ファイルを読むだけ。read_tracker への追加は順序に依存しない。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

@@ -157,6 +157,14 @@ pub trait Tool: Send + Sync {
     fn is_destructive(&self) -> bool {
         true
     }
+    /// 同じ応答の中の他の呼び出しと同時に実行してよいなら true (#73)。
+    /// 既定は安全側の false。read-only でも並列にできないものがある — 共有状態を書く
+    /// (TodoWrite)、stdin を取り合う (AskUserQuestion)、読み取り位置を持つ (Monitor)。
+    /// 「呼び出し同士が互いの結果に影響しない」と言えるツールにだけ、明示的に true を実装すること。
+    /// `is_destructive()` が true のツールは、これが true でも並列にしない (承認の直列性を保つ)。
+    fn parallel_safe(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         args: serde_json::Value,

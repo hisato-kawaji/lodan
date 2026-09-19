@@ -177,6 +177,22 @@ mod tests {
     }
 
     #[test]
+    fn only_the_listed_tools_opt_into_parallel_execution() {
+        // 並列可の宣言は個別の判断。増やすときはこの一覧も理由つきで更新すること。
+        let r = default_registry();
+        let mut safe: Vec<&str> = r
+            .all_names()
+            .into_iter()
+            .filter(|n| r.get(n).unwrap().parallel_safe())
+            .collect();
+        safe.sort();
+        assert_eq!(safe, ["Glob", "Grep", "Read", "WebFetch", "WebSearch"]);
+        for name in safe {
+            assert!(!r.get(name).unwrap().is_destructive(), "{name}");
+        }
+    }
+
+    #[test]
     fn full_profile_shows_everything() {
         let mut r = default_registry();
         assert!(

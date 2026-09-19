@@ -145,6 +145,11 @@ impl Tool for SubAgentTool {
         false
     }
 
+    /// 子エージェントは親の履歴も他の子の結果も見ない。独立した調査を同時に走らせるのが主目的。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

@@ -182,6 +182,9 @@ pub struct AgentConfig {
     /// 直前と同一の read-only 呼び出しを実行せず別の行動を促す (#61)。
     /// 既定 true。無効化できるのは ablation で寄与を測るため。
     pub dup_suppress: bool,
+    /// 同じ応答の中で連続する並列可能なツール呼び出し (Read / Grep / Glob / WebFetch /
+    /// WebSearch / Task) を同時に実行する (#73)。既定 true。無効化できるのは ablation 用。
+    pub parallel_tools: bool,
     /// モデルに見せるツールの範囲。既定 `full`。
     pub tool_profile: ToolProfile,
     /// モデルに見せるツールの明示リスト。空でなければ `tool_profile` より優先する。
@@ -299,6 +302,7 @@ impl Default for AgentConfig {
             finish_nudge: false,
             malformed_retry: true,
             dup_suppress: true,
+            parallel_tools: true,
             tool_profile: ToolProfile::Full,
             tools: Vec::new(),
         }
@@ -417,6 +421,10 @@ impl Config {
             self.agent.dup_suppress = v;
             mark("agent.dup_suppress".into());
         }
+        if let Some(v) = o.parallel_tools {
+            self.agent.parallel_tools = v;
+            mark("agent.parallel_tools".into());
+        }
         if let Some(v) = o.tool_profile {
             self.agent.tool_profile = v;
             mark("agent.tool_profile".into());
@@ -450,6 +458,7 @@ pub struct Overrides {
     pub finish_nudge: Option<bool>,
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,
+    pub parallel_tools: Option<bool>,
     pub tool_profile: Option<ToolProfile>,
     pub tools: Option<Vec<String>>,
 }

@@ -17,7 +17,7 @@
 //! | `malformed_retry` | `turn`, `iter`, `n` |
 //! | `finish_nudge` | `turn`, `iter`, `kind` (`act` / `verify`) |
 //! | `stop_hook_block` | `turn`, `iter` |
-//! | `tool_result` | `turn`, `iter`, `name`, `outcome` (`ok` / `error`), `reason`, `ms`, `args_bytes`, `output_bytes` |
+//! | `tool_result` | `turn`, `iter`, `name`, `outcome` (`ok` / `error`), `reason`, `ms`, `parallel` (同じ応答の他の呼び出しと同時に実行したか), `args_bytes`, `output_bytes` |
 //! | `compact` | `turn`, `outcome` |
 //! | `result` | ヘッドレス実行 (`-p`) の最後に 1 回。`is_error`, `exit_code`, `result`, `error`, `session_id`, `usage` |
 //! | `turn_end` | `turn`, `iterations`, `tool_calls`, `reason` (`final` / `max_iterations` / `error` / `aborted`), `ms` |

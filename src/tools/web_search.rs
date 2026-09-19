@@ -51,6 +51,11 @@ impl Tool for WebSearch {
         false
     }
 
+    /// 独立した検索リクエスト。呼び出し同士は互いに影響しない。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

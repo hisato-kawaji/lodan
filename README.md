@@ -194,6 +194,7 @@ auto_approve    = false
 finish_nudge    = false   # 終了前自己検証ナッジ (#63)
 malformed_retry = true    # テキストに漏れたツールコールの再要求 (#61)
 dup_suppress    = true    # 直前と同一の read-only 呼び出しの抑止 (#61)
+parallel_tools  = true    # 連続する並列可能なツール呼び出し (Read / Grep / Glob / WebFetch / WebSearch / Task) を同時に実行
 tool_profile    = "full"  # モデルに見せるツール: full / core (6 個) / readonly
 tools           = []      # 明示リスト。空でなければ tool_profile より優先 (例: ["Read", "Grep", "TodoWrite"])
 
@@ -282,6 +283,17 @@ lodan -p "続きをやって" --resume last
 - **stdin**: プロンプト引数があるときは stdin を**読まない**。CI や親プロセスから継承した stdin は端末でなくても閉じられないことがあり、EOF 待ちで固まるため。引数に stdin を足したいときは `--stdin` を明示する（上限 10 MiB）
 - slash コマンド（`/compact` など）は解釈しない。プロンプトはそのままモデルに渡る
 - hooks（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SessionEnd）、MCP、skills、プロジェクトメモリ、セッション保存は REPL と同じ
+
+## ツール呼び出しの並列実行
+
+モデルが 1 つの応答で複数のツールを呼んだとき、**並列可能なツールが 2 つ以上連続する区間**は同時に実行する(`[agent] parallel_tools`、既定 true。`--parallel-tools=false` / `LODAN_PARALLEL_TOOLS` で無効化)。API 級のモデルは 1 応答で Read や Grep を何本も出すので、待ち時間が直列に積まれなくなる。独立した調査を複数の `Task` に分けた場合も同時に走る。
+
+- 並列にするのは、ツール自身が `parallel_safe()` を宣言したものだけ: **Read / Grep / Glob / WebFetch / WebSearch / Task**。read-only でも、共有状態を書く TodoWrite、stdin を取り合う AskUserQuestion、読み取り位置を持つ Monitor は対象外。MCP ツールと破壊的ツール(Write / Edit / Bash …)は常に 1 つずつ、承認も 1 つずつ
+- 破壊的ツールや並列不可のツールが挟まると、そこで区間が切れる: `[Read, Read, Edit, Read]` は最初の 2 つだけが同時
+- **結果の順序は変わらない**。表示・PostToolUse hook・runlog・モデルへ返す tool 応答は、逐次実行のときと同じ呼び出し順
+- PreToolUse hook は区間内でも順番どおり 1 つずつ通り、ブロックされた呼び出しは実行されない
+- 直前と同一の呼び出し(重複抑止の対象)と、`ExitPlanMode` より後ろの呼び出し(承認されるとスキップされる決まり)は先行実行しない
+- `tool_result` イベントの `parallel` で、同時実行されたかが分かる。`ms` は実際の実行時間
 
 ## MCP サーバ接続 (stdio / HTTP + tools / prompts / resources)
 

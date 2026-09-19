@@ -1,8 +1,8 @@
 //! ヘッドレス実行 (`lodan -p`) の end-to-end。実バイナリを起動して **stdout を検証する** —
 //! stdout は呼び出し側との契約で、`Session` を直接叩くテストからは見えない。
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -23,28 +23,36 @@ impl Drop for MockServer {
     }
 }
 
+/// mock を起動して、実際に bind されたポートを受け取る。
+///
+/// 以前は「空きポートを選んで閉じ、その番号を mock に渡す」方式だった。閉じてから mock が
+/// bind するまでの間に、並列で走る別のテストが同じ番号を引くことがある。すると後発の mock は
+/// bind に失敗して終了するのに、接続確認は先発の mock に繋がって成功してしまい、先発のテストが
+/// 終わって mock を kill した時点で後発のテストが落ちる (稀な flake として実際に出た)。
+/// ポート 0 で bind させ、mock 自身に番号を名乗らせれば競合しない。
 fn start_mock(demo_dir: &Path) -> MockServer {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
     let script: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_llm.py");
-    let child = Command::new("python3")
+    let mut child = Command::new("python3")
         .arg(script)
-        .arg(port.to_string())
+        .arg("0")
         .arg(demo_dir)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn python3 mock_llm.py (is python3 on PATH?)");
-    let server = MockServer { child, port };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return server;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("mock server did not become ready on port {port}");
+    let stdout = child.stdout.take().expect("piped stdout");
+    // child を先に MockServer に包む。以降で panic しても Drop が kill + wait する。
+    let mut server = MockServer { child, port: 0 };
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read the PORT line from mock_llm.py");
+    server.port = line
+        .trim()
+        .strip_prefix("PORT ")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("mock_llm.py did not announce its port (got {line:?})"));
+    server
 }
 
 /// stdin に何を繋ぐか。

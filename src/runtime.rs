@@ -1,0 +1,189 @@
+//! REPL とヘッドレス実行 (`-p`) が共有する起動処理。
+//!
+//! LLM クライアント・ツール登録 (built-in / MCP / Task / Skill)・セッションの新規作成と
+//! 復元をここに集める。起動時の状況報告 (`skills: 2 loaded` など) は `Notices` 経由で
+//! 出すので、呼び出し側が行き先を決められる — REPL は stdout、ヘッドレスは stdout を
+//! 機械可読に保つため stderr。
+
+use anyhow::Result;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::agent;
+use crate::config::Config;
+use crate::llm::{self, LlmClient};
+use crate::mcp;
+use crate::mcp::prompt::McpPrompt;
+use crate::session::Recorder;
+use crate::tools::registry::{ToolRegistry, default_registry, read_only_registry};
+
+/// 起動時の状況報告の行き先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notices {
+    Stdout,
+    Stderr,
+}
+
+impl Notices {
+    pub fn say(self, line: &str) {
+        match self {
+            Notices::Stdout => println!("{line}"),
+            Notices::Stderr => eprintln!("{line}"),
+        }
+    }
+}
+
+pub struct Runtime {
+    pub cwd: PathBuf,
+    pub llm: Arc<dyn LlmClient>,
+    pub registry: Arc<ToolRegistry>,
+    /// MCP サーバが公開する prompt (`/mcp__<server>__<prompt>`)。
+    pub mcp_prompts: BTreeMap<String, McpPrompt>,
+    /// セッションの間 MCP クライアントを生かしておく (Drop でサブプロセスが kill される)。
+    _mcp_clients: Vec<Arc<mcp::client::McpClient>>,
+}
+
+impl Runtime {
+    pub async fn build(cfg: &Config, notices: Notices) -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        let user_skills =
+            crate::skills::load_from(&cwd.join(".lodan/skills")).unwrap_or_else(|e| {
+                eprintln!("skills: load failed: {e}");
+                Vec::new()
+            });
+        if !user_skills.is_empty() {
+            notices.say(&format!("skills: {} loaded", user_skills.len()));
+        }
+
+        let llm: Arc<dyn LlmClient> = llm::build_client(cfg)?;
+
+        let mut registry = default_registry();
+        // sampling は opt-in サーバにのみ active モデルの LLM を貸す。
+        let sampling_ctx = mcp::registry::SamplingContext {
+            llm: Arc::clone(&llm),
+            model: cfg.llm.active().model.clone(),
+        };
+        let mcp_outcome = mcp::registry::load_and_register(&mut registry, Some(sampling_ctx))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("mcp: {e}");
+                mcp::registry::LoadOutcome::default()
+            });
+        if mcp_outcome.servers > 0 {
+            notices.say(&format!(
+                "mcp: {} server(s), {} tool(s), {} prompt(s), {} resource(s) registered",
+                mcp_outcome.servers,
+                mcp_outcome.tools,
+                mcp_outcome.prompts.len(),
+                mcp_outcome.resources
+            ));
+        }
+        let mcp_prompts = mcp_outcome
+            .prompts
+            .into_iter()
+            .map(|p| (p.full_name().to_string(), p))
+            .collect();
+
+        // サブエージェント (Task): 読み取り専用ツールで調査を委譲する。
+        // LLM クライアントが要るため default_registry ではなくここで登録する。
+        registry.register(Arc::new(agent::subagent::SubAgentTool::new(
+            Arc::clone(&llm),
+            cfg.llm.active().model.clone(),
+            Arc::new(read_only_registry()),
+            cwd.clone(),
+            cfg.agent.max_iterations,
+        )));
+
+        // Skill ツール: モデルが名前で手順書を読み込める。skill が無ければ登録しない。
+        if !user_skills.is_empty() {
+            registry.register(Arc::new(crate::skills::SkillTool::new(user_skills)));
+        }
+
+        Ok(Self {
+            cwd,
+            llm,
+            registry: Arc::new(registry),
+            mcp_prompts,
+            _mcp_clients: mcp_outcome.clients,
+        })
+    }
+
+    /// `resume` があれば復元、無ければ新規。復元に失敗したら警告して新規にフォールバックする。
+    pub fn open_session(
+        &self,
+        cfg: &Config,
+        resume: Option<&str>,
+        notices: Notices,
+    ) -> (agent::Session, Option<Recorder>) {
+        match resume {
+            Some(arg) => resume_session(arg, &self.cwd, cfg, &self.registry, notices),
+            None => new_session(&self.cwd, cfg, &self.registry, notices),
+        }
+    }
+}
+
+/// 新規セッションを作り、永続化レコーダを用意する。
+/// レコーダ作成に失敗してもセッションは続行する (永続化なしの ephemeral)。
+fn new_session(
+    cwd: &Path,
+    cfg: &Config,
+    registry: &Arc<ToolRegistry>,
+    notices: Notices,
+) -> (agent::Session, Option<Recorder>) {
+    let session = agent::Session::new(cfg.clone(), Arc::clone(registry));
+    let recorder = match Recorder::create(cwd, cfg.llm.provider.as_str(), &cfg.llm.active().model) {
+        Ok(r) => {
+            notices.say(&format!("session: {}", r.id()));
+            Some(r)
+        }
+        Err(e) => {
+            eprintln!("session: persistence disabled ({e})");
+            None
+        }
+    };
+    (session, recorder)
+}
+
+/// 保存済みセッションを復元する。失敗時は警告して新規セッションにフォールバックする。
+fn resume_session(
+    arg: &str,
+    cwd: &Path,
+    cfg: &Config,
+    registry: &Arc<ToolRegistry>,
+    notices: Notices,
+) -> (agent::Session, Option<Recorder>) {
+    let resolved = if arg == "last" {
+        crate::session::latest_session_id().ok().flatten()
+    } else {
+        Some(arg.to_string())
+    };
+
+    let Some(id) = resolved else {
+        eprintln!("session: no session to resume");
+        return new_session(cwd, cfg, registry, notices);
+    };
+
+    match crate::session::load_transcript(&id) {
+        Ok(prior) => {
+            let n = prior.len();
+            let session = agent::Session::resume(cfg.clone(), Arc::clone(registry), prior);
+            // recorder は復元後の history を基準に「保存済み」位置を決める。
+            match Recorder::open_resumed(&id, session.history()) {
+                Ok(recorder) => {
+                    notices.say(&format!("session: resumed {id} ({n} messages)"));
+                    (session, Some(recorder))
+                }
+                Err(e) => {
+                    eprintln!("session: resumed {id} but persistence disabled ({e})");
+                    (session, None)
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("session: cannot resume {id}: {e}");
+            new_session(cwd, cfg, registry, notices)
+        }
+    }
+}

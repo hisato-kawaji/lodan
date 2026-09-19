@@ -13,12 +13,11 @@ use crate::agent;
 use crate::config::Config;
 use crate::hooks::{self, HookOutcome, Lifecycle};
 use crate::llm;
-use crate::mcp;
 use crate::mcp::prompt::McpPrompt;
 use crate::permission::PermissionGate;
+use crate::runtime::{Notices, Runtime};
 use crate::session::Recorder;
 use crate::slash::{self, SlashCommand};
-use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
@@ -177,44 +176,10 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         println!("slash: {} user command(s) loaded", user_commands.len());
     }
 
-    let user_skills = crate::skills::load_from(&cwd.join(".lodan/skills")).unwrap_or_else(|e| {
-        eprintln!("skills: load failed: {e}");
-        Vec::new()
-    });
-    if !user_skills.is_empty() {
-        println!("skills: {} loaded", user_skills.len());
-    }
-
-    let llm_client: Arc<dyn llm::LlmClient> = llm::build_client(&cfg)?;
-
-    let mut registry = default_registry();
-    // sampling は opt-in サーバにのみ active モデルの LLM を貸す。
-    let sampling_ctx = mcp::registry::SamplingContext {
-        llm: Arc::clone(&llm_client),
-        model: cfg.llm.active().model.clone(),
-    };
-    let mcp_outcome = mcp::registry::load_and_register(&mut registry, Some(sampling_ctx))
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("mcp: {e}");
-            mcp::registry::LoadOutcome::default()
-        });
-    if mcp_outcome.servers > 0 {
-        println!(
-            "mcp: {} server(s), {} tool(s), {} prompt(s), {} resource(s) registered",
-            mcp_outcome.servers,
-            mcp_outcome.tools,
-            mcp_outcome.prompts.len(),
-            mcp_outcome.resources
-        );
-    }
-    let mcp_prompts: BTreeMap<String, McpPrompt> = mcp_outcome
-        .prompts
-        .into_iter()
-        .map(|p| (p.full_name().to_string(), p))
-        .collect();
-    // Keep clients alive for the full session; Drop kills subprocesses.
-    let _mcp_clients = mcp_outcome.clients;
+    let runtime = Runtime::build(&cfg, Notices::Stdout).await?;
+    let llm_client = Arc::clone(&runtime.llm);
+    let registry = Arc::clone(&runtime.registry);
+    let mcp_prompts = &runtime.mcp_prompts;
 
     // 補完対象が出揃ったところで helper を装着する (#42 P7)。
     let completion_names: Vec<String> = BUILTINS
@@ -225,29 +190,10 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         .collect();
     rl.set_helper(Some(ReplHelper::new(completion_names)));
 
-    // サブエージェント (Task): 読み取り専用ツールで調査を委譲する。
-    // LLM クライアントが要るため default_registry ではなくここで登録する。
-    let sub_tools = Arc::new(crate::tools::registry::read_only_registry());
-    registry.register(Arc::new(agent::subagent::SubAgentTool::new(
-        Arc::clone(&llm_client),
-        cfg.llm.active().model.clone(),
-        sub_tools,
-        cwd.clone(),
-        cfg.agent.max_iterations,
-    )));
-
-    // Skill ツール: モデルが名前で手順書を読み込める。skill が無ければ登録しない。
-    if !user_skills.is_empty() {
-        registry.register(Arc::new(crate::skills::SkillTool::new(user_skills)));
-    }
-
-    let registry = Arc::new(registry);
     let gate = PermissionGate::new(cfg.agent.auto_approve);
 
-    let (mut session, mut recorder) = match resume {
-        Some(arg) => resume_session(&arg, &cfg, &registry),
-        None => new_session(&cwd, &cfg, &registry),
-    };
+    let (mut session, mut recorder) =
+        runtime.open_session(&cfg, resume.as_deref(), Notices::Stdout);
 
     // /goal の状態。上限到達などで未達のまま止まった goal は paused として残り、
     // `/goal` (状態表示) と `/goal clear` (解除) の対象になる。
@@ -391,7 +337,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                 continue;
             }
 
-            match handle_slash(head, &registry, &user_commands, &mcp_prompts) {
+            match handle_slash(head, &registry, &user_commands, mcp_prompts) {
                 SlashResult::Exit => break,
                 SlashResult::Handled => continue,
                 SlashResult::Unknown => {
@@ -434,69 +380,6 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let _ = hooks::runner::dispatch(Lifecycle::SessionEnd, None, &end_payload, &cfg.hooks).await;
 
     Ok(())
-}
-
-/// 新規セッションを作り、永続化レコーダを用意する。
-/// レコーダ作成に失敗してもセッションは続行する (永続化なしの ephemeral)。
-fn new_session(
-    cwd: &std::path::Path,
-    cfg: &Config,
-    registry: &Arc<crate::tools::registry::ToolRegistry>,
-) -> (agent::Session, Option<Recorder>) {
-    let session = agent::Session::new(cfg.clone(), Arc::clone(registry));
-    let recorder = match Recorder::create(cwd, cfg.llm.provider.as_str(), &cfg.llm.active().model) {
-        Ok(r) => {
-            println!("session: {}", r.id());
-            Some(r)
-        }
-        Err(e) => {
-            eprintln!("session: persistence disabled ({e})");
-            None
-        }
-    };
-    (session, recorder)
-}
-
-/// 保存済みセッションを復元する。失敗時は警告して新規セッションにフォールバックする。
-fn resume_session(
-    arg: &str,
-    cfg: &Config,
-    registry: &Arc<crate::tools::registry::ToolRegistry>,
-) -> (agent::Session, Option<Recorder>) {
-    let resolved = if arg == "last" {
-        crate::session::latest_session_id().ok().flatten()
-    } else {
-        Some(arg.to_string())
-    };
-
-    let Some(id) = resolved else {
-        eprintln!("session: no session to resume");
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        return new_session(&cwd, cfg, registry);
-    };
-
-    match crate::session::load_transcript(&id) {
-        Ok(prior) => {
-            let n = prior.len();
-            let session = agent::Session::resume(cfg.clone(), Arc::clone(registry), prior);
-            // recorder は復元後の history を基準に「保存済み」位置を決める。
-            match Recorder::open_resumed(&id, session.history()) {
-                Ok(recorder) => {
-                    println!("session: resumed {id} ({n} messages)");
-                    (session, Some(recorder))
-                }
-                Err(e) => {
-                    eprintln!("session: resumed {id} but persistence disabled ({e})");
-                    (session, None)
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("session: cannot resume {id}: {e}");
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            new_session(&cwd, cfg, registry)
-        }
-    }
 }
 
 /// `/goal` builtin。引数なし = 状態表示、解除別名 = 解除、それ以外 = 条件設定＋

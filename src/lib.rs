@@ -14,6 +14,7 @@ pub mod permission;
 pub mod prompt;
 pub mod repl;
 pub mod runlog;
+pub mod runtime;
 pub mod session;
 pub mod skills;
 pub mod slash;

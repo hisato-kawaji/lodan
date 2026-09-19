@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::agent::messages::Message;
 use crate::llm::LlmClient;
+use crate::permission_rules::{RuleSet, Verdict};
 use crate::prompt;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{Tool, ToolCtx, ToolError, ToolOutput};
@@ -35,6 +36,9 @@ pub struct SubAgentTool {
     tools: Arc<ToolRegistry>,
     cwd: PathBuf,
     max_iterations: usize,
+    /// 親と同じ permission ルール。子は親の承認ゲートを通らずにツールを実行するので、
+    /// ここで見ないと `deny = ["Read(**/.env)"]` を「Task に読ませる」だけですり抜けられる。
+    rules: Arc<RuleSet>,
 }
 
 impl SubAgentTool {
@@ -52,6 +56,29 @@ impl SubAgentTool {
             cwd,
             // 親の上限と子専用上限の小さい方を採る。
             max_iterations: max_iterations.min(SUBAGENT_MAX_ITERATIONS),
+            rules: Arc::new(RuleSet::default()),
+        }
+    }
+
+    /// 親の permission ルールを子にも適用する。
+    pub fn with_rules(mut self, rules: Arc<RuleSet>) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    /// 子の中でのツール呼び出しを通すか。子は静かに走り、尋ねる相手がいないので、
+    /// deny は拒否、ask も拒否 (尋ねられない)、それ以外は read-only なので通す。
+    fn refusal(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
+        match self.rules.evaluate(tool, args, &self.cwd)? {
+            Verdict::Deny(rule) => Some(format!(
+                "denied by permission rule `{rule}`. Do not retry this call or work around it."
+            )),
+            Verdict::Ask => Some(
+                "this call needs the user's approval, which a sub-agent cannot ask for. \
+                 Report that it is needed instead of retrying."
+                    .to_string(),
+            ),
+            Verdict::Allow => None,
         }
     }
 
@@ -92,6 +119,11 @@ impl SubAgentTool {
                 let output = match self.tools.get(&call.function.name) {
                     // 読み取り専用 registry にしか無いので未知名はまず出ないが、保険。
                     None => ToolOutput::error(format!("unknown tool: {}", call.function.name)),
+                    Some(_) if self.refusal(&call.function.name, &args).is_some() => {
+                        ToolOutput::error(
+                            self.refusal(&call.function.name, &args).unwrap_or_default(),
+                        )
+                    }
                     Some(tool) => match tool.execute(args, &ctx).await {
                         Ok(o) => o,
                         Err(e) => ToolOutput::error(format!("tool error: {e}")),
@@ -238,6 +270,100 @@ mod tests {
             cwd,
             8,
         )
+    }
+
+    /// 1 回目は指定のツールを呼び、2 回目は**受け取ったツール出力をそのまま最終応答にする** LLM。
+    /// 子の中で読めてしまった内容が親へ漏れるかを観測するためのもの。
+    struct EchoToolOutputLlm {
+        call: ToolCall,
+    }
+
+    #[async_trait]
+    impl LlmClient for EchoToolOutputLlm {
+        async fn chat(
+            &self,
+            history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _max_tokens: Option<u32>,
+        ) -> Result<ChatResponse> {
+            let last_tool_output = history.iter().rev().find_map(|m| match m {
+                Message::Tool { content, .. } => Some(content.clone()),
+                _ => None,
+            });
+            Ok(match last_tool_output {
+                None => ChatResponse {
+                    content: None,
+                    tool_calls: vec![self.call.clone()],
+                    usage: None,
+                },
+                Some(output) => ChatResponse {
+                    content: Some(output),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn task_reads_env(rules: RuleSet) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "API_KEY=hunter2").unwrap();
+        let read_args = serde_json::json!({ "path": env_path.display().to_string() }).to_string();
+        let tool = SubAgentTool::new(
+            Arc::new(EchoToolOutputLlm {
+                call: tool_call("Read", &read_args),
+            }),
+            "mock".into(),
+            Arc::new(read_only_registry()),
+            tmp.path().to_path_buf(),
+            8,
+        )
+        .with_rules(Arc::new(rules));
+        crate::tools::Tool::execute(
+            &tool,
+            serde_json::json!({ "description": "peek", "prompt": "read .env" }),
+            &ToolCtx::new(tmp.path().to_path_buf()),
+        )
+        .await
+        .unwrap()
+        .content
+    }
+
+    #[tokio::test]
+    async fn the_parents_deny_rules_also_bind_the_sub_agent() {
+        // ルールが無ければ子は読めて、その内容が親へ返る (テストの観測方法が効いていることの確認)。
+        assert!(task_reads_env(RuleSet::default()).await.contains("hunter2"));
+
+        let deny = RuleSet::parse(&[], &["Read(.env)".to_string()], &[]).unwrap();
+        let out = task_reads_env(deny).await;
+        assert!(
+            !out.contains("hunter2"),
+            "the secret reached the parent: {out}"
+        );
+        assert!(
+            out.contains("denied by permission rule `Read(.env)`"),
+            "{out}"
+        );
+
+        // ask も子の中では尋ねられないので通さない。
+        let ask = RuleSet::parse(&[], &[], &["Read(.env)".to_string()]).unwrap();
+        let out = task_reads_env(ask).await;
+        assert!(
+            !out.contains("hunter2") && out.contains("approval"),
+            "{out}"
+        );
     }
 
     #[test]

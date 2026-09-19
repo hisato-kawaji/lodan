@@ -59,6 +59,19 @@ pub struct Cli {
     #[arg(long, env = "LODAN_DUP_SUPPRESS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub dup_suppress: Option<bool>,
 
+    /// Which tools the model sees: full (default), core (Read/Write/Edit/Bash/Grep/Glob), readonly
+    #[arg(long, env = "LODAN_TOOL_PROFILE", value_enum)]
+    pub tool_profile: Option<crate::config::ToolProfile>,
+
+    /// Exact list of tools the model sees, comma-separated (overrides --tool-profile)
+    #[arg(
+        long,
+        env = "LODAN_TOOLS",
+        value_delimiter = ',',
+        value_name = "NAME,..."
+    )]
+    pub tools: Option<Vec<String>>,
+
     /// Run one turn non-interactively and exit. Without PROMPT, the prompt is read from stdin
     #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, default_missing_value = "")]
     pub print: Option<String>,
@@ -116,6 +129,8 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         finish_nudge: args.finish_nudge,
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,
+        tool_profile: args.tool_profile,
+        tools: args.tools,
     };
     cfg.apply_overrides_tracked(overrides, &mut origins);
 

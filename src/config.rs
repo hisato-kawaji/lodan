@@ -143,6 +143,30 @@ pub struct ProviderConfig {
     pub stream_idle_timeout_secs: u64,
 }
 
+/// モデルに見せるツールの範囲 (#72)。ツール定義は毎リクエスト全量が送られるので、
+/// 小型モデルでは固定費 (実測 1.8k-2.4k tok/呼び出し) がそのまま所要時間になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolProfile {
+    /// 登録された全ツール (built-in / Task / Skill / MCP)。
+    #[default]
+    Full,
+    /// コーディングに最低限必要な 6 個: Read / Write / Edit / Bash / Grep / Glob。
+    Core,
+    /// 破壊的でないツールだけ。
+    Readonly,
+}
+
+impl ToolProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ToolProfile::Full => "full",
+            ToolProfile::Core => "core",
+            ToolProfile::Readonly => "readonly",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
@@ -158,6 +182,10 @@ pub struct AgentConfig {
     /// 直前と同一の read-only 呼び出しを実行せず別の行動を促す (#61)。
     /// 既定 true。無効化できるのは ablation で寄与を測るため。
     pub dup_suppress: bool,
+    /// モデルに見せるツールの範囲。既定 `full`。
+    pub tool_profile: ToolProfile,
+    /// モデルに見せるツールの明示リスト。空でなければ `tool_profile` より優先する。
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -271,6 +299,8 @@ impl Default for AgentConfig {
             finish_nudge: false,
             malformed_retry: true,
             dup_suppress: true,
+            tool_profile: ToolProfile::Full,
+            tools: Vec::new(),
         }
     }
 }
@@ -387,6 +417,21 @@ impl Config {
             self.agent.dup_suppress = v;
             mark("agent.dup_suppress".into());
         }
+        if let Some(v) = o.tool_profile {
+            self.agent.tool_profile = v;
+            mark("agent.tool_profile".into());
+            // 明示リストはプロファイルより優先される。設定ファイルの `tools = [...]` を残すと、
+            // 実行時に指定した `--tool-profile` が黙って無視される (ablation が空振りする)。
+            // より具体的な指定元 (CLI / env) を勝たせる。同時に `--tools` があればそれが効く。
+            if o.tools.is_none() && !self.agent.tools.is_empty() {
+                self.agent.tools.clear();
+                mark("agent.tools".into());
+            }
+        }
+        if let Some(v) = o.tools {
+            self.agent.tools = v;
+            mark("agent.tools".into());
+        }
     }
 }
 
@@ -405,6 +450,8 @@ pub struct Overrides {
     pub finish_nudge: Option<bool>,
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,
+    pub tool_profile: Option<ToolProfile>,
+    pub tools: Option<Vec<String>>,
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -593,6 +640,43 @@ mod tests {
             origins["llm.kimi.api_key"],
             Origin::File(PathBuf::from("user.toml"))
         );
+    }
+
+    #[test]
+    fn tool_profile_and_explicit_tools_parse_and_override() {
+        let (mut cfg, _) = from_layers(vec![layer(
+            "user.toml",
+            "[agent]\ntool_profile = \"core\"\ntools = [\"Read\", \"Grep\"]\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.agent.tool_profile, ToolProfile::Core);
+        assert_eq!(cfg.agent.tools, ["Read", "Grep"]);
+
+        // 実行時のプロファイル指定は、設定ファイルの明示リストに負けない。
+        let mut by_profile = cfg.clone();
+        let mut origins = Origins::new();
+        by_profile.apply_overrides_tracked(
+            Overrides {
+                tool_profile: Some(ToolProfile::Readonly),
+                ..Default::default()
+            },
+            &mut origins,
+        );
+        assert_eq!(by_profile.agent.tool_profile, ToolProfile::Readonly);
+        assert!(
+            by_profile.agent.tools.is_empty(),
+            "a stale list would silently win"
+        );
+        assert_eq!(origins["agent.tools"], Origin::Override);
+
+        // 両方指定されたら、実行時の明示リストが効く。
+        cfg.apply_overrides(Overrides {
+            tool_profile: Some(ToolProfile::Core),
+            tools: Some(vec!["Glob".into()]),
+            ..Default::default()
+        });
+        assert_eq!(cfg.agent.tools, ["Glob"]);
+        assert_eq!(Config::default().agent.tool_profile, ToolProfile::Full);
     }
 
     #[test]

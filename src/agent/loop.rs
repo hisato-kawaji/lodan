@@ -313,6 +313,16 @@ impl Session {
                             reason = "unknown_tool";
                             ToolOutput::error(format!("unknown tool: {name}"))
                         }
+                        // プロファイルで隠したツール。名前だけ覚えているモデルが呼んでくる
+                        // ことがあるので、使えるものを示して誘導する (#72)。
+                        Some(_) if !self.registry.is_visible(&name) => {
+                            reason = "profile_hidden";
+                            ToolOutput::error(format!(
+                                "tool '{name}' is disabled by the active tool profile. \
+                                 Available tools: {}",
+                                self.registry.names().join(", ")
+                            ))
+                        }
                         // specs から隠していても呼ばれ得るので実行側でも防ぐ (多層防御)。
                         Some(tool) if self.mode == Mode::Plan && tool.is_destructive() => {
                             reason = "plan_blocked";
@@ -1618,6 +1628,33 @@ mod tests {
             m,
             Message::Tool { tool_call_id, content }
                 if tool_call_id == "w1" && content.contains("Re-issue")
+        )));
+    }
+
+    /// プロファイルで隠したツールは、呼ばれても実行せず、使えるツールを示して誘導する。
+    #[tokio::test]
+    async fn a_tool_hidden_by_the_profile_is_not_run_and_the_model_is_redirected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("should_not_exist.txt");
+        let args = format!(r#"{{"path": "{}", "content": "x"}}"#, target.display());
+
+        let mut registry = default_registry();
+        registry.apply_profile(crate::config::ToolProfile::Readonly, &[]);
+        let mut session = Session::new(Config::default(), Arc::new(registry));
+        let llm = CallThenDoneLlm::one(tool_call_with_args("w1", "Write", &args));
+        let gate = PermissionGate::new(true);
+        session.run_turn("write it", &llm, &gate).await.unwrap();
+
+        assert!(
+            !target.exists(),
+            "auto-approve must not rescue a hidden tool"
+        );
+        assert!(session.history().iter().any(|m| matches!(
+            m,
+            Message::Tool { tool_call_id, content }
+                if tool_call_id == "w1"
+                    && content.contains("disabled by the active tool profile")
+                    && content.contains("Read")
         )));
     }
 

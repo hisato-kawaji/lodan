@@ -75,6 +75,8 @@ struct PathPattern {
     /// glob のメタ文字が現れる前までの固定部分 (`secrets/**` → `secrets`、`**/.env` → 空)。
     /// 検索ツールの「検索範囲がこのパターンに一致し得るものを含むか」の判定に使う。
     literal_base: PathBuf,
+    /// `<固定部分>/**` (または `**`) の形で、固定部分以下の全てに一致するパターン。
+    whole_subtree: bool,
     /// `/` か `~/` で始まるパターン。絶対パスと照合する。それ以外は cwd 相対のパスと照合する。
     absolute: bool,
 }
@@ -168,7 +170,11 @@ impl Rule {
             // allow は「どの見え方でも一致」を要求する (symlink で cwd の外を指していたら不一致)。
             Matcher::Path(p) => {
                 let candidates = path_candidates(tool, args, cwd);
-                !candidates.is_empty() && candidates.iter().all(|path| p.matches(path, cwd))
+                let search = SEARCH_TOOLS.contains(&tool);
+                !candidates.is_empty()
+                    && candidates
+                        .iter()
+                        .all(|path| p.matches(path, cwd) || (search && p.covers_tree(path, cwd)))
             }
             Matcher::Domain(d) => url_host(args).is_some_and(|h| host_matches(&h, d)),
         }
@@ -269,7 +275,12 @@ impl PathPattern {
             .take_while(|part| !part.contains(['*', '?', '[', '{']))
             .collect::<Vec<_>>()
             .join("/");
+        let whole_subtree = body == "**"
+            || body
+                .strip_suffix("/**")
+                .is_some_and(|base| !base.contains(['*', '?', '[', '{']));
         Ok(Self {
+            whole_subtree,
             glob: build(false)?,
             glob_any_case: build(true)?,
             literal_base: PathBuf::from(if absolute && literal_base.is_empty() {
@@ -296,6 +307,22 @@ impl PathPattern {
             return glob.is_match(path);
         }
         path.strip_prefix(cwd).is_ok_and(|rel| glob.is_match(rel))
+    }
+
+    /// `root` 以下の全てがこのパターンに一致すると言えるか (検索ツールの allow 用)。
+    /// `src/**` は `src/agent` には一致するが、glob としては `src` そのものには一致しない。
+    /// 「src 以下を検索してよい」と書いた人は `path = "src"` の検索も通るつもりでいるので、
+    /// `<固定部分>/**` の形に限り、起点が固定部分と同じかその下なら一致とみなす。
+    fn covers_tree(&self, root: &Path, cwd: &Path) -> bool {
+        if !self.whole_subtree {
+            return false;
+        }
+        let base = if self.absolute {
+            self.literal_base.clone()
+        } else {
+            cwd.join(&self.literal_base)
+        };
+        root.starts_with(&base)
     }
 
     /// `root` 以下の検索が、このパターンに一致するファイルに実際に触れるか。
@@ -873,6 +900,12 @@ mod tests {
             Some(Verdict::Allow)
         );
         assert_eq!(at("Grep", json!({ "pattern": "x", "path": "docs" })), None);
+        // `src/**` の allow は、src そのものを起点にした検索も含む。
+        assert_eq!(
+            at("Grep", json!({ "pattern": "x", "path": "src" })),
+            Some(Verdict::Allow)
+        );
+        assert_eq!(at("Grep", json!({ "pattern": "x", "path": "srcs" })), None);
 
         // 固定部分の無いパターンは「実際に触れるか」で決まる。全ての検索を止めたりしない。
         assert_eq!(at("Glob", json!({ "pattern": "*", "path": "docs" })), None);

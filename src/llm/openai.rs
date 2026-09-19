@@ -355,7 +355,7 @@ impl LlmClient for OpenAiClient {
         };
 
         let body: ChatResponseBody = serde_json::from_str(&text)
-            .with_context(|| format!("parsing chat response: {text}"))?;
+            .with_context(|| format!("parsing chat response: {}", clip_body(&text)))?;
         let usage = body.usage.map(Usage::normalized);
         let choice = body
             .choices
@@ -499,7 +499,15 @@ impl OpenAiClient {
                     return Err(StreamFailure {
                         emitted_text: !text_buf.is_empty(),
                         request_timed_out,
-                        error: anyhow::Error::new(e).context("SSE chunk error"),
+                        // eventsource の Error は source() を実装していないので、`{:#}` では
+                        // 「Transport error: error decoding response body」で止まる。
+                        // 転送エラーは中の reqwest エラーを自前でたどって原因まで出す。
+                        error: match &e {
+                            eventsource_stream::EventStreamError::Transport(t) => {
+                                anyhow!("SSE chunk error: {}", error_chain(t))
+                            }
+                            _ => anyhow::Error::new(e).context("SSE chunk error"),
+                        },
                     });
                 }
             };
@@ -769,6 +777,23 @@ mod tests {
             text.len()
         );
         assert!(text.contains("50000 bytes total"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_success_body_is_clipped_in_the_error() {
+        // 200 で巨大な HTML を返すプロキシ。パース失敗のエラーに本文を丸ごと載せない。
+        let html = format!("<html>{}</html>", "y".repeat(50_000));
+        let (url, _) = scripted_server(vec![http("200 OK", "", &html)]).await;
+        let text = format!(
+            "{:#}",
+            client(&url, 0).chat(&[], &[], "m", None).await.unwrap_err()
+        );
+        assert!(
+            text.contains("parsing chat response"),
+            "{}",
+            &text[..200.min(text.len())]
+        );
+        assert!(text.len() < 1_500, "got {} chars", text.len());
     }
 
     #[test]

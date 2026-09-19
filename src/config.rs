@@ -304,33 +304,52 @@ impl Config {
     /// the currently-active provider so users can flip provider once and tweak
     /// per-call without rewriting their config.
     pub fn apply_overrides(&mut self, o: Overrides) {
+        self.apply_overrides_tracked(o, &mut Origins::new());
+    }
+
+    /// `apply_overrides` と同じ。上書きしたキーを `origins` にも反映する
+    /// (`--show-origin` が、env で潰された値をファイル由来と表示しないように)。
+    pub fn apply_overrides_tracked(&mut self, o: Overrides, origins: &mut Origins) {
+        let mut mark = |key: String| {
+            origins.insert(key, Origin::Override);
+        };
         if let Some(p) = o.provider {
             self.llm.provider = p;
+            mark("llm.provider".into());
         }
+        let provider = self.llm.provider.as_str();
         let active = self.llm.active_mut();
         if let Some(v) = o.base_url {
             active.base_url = v;
+            mark(format!("llm.{provider}.base_url"));
         }
         if let Some(v) = o.model {
             active.model = v;
+            mark(format!("llm.{provider}.model"));
         }
         if let Some(v) = o.api_key {
             active.api_key = v;
+            mark(format!("llm.{provider}.api_key"));
         }
         if let Some(v) = o.temperature {
             active.temperature = Some(v);
+            mark(format!("llm.{provider}.temperature"));
         }
         if o.auto_approve {
             self.agent.auto_approve = true;
+            mark("agent.auto_approve".into());
         }
         if let Some(v) = o.finish_nudge {
             self.agent.finish_nudge = v;
+            mark("agent.finish_nudge".into());
         }
         if let Some(v) = o.malformed_retry {
             self.agent.malformed_retry = v;
+            mark("agent.malformed_retry".into());
         }
         if let Some(v) = o.dup_suppress {
             self.agent.dup_suppress = v;
+            mark("agent.dup_suppress".into());
         }
     }
 }
@@ -356,9 +375,25 @@ fn user_config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "lodan").map(|d| d.config_dir().join("config.toml"))
 }
 
-/// キー (`llm.kimi.model` のようなドット区切り) → その値を最後に書いたファイル。
-/// どのファイルにも現れないキーは既定値のままなので載らない。
-pub type Origins = std::collections::BTreeMap<String, PathBuf>;
+/// キー (`llm.kimi.model` のようなドット区切り) → その値を最後に決めたもの。
+/// どこからも設定されていないキーは既定値のままなので載らない。
+pub type Origins = std::collections::BTreeMap<String, Origin>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    File(PathBuf),
+    /// env か CLI フラグ (`apply_overrides`)。ファイルの値より後に効く。
+    Override,
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Origin::File(p) => write!(f, "{}", p.display()),
+            Origin::Override => f.write_str("env or CLI flag"),
+        }
+    }
+}
 
 /// レイヤー間で後勝ちにせず連結する配列キー。hook はユーザ設定とプロジェクト設定の
 /// 両方を効かせたい (プロジェクト側に 1 つ足しただけでユーザの hook が消えるのは事故)。
@@ -394,6 +429,10 @@ fn from_layers(layers: Vec<(PathBuf, toml::Table)>) -> Result<(Config, Origins)>
 }
 
 /// テーブルは再帰、`CONCAT_ARRAY_KEYS` は連結、それ以外の値は `over` で置き換える。
+///
+/// 前提: 各レイヤーは `read_toml` で単体でも `Config` として検証済み。だから既知のキーで
+/// レイヤー間の型が食い違う (スカラーの上にテーブル、など) ことは無く、部分木を丸ごと
+/// 置き換える腕で古い `origins` を掃除する必要も無い。この検証を緩めるなら、ここも見直すこと。
 fn merge_table(
     base: &mut toml::Table,
     over: toml::Table,
@@ -418,7 +457,10 @@ fn merge_table(
                     _ => 0,
                 };
                 for i in 0..o.len() {
-                    origins.insert(format!("{full}[{}]", start + i), origin.to_path_buf());
+                    origins.insert(
+                        format!("{full}[{}]", start + i),
+                        Origin::File(origin.to_path_buf()),
+                    );
                 }
                 match existing {
                     Some(Value::Array(b)) => b.extend(o),
@@ -435,7 +477,7 @@ fn merge_table(
             }
             (_, v) => {
                 base.insert(key, v);
-                origins.insert(full, origin.to_path_buf());
+                origins.insert(full, Origin::File(origin.to_path_buf()));
             }
         }
     }
@@ -481,12 +523,40 @@ mod tests {
             ProviderConfig::default_kimi().base_url
         );
 
-        assert_eq!(origins["llm.kimi.model"], PathBuf::from("user.toml"));
+        assert_eq!(
+            origins["llm.kimi.model"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
         assert_eq!(
             origins["agent.max_iterations"],
-            PathBuf::from("project.toml")
+            Origin::File(PathBuf::from("project.toml"))
         );
         assert!(!origins.contains_key("llm.kimi.base_url"));
+    }
+
+    #[test]
+    fn overrides_take_over_the_origin_of_keys_they_replace() {
+        let (mut cfg, mut origins) = from_layers(vec![layer(
+            "user.toml",
+            "[llm]\nprovider = \"kimi\"\n[llm.kimi]\nmodel = \"kimi-k2.6\"\napi_key = \"k\"\n",
+        )])
+        .unwrap();
+        cfg.apply_overrides_tracked(
+            Overrides {
+                model: Some("kimi-k3".into()),
+                dup_suppress: Some(false),
+                ..Default::default()
+            },
+            &mut origins,
+        );
+        assert_eq!(cfg.llm.kimi.model, "kimi-k3");
+        assert_eq!(origins["llm.kimi.model"], Origin::Override);
+        assert_eq!(origins["agent.dup_suppress"], Origin::Override);
+        // 触っていないキーはファイル由来のまま。
+        assert_eq!(
+            origins["llm.kimi.api_key"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
     }
 
     #[test]
@@ -500,7 +570,7 @@ mod tests {
         assert_eq!(cfg.agent.max_iterations, 5);
         assert_eq!(
             origins["agent.max_iterations"],
-            PathBuf::from("explicit.toml")
+            Origin::File(PathBuf::from("explicit.toml"))
         );
     }
 
@@ -526,8 +596,14 @@ mod tests {
         let (cfg, origins) = from_layers(vec![user, project]).unwrap();
         let commands: Vec<&str> = cfg.hooks.iter().map(|h| h.command.as_str()).collect();
         assert_eq!(commands, ["user-stop", "project-pre"]);
-        assert_eq!(origins["hooks[0]"], PathBuf::from("user.toml"));
-        assert_eq!(origins["hooks[1]"], PathBuf::from("project.toml"));
+        assert_eq!(
+            origins["hooks[0]"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
+        assert_eq!(
+            origins["hooks[1]"],
+            Origin::File(PathBuf::from("project.toml"))
+        );
     }
 
     #[test]

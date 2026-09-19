@@ -146,7 +146,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 設定ファイルは**フィールド単位で重なる**。後段のファイルは自分が書いたキーだけを上書きし、書かなかったキーは前段の値が残る (プロジェクト側に `[agent] max_iterations = 40` だけ書いても、ユーザ設定の provider は消えない)。`[[hooks]]` だけは上書きではなく**連結**で、ユーザ設定 → プロジェクト設定 → `--config` の順に全て発火する。
 
-`lodan config` は合成後の設定を表示する。`lodan config --show-origin` を付けると、設定ファイルに書かれた各キーがどのファイル由来かも出る (載らないキーは既定値か env / CLI フラグ)。
+`lodan config` は合成後の設定を表示する。`lodan config --show-origin` を付けると、各キーを最後に決めたもの (設定ファイルのパス、または `env or CLI flag`) も出る。載らないキーは既定値。
 
 ```toml
 # ~/.config/lodan/config.toml

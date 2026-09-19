@@ -78,8 +78,8 @@ pub enum Command {
 }
 
 pub async fn dispatch(args: Cli) -> Result<()> {
-    let (mut cfg, origins) = Config::load_with_origins(args.config.as_deref())?;
-    cfg.apply_overrides(crate::config::Overrides {
+    let (mut cfg, mut origins) = Config::load_with_origins(args.config.as_deref())?;
+    let overrides = crate::config::Overrides {
         provider: args.provider,
         base_url: args.base_url,
         model: args.model,
@@ -89,7 +89,8 @@ pub async fn dispatch(args: Cli) -> Result<()> {
         finish_nudge: args.finish_nudge,
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,
-    });
+    };
+    cfg.apply_overrides_tracked(overrides, &mut origins);
 
     // 計測が本編を壊さないよう、ログを開けなくても実行は続ける。
     if let Some(path) = args.log_jsonl.as_deref() {
@@ -120,15 +121,15 @@ pub async fn dispatch(args: Cli) -> Result<()> {
     }
 }
 
-/// `--show-origin` の表示。設定ファイルに書かれたキーだけが載る — ここに無い値は
-/// 既定値か、env / CLI フラグによる上書き。
+/// `--show-origin` の表示。設定ファイル・env・CLI フラグのいずれかが決めたキーが載る。
+/// ここに無い値は既定値。
 fn describe_origins(origins: &crate::config::Origins) -> String {
-    let mut out = String::from("# origins (keys not listed: built-in default, env or CLI flag)\n");
+    let mut out = String::from("# origins (keys not listed: built-in default)\n");
     if origins.is_empty() {
-        out.push_str("# (no config file sets any key)\n");
+        out.push_str("# (nothing overrides the defaults)\n");
     }
-    for (key, path) in origins {
-        out.push_str(&format!("# {key} <- {}\n", path.display()));
+    for (key, origin) in origins {
+        out.push_str(&format!("# {key} <- {origin}\n"));
     }
     out
 }

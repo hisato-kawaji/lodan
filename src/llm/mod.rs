@@ -1,5 +1,7 @@
+pub mod kimi;
 pub mod openai;
 pub mod sakana;
+pub mod sakura;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -74,5 +76,7 @@ pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
     match cfg.llm.provider {
         Provider::Local => Ok(Arc::new(openai::OpenAiClient::new(&cfg.llm.local)?)),
         Provider::Sakana => Ok(Arc::new(sakana::SakanaClient::new(&cfg.llm.sakana)?)),
+        Provider::Sakura => Ok(Arc::new(sakura::SakuraClient::new(&cfg.llm.sakura)?)),
+        Provider::Kimi => Ok(Arc::new(kimi::KimiClient::new(&cfg.llm.kimi)?)),
     }
 }

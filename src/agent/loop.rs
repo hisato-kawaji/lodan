@@ -659,7 +659,7 @@ impl SessionUsage {
         self.last_context_tokens = u.prompt_tokens;
     }
 
-    /// `/cost` 用の表示文字列。料金はローカル/Sakana では出せないためトークン数のみ。
+    /// `/cost` 用の表示文字列。料金はどの provider でも単価を持たないためトークン数のみ。
     pub fn describe(&self) -> String {
         if self.llm_calls == 0 {
             return "no LLM calls yet".to_string();

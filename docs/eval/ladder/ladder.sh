@@ -147,7 +147,7 @@ for task_file in $TASK_FILES; do
 
         limit="$(timeout_for_level "$LEVEL")"
         t0=$(date +%s)
-        # shellcheck disable=SC2086
+        # shellcheck disable=SC2046  # フラグ列は意図的に単語分割する
         printf '%s\n/exit\n' "$PROMPT" \
           | timeout "$limit" "$LODAN" \
               --provider "$PROVIDER" --model "$MODEL" --yes \

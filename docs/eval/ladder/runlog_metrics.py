@@ -13,6 +13,10 @@ from collections import Counter
 from pathlib import Path
 
 
+# モデル自身の振る舞いで終わったターンの `turn_end.reason`。
+TURN_COMPLETED = {"final", "max_iterations"}
+
+
 def collect(path: Path) -> dict:
     events = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -33,7 +37,14 @@ def collect(path: Path) -> dict:
 
     # ツールを 1 度も使わずに終えたターン = 「計画だけ述べて実行しない」失敗。
     # 最終応答は必ずツールなしなので、応答単位ではなくターン単位で数える。
-    plan_only_turns = sum(1 for e in turn_ends if e.get("tool_calls", 0) == 0)
+    # モデルが自分で終えたターンだけが対象。LLM 呼び出しの失敗 (error) や中断
+    # (aborted) もツール 0 回で終わるが、それは plan-only ではない。
+    end_reasons = Counter(e.get("reason") for e in turn_ends)
+    plan_only_turns = sum(
+        1
+        for e in turn_ends
+        if e.get("reason") in TURN_COMPLETED and e.get("tool_calls", 0) == 0
+    )
 
     return {
         "llm_calls": len(llm_rows),
@@ -51,7 +62,11 @@ def collect(path: Path) -> dict:
         # 実行中にマシンがスリープしても伸びない。壁時計の secs より信頼できる。
         "active_ms": sum(e.get("ms", 0) for e in turn_ends),
         "iterations": sum(e.get("iterations", 0) for e in turn_ends),
-        "hit_max_iterations": sum(1 for e in turn_ends if e.get("reason") == "max_iterations"),
+        "hit_max_iterations": end_reasons.get("max_iterations", 0),
+        # 外側の timeout で kill された実行は turn_end 自体が残らない (Drop が走らない)。
+        # ここに出るのは lodan が生きたままターンを失った場合だけ。
+        "errored_turns": end_reasons.get("error", 0),
+        "aborted_turns": end_reasons.get("aborted", 0),
         "prompt_tokens": sum(e.get("prompt_tokens", 0) for e in llm_rows),
         "completion_tokens": sum(e.get("completion_tokens", 0) for e in llm_rows),
         # 生成の重さの目安。巨大な単一引数は小型モデルが壊れる主因なので見ておく。

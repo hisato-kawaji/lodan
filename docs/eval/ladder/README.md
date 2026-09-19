@@ -2,7 +2,7 @@
 
 ## なぜ作ったか
 
-先行の [mini-renovater ベンチ](../mini-renovater-bench-2026-07.md) は、ローカル 9B/12B が
+先行の [mini-renovater ベンチ](https://github.com/hisato-kawaji/lodan/pull/60) (PR #60、未マージ) は、ローカル 9B/12B が
 **0/5** という結果で止まった。この数字には 3 つの問題がある。
 
 1. **二値なので改善が見えない** — 「サブ要件 1 個の不足」も「ステージ丸ごとの崩壊」も同じ 0 になる

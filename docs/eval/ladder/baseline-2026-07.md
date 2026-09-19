@@ -2,9 +2,13 @@
 
 ローカル 3 モデル × 4 config × 10 タスク、計 90 実行（各条件 1 回）。
 ハーネスと指標の定義は [README](README.md)、先行データは
-[mini-renovater ベンチ](../mini-renovater-bench-2026-07.md)。
+[mini-renovater ベンチ](https://github.com/hisato-kawaji/lodan/pull/60) (PR #60、未マージ)。
 
-- 環境: MacBook Air M3 / 24GB、ollama 0.32.1、lodan `feat/eval-instrumentation`
+- 環境: MacBook Air M3 / 24GB、ollama 0.32.1、lodan `feat/eval-instrumentation` @ `81dd077`
+  - この時点の lodan はエラー終了・中断したターンで `turn_end` を出さなかった (`b6634f8` で修正)。
+    本レポートの指標は完了したターンだけから集計されている。`plan_only_turns` は現行の
+    `runlog_metrics.py` (完了ターンのみを母数にする) と定義が一致する。`active_ms` は現行では
+    失敗ターンの所要も含むため、再取得すると失敗を含む実行でわずかに大きく出る
 - モデルは全て `num_ctx 8192` の派生（`FROM <base>` + `PARAMETER num_ctx 8192`）
 - 実行時間上限: llama/qwen は L0/L1/L2 = 150/300/480s、gemma は 400/700/900s
   （較正の理由は後述）

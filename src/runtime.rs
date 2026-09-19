@@ -105,6 +105,14 @@ impl Runtime {
         for name in registry.apply_profile(cfg.agent.tool_profile, &cfg.agent.tools) {
             eprintln!("tools: '{name}' is listed in agent.tools but no such tool is registered");
         }
+        // 綴り間違いで全ツールが消えた実行は、ツールなしのまま LLM を呼んで終わるだけで何も
+        // 測れない。走らせる前に止める。
+        if registry.is_empty() {
+            anyhow::bail!(
+                "agent.tools / --tools matches no registered tool (registered: {})",
+                registry.all_names().join(", ")
+            );
+        }
         let spec_bytes = serde_json::to_string(&registry.tool_specs()).map_or(0, |s| s.len());
         crate::runlog::record(
             "tools",

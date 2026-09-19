@@ -72,6 +72,11 @@ impl ToolRegistry {
         self.tools.contains_key(name) && self.visible.as_ref().is_none_or(|v| v.contains(name))
     }
 
+    /// 登録済みの全ツール名 (隠したものを含む)。
+    pub fn all_names(&self) -> Vec<&str> {
+        self.tools.keys().map(|s| s.as_str()).collect()
+    }
+
     /// 登録済みの全ツール数 (隠したものを含む)。
     pub fn registered_len(&self) -> usize {
         self.tools.len()
@@ -99,8 +104,9 @@ impl ToolRegistry {
         self.names().len()
     }
 
+    /// モデルに見せているツールが 1 つも無いか (`len() == 0` と同じ意味)。
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.len() == 0
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec<'_>> {
@@ -216,6 +222,15 @@ mod tests {
         );
         assert_eq!(unknown, ["NoSuchTool"]);
         assert_eq!(spec_names(&r), ["Read", "TodoWrite"]);
+        assert!(!r.is_empty());
+
+        let mut none = default_registry();
+        none.apply_profile(crate::config::ToolProfile::Full, &["NoSuchTool".into()]);
+        assert!(none.is_empty(), "nothing visible");
+        assert!(
+            none.names().is_empty(),
+            "is_empty must agree with what the model sees"
+        );
     }
 
     #[test]

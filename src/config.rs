@@ -420,6 +420,13 @@ impl Config {
         if let Some(v) = o.tool_profile {
             self.agent.tool_profile = v;
             mark("agent.tool_profile".into());
+            // 明示リストはプロファイルより優先される。設定ファイルの `tools = [...]` を残すと、
+            // 実行時に指定した `--tool-profile` が黙って無視される (ablation が空振りする)。
+            // より具体的な指定元 (CLI / env) を勝たせる。同時に `--tools` があればそれが効く。
+            if o.tools.is_none() && !self.agent.tools.is_empty() {
+                self.agent.tools.clear();
+                mark("agent.tools".into());
+            }
         }
         if let Some(v) = o.tools {
             self.agent.tools = v;
@@ -645,13 +652,30 @@ mod tests {
         assert_eq!(cfg.agent.tool_profile, ToolProfile::Core);
         assert_eq!(cfg.agent.tools, ["Read", "Grep"]);
 
+        // 実行時のプロファイル指定は、設定ファイルの明示リストに負けない。
+        let mut by_profile = cfg.clone();
+        let mut origins = Origins::new();
+        by_profile.apply_overrides_tracked(
+            Overrides {
+                tool_profile: Some(ToolProfile::Readonly),
+                ..Default::default()
+            },
+            &mut origins,
+        );
+        assert_eq!(by_profile.agent.tool_profile, ToolProfile::Readonly);
+        assert!(
+            by_profile.agent.tools.is_empty(),
+            "a stale list would silently win"
+        );
+        assert_eq!(origins["agent.tools"], Origin::Override);
+
+        // 両方指定されたら、実行時の明示リストが効く。
         cfg.apply_overrides(Overrides {
-            tool_profile: Some(ToolProfile::Readonly),
-            tools: Some(Vec::new()),
+            tool_profile: Some(ToolProfile::Core),
+            tools: Some(vec!["Glob".into()]),
             ..Default::default()
         });
-        assert_eq!(cfg.agent.tool_profile, ToolProfile::Readonly);
-        assert!(cfg.agent.tools.is_empty());
+        assert_eq!(cfg.agent.tools, ["Glob"]);
         assert_eq!(Config::default().agent.tool_profile, ToolProfile::Full);
     }
 

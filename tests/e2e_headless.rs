@@ -431,3 +431,60 @@ fn tool_profile_core_is_reported_and_shrinks_the_tool_specs() {
         "core = {core_bytes}, full = {full_bytes}"
     );
 }
+
+#[test]
+fn a_tool_list_that_matches_nothing_fails_before_calling_the_model() {
+    let home = tempfile::tempdir().unwrap();
+    let out = lodan(
+        home.path(),
+        1, // 誰も listen していない。LLM を呼びに行けば別のエラーになる。
+        &[
+            "-p",
+            "hi",
+            "--output-format",
+            "json",
+            "--tools",
+            "Raed,Grpe",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let error = v["error"].as_str().unwrap();
+    assert!(error.contains("matches no registered tool"), "{error}");
+    assert!(
+        error.contains("Read"),
+        "the error lists what exists: {error}"
+    );
+    assert_eq!(v["usage"]["llm_calls"], 0);
+}
+
+#[test]
+fn a_runtime_tool_profile_beats_a_tool_list_in_the_config_file() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg_dir = home.path().join("work/.lodan");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.toml"), "[agent]\ntools = [\"Read\"]\n").unwrap();
+    let server = start_mock(home.path());
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "-p",
+            "hi",
+            "--output-format",
+            "stream-json",
+            "--tool-profile",
+            "core",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(out.status.success());
+    let tools = stdout(&out)
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["event"] == "tools")
+        .unwrap();
+    assert_eq!(tools["visible"].as_array().unwrap().len(), 6, "{tools}");
+    assert_eq!(tools["explicit"], false);
+}

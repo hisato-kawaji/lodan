@@ -136,7 +136,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 - **温度制御**: provider 設定の `temperature`(既定は未送信 = サーバ既定)。整形の破綻・綴りブレ・実行ごとの分散を抑えるには `0.1`〜`0.2` を推奨。
 - **壊れツールコールの再要求**: tool_calls が空なのに応答テキストへ呼び出しの痕跡(`<function=`、`call:Name{…}`、`<|tool_call` 等)が漏れている場合、「正しい tool call として再発行せよ」と自動で注入してターンを継続する(1 ターン 2 回まで)。
 - **重複呼び出しの抑止**: 直前と完全同一(名前 + 引数)の **read-only** 呼び出しは実行せず「結果は不変。別の行動を」と返す(同一ファイルを延々 Read するループ対策)。Bash 再実行など破壊系の正当な繰り返しは対象外。
-- **ツールプロファイル**(`[agent] tool_profile`、`--tool-profile`、`LODAN_TOOL_PROFILE`): ツール定義は**毎リクエスト全量が送られる**ので、小型モデルでは固定費がそのまま所要時間になる(ラダーのベースラインで 1.8k〜2.4k tok/呼び出し)。`core` は Read / Write / Edit / Bash / Grep / Glob の 6 個だけを見せ、定義の JSON は 6,643 → 2,437 バイト(-63%)。`readonly` は破壊的でないツールだけ。`tools = [...]`(`--tools Read,Grep,...`)で明示リストも指定できる。隠したツールは登録に残るので、モデルが名前を覚えていて呼んできても実行はされず「このプロファイルでは無効。使えるのは …」と返る(`--yes` でも通らない)。Task / Skill / MCP のツールも `core` では隠れる点に注意。起動時の `tools` イベント(`--log-jsonl` / `stream-json`)に、見せているツールと定義のバイト数が残る
+- **ツールプロファイル**(`[agent] tool_profile`、`--tool-profile`、`LODAN_TOOL_PROFILE`): ツール定義は**毎リクエスト全量が送られる**ので、小型モデルでは固定費がそのまま所要時間になる(ラダーのベースラインで 1.8k〜2.4k tok/呼び出し)。`core` は Read / Write / Edit / Bash / Grep / Glob の 6 個だけを見せ、定義の JSON は 6,643 → 2,437 バイト(-63%)。`readonly` は破壊的でないツールだけ。`tools = [...]`(`--tools Read,Grep,...`)で明示リストも指定できる。隠したツールは登録に残るので、モデルが名前を覚えていて呼んできても実行はされず「このプロファイルでは無効。使えるのは …」と返る(`--yes` でも通らない)。Task / Skill / MCP のツールも `core` では隠れる点に注意。`agent.tools` は設定ファイルのレイヤー間で連結されず後勝ち。実行時の `--tool-profile` は設定ファイルの `tools = [...]` より優先される(リストを残すとプロファイル指定が黙って無視されるため)。リストがどのツールにも一致しなければ、LLM を呼ぶ前にエラーで止まる。`Task` の内側の調査エージェントは常に Read / Grep / Glob の 3 個を使い、プロファイルの影響を受けない。`readonly` は WebFetch / WebSearch を含むので、権限の境界としては使わないこと(それは承認ゲートの役割)。起動時の `tools` イベント(`--log-jsonl` / `stream-json`)に、見せているツールと定義のバイト数が残る
 - **終了前自己検証ナッジ**(`[agent] finish_nudge = true`、既定 false): ターンが終わろうとする最初の応答で 1 回だけ、ツール未使用なら「計画を述べ直さず今実行せよ」、使用済みなら「元の依頼を読み直し全要件の実装・検証を確認せよ」と促して継続させる。「計画だけ述べて終了」「長い自己編集中の要件脱落」対策(#63)。良行儀なモデルには余計なラウンドトリップになるため opt-in。
 
 ## 設定
@@ -647,7 +647,7 @@ cargo test
 - `tools/edit.rs` — 一意マッチ / 多重マッチ拒否 / Read 必須
 - `tools/read.rs` — offset / limit
 - `tools/todo_write.rs` — replace / clear / multi-in_progress 拒否 / 引数不正
-- `tools/registry.rs` — 動的名登録 / built-in 既定 14 ツール
+- `tools/registry.rs` — 動的名登録 / built-in 既定 14 ツール / ツールプロファイル (core はちょうど 6 個・readonly は破壊系なし・明示リスト優先・plan モードにも効く・定義が半減以上)
 - `tools/background.rs` / `tools/bash.rs` — BG ストアの増分読み出し・上限 append・kill 合図 / Bash の run_in_background → Monitor / KillShell 一周
 - `memory/mod.rs` — LODAN.md/CLAUDE.md 探索・優先順・外内連結・空ファイル除外・上限の文字境界打ち切り
 - `permission.rs` — auto_approve / always-tool / always-command の判定

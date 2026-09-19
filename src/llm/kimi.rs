@@ -14,6 +14,10 @@ use crate::llm::{ChatEvent, ChatResponse, LlmClient};
 
 const API_KEY_ENV: &str = "KIMI_API_KEY";
 
+/// K3 系は temperature が 1 固定で、それ以外を送ると 400 を返す (2026-09 実測)。
+const FIXED_TEMPERATURE_MODEL_PREFIX: &str = "kimi-k3";
+const FIXED_TEMPERATURE: f32 = 1.0;
+
 pub struct KimiClient {
     inner: OpenAiClient,
 }
@@ -31,9 +35,25 @@ impl KimiClient {
                 "Kimi provider requires an API key (set [llm.kimi].api_key, --api-key, or {API_KEY_ENV})"
             ));
         }
+        effective.temperature = effective_temperature(&effective.model, effective.temperature);
         Ok(Self {
             inner: OpenAiClient::new(&effective)?,
         })
+    }
+}
+
+/// K3 に 1 以外の temperature が来たら送らない。`--temperature 0.2` は小型モデル向けの
+/// 推奨値として他 provider と共用されるので (#61)、ここで落とさないと上流の素っ気ない
+/// 400 でターンごと失敗する。
+fn effective_temperature(model: &str, requested: Option<f32>) -> Option<f32> {
+    match requested {
+        Some(t) if model.starts_with(FIXED_TEMPERATURE_MODEL_PREFIX) && t != FIXED_TEMPERATURE => {
+            tracing::warn!(
+                "{model} only accepts temperature={FIXED_TEMPERATURE}; ignoring temperature={t}"
+            );
+            None
+        }
+        other => other,
     }
 }
 
@@ -63,6 +83,18 @@ impl LlmClient for KimiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn k3_drops_any_temperature_other_than_one() {
+        assert_eq!(effective_temperature("kimi-k3", Some(0.2)), None);
+        assert_eq!(effective_temperature("kimi-k3", Some(1.0)), Some(1.0));
+        assert_eq!(effective_temperature("kimi-k3", None), None);
+    }
+
+    #[test]
+    fn other_kimi_models_keep_their_temperature() {
+        assert_eq!(effective_temperature("kimi-k2.6", Some(0.2)), Some(0.2));
+    }
 
     #[test]
     fn missing_api_key_is_rejected() {

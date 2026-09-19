@@ -63,26 +63,25 @@ struct ProviderOverlay {
 }
 
 impl ProviderOverlay {
-    fn apply(self, mut base: ProviderConfig) -> ProviderConfig {
-        if let Some(v) = self.base_url {
-            base.base_url = v;
+    fn apply(self, base: ProviderConfig) -> ProviderConfig {
+        // 両側を分解して組み直す。`ProviderConfig` にフィールドを足して overlay 側を
+        // 忘れると、黙って無視されるのではなくここでコンパイルが止まる。
+        let Self {
+            base_url,
+            model,
+            api_key,
+            timeout_secs,
+            context_window,
+            temperature,
+        } = self;
+        ProviderConfig {
+            base_url: base_url.unwrap_or(base.base_url),
+            model: model.unwrap_or(base.model),
+            api_key: api_key.unwrap_or(base.api_key),
+            timeout_secs: timeout_secs.unwrap_or(base.timeout_secs),
+            context_window: context_window.unwrap_or(base.context_window),
+            temperature: temperature.or(base.temperature),
         }
-        if let Some(v) = self.model {
-            base.model = v;
-        }
-        if let Some(v) = self.api_key {
-            base.api_key = v;
-        }
-        if let Some(v) = self.timeout_secs {
-            base.timeout_secs = v;
-        }
-        if let Some(v) = self.context_window {
-            base.context_window = v;
-        }
-        if let Some(v) = self.temperature {
-            base.temperature = Some(v);
-        }
-        base
     }
 }
 
@@ -368,6 +367,18 @@ fn merge(_base: Config, over: Config) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_output_round_trips() {
+        // `lodan config` の出力をそのまま config.toml に貼れること。
+        let mut cfg = Config::default();
+        cfg.llm.provider = Provider::Kimi;
+        cfg.llm.sakura.temperature = Some(0.2);
+        cfg.llm.kimi.model = "kimi-k2.6".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(toml::to_string_pretty(&back).unwrap(), text);
+    }
 
     #[test]
     fn defaults_set_local_provider_and_endpoints() {

@@ -40,6 +40,9 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize)]
 pub struct LlmConfig {
     pub provider: Provider,
+    /// primary が一時的に使えないとき (再試行を使い切った 5xx / 429 / 接続エラーなど) に
+    /// 投げ直す先。未設定なら fallback しない (#70)。
+    pub fallback: Option<Provider>,
     pub local: ProviderConfig,
     pub sakana: ProviderConfig,
     pub sakura: ProviderConfig,
@@ -101,6 +104,7 @@ impl<'de> Deserialize<'de> for LlmConfig {
         #[serde(default)]
         struct Raw {
             provider: Provider,
+            fallback: Option<Provider>,
             local: ProviderOverlay,
             sakana: ProviderOverlay,
             sakura: ProviderOverlay,
@@ -110,6 +114,7 @@ impl<'de> Deserialize<'de> for LlmConfig {
         let raw = Raw::deserialize(d)?;
         Ok(Self {
             provider: raw.provider,
+            fallback: raw.fallback,
             local: raw.local.apply(ProviderConfig::default_local()),
             sakana: raw.sakana.apply(ProviderConfig::default_sakana()),
             sakura: raw.sakura.apply(ProviderConfig::default_sakura()),
@@ -204,6 +209,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: Provider::Local,
+            fallback: None,
             local: ProviderConfig::default_local(),
             sakana: ProviderConfig::default_sakana(),
             sakura: ProviderConfig::default_sakura(),
@@ -313,7 +319,11 @@ impl Default for BashConfig {
 
 impl LlmConfig {
     pub fn active(&self) -> &ProviderConfig {
-        match self.provider {
+        self.get(self.provider)
+    }
+
+    pub fn get(&self, provider: Provider) -> &ProviderConfig {
+        match provider {
             Provider::Local => &self.local,
             Provider::Sakana => &self.sakana,
             Provider::Sakura => &self.sakura,
@@ -383,6 +393,10 @@ impl Config {
             self.llm.provider = p;
             mark("llm.provider".into());
         }
+        if let Some(p) = o.fallback {
+            self.llm.fallback = Some(p);
+            mark("llm.fallback".into());
+        }
         let provider = self.llm.provider.as_str();
         let active = self.llm.active_mut();
         if let Some(v) = o.base_url {
@@ -441,6 +455,7 @@ impl Config {
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub provider: Option<Provider>,
+    pub fallback: Option<Provider>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,

@@ -147,6 +147,8 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 **LLM API の再試行**: 接続エラーと 408 / 429 / 5xx は `max_retries` 回まで自動で送り直す (全 provider 共通、`[llm.<provider>]` ごとに設定)。400 / 401 のような恒久的な失敗と、`timeout_secs` を使い切ったタイムアウトは再試行しない。ストリーミングは**本文を 1 文字も表示していない断だけ**を送り直す (表示後にやり直すと同じ文が二重に出るため)。再試行は stderr の警告と、`--log-jsonl` の `api_retry` イベントに残る。待ち時間中の Ctrl-C は即座に効く。
 
+**fallback provider**: `[llm] fallback = "sakura"`(`--fallback-provider` / `LODAN_FALLBACK_PROVIDER`)を設定すると、primary が**一時的に**使えないとき — 再試行を使い切った接続エラー / 408 / 429 / 5xx、本文を 1 文字も出していないストリーム断、タイムアウト — に、その呼び出しを fallback の provider へ(**fallback 側の設定のモデルで**)投げ直す。400 / 401 のような設定ミスと、本文を表示した後の断(二重表示になる)は対象外。一度 fallback が成功したら、そのプロセスの間は fallback を使い続ける(primary が落ちている間、呼び出しのたびにバックオフを払わないため)。切替は stderr の警告と `provider_fallback` イベントに残る。fallback 側の API キーが無いなどで組めない場合は、警告して fallback なしで続行する。注意: 自動圧縮のしきい値と `/cost` は primary の `context_window` を基準にしたままなので、fallback の窓が小さい場合は `[llm.<fallback>] context_window` の小さい方に primary 側を合わせておくこと。
+
 設定ファイルは**フィールド単位で重なる**。後段のファイルは自分が書いたキーだけを上書きし、書かなかったキーは前段の値が残る (プロジェクト側に `[agent] max_iterations = 40` だけ書いても、ユーザ設定の provider は消えない)。`[[hooks]]` だけは上書きではなく**連結**で、ユーザ設定 → プロジェクト設定 → `--config` の順に全て発火する。
 
 `lodan config` は合成後の設定を表示する。`lodan config --show-origin` を付けると、各キーを最後に決めたもの (設定ファイルのパス、または `env or CLI flag`) も出る。載らないキーは既定値。
@@ -205,6 +207,7 @@ timeout_secs = 30
 
 環境変数:
 - `LODAN_PROVIDER` (`local` | `sakana` | `sakura` | `kimi`)
+- `LODAN_FALLBACK_PROVIDER` (同上。未設定なら fallback しない)
 - `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
 - `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
 - `LODAN_TOOL_PROFILE` / `LODAN_TOOLS` (カンマ区切り)
@@ -213,7 +216,7 @@ timeout_secs = 30
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 

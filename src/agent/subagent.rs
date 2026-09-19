@@ -116,14 +116,11 @@ impl SubAgentTool {
             for call in tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
+                let refusal = self.refusal(&call.function.name, &args);
                 let output = match self.tools.get(&call.function.name) {
                     // 読み取り専用 registry にしか無いので未知名はまず出ないが、保険。
                     None => ToolOutput::error(format!("unknown tool: {}", call.function.name)),
-                    Some(_) if self.refusal(&call.function.name, &args).is_some() => {
-                        ToolOutput::error(
-                            self.refusal(&call.function.name, &args).unwrap_or_default(),
-                        )
-                    }
+                    Some(_) if refusal.is_some() => ToolOutput::error(refusal.unwrap_or_default()),
                     Some(tool) => match tool.execute(args, &ctx).await {
                         Ok(o) => o,
                         Err(e) => ToolOutput::error(format!("tool error: {e}")),

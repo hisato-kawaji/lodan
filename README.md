@@ -296,16 +296,16 @@ lodan -p "続きをやって" --resume last
 ```toml
 [permissions]
 mode  = "default"          # default / accept-edits / plan / dont-ask / bypass
-allow = ["Bash(git status)", "Bash(cargo *)", "Edit(src/**)", "WebFetch(domain:docs.rs)"]
+allow = ["Bash(git status)", "Bash(git diff *)", "Bash(cargo check*)", "Edit(src/**)", "WebFetch(domain:docs.rs)"]
 ask   = ["Bash(cargo publish*)"]
-deny  = ["Read(**/.env)", "Read(~/.ssh/**)", "Bash(git push --force*)", "Bash(rm -rf *)"]
+deny  = ["Read(**/.env)", "Grep(**/.env)", "Glob(**/.env)", "Read(~/.ssh/**)", "Bash(git push --force*)"]
 ```
 
 **評価順は deny → ask → allow → 既定**。
 
 - **deny は何にでも勝つ**: read-only のツールにも (`Read(**/.env)`)、`--yes` / `bypass` にも効く。「基本は全部通すが、これだけは絶対に通さない」が書ける。拒否されるとモデルには `denied by permission rule …` と、回り道をするなという指示が返る
-- **ask** は必ず尋ねる (allow より優先、read-only にも効く)。**allow** は尋ねずに通す
-- ルールはユーザ設定 → プロジェクト設定 → `--config` の間で**連結**される。プロジェクト設定はユーザ設定の deny を消せない。`--allowed-tools <RULE>` / `--disallowed-tools <RULE>` (繰り返し可) も足すだけで、置き換えない
+- **ask** は必ず尋ねる (allow より優先、read-only にも効く)。**allow** は尋ねずに通す。ただし `--yes` / `bypass` は ask も尋ねずに通す (尋ねないのが bypass の意味なので。止めたいものは deny に書く)
+- ルールはユーザ設定 → プロジェクト設定 → `--config` の間で**連結**される。プロジェクト設定はユーザ設定の deny を消せない。**ただし広げることはできる**: プロジェクトの `.lodan/config.toml` は `allow = ["Bash(*)"]` を足すことも `mode = "bypass"` にすることもできる (信頼していないリポジトリで lodan を起動しない、という既存の前提のまま。未信頼ディレクトリの設定を読む前に確認する workspace trust は #75)。`--allowed-tools <RULE>` / `--disallowed-tools <RULE>` (繰り返し可) も足すだけで、置き換えない
 - 解釈できないルールが 1 つでもあれば**起動時にエラー**。権限の設定を黙って読み飛ばさない
 
 **ルールの構文** (Claude Code の `permissions` と同じ `Tool` / `Tool(pattern)`):
@@ -318,12 +318,14 @@ deny  = ["Read(**/.env)", "Read(~/.ssh/**)", "Bash(git push --force*)", "Bash(rm
 | `Bash(npm run test:*)` | `npm run test` そのもの、または後に引数が続くもの (`npm run testing` には一致しない) |
 | `Read(src/**)` / `Edit(*.md)` | パスの glob。相対パターンは cwd 基準。`/` の無いパターンはどの階層のファイル名にも一致 (gitignore と同じ)。対象: Read / Write / Edit / MultiEdit / NotebookEdit / Glob / Grep |
 | `Write(/etc/**)` / `Read(~/.ssh/**)` | 絶対パス / ホーム基準 |
-| `WebFetch(domain:docs.rs)` | ホスト名 (サブドメインを含む) |
+| `WebFetch(domain:docs.rs)` | ホスト名 (サブドメインを含む)。判定するのは**最初の URL** だけで、リダイレクト先は見ない |
 | `mcp__github` / `mcp__github__create_issue` | その MCP サーバの全ツール / 1 つだけ |
 
 **Bash の複合コマンド**: `Bash(git *)` を allow していても `git status && rm -rf /` は通らない。コマンドを `&&` `||` `;` `|` `&` と改行で分割し、**全ての部分が allow に一致したときだけ**通す。`$(…)`・バッククォート・プロセス置換・リダイレクト (`>` `<`) を含むコマンドは中身を追い切れないので、allow には決して一致させず尋ねる。deny は逆に、コマンド全体か**いずれかの部分**が一致すれば効く。
 
-**パス**: `src/../.env` のような `..` は畳んでから照合する。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。
+**検索ツール (Grep / Glob)** は `path` 以下を丸ごと読む (`path` 省略時は cwd)。deny / ask は、**その検索が実際に触れるファイルの中に一致するものがあれば**効く: `deny = ["Grep(secrets/**)"]` は `path` 無しの Grep も止める。判定は Grep / Glob と同じ走査 (`.gitignore` を尊重、隠しファイルは含む) で行うので、`Grep(**/.env)` は `.env` のあるディレクトリの検索だけを止め、gitignore された `.env` は上の階層からの検索では読まれないので止めない (ignore されたディレクトリ自体を起点に指定した検索は中を読むので、止める)。5 万エントリを超える範囲は確かめきれないので止める側に倒す。
+
+**パス**: `src/../.env` のような `..` は畳んでから照合する。deny / ask は大文字小文字を無視する (macOS / Windows では `.GITHUB/x` への書き込みが `.github/x` に着地するため)。allow は綴りどおり。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。
 
 **モード** (`[permissions] mode` / `--permission-mode` / `LODAN_PERMISSION_MODE`):
 
@@ -337,7 +339,13 @@ deny  = ["Read(**/.env)", "Read(~/.ssh/**)", "Bash(git push --force*)", "Bash(rm
 
 `Task` の子エージェントにも同じルールが効く (子は親の承認を通らずに Read / Grep / Glob を実行するので、ここで見ないと deny を「Task に読ませる」だけですり抜けられる)。子の中では尋ねられないため、ask に当たる呼び出しも拒否される。
 
-限界: ルールは lodan のツール呼び出しを見ているだけで、OS レベルの隔離ではない。allow した Bash コマンドが内部で何をするか (`cargo test` がテストコードから何を実行するか) までは制御できない。サンドボックスは #75。
+**限界** — ルールは lodan のツール呼び出しの**文字列**を見ているだけで、OS レベルの隔離ではない:
+
+- **Bash の deny は回り道に弱い**。`deny = ["Bash(rm *)"]` は `/bin/rm`・`command rm`・`\rm`・`"rm" -rf`・`sudo rm`・`env rm`・`xargs rm`・`sh -c 'rm …'`・`X=rm; $X …` を止めない。Bash の deny は事故の防止であって、敵対的なモデルへの防壁ではない。確実に止めたいなら Bash 自体を尋ねる対象のままにして、**allow を狭く**書く
+- **広い allow は実質 `Bash(*)`**。`Bash(git *)` は `git -c core.pager='…' log` や `git -c alias.x='!…' x`、`git config --global alias.…` を通すので、任意コマンド実行と同じ。`Bash(git status)` / `Bash(git diff *)` / `Bash(git log *)` のように、サブコマンドまで書くこと。`cargo *` / `npm *` / `make *` も同様 (ビルドスクリプトが何でも実行する)
+- **ルールはツールごと**。`deny = ["Read(**/.env)"]` は Read を止めるだけで、`Grep` が一致行を返すことも、`Bash(cat .env)` も止めない。秘密を守るなら `Read` / `Grep` / `Glob` の 3 つに書き、Bash は尋ねる対象のままにする
+
+- allow した Bash コマンドが内部で何をするか (`cargo test` がテストコードから何を実行するか) までは制御できない。サンドボックスは #75
 
 ## ツール呼び出しの並列実行
 

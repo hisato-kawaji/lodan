@@ -153,7 +153,7 @@ impl Tool for SubAgentTool {
         let args: TaskArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("Task: {e}")))?;
         // 子は静かに走るので、起動を 1 行知らせて可視性を確保する。
-        println!("  ↳ Task: {}", args.description);
+        crate::say!("  ↳ Task: {}", args.description);
         let summary = self.run(&args.prompt).await?;
         Ok(ToolOutput::ok(summary))
     }

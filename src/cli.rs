@@ -59,6 +59,18 @@ pub struct Cli {
     #[arg(long, env = "LODAN_DUP_SUPPRESS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub dup_suppress: Option<bool>,
 
+    /// Run one turn non-interactively and exit. Without PROMPT, the prompt is read from stdin
+    #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, default_missing_value = "")]
+    pub print: Option<String>,
+
+    /// With -p PROMPT: also read stdin to EOF and append it (`cat log | lodan -p "summarize" --stdin`)
+    #[arg(long, requires = "print")]
+    pub stdin: bool,
+
+    /// What -p writes to stdout: the final answer, one JSON result, or JSONL events
+    #[arg(long, value_enum, default_value_t, requires = "print")]
+    pub output_format: crate::headless::OutputFormat,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }
@@ -77,8 +89,23 @@ pub enum Command {
     Sessions,
 }
 
-pub async fn dispatch(args: Cli) -> Result<()> {
-    let (mut cfg, mut origins) = Config::load_with_origins(args.config.as_deref())?;
+/// 戻り値はプロセスの終了コード。
+pub async fn dispatch(args: Cli) -> Result<i32> {
+    let headless_format = args.print.is_some().then_some(args.output_format);
+    let stream_json = headless_format == Some(crate::headless::OutputFormat::StreamJson);
+
+    let loaded = Config::load_with_origins(args.config.as_deref());
+    let (mut cfg, mut origins) = match (loaded, headless_format) {
+        (Ok(loaded), _) => loaded,
+        // ヘッドレスでは設定の読み込み失敗も、頼まれた形式の結果として stdout に出す。
+        (Err(e), Some(format)) => {
+            // 設定が読めていないので provider / model は分からない。それでもイベント列は
+            // run_start から始め、`--log-jsonl` にも同じものを残す。
+            init_runlog(args.log_jsonl.as_deref(), stream_json, None);
+            return Ok(crate::headless::report_startup_failure(format, &e));
+        }
+        (Err(e), None) => return Err(e),
+    };
     let overrides = crate::config::Overrides {
         provider: args.provider,
         base_url: args.base_url,
@@ -92,33 +119,59 @@ pub async fn dispatch(args: Cli) -> Result<()> {
     };
     cfg.apply_overrides_tracked(overrides, &mut origins);
 
-    // 計測が本編を壊さないよう、ログを開けなくても実行は続ける。
-    if let Some(path) = args.log_jsonl.as_deref() {
-        match crate::runlog::init(path) {
-            Ok(()) => crate::runlog::record(
-                "run_start",
-                serde_json::json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "provider": cfg.llm.provider.as_str(),
-                    "model": cfg.llm.active().model,
-                    "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
-                }),
-            ),
-            Err(e) => eprintln!("runlog: disabled ({e})"),
+    init_runlog(args.log_jsonl.as_deref(), stream_json, Some(&cfg));
+
+    if let Some(prompt) = args.print {
+        let format = args.output_format;
+        if args.cmd.is_some() {
+            let e = anyhow::anyhow!("-p cannot be combined with a subcommand");
+            return Ok(crate::headless::report_startup_failure(format, &e));
         }
+        let opts = crate::headless::Options {
+            prompt,
+            read_stdin: args.stdin,
+            format,
+            resume: args.resume,
+        };
+        return Ok(crate::headless::run(cfg, opts).await);
     }
 
     match args.cmd.unwrap_or(Command::Repl) {
-        Command::Repl => repl::run(cfg, args.resume).await,
+        Command::Repl => repl::run(cfg, args.resume).await.map(|()| 0),
         Command::Config { show_origin } => {
             println!("{}", toml::to_string_pretty(&cfg)?);
             if show_origin {
                 print!("{}", describe_origins(&origins));
             }
-            Ok(())
+            Ok(0)
         }
-        Command::Sessions => list_sessions(),
+        Command::Sessions => list_sessions().map(|()| 0),
     }
+}
+
+/// runlog の sink を立てて `run_start` を記録する。計測が本編を壊さないよう、ログファイルを
+/// 開けなくても実行は続ける。`cfg` が無いのは設定の読み込みに失敗した起動失敗の経路。
+fn init_runlog(path: Option<&std::path::Path>, stream_json: bool, cfg: Option<&Config>) {
+    if path.is_none() && !stream_json {
+        return;
+    }
+    if let Err(e) = crate::runlog::init_with(path, stream_json) {
+        eprintln!("runlog: disabled ({e})");
+        // ログファイルを開けなくても、stream-json の stdout は契約なので生かす。
+        if stream_json {
+            let _ = crate::runlog::init_with(None, true);
+        }
+    }
+    // どの経路で sink が立っても、イベント列は run_start から始まる。
+    crate::runlog::record(
+        "run_start",
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "provider": cfg.map(|c| c.llm.provider.as_str()),
+            "model": cfg.map(|c| c.llm.active().model.as_str()),
+            "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
+        }),
+    );
 }
 
 /// `--show-origin` の表示。設定ファイル・env・CLI フラグのいずれかが決めたキーが載る。

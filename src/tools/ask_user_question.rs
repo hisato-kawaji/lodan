@@ -70,6 +70,15 @@ impl Tool for AskUserQuestion {
             ));
         }
 
+        // ヘッドレス実行では尋ねる相手がいない。質問を stdout に書くと機械可読な出力を壊し、
+        // stdin はプロンプトに使われているので答えも読めない。
+        if crate::term::display_to_stderr() {
+            return Ok(ToolOutput::error(
+                "AskUserQuestion: this is a non-interactive run, so nobody can answer. \
+                 Choose the most reasonable option yourself and state the assumption.",
+            ));
+        }
+
         // stdin は同期ブロッキングなので blocking スレッドで読む。
         let chosen = tokio::task::spawn_blocking(move || prompt_loop(&question, &options))
             .await

@@ -6,6 +6,36 @@
 
 use std::io::IsTerminal;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 人間向けの表示 (ストリーム本文・ツール出力の要約・各種通知) を stderr へ回すか。
+/// ヘッドレスの `json` / `stream-json` では stdout が機械可読な契約になるため。
+static DISPLAY_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// 以後の人間向け表示を stderr へ回す (プロセス内で戻す経路は無い)。
+pub fn route_display_to_stderr() {
+    DISPLAY_TO_STDERR.store(true, Ordering::Relaxed);
+}
+
+pub fn display_to_stderr() -> bool {
+    DISPLAY_TO_STDERR.load(Ordering::Relaxed)
+}
+
+/// 人間向けの 1 行。`println!` の代わりに `crate::say!` 経由で使う。
+pub fn say_line(args: std::fmt::Arguments<'_>) {
+    if display_to_stderr() {
+        eprintln!("{args}");
+    } else {
+        println!("{args}");
+    }
+}
+
+/// 人間向け表示用の `println!`。行き先は `route_display_to_stderr` に従う。
+#[macro_export]
+macro_rules! say {
+    () => { $crate::term::say_line(format_args!("")) };
+    ($($arg:tt)*) => { $crate::term::say_line(format_args!($($arg)*)) };
+}
 
 /// stdout が端末に繋がっているか（プロセス内で 1 度だけ判定）。
 pub fn is_terminal() -> bool {
@@ -44,7 +74,13 @@ fn style(code: &str, s: &str, enabled: bool) -> String {
 }
 
 fn paint(code: &str, s: &str) -> String {
-    style(code, s, stdout_color())
+    // 表示を stderr へ回しているときは、着色の可否も stderr の側で決める。
+    let enabled = if display_to_stderr() {
+        stderr_color()
+    } else {
+        stdout_color()
+    };
+    style(code, s, enabled)
 }
 
 // stdout 向け（`println!` / stdout ロックに使う）。

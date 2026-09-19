@@ -10,14 +10,40 @@ pub struct SessionPolicy {
 
 pub struct PermissionGate {
     auto_approve: bool,
+    /// 尋ねる相手がいない (ヘッドレス実行)。承認が要る呼び出しは尋ねずに拒否する。
+    non_interactive: bool,
     policy: Mutex<SessionPolicy>,
 }
+
+const DENIED_BY_USER: &str = "user denied execution";
+const DENIED_NON_INTERACTIVE: &str = "denied: this is a non-interactive run and nobody can approve \
+    this action. Do not retry it. Finish with the tools that are allowed, or report what is blocked \
+    (the operator can re-run with --yes to allow destructive tools).";
 
 impl PermissionGate {
     pub fn new(auto_approve: bool) -> Self {
         Self {
             auto_approve,
+            non_interactive: false,
             policy: Mutex::new(SessionPolicy::default()),
+        }
+    }
+
+    /// プロンプトを出さないゲート。stdin はプロンプト本文に使われ得るので、承認待ちで
+    /// 読みに行くとハングするか、入力の続きを承認の答えと取り違える。
+    pub fn non_interactive(auto_approve: bool) -> Self {
+        Self {
+            non_interactive: true,
+            ..Self::new(auto_approve)
+        }
+    }
+
+    /// 拒否したときにモデルへ返す文面。
+    pub fn denial_message(&self) -> &'static str {
+        if self.non_interactive {
+            DENIED_NON_INTERACTIVE
+        } else {
+            DENIED_BY_USER
         }
     }
 
@@ -35,6 +61,9 @@ impl PermissionGate {
             {
                 return true;
             }
+        }
+        if self.non_interactive {
+            return false;
         }
         self.prompt(tool_name, args)
     }

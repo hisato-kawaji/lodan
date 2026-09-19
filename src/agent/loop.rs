@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use std::io::Write as _;
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -1004,22 +1004,34 @@ async fn stream_once(
     tools: &[crate::agent::messages::ToolSpec<'_>],
     model: &str,
 ) -> Result<ChatResponse> {
+    let mut stdout = std::io::stdout();
+    let show_wait = crate::term::is_terminal();
+    stream_once_to(llm, history, tools, model, &mut stdout, show_wait).await
+}
+
+/// `stream_once` の本体。出力先を差し替えられるようにしてある (テスト用)。
+async fn stream_once_to(
+    llm: &dyn LlmClient,
+    history: &[Message],
+    tools: &[crate::agent::messages::ToolSpec<'_>],
+    model: &str,
+    stdout: &mut dyn Write,
+    show_wait: bool,
+) -> Result<ChatResponse> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     let send_fut = llm.chat_stream(history, tools, model, tx);
     tokio::pin!(send_fut);
 
     let mut last_done: Option<ChatResponse> = None;
-    let mut stdout = std::io::stdout();
 
     // 応答待ちインジケータ: 最初のトークンが来るまで dim の "…thinking" を出し、
     // 到着時に行ごと消す。tty のときだけ（パイプに制御文字を混ぜない）。
-    let show_wait = crate::term::is_terminal();
     if show_wait {
         let _ = write!(stdout, "{}", crate::term::dim("…thinking"));
         let _ = stdout.flush();
     }
     let mut cleared = false;
-    let mut clear_wait = |stdout: &mut std::io::Stdout| {
+    let mut clear_wait = |stdout: &mut dyn Write| {
         if show_wait && !cleared {
             let _ = write!(stdout, "\r\x1b[2K"); // 行頭へ戻して行クリア
             let _ = stdout.flush();
@@ -1030,11 +1042,11 @@ async fn stream_once(
     loop {
         tokio::select! {
             // 正常/異常どちらの完了でもインジケータを消してから抜ける。
-            res = &mut send_fut => { clear_wait(&mut stdout); res?; break; }
+            res = &mut send_fut => { clear_wait(stdout); res?; break; }
             ev = rx.recv() => {
                 match ev {
                     Some(ChatEvent::TextDelta(s)) => {
-                        clear_wait(&mut stdout);
+                        clear_wait(stdout);
                         let _ = stdout.write_all(s.as_bytes());
                         let _ = stdout.flush();
                     }
@@ -1045,11 +1057,17 @@ async fn stream_once(
         }
     }
     // テキストが 1 つも来なかった場合もインジケータを消す。
-    clear_wait(&mut stdout);
-    // ストリーム完了後にチャネルへ残った Done を回収
+    clear_wait(stdout);
+    // 送信側が先に完了すると、チャネルにまだイベントが残っている。Done だけでなく
+    // 本文デルタも拾う — 捨てると履歴には入るのに画面には出ない (速いサーバでは全文、
+    // 通常でも応答の末尾が欠ける)。
     while let Ok(ev) = rx.try_recv() {
-        if let ChatEvent::Done(r) = ev {
-            last_done = Some(r);
+        match ev {
+            ChatEvent::TextDelta(s) => {
+                let _ = stdout.write_all(s.as_bytes());
+                let _ = stdout.flush();
+            }
+            ChatEvent::Done(r) => last_done = Some(r),
         }
     }
 
@@ -1135,6 +1153,51 @@ fn clip_lines(s: &str, max_lines: usize, max_chars: usize, total_bytes: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 全イベントを sink に積んでから即完了する LLM。送信 future が受信より先に
+    /// 終わる状況 (速いローカルサーバ、応答の末尾) を作る。
+    struct BurstLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for BurstLlm {
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            _: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("stream_once only streams")
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            for part in ["al", "pha ", "beta"] {
+                let _ = sink.send(ChatEvent::TextDelta(part.to_string()));
+            }
+            let _ = sink.send(ChatEvent::Done(ChatResponse {
+                content: Some("alpha beta".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+            }));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_once_prints_deltas_still_queued_when_the_sender_finishes() {
+        let mut out = Vec::new();
+        let resp = stream_once_to(&BurstLlm, &[], &[], "m", &mut out, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("alpha beta"));
+        assert_eq!(String::from_utf8(out).unwrap(), "alpha beta");
+    }
 
     #[test]
     fn turn_end_is_silent_until_armed() {

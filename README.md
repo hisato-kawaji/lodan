@@ -144,6 +144,8 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 ユーザ設定の場所は OS の流儀に従う (`directories` crate): Linux は `~/.config/lodan/config.toml`、**macOS は `~/Library/Application Support/lodan/config.toml`**。以下 `~/.config/lodan/` と書いている箇所は macOS では後者に読み替えること。
 
+**LLM API の再試行**: 接続エラーと 408 / 429 / 5xx は `max_retries` 回まで自動で送り直す (全 provider 共通、`[llm.<provider>]` ごとに設定)。400 / 401 のような恒久的な失敗と、`timeout_secs` を使い切ったタイムアウトは再試行しない。ストリーミングは**本文を 1 文字も表示していない断だけ**を送り直す (表示後にやり直すと同じ文が二重に出るため)。再試行は stderr の警告と、`--log-jsonl` の `api_retry` イベントに残る。待ち時間中の Ctrl-C は即座に効く。
+
 設定ファイルは**フィールド単位で重なる**。後段のファイルは自分が書いたキーだけを上書きし、書かなかったキーは前段の値が残る (プロジェクト側に `[agent] max_iterations = 40` だけ書いても、ユーザ設定の provider は消えない)。`[[hooks]]` だけは上書きではなく**連結**で、ユーザ設定 → プロジェクト設定 → `--config` の順に全て発火する。
 
 `lodan config` は合成後の設定を表示する。`lodan config --show-origin` を付けると、各キーを最後に決めたもの (設定ファイルのパス、または `env or CLI flag`) も出る。載らないキーは既定値。
@@ -159,6 +161,9 @@ model          = "qwen2.5-coder:7b"
 api_key        = ""
 timeout_secs   = 120
 context_window = 32768   # モデルの文脈窓 (トークン)。自動圧縮のしきい値計算に使う。0 で自動圧縮無効
+max_retries    = 3       # 一時的な失敗 (接続エラー / 408 / 429 / 5xx / 出力前のストリーム断) の再試行回数。0 で無効
+retry_base_ms  = 500     # 再試行待ちの起点。試行ごとに倍 (上限 30s)。サーバの Retry-After があればそちらを優先
+stream_idle_timeout_secs = 0   # ストリームがこの秒数黙ったら断とみなす。0 (既定) は無効
 # temperature  = 0.2     # 未設定ならリクエストに含めない (サーバ既定)。小型モデルは 0.1-0.2 推奨
 
 [llm.sakana]

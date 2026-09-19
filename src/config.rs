@@ -60,6 +60,9 @@ struct ProviderOverlay {
     timeout_secs: Option<u64>,
     context_window: Option<u64>,
     temperature: Option<f32>,
+    max_retries: Option<u32>,
+    retry_base_ms: Option<u64>,
+    stream_idle_timeout_secs: Option<u64>,
 }
 
 impl ProviderOverlay {
@@ -73,6 +76,9 @@ impl ProviderOverlay {
             timeout_secs,
             context_window,
             temperature,
+            max_retries,
+            retry_base_ms,
+            stream_idle_timeout_secs,
         } = self;
         ProviderConfig {
             base_url: base_url.unwrap_or(base.base_url),
@@ -81,6 +87,10 @@ impl ProviderOverlay {
             timeout_secs: timeout_secs.unwrap_or(base.timeout_secs),
             context_window: context_window.unwrap_or(base.context_window),
             temperature: temperature.or(base.temperature),
+            max_retries: max_retries.unwrap_or(base.max_retries),
+            retry_base_ms: retry_base_ms.unwrap_or(base.retry_base_ms),
+            stream_idle_timeout_secs: stream_idle_timeout_secs
+                .unwrap_or(base.stream_idle_timeout_secs),
         }
     }
 }
@@ -122,6 +132,15 @@ pub struct ProviderConfig {
     /// サンプリング温度。None (既定) はリクエストに含めずサーバ既定に従う。
     /// 小型ローカルモデルはツールコール整形が崩れやすいため 0.1-0.2 を推奨 (#61)。
     pub temperature: Option<f32>,
+    /// 一時的な失敗 (接続エラー / 408 / 429 / 5xx / 出力前のストリーム断) を再試行する
+    /// 最大回数。`0` で無効。400 や 401 のような恒久的な失敗は再試行しない (#70)。
+    pub max_retries: u32,
+    /// 再試行の待ち時間の起点 (ミリ秒)。試行ごとに倍になり、サーバの `Retry-After` が
+    /// あればそちらを優先する。
+    pub retry_base_ms: u64,
+    /// ストリーミング中にこの秒数チャンクが来なければ断とみなす。`0` (既定) は無効で、
+    /// その場合はリクエスト全体の `timeout_secs` だけが効く。
+    pub stream_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +193,11 @@ impl Default for ProviderConfig {
 /// context_window の既定値。qwen2.5-coder 系の 32k を採用 (モデルに合わせて要調整)。
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 32_768;
 
+/// 一時的な LLM API 失敗の再試行回数の既定値。
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+/// 再試行待ちの起点 (ミリ秒) の既定値。500 → 1000 → 2000ms と伸びる。
+pub const DEFAULT_RETRY_BASE_MS: u64 = 500;
+
 /// Kimi の既定 timeout。reasoning_effort 既定 (max) の思考込みで 120 秒を超え得る。
 const KIMI_TIMEOUT_SECS: u64 = 600;
 
@@ -186,6 +210,9 @@ impl ProviderConfig {
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_base_ms: DEFAULT_RETRY_BASE_MS,
+            stream_idle_timeout_secs: 0,
         }
     }
 
@@ -197,6 +224,9 @@ impl ProviderConfig {
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_base_ms: DEFAULT_RETRY_BASE_MS,
+            stream_idle_timeout_secs: 0,
         }
     }
 
@@ -210,6 +240,9 @@ impl ProviderConfig {
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_base_ms: DEFAULT_RETRY_BASE_MS,
+            stream_idle_timeout_secs: 0,
         }
     }
 
@@ -223,6 +256,9 @@ impl ProviderConfig {
             timeout_secs: KIMI_TIMEOUT_SECS,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_base_ms: DEFAULT_RETRY_BASE_MS,
+            stream_idle_timeout_secs: 0,
         }
     }
 }

@@ -198,6 +198,16 @@ fn final_text(history: &[Message]) -> Option<String> {
     }
 }
 
+fn usage_json(usage: &crate::agent::r#loop::SessionUsage) -> serde_json::Value {
+    serde_json::json!({
+        "llm_calls": usage.llm_calls,
+        "estimated_calls": usage.estimated_calls,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    })
+}
+
 struct Report {
     exit_code: i32,
     result: Option<String>,
@@ -214,13 +224,13 @@ impl Report {
         usage: &crate::agent::r#loop::SessionUsage,
     ) -> Self {
         let (exit_code, result, error) = match outcome {
-            // 例: UserPromptSubmit hook がプロンプトをブロックした。成功扱いで空を返すと
-            // 呼び出し側は「空の回答」と区別できない。
+            // UserPromptSubmit hook がプロンプトをブロックしたか、モデルが本文の無い応答で
+            // ターンを終えた。成功扱いで空を返すと、呼び出し側は「空の回答」と区別できない。
             Outcome::Done if text.is_none() => (
                 EXIT_ERROR,
                 None,
                 Some(
-                    "the turn ended without a final answer (was the prompt blocked by a hook?)"
+                    "the turn ended without a final answer (the prompt was blocked by a hook, or the model returned no text)"
                         .to_string(),
                 ),
             ),
@@ -240,13 +250,7 @@ impl Report {
             result,
             error,
             session_id,
-            usage: serde_json::json!({
-                "llm_calls": usage.llm_calls,
-                "estimated_calls": usage.estimated_calls,
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "total_tokens": usage.total_tokens,
-            }),
+            usage: usage_json(usage),
         }
     }
 
@@ -256,7 +260,8 @@ impl Report {
             result: None,
             error: Some(format!("{error:#}")),
             session_id: None,
-            usage: serde_json::Value::Null,
+            // 形は成功時と揃える (呼び出し側が `usage.llm_calls` を無条件に読めるように)。
+            usage: usage_json(&crate::agent::r#loop::SessionUsage::default()),
         }
     }
 

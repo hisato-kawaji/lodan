@@ -328,9 +328,21 @@ fn a_broken_config_file_is_reported_as_a_stream_json_result() {
         Stdin::OpenAndSilent,
     );
     assert_eq!(out.status.code(), Some(1));
-    let last: serde_json::Value =
-        serde_json::from_str(stdout(&out).lines().last().expect("a result line")).unwrap();
+    let events: Vec<serde_json::Value> = stdout(&out)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every stdout line is JSON"))
+        .collect();
+    assert_eq!(
+        events.first().unwrap()["event"],
+        "run_start",
+        "the stream always opens with run_start"
+    );
+    let last = events.last().unwrap();
     assert_eq!(last["event"], "result");
+    assert_eq!(
+        last["usage"]["llm_calls"], 0,
+        "usage keeps its shape on failure"
+    );
     assert_eq!(last["is_error"], true);
     assert!(
         last["error"].as_str().unwrap().contains("config.toml"),

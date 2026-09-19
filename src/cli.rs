@@ -99,9 +99,9 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         (Ok(loaded), _) => loaded,
         // ヘッドレスでは設定の読み込み失敗も、頼まれた形式の結果として stdout に出す。
         (Err(e), Some(format)) => {
-            if stream_json {
-                let _ = crate::runlog::init_with(None, true);
-            }
+            // 設定が読めていないので provider / model は分からない。それでもイベント列は
+            // run_start から始め、`--log-jsonl` にも同じものを残す。
+            init_runlog(args.log_jsonl.as_deref(), stream_json, None);
             return Ok(crate::headless::report_startup_failure(format, &e));
         }
         (Err(e), None) => return Err(e),
@@ -119,26 +119,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
     };
     cfg.apply_overrides_tracked(overrides, &mut origins);
 
-    // 計測が本編を壊さないよう、ログを開けなくても実行は続ける。
-    if args.log_jsonl.is_some() || stream_json {
-        if let Err(e) = crate::runlog::init_with(args.log_jsonl.as_deref(), stream_json) {
-            eprintln!("runlog: disabled ({e})");
-            // ログファイルを開けなくても、stream-json の stdout は契約なので生かす。
-            if stream_json {
-                let _ = crate::runlog::init_with(None, true);
-            }
-        }
-        // どの経路で sink が立っても、イベント列は run_start から始まる。
-        crate::runlog::record(
-            "run_start",
-            serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "provider": cfg.llm.provider.as_str(),
-                "model": cfg.llm.active().model,
-                "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
-            }),
-        );
-    }
+    init_runlog(args.log_jsonl.as_deref(), stream_json, Some(&cfg));
 
     if let Some(prompt) = args.print {
         let format = args.output_format;
@@ -166,6 +147,31 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         }
         Command::Sessions => list_sessions().map(|()| 0),
     }
+}
+
+/// runlog の sink を立てて `run_start` を記録する。計測が本編を壊さないよう、ログファイルを
+/// 開けなくても実行は続ける。`cfg` が無いのは設定の読み込みに失敗した起動失敗の経路。
+fn init_runlog(path: Option<&std::path::Path>, stream_json: bool, cfg: Option<&Config>) {
+    if path.is_none() && !stream_json {
+        return;
+    }
+    if let Err(e) = crate::runlog::init_with(path, stream_json) {
+        eprintln!("runlog: disabled ({e})");
+        // ログファイルを開けなくても、stream-json の stdout は契約なので生かす。
+        if stream_json {
+            let _ = crate::runlog::init_with(None, true);
+        }
+    }
+    // どの経路で sink が立っても、イベント列は run_start から始まる。
+    crate::runlog::record(
+        "run_start",
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "provider": cfg.map(|c| c.llm.provider.as_str()),
+            "model": cfg.map(|c| c.llm.active().model.as_str()),
+            "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
+        }),
+    );
 }
 
 /// `--show-origin` の表示。設定ファイル・env・CLI フラグのいずれかが決めたキーが載る。

@@ -276,14 +276,22 @@ impl Session {
             // 残り tool_call を実行すると plan ガードを素通りしてしまうため、
             // 残りは実行せずスキップ応答を返す (tool_call_id の対は維持)。
             let mut plan_just_approved = false;
-            for call in tool_calls {
+            // 並列可能な呼び出しが連続する区間は、ここで先に同時実行しておく (#73)。
+            // 下の逐次ループが結果を元の順序で消費するので、表示・PostToolUse hook・
+            // runlog・history の順序は逐次実行のときと変わらない。
+            let mut prefetched = self
+                .prefetch_parallel(&tool_calls, last_call.as_ref())
+                .await?;
+            for (call_index, call) in tool_calls.into_iter().enumerate() {
                 let name = call.function.name.clone();
-                let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
+                let args = parse_tool_args(&call.function.arguments);
 
                 // 何が起きたかを 1 語で記録する (ablation で緩和策の発火回数を数える)。
                 let mut reason = TOOL_REASON_OK;
                 let call_started = std::time::Instant::now();
+                // 先行実行した呼び出しの所要は、消費した時点ではなく実行時に測ったものを使う。
+                let mut parallel_ms: Option<u64> = None;
+                let mut ran_parallel = false;
                 end.tool_calls += 1;
 
                 let mut output = if plan_just_approved {
@@ -337,6 +345,27 @@ impl Session {
                                 "identical read-only call to '{name}' repeated — the result is \
                                  unchanged. Use the previous result and take a different next action."
                             ))
+                        }
+                        Some(_) if prefetched.contains_key(&call_index) => {
+                            match prefetched.remove(&call_index) {
+                                // hook が止めた呼び出しは実行していないので、並列扱いにしない。
+                                Some(Prefetched::HookBlocked(hook_reason)) => {
+                                    reason = "hook_blocked";
+                                    ToolOutput::error(format!("blocked by hook: {hook_reason}"))
+                                }
+                                Some(Prefetched::Ran { result, ms }) => {
+                                    ran_parallel = true;
+                                    parallel_ms = Some(ms);
+                                    match result {
+                                        Ok(o) => o,
+                                        Err(e) => {
+                                            reason = "tool_error";
+                                            ToolOutput::error(format!("tool error: {e}"))
+                                        }
+                                    }
+                                }
+                                None => unreachable!("contains_key was just checked"),
+                            }
                         }
                         Some(tool) => {
                             let pre_payload =
@@ -414,7 +443,8 @@ impl Session {
                         "name": name,
                         "outcome": if output.is_error { "error" } else { "ok" },
                         "reason": reason,
-                        "ms": call_started.elapsed().as_millis() as u64,
+                        "ms": parallel_ms.unwrap_or(call_started.elapsed().as_millis() as u64),
+                        "parallel": ran_parallel,
                         "args_bytes": call.function.arguments.len(),
                         "output_bytes": output.content.len(),
                     }),
@@ -429,6 +459,123 @@ impl Session {
 
         end.reason = TURN_END_MAX_ITERATIONS;
         Err(MaxIterationsError(self.cfg.agent.max_iterations).into())
+    }
+
+    /// 1 応答の tool_calls のうち、並列可能な呼び出しが 2 つ以上連続する区間を同時に実行し、
+    /// 結果を呼び出しの添字で返す。区間に入らない呼び出しは返さない (逐次ループが普通に実行する)。
+    ///
+    /// 区間内でも PreToolUse hook は順番どおり 1 つずつ通す。hook がブロックした呼び出しは
+    /// 実行しない — 「読むだけ」のツールでも WebFetch は外へ出ていくので、結果を捨てれば
+    /// 済む話ではない。
+    async fn prefetch_parallel(
+        &self,
+        calls: &[crate::agent::messages::ToolCall],
+        last_call: Option<&(String, String)>,
+    ) -> Result<std::collections::HashMap<usize, Prefetched>> {
+        let mut out = std::collections::HashMap::new();
+        if !self.cfg.agent.parallel_tools {
+            return Ok(out);
+        }
+
+        // ExitPlanMode が承認されると、同じ応答の残りの呼び出しは実行せずスキップする決まり。
+        // 承認されるかはまだ分からないので、それ以降は先行実行しない。
+        let limit = calls
+            .iter()
+            .position(|c| c.function.name == EXIT_PLAN_MODE)
+            .unwrap_or(calls.len());
+
+        let eligible: Vec<bool> = (0..calls.len())
+            .map(|i| {
+                if i >= limit {
+                    return false;
+                }
+                let call = &calls[i].function;
+                let Some(tool) = self.registry.get(&call.name) else {
+                    return false;
+                };
+                // 直前と同一の呼び出しは逐次ループの重複抑止が実行せずに返す。
+                let previous = match i {
+                    0 => last_call.map(|(n, a)| (n.as_str(), a.as_str())),
+                    _ => Some((
+                        calls[i - 1].function.name.as_str(),
+                        calls[i - 1].function.arguments.as_str(),
+                    )),
+                };
+                let duplicate = self.cfg.agent.dup_suppress
+                    && previous == Some((call.name.as_str(), call.arguments.as_str()));
+                self.registry.is_visible(&call.name)
+                    && !tool.is_destructive()
+                    && tool.parallel_safe()
+                    && !duplicate
+            })
+            .collect();
+
+        let mut start = 0;
+        while start < calls.len() {
+            if !eligible[start] {
+                start += 1;
+                continue;
+            }
+            let end = (start..calls.len())
+                .find(|&i| !eligible[i])
+                .unwrap_or(calls.len());
+            // 区間が長くても同時に走らせるのは MAX_PARALLEL_TOOL_CALLS 個まで。残りは次の組に回す
+            // (端数の 1 個は先行実行せず、逐次ループに任せる)。
+            let mut chunk_start = start;
+            while end - chunk_start >= 2 {
+                let chunk_end = end.min(chunk_start + MAX_PARALLEL_TOOL_CALLS);
+                self.run_parallel_span(calls, chunk_start..chunk_end, &mut out)
+                    .await?;
+                chunk_start = chunk_end;
+            }
+            start = end;
+        }
+        Ok(out)
+    }
+
+    async fn run_parallel_span(
+        &self,
+        calls: &[crate::agent::messages::ToolCall],
+        span: std::ops::Range<usize>,
+        out: &mut std::collections::HashMap<usize, Prefetched>,
+    ) -> Result<()> {
+        let mut to_run = Vec::new();
+        for i in span {
+            let name = &calls[i].function.name;
+            let args = parse_tool_args(&calls[i].function.arguments);
+            let payload = serde_json::json!({ "tool_name": name, "tool_input": args });
+            match hooks::runner::dispatch(
+                Lifecycle::PreToolUse,
+                Some(name),
+                &payload,
+                &self.cfg.hooks,
+            )
+            .await?
+            {
+                HookOutcome::Block(reason) => {
+                    out.insert(i, Prefetched::HookBlocked(reason));
+                }
+                HookOutcome::Continue => {
+                    // eligible の判定で存在は確認済み。
+                    if let Some(tool) = self.registry.get(name) {
+                        to_run.push((i, tool, args));
+                    }
+                }
+            }
+        }
+
+        let ctx = &self.ctx;
+        let results =
+            futures_util::future::join_all(to_run.into_iter().map(|(i, tool, args)| async move {
+                let started = std::time::Instant::now();
+                let result = tool.execute(args, ctx).await;
+                (i, result, started.elapsed().as_millis() as u64)
+            }))
+            .await;
+        for (i, result, ms) in results {
+            out.insert(i, Prefetched::Ran { result, ms });
+        }
+        Ok(())
     }
 
     /// 直近のコンテキストサイズがしきい値 (context_window の
@@ -773,6 +920,28 @@ impl CompactOutcome {
 
 /// runlog の `tool_result.reason` 既定値 (ループ側の介入なしに実行された)。
 const TOOL_REASON_OK: &str = "ok";
+
+/// 1 度に同時実行するツール呼び出しの上限。Task は承認ゲートを通らない (非破壊) ので、
+/// モデルが 1 応答に `Task` を 10 個並べると、子エージェントの LLM ループが 10 本同時に走って
+/// トークン消費が黙って 10 倍になる。WebFetch も同じホストへ一斉に飛ぶと 429 を招く。
+/// 上限を超えた分は、前の組が終わってから次の組として同時実行する。
+const MAX_PARALLEL_TOOL_CALLS: usize = 4;
+
+/// `prefetch_parallel` が先に済ませた呼び出しの結果。
+enum Prefetched {
+    /// PreToolUse hook がブロックした (実行していない)。
+    HookBlocked(String),
+    Ran {
+        result: std::result::Result<ToolOutput, crate::tools::ToolError>,
+        ms: u64,
+    },
+}
+
+/// モデルが返した引数文字列を JSON にする。壊れていたら `{"raw": …}` に包んでツールへ渡し、
+/// ツール側の引数エラーとしてモデルに返るようにする。
+fn parse_tool_args(arguments: &str) -> serde_json::Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({ "raw": arguments }))
+}
 
 /// 最終応答に至らないまま `agent.max_iterations` を使い切った。呼び出し側 (ヘッドレスの
 /// 終了コード) が他の失敗と区別できるよう、文字列ではなく型で返す。
@@ -1656,6 +1825,273 @@ mod tests {
                     && content.contains("disabled by the active tool profile")
                     && content.contains("Read")
         )));
+    }
+
+    // ---- #73: 並列可能なツール呼び出しの同時実行 ----
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// 実行中の同時数と実行回数を数えるだけのツール。
+    struct Probe {
+        name: &'static str,
+        parallel_safe: bool,
+        destructive: bool,
+        stats: Arc<ProbeStats>,
+    }
+
+    #[derive(Default)]
+    struct ProbeStats {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        runs: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for Probe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn is_destructive(&self) -> bool {
+            self.destructive
+        }
+        fn parallel_safe(&self) -> bool {
+            self.parallel_safe
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &crate::tools::ToolCtx,
+        ) -> std::result::Result<ToolOutput, crate::tools::ToolError> {
+            let now = self.stats.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.stats.max_active.fetch_max(now, AtomicOrdering::SeqCst);
+            self.stats.runs.fetch_add(1, AtomicOrdering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            self.stats.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(ToolOutput::ok(format!("{} {}", self.name, args["n"])))
+        }
+    }
+
+    /// `Par` (並列可) / `Ser` (read-only だが並列不可) / `Mut` (破壊的) を積んだセッション。
+    fn probe_session(cfg: Config) -> (Session, Arc<ProbeStats>) {
+        let stats = Arc::new(ProbeStats::default());
+        let mut registry = crate::tools::registry::ToolRegistry::new();
+        for (name, parallel_safe, destructive) in [
+            ("Par", true, false),
+            ("Ser", false, false),
+            ("Mut", true, true),
+        ] {
+            registry.register(Arc::new(Probe {
+                name,
+                parallel_safe,
+                destructive,
+                stats: stats.clone(),
+            }));
+        }
+        (Session::new(cfg, Arc::new(registry)), stats)
+    }
+
+    fn batch(calls: &[(&str, u32)]) -> CallThenDoneLlm {
+        CallThenDoneLlm {
+            calls: calls
+                .iter()
+                .enumerate()
+                .map(|(i, (name, n))| {
+                    tool_call_with_args(&format!("c{i}"), name, &format!(r#"{{"n": {n}}}"#))
+                })
+                .collect(),
+            called: false.into(),
+        }
+    }
+
+    fn tool_replies(session: &Session) -> Vec<(String, String)> {
+        session
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn consecutive_parallel_safe_calls_run_together_and_reply_in_call_order() {
+        let (mut session, stats) = probe_session(Config::default());
+        let llm = batch(&[("Par", 1), ("Par", 2), ("Par", 3)]);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.max_active.load(AtomicOrdering::SeqCst), 3);
+        let replies = tool_replies(&session);
+        assert_eq!(
+            replies,
+            [
+                ("c0".to_string(), "Par 1".to_string()),
+                ("c1".to_string(), "Par 2".to_string()),
+                ("c2".to_string(), "Par 3".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_span_runs_in_capped_groups() {
+        let (mut session, stats) = probe_session(Config::default());
+        let calls: Vec<(&str, u32)> = (1..=(MAX_PARALLEL_TOOL_CALLS as u32 * 2 + 1))
+            .map(|n| ("Par", n))
+            .collect();
+        let llm = batch(&calls);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.max_active.load(AtomicOrdering::SeqCst),
+            MAX_PARALLEL_TOOL_CALLS
+        );
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), calls.len());
+        let order: Vec<String> = tool_replies(&session)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let expected: Vec<String> = (0..calls.len()).map(|i| format!("c{i}")).collect();
+        assert_eq!(order, expected);
+    }
+
+    #[tokio::test]
+    async fn parallel_tools_off_runs_everything_one_at_a_time() {
+        let mut cfg = Config::default();
+        cfg.agent.parallel_tools = false;
+        let (mut session, stats) = probe_session(cfg);
+        let llm = batch(&[("Par", 1), ("Par", 2), ("Par", 3)]);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        assert_eq!(stats.max_active.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn tools_that_did_not_opt_in_never_overlap_even_if_read_only() {
+        let (mut session, stats) = probe_session(Config::default());
+        let llm = batch(&[("Ser", 1), ("Ser", 2), ("Ser", 3)]);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        assert_eq!(stats.max_active.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_destructive_call_splits_the_batch_and_is_never_run_in_parallel() {
+        // Mut は parallel_safe を名乗っていても破壊的なので対象外。前後の Par 2 個ずつだけが並ぶ。
+        let (mut session, stats) = probe_session(Config::default());
+        let llm = batch(&[("Par", 1), ("Par", 2), ("Mut", 3), ("Mut", 4), ("Par", 5)]);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.max_active.load(AtomicOrdering::SeqCst),
+            2,
+            "only the leading Par pair overlaps"
+        );
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), 5);
+        let order: Vec<String> = tool_replies(&session)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(order, ["c0", "c1", "c2", "c3", "c4"]);
+    }
+
+    #[tokio::test]
+    async fn an_identical_repeat_inside_a_batch_is_suppressed_not_prefetched() {
+        let (mut session, stats) = probe_session(Config::default());
+        let llm = batch(&[("Par", 1), ("Par", 1), ("Par", 2)]);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.runs.load(AtomicOrdering::SeqCst),
+            2,
+            "the repeat is answered without running"
+        );
+        assert!(
+            tool_replies(&session)[1]
+                .1
+                .contains("identical read-only call")
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_after_exit_plan_mode_is_run_ahead_of_the_approval() {
+        let (mut session, stats) = probe_session(Config::default());
+        session.set_mode(Mode::Plan);
+        let llm = CallThenDoneLlm {
+            calls: vec![
+                tool_call_with_args("c0", "Par", r#"{"n": 1}"#),
+                tool_call_with_args("c1", "Par", r#"{"n": 2}"#),
+                tool_call_with_args("p", EXIT_PLAN_MODE, r#"{"plan": "do it"}"#),
+                tool_call_with_args("c3", "Par", r#"{"n": 3}"#),
+                tool_call_with_args("c4", "Par", r#"{"n": 4}"#),
+            ],
+            called: false.into(),
+        };
+        session
+            .run_turn("plan", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.runs.load(AtomicOrdering::SeqCst),
+            2,
+            "c3 / c4 are skipped, so they must not have run"
+        );
+        assert!(tool_replies(&session)[3].1.contains("Re-issue"));
+    }
+
+    #[tokio::test]
+    async fn a_pre_tool_hook_still_blocks_a_call_inside_a_parallel_span() {
+        // n = 2 の呼び出しだけをブロックする hook (payload は stdin に JSON で来る)。
+        let cfg = Config {
+            hooks: vec![HookConfig {
+                event: Lifecycle::PreToolUse,
+                matcher: "Par".into(),
+                command: r#"grep -q '"n":2' && { echo "no twos" >&2; exit 1; } || exit 0"#.into(),
+            }],
+            ..Default::default()
+        };
+        let (mut session, stats) = probe_session(cfg);
+        let llm = batch(&[("Par", 1), ("Par", 2), ("Par", 3)]);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.runs.load(AtomicOrdering::SeqCst),
+            2,
+            "the blocked call must not execute"
+        );
+        let replies = tool_replies(&session);
+        assert_eq!(replies[0].1, "Par 1");
+        assert!(
+            replies[1].1.contains("blocked by hook") && replies[1].1.contains("no twos"),
+            "{}",
+            replies[1].1
+        );
+        assert_eq!(replies[2].1, "Par 3");
     }
 
     /// Normal 中に呼ばれた ExitPlanMode はエラー応答でモードも変わらない。

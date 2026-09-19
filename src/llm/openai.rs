@@ -260,8 +260,16 @@ impl LlmClient for OpenAiClient {
         };
 
         let mut budget = RetryBudget::new(self.retry);
-        let resp = self.send(&req, &mut budget).await?;
-        let text = resp.text().await.context("reading chat response")?;
+        // 200 の後に本文が途中で切れるのも一時的な失敗。非ストリームでは利用者にまだ何も
+        // 見せていないので、ストリームの「出力前の断」と同じく送り直してよい。
+        let text = loop {
+            let resp = self.send(&req, &mut budget).await?;
+            match resp.text().await {
+                Ok(text) => break text,
+                Err(_) if budget.wait("response body interrupted", None).await => continue,
+                Err(e) => return Err(e).context("reading chat response"),
+            }
+        };
 
         let body: ChatResponseBody = serde_json::from_str(&text)
             .with_context(|| format!("parsing chat response: {text}"))?;
@@ -530,6 +538,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const OK_JSON: &str = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+    const STALL: &str = "STALL:";
+    const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1000\r\nconnection: close\r\n\r\n";
 
     fn http(status: &str, extra_headers: &str, body: &str) -> String {
         format!(
@@ -578,6 +588,12 @@ mod tests {
                                 break;
                             }
                         }
+                    }
+                    // `STALL:` で始まる台本は、残りを送ったあと黙ったまま接続を保つ。
+                    if let Some(head) = reply.strip_prefix(STALL) {
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
                     }
                     let _ = sock.write_all(reply.as_bytes()).await;
                     let _ = sock.shutdown().await;
@@ -707,6 +723,59 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(rx.recv().await, Some(ChatEvent::TextDelta(d)) if d == "ok"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    fn sse_ok(text: &str) -> String {
+        let sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\ndata: [DONE]\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len()
+        )
+    }
+
+    fn idle_client(base_url: &str) -> OpenAiClient {
+        let mut cfg = ProviderConfig::default_local();
+        cfg.base_url = base_url.to_string();
+        cfg.retry_base_ms = 1;
+        cfg.stream_idle_timeout_secs = 1;
+        OpenAiClient::new(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn idle_stream_before_any_text_is_retried() {
+        let (url, hits) = scripted_server(vec![format!("{STALL}{SSE_HEAD}"), sse_ok("ok")]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        idle_client(&url)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(ChatEvent::TextDelta(d)) if d == "ok"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn idle_stream_after_text_is_an_error_not_a_retry() {
+        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let (url, hits) =
+            scripted_server(vec![format!("{STALL}{SSE_HEAD}{partial}"), sse_ok("ok")]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = idle_client(&url)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("idle"), "{err:#}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_non_stream_body_is_retried() {
+        let cut = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n\r\n{\"choi".to_string();
+        let (url, hits) = scripted_server(vec![cut, http("200 OK", "", OK_JSON)]).await;
+        let resp = client(&url, 3).chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("hi"));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 

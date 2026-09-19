@@ -268,63 +268,88 @@ impl LlmConfig {
 impl Config {
     /// Load config with layering: defaults <- user <- project <- explicit path.
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        let mut cfg = Config::default();
+        Ok(Self::load_with_origins(explicit)?.0)
+    }
+
+    /// `load` と同じ結果に、各キーがどのファイル由来かを添えて返す
+    /// (`lodan config --show-origin` 用)。
+    pub fn load_with_origins(explicit: Option<&Path>) -> Result<(Self, Origins)> {
+        let mut layers = Vec::new();
 
         if let Some(user_path) = user_config_path()
-            && let Some(loaded) = read_toml(&user_path)?
+            && let Some(table) = read_toml(&user_path)?
         {
-            cfg = merge(cfg, loaded);
+            layers.push((user_path, table));
         }
 
         let project_path = std::env::current_dir()
             .ok()
             .map(|p| p.join(".lodan").join("config.toml"));
         if let Some(p) = project_path
-            && let Some(loaded) = read_toml(&p)?
+            && let Some(table) = read_toml(&p)?
         {
-            cfg = merge(cfg, loaded);
+            layers.push((p, table));
         }
 
         if let Some(p) = explicit {
-            let loaded =
+            let table =
                 read_toml(p)?.with_context(|| format!("config file not found: {}", p.display()))?;
-            cfg = merge(cfg, loaded);
+            layers.push((p.to_path_buf(), table));
         }
 
-        Ok(cfg)
+        from_layers(layers)
     }
 
     /// CLI/env overrides. `base_url` / `model` / `api_key` / `temperature` act on
     /// the currently-active provider so users can flip provider once and tweak
     /// per-call without rewriting their config.
     pub fn apply_overrides(&mut self, o: Overrides) {
+        self.apply_overrides_tracked(o, &mut Origins::new());
+    }
+
+    /// `apply_overrides` と同じ。上書きしたキーを `origins` にも反映する
+    /// (`--show-origin` が、env で潰された値をファイル由来と表示しないように)。
+    pub fn apply_overrides_tracked(&mut self, o: Overrides, origins: &mut Origins) {
+        let mut mark = |key: String| {
+            origins.insert(key, Origin::Override);
+        };
         if let Some(p) = o.provider {
             self.llm.provider = p;
+            mark("llm.provider".into());
         }
+        let provider = self.llm.provider.as_str();
         let active = self.llm.active_mut();
         if let Some(v) = o.base_url {
             active.base_url = v;
+            mark(format!("llm.{provider}.base_url"));
         }
         if let Some(v) = o.model {
             active.model = v;
+            mark(format!("llm.{provider}.model"));
         }
         if let Some(v) = o.api_key {
             active.api_key = v;
+            mark(format!("llm.{provider}.api_key"));
         }
         if let Some(v) = o.temperature {
             active.temperature = Some(v);
+            mark(format!("llm.{provider}.temperature"));
         }
         if o.auto_approve {
             self.agent.auto_approve = true;
+            mark("agent.auto_approve".into());
         }
         if let Some(v) = o.finish_nudge {
             self.agent.finish_nudge = v;
+            mark("agent.finish_nudge".into());
         }
         if let Some(v) = o.malformed_retry {
             self.agent.malformed_retry = v;
+            mark("agent.malformed_retry".into());
         }
         if let Some(v) = o.dup_suppress {
             self.agent.dup_suppress = v;
+            mark("agent.dup_suppress".into());
         }
     }
 }
@@ -350,23 +375,256 @@ fn user_config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "lodan").map(|d| d.config_dir().join("config.toml"))
 }
 
-fn read_toml(path: &Path) -> Result<Option<Config>> {
+/// キー (`llm.kimi.model` のようなドット区切り) → その値を最後に決めたもの。
+/// どこからも設定されていないキーは既定値のままなので載らない。
+pub type Origins = std::collections::BTreeMap<String, Origin>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    File(PathBuf),
+    /// env か CLI フラグ (`apply_overrides`)。ファイルの値より後に効く。
+    Override,
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Origin::File(p) => write!(f, "{}", p.display()),
+            Origin::Override => f.write_str("env or CLI flag"),
+        }
+    }
+}
+
+/// レイヤー間で後勝ちにせず連結する配列キー。hook はユーザ設定とプロジェクト設定の
+/// 両方を効かせたい (プロジェクト側に 1 つ足しただけでユーザの hook が消えるのは事故)。
+const CONCAT_ARRAY_KEYS: &[&str] = &["hooks"];
+
+fn read_toml(path: &Path) -> Result<Option<toml::Table>> {
     if !path.exists() {
         return Ok(None);
     }
     let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config = toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some(cfg))
+    let table: toml::Table =
+        toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+    // 型の誤りは合成後だとどのファイルのせいか分からなくなるので、ここで単体検証する。
+    let _: Config = toml::Value::Table(table.clone())
+        .try_into()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(table))
 }
 
-/// Shallow merge: `over` fields replace `base` fields (TOML defaults already populated).
-fn merge(_base: Config, over: Config) -> Config {
-    over
+/// レイヤー (優先度の低い順) をフィールド単位で重ねてから 1 回だけ `Config` にする。
+/// 先に `Config` へ落としてから重ねると、書かれなかったフィールドが既定値で埋まって
+/// 「未指定」と「既定値を明示」の区別が消え、後段のファイルが前段を丸ごと潰す。
+fn from_layers(layers: Vec<(PathBuf, toml::Table)>) -> Result<(Config, Origins)> {
+    let mut merged = toml::Table::new();
+    let mut origins = Origins::new();
+    for (path, table) in layers {
+        merge_table(&mut merged, table, "", &path, &mut origins);
+    }
+    let cfg: Config = toml::Value::Table(merged)
+        .try_into()
+        .context("merging config layers")?;
+    Ok((cfg, origins))
+}
+
+/// テーブルは再帰、`CONCAT_ARRAY_KEYS` は連結、それ以外の値は `over` で置き換える。
+///
+/// 前提: 各レイヤーは `read_toml` で単体でも `Config` として検証済み。だから既知のキーで
+/// レイヤー間の型が食い違う (スカラーの上にテーブル、など) ことは無く、部分木を丸ごと
+/// 置き換える腕で古い `origins` を掃除する必要も無い。この検証を緩めるなら、ここも見直すこと。
+fn merge_table(
+    base: &mut toml::Table,
+    over: toml::Table,
+    prefix: &str,
+    origin: &Path,
+    origins: &mut Origins,
+) {
+    use toml::Value;
+    for (key, value) in over {
+        let full = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let concat = prefix.is_empty() && CONCAT_ARRAY_KEYS.contains(&key.as_str());
+        match (base.get_mut(&key), value) {
+            (Some(Value::Table(b)), Value::Table(o)) => merge_table(b, o, &full, origin, origins),
+            (existing, Value::Array(o)) if concat => {
+                // 連結される配列は要素ごとに由来が違うので `hooks[0]` の形で残す。
+                let start = match &existing {
+                    Some(Value::Array(b)) => b.len(),
+                    _ => 0,
+                };
+                for i in 0..o.len() {
+                    origins.insert(
+                        format!("{full}[{}]", start + i),
+                        Origin::File(origin.to_path_buf()),
+                    );
+                }
+                match existing {
+                    Some(Value::Array(b)) => b.extend(o),
+                    _ => {
+                        base.insert(key, Value::Array(o));
+                    }
+                }
+            }
+            (_, Value::Table(o)) => {
+                // base 側が無い (か型違い) テーブル。葉ごとに由来を残すため空から重ねる。
+                let mut fresh = toml::Table::new();
+                merge_table(&mut fresh, o, &full, origin, origins);
+                base.insert(key, Value::Table(fresh));
+            }
+            (_, v) => {
+                base.insert(key, v);
+                origins.insert(full, Origin::File(origin.to_path_buf()));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layer(name: &str, toml_src: &str) -> (PathBuf, toml::Table) {
+        (PathBuf::from(name), toml::from_str(toml_src).unwrap())
+    }
+
+    #[test]
+    fn later_layer_keeps_fields_it_does_not_mention() {
+        let user = layer(
+            "user.toml",
+            r#"
+            [llm]
+            provider = "kimi"
+            [llm.kimi]
+            model = "kimi-k2.6"
+            [agent]
+            finish_nudge = true
+            "#,
+        );
+        let project = layer(
+            "project.toml",
+            r#"
+            [agent]
+            max_iterations = 40
+            "#,
+        );
+        let (cfg, origins) = from_layers(vec![user, project]).unwrap();
+
+        assert_eq!(cfg.llm.provider, Provider::Kimi);
+        assert_eq!(cfg.llm.kimi.model, "kimi-k2.6");
+        assert!(cfg.agent.finish_nudge);
+        assert_eq!(cfg.agent.max_iterations, 40);
+        // 書かれなかったフィールドはそのプロバイダの既定のまま。
+        assert_eq!(
+            cfg.llm.kimi.base_url,
+            ProviderConfig::default_kimi().base_url
+        );
+
+        assert_eq!(
+            origins["llm.kimi.model"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
+        assert_eq!(
+            origins["agent.max_iterations"],
+            Origin::File(PathBuf::from("project.toml"))
+        );
+        assert!(!origins.contains_key("llm.kimi.base_url"));
+    }
+
+    #[test]
+    fn overrides_take_over_the_origin_of_keys_they_replace() {
+        let (mut cfg, mut origins) = from_layers(vec![layer(
+            "user.toml",
+            "[llm]\nprovider = \"kimi\"\n[llm.kimi]\nmodel = \"kimi-k2.6\"\napi_key = \"k\"\n",
+        )])
+        .unwrap();
+        cfg.apply_overrides_tracked(
+            Overrides {
+                model: Some("kimi-k3".into()),
+                dup_suppress: Some(false),
+                ..Default::default()
+            },
+            &mut origins,
+        );
+        assert_eq!(cfg.llm.kimi.model, "kimi-k3");
+        assert_eq!(origins["llm.kimi.model"], Origin::Override);
+        assert_eq!(origins["agent.dup_suppress"], Origin::Override);
+        // 触っていないキーはファイル由来のまま。
+        assert_eq!(
+            origins["llm.kimi.api_key"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
+    }
+
+    #[test]
+    fn scalars_are_last_writer_wins() {
+        let (cfg, origins) = from_layers(vec![
+            layer("user.toml", "[agent]\nmax_iterations = 10\n"),
+            layer("project.toml", "[agent]\nmax_iterations = 40\n"),
+            layer("explicit.toml", "[agent]\nmax_iterations = 5\n"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.agent.max_iterations, 5);
+        assert_eq!(
+            origins["agent.max_iterations"],
+            Origin::File(PathBuf::from("explicit.toml"))
+        );
+    }
+
+    #[test]
+    fn hooks_concatenate_across_layers_in_layer_order() {
+        let user = layer(
+            "user.toml",
+            r#"
+            [[hooks]]
+            event = "Stop"
+            command = "user-stop"
+            "#,
+        );
+        let project = layer(
+            "project.toml",
+            r#"
+            [[hooks]]
+            event = "PreToolUse"
+            matcher = "Bash"
+            command = "project-pre"
+            "#,
+        );
+        let (cfg, origins) = from_layers(vec![user, project]).unwrap();
+        let commands: Vec<&str> = cfg.hooks.iter().map(|h| h.command.as_str()).collect();
+        assert_eq!(commands, ["user-stop", "project-pre"]);
+        assert_eq!(
+            origins["hooks[0]"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
+        assert_eq!(
+            origins["hooks[1]"],
+            Origin::File(PathBuf::from("project.toml"))
+        );
+    }
+
+    #[test]
+    fn no_layers_is_all_defaults() {
+        let (cfg, origins) = from_layers(Vec::new()).unwrap();
+        assert_eq!(cfg.llm.provider, Provider::Local);
+        assert_eq!(
+            cfg.agent.max_iterations,
+            AgentConfig::default().max_iterations
+        );
+        assert!(origins.is_empty());
+    }
+
+    #[test]
+    fn type_error_names_the_offending_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "[agent]\nmax_iterations = \"many\"\n").unwrap();
+        let err = format!("{:#}", read_toml(&path).unwrap_err());
+        assert!(err.contains("bad.toml"), "{err}");
+    }
 
     #[test]
     fn config_output_round_trips() {

@@ -66,7 +66,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Print effective configuration
-    Config,
+    Config {
+        /// Also list which config file each explicitly-set key came from
+        #[arg(long)]
+        show_origin: bool,
+    },
     /// Start the interactive REPL (default if omitted)
     Repl,
     /// List saved sessions
@@ -74,8 +78,8 @@ pub enum Command {
 }
 
 pub async fn dispatch(args: Cli) -> Result<()> {
-    let mut cfg = Config::load(args.config.as_deref())?;
-    cfg.apply_overrides(crate::config::Overrides {
+    let (mut cfg, mut origins) = Config::load_with_origins(args.config.as_deref())?;
+    let overrides = crate::config::Overrides {
         provider: args.provider,
         base_url: args.base_url,
         model: args.model,
@@ -85,7 +89,8 @@ pub async fn dispatch(args: Cli) -> Result<()> {
         finish_nudge: args.finish_nudge,
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,
-    });
+    };
+    cfg.apply_overrides_tracked(overrides, &mut origins);
 
     // 計測が本編を壊さないよう、ログを開けなくても実行は続ける。
     if let Some(path) = args.log_jsonl.as_deref() {
@@ -105,12 +110,28 @@ pub async fn dispatch(args: Cli) -> Result<()> {
 
     match args.cmd.unwrap_or(Command::Repl) {
         Command::Repl => repl::run(cfg, args.resume).await,
-        Command::Config => {
+        Command::Config { show_origin } => {
             println!("{}", toml::to_string_pretty(&cfg)?);
+            if show_origin {
+                print!("{}", describe_origins(&origins));
+            }
             Ok(())
         }
         Command::Sessions => list_sessions(),
     }
+}
+
+/// `--show-origin` の表示。設定ファイル・env・CLI フラグのいずれかが決めたキーが載る。
+/// ここに無い値は既定値。
+fn describe_origins(origins: &crate::config::Origins) -> String {
+    let mut out = String::from("# origins (keys not listed: built-in default)\n");
+    if origins.is_empty() {
+        out.push_str("# (nothing overrides the defaults)\n");
+    }
+    for (key, origin) in origins {
+        out.push_str(&format!("# {key} <- {origin}\n"));
+    }
+    out
 }
 
 fn list_sessions() -> Result<()> {

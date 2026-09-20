@@ -291,7 +291,15 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
 
             // /cost も session を要するためここで処理する。
             if head == "cost" {
-                println!("{}", session.usage().describe());
+                // 合計と内訳はプロセス全体の台帳から (サブエージェントや /goal の評価器も入る)。
+                // 現在のコンテキストの大きさだけは、このセッションのループが知っている。
+                println!("{}", runtime.ledger.describe());
+                if session.usage().llm_calls > 0 {
+                    println!(
+                        "last context: {} prompt tokens",
+                        session.usage().last_context_tokens
+                    );
+                }
                 continue;
             }
 

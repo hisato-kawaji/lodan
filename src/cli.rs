@@ -100,6 +100,14 @@ pub struct Cli {
     #[arg(long, env = "LODAN_PARALLEL_TOOLS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub parallel_tools: Option<bool>,
 
+    /// Stop after this many LLM requests in this process (sub-agents and the /goal evaluator count too)
+    #[arg(long, env = "LODAN_MAX_REQUESTS", value_name = "N")]
+    pub max_requests: Option<u64>,
+
+    /// Stop once this many tokens have been used in this process (checked before each request)
+    #[arg(long = "max-tokens", env = "LODAN_MAX_TOKENS", value_name = "N")]
+    pub max_total_tokens: Option<u64>,
+
     /// Which tools the model sees: full (default), core (Read/Write/Edit/Bash/Grep/Glob), readonly
     #[arg(long, env = "LODAN_TOOL_PROFILE", value_enum)]
     pub tool_profile: Option<crate::config::ToolProfile>,
@@ -192,6 +200,8 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         parallel_tools: args.parallel_tools,
         sandbox: args.sandbox,
         sandbox_network: args.sandbox_network,
+        max_requests: args.max_requests,
+        max_total_tokens: args.max_total_tokens,
         permission_mode: args.permission_mode,
         allowed_tools: args.allowed_tools,
         disallowed_tools: args.disallowed_tools,

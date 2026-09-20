@@ -98,11 +98,12 @@ impl SubAgentTool {
 
         for _ in 0..self.max_iterations {
             let specs = self.tools.tool_specs();
-            let resp = self
-                .llm
-                .chat(&history, &specs, &self.model, None)
-                .await
-                .map_err(|e| ToolError::Other(format!("sub-agent llm error: {e}")))?;
+            let resp = crate::llm::metered::with_kind(
+                crate::llm::metered::KIND_SUBAGENT,
+                self.llm.chat(&history, &specs, &self.model, None),
+            )
+            .await
+            .map_err(|e| ToolError::Other(format!("sub-agent llm error: {e}")))?;
 
             let tool_calls = resp.tool_calls.clone();
             history.push(Message::Assistant {
@@ -372,6 +373,52 @@ mod tests {
         let tool = subagent(Vec::new(), PathBuf::from("."));
         assert!(crate::tools::Tool::parallel_safe(&tool));
         assert!(!crate::tools::Tool::is_destructive(&tool));
+    }
+
+    /// #84: 子エージェントの LLM 呼び出しは親のループを通らないが、同じ台帳に `subagent` として載り、
+    /// 同じ予算から引かれる。
+    #[tokio::test]
+    async fn sub_agent_calls_are_metered_and_draw_on_the_same_budget() {
+        use crate::llm::metered::{Budget, KIND_MAIN, KIND_SUBAGENT, Ledger, MeteredClient};
+        let usage = Some(crate::llm::Usage {
+            prompt_tokens: 40,
+            completion_tokens: 2,
+            total_tokens: 42,
+        });
+        let reply = |text: &str| ChatResponse {
+            content: Some(text.into()),
+            tool_calls: vec![],
+            usage,
+        };
+        let ledger = Arc::new(Ledger::new(Budget {
+            max_requests: Some(2),
+            max_total_tokens: None,
+        }));
+        let llm: Arc<dyn LlmClient> = Arc::new(MeteredClient::new(
+            Arc::new(ScriptedLlm::new(vec![reply("parent"), reply("child")])),
+            ledger.clone(),
+        ));
+        // 親のターンに相当する呼び出しが 1 回、続いて子が 1 回。
+        llm.chat(&[], &[], "mock", None).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = SubAgentTool::new(
+            llm.clone(),
+            "mock".into(),
+            Arc::new(read_only_registry()),
+            tmp.path().to_path_buf(),
+            8,
+        );
+        assert_eq!(sub.run("look around").await.unwrap(), "child");
+
+        let by_kind = ledger.by_kind();
+        let kinds: Vec<&str> = by_kind.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [KIND_MAIN, KIND_SUBAGENT]);
+        assert_eq!(ledger.total().total_tokens, 84, "parent + child");
+
+        // 予算は共有: 2 件を使い切ったので、次の子は 1 回も LLM を呼べずに失敗する。
+        let err = sub.run("again").await.unwrap_err().to_string();
+        assert!(err.contains("budget exhausted"), "{err}");
+        assert_eq!(ledger.requests(), 2);
     }
 
     #[tokio::test]

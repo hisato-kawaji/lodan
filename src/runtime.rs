@@ -37,6 +37,8 @@ impl Notices {
 pub struct Runtime {
     pub cwd: PathBuf,
     pub llm: Arc<dyn LlmClient>,
+    /// `llm` を通った全ての呼び出しの使用量と予算 (`/cost`、`-p` の結果)。
+    pub ledger: Arc<llm::metered::Ledger>,
     pub registry: Arc<ToolRegistry>,
     /// MCP サーバが公開する prompt (`/mcp__<server>__<prompt>`)。
     pub mcp_prompts: BTreeMap<String, McpPrompt>,
@@ -67,7 +69,7 @@ impl Runtime {
             notices.say(&format!("skills: {} loaded", user_skills.len()));
         }
 
-        let llm: Arc<dyn LlmClient> = llm::build_client(cfg)?;
+        let (llm, ledger) = llm::build_metered(cfg)?;
 
         let mut registry = default_registry();
         // sampling は opt-in サーバにのみ active モデルの LLM を貸す。
@@ -153,6 +155,7 @@ impl Runtime {
         Ok(Self {
             cwd,
             llm,
+            ledger,
             registry: Arc::new(registry),
             mcp_prompts,
             _mcp_clients: mcp_outcome.clients,

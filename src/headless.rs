@@ -16,6 +16,7 @@ use crate::agent::r#loop::MaxIterationsError;
 use crate::agent::messages::Message;
 use crate::config::Config;
 use crate::hooks::Lifecycle;
+use crate::llm::metered::BudgetExceededError;
 use crate::permission::PermissionGate;
 use crate::runtime::{Notices, Runtime};
 
@@ -32,6 +33,8 @@ pub const EXIT_ERROR: i32 = 1;
 // 2 は clap が引数エラーに使う (`--output-format yaml` など)。呼び出し側が区別できるよう空けておく。
 /// 最終応答に至らないまま `agent.max_iterations` を使い切った。
 pub const EXIT_MAX_ITERATIONS: i32 = 3;
+/// `max_requests` / `max_total_tokens` を使い切り、次の LLM リクエストを送らずに打ち切った。
+pub const EXIT_BUDGET: i32 = 4;
 /// SIGINT (128 + 2)。
 pub const EXIT_INTERRUPTED: i32 = 130;
 
@@ -157,7 +160,8 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         final_text(added_this_turn(session.history(), history_before)),
         recorder.as_ref().map(|r| r.id().to_string()),
         session.usage(),
-    ))
+    )
+    .with_ledger(&runtime.ledger))
 }
 
 /// ターン開始時点より後ろの履歴。自動圧縮で履歴が開始時点より短くなっていたら、圧縮は
@@ -272,6 +276,11 @@ impl Report {
             Outcome::Failed(e) => {
                 let code = if e.downcast_ref::<MaxIterationsError>().is_some() {
                     EXIT_MAX_ITERATIONS
+                } else if e
+                    .chain()
+                    .any(|c| c.downcast_ref::<BudgetExceededError>().is_some())
+                {
+                    EXIT_BUDGET
                 } else {
                     EXIT_ERROR
                 };
@@ -285,6 +294,33 @@ impl Report {
             session_id,
             usage: usage_json(usage),
         }
+    }
+
+    /// usage をプロセス全体の台帳で置き換える。エージェントループの外の呼び出し (サブエージェント、
+    /// `/goal` の評価器、圧縮、MCP sampling) も合計に入り、`by_kind` に内訳が載る。
+    fn with_ledger(mut self, ledger: &crate::llm::metered::Ledger) -> Self {
+        let total = ledger.total();
+        let by_kind: serde_json::Map<String, serde_json::Value> = ledger
+            .by_kind()
+            .into_iter()
+            .map(|(kind, u)| {
+                let fields = serde_json::json!({
+                    "llm_calls": u.calls,
+                    "total_tokens": u.total_tokens,
+                });
+                (kind.to_string(), fields)
+            })
+            .collect();
+        self.usage = serde_json::json!({
+            "llm_calls": total.calls,
+            "requests": ledger.requests(),
+            "estimated_calls": total.estimated_calls,
+            "prompt_tokens": total.prompt_tokens,
+            "completion_tokens": total.completion_tokens,
+            "total_tokens": total.total_tokens,
+            "by_kind": by_kind,
+        });
+        self
     }
 
     fn startup_failure(error: &anyhow::Error) -> Self {

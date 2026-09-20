@@ -1,5 +1,6 @@
 pub mod fallback;
 pub mod kimi;
+pub mod metered;
 pub mod openai;
 pub mod sakana;
 pub mod sakura;
@@ -86,8 +87,29 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
         .any(|c| c.downcast_ref::<TransientLlmError>().is_some())
 }
 
+/// 設定どおりのクライアントと、その使用量の台帳。台帳は provider ごとのクライアントの**内側**で
+/// 共有するので、fallback に切り替わって送り直したリクエストも 1 件ずつ数えられる。
+pub fn build_metered(cfg: &Config) -> Result<(Arc<dyn LlmClient>, Arc<metered::Ledger>)> {
+    let ledger = Arc::new(metered::Ledger::new(metered::Budget {
+        max_requests: cfg.agent.max_requests,
+        max_total_tokens: cfg.agent.max_total_tokens,
+    }));
+    let client = build_with(cfg, &|inner| {
+        Arc::new(metered::MeteredClient::new(inner, ledger.clone())) as Arc<dyn LlmClient>
+    })?;
+    Ok((client, ledger))
+}
+
 pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
-    let primary = build_for(cfg.llm.provider, cfg)?;
+    build_with(cfg, &|inner| inner)
+}
+
+/// `wrap` は provider ごとのクライアント 1 つずつに掛かる。
+fn build_with(
+    cfg: &Config,
+    wrap: &dyn Fn(Arc<dyn LlmClient>) -> Arc<dyn LlmClient>,
+) -> Result<Arc<dyn LlmClient>> {
+    let primary = wrap(build_for(cfg.llm.provider, cfg)?);
     let Some(fallback) = cfg.llm.fallback else {
         return Ok(primary);
     };
@@ -102,7 +124,7 @@ pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
     match build_for(fallback, cfg) {
         Ok(client) => Ok(Arc::new(fallback::FallbackClient::new(
             primary,
-            client,
+            wrap(client),
             fallback.as_str(),
             cfg.llm.get(fallback).model.clone(),
         ))),

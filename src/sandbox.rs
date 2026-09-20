@@ -202,6 +202,7 @@ fn protected_paths(cwd: &Path) -> Vec<(PathBuf, bool)> {
         (cwd.join(".git").join("hooks"), true),
         (cwd.join(".git").join("modules"), true),
         (cwd.join(".git").join("config"), false),
+        (cwd.join(".git").join("config.worktree"), false),
         (cwd.join(".mcp.json"), false),
         (cwd.join(".env"), false),
     ]
@@ -252,10 +253,17 @@ pub fn seatbelt_profile(policy: &SandboxPolicy, temp_dirs: &[PathBuf]) -> String
         // `.git` という名前そのものも固定する。中身を守っても、`.git` ごと rename して、hooks を
         // 仕込んだ別のディレクトリ (や symlink) を同じ名前で置かれたら意味が無い。中への書き込み
         // (index / objects / refs) はこれまでどおり通る。`git init` はサンドボックスの外で。
-        let dot_git = sbpl_string(&policy.cwd.join(".git"));
+        let dot_git_path = policy.cwd.join(".git");
+        let dot_git = sbpl_string(&dot_git_path);
         p.push_str(&format!(
             "(deny file-write-create (literal {dot_git}))\n(deny file-write-unlink (literal {dot_git}))\n"
         ));
+        // linked worktree やサブモジュールでは `.git` は `gitdir: <path>` と書かれた**ファイル**。
+        // 中身を書き換えて、hooks を仕込んだ偽の git ディレクトリを指させることができてしまうので、
+        // ディレクトリでないときは書き込みを丸ごと拒否する。
+        if !dot_git_path.is_dir() {
+            p.push_str(&format!("(deny file-write* (literal {dot_git}))\n"));
+        }
     }
     if !policy.network {
         p.push_str("(deny network*)\n");
@@ -281,12 +289,24 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
             a.extend(["--bind".into(), cwd.clone(), cwd]);
             // `.git` をそれ自身に bind して mount point にする。mount point は rename も削除も
             // できない (EBUSY) ので、`.git` ごと差し替えて hooks の保護を外す回り道が塞がる。
-            let dot_git = policy.cwd.join(".git").display().to_string();
-            a.extend(["--bind-try".into(), dot_git.clone(), dot_git]);
+            let dot_git_path = policy.cwd.join(".git");
+            let dot_git = dot_git_path.display().to_string();
+            if dot_git_path.is_dir() {
+                a.extend(["--bind-try".into(), dot_git.clone(), dot_git]);
+            } else {
+                // linked worktree やサブモジュールの `.git` は `gitdir: <path>` と書かれたファイル。
+                // 読み取り専用にして、偽の git ディレクトリを指すように書き換えさせない。
+                a.extend(["--ro-bind-try".into(), dot_git.clone(), dot_git]);
+            }
             // bind し直せるのは既にあるパスだけ (`-try` は無ければ黙って飛ばす)。だからディレクトリは
             // `prepare_workspace` が先に作っておく。まだ無い**ファイル**は止められないので、
             // 実行後に `planted` で検出して知らせる。
             for (path, _) in protected_paths(&policy.cwd) {
+                // `.git` がファイルのとき、その「下」のパスは ENOTDIR になる。`-try` が見逃すのは
+                // ENOENT だけで、ENOTDIR では bwrap ごと起動に失敗する。
+                if path.starts_with(&dot_git_path) && !dot_git_path.is_dir() {
+                    continue;
+                }
                 let path = path.display().to_string();
                 a.extend(["--ro-bind-try".into(), path.clone(), path]);
             }
@@ -335,7 +355,11 @@ pub fn unguarded(policy: &SandboxPolicy) -> Vec<PathBuf> {
         .into_iter()
         .map(|(path, _)| path)
         .collect();
-    paths.push(policy.cwd.join(".git"));
+    let dot_git = policy.cwd.join(".git");
+    // `.git` がファイル (worktree) なら、その下のパスは作りようがない。
+    let gitfile = dot_git.is_file();
+    paths.retain(|p| !(gitfile && p.starts_with(&dot_git)));
+    paths.push(dot_git);
     paths.retain(|p| std::fs::symlink_metadata(p).is_err());
     paths
 }
@@ -766,5 +790,33 @@ mod tests {
         assert!(run(&p, "echo LODAN_SANDBOX=off > .env"));
         assert_eq!(planted(&before), vec![a.ws.join(".env")]);
         assert!(planted_warning(&planted(&before)).contains(".env"));
+    }
+
+    /// linked worktree / サブモジュールでは `.git` はファイル。そこでもサンドボックスが起動でき、
+    /// かつ `.git` を書き換えて偽の git ディレクトリ (hooks 入り) を指させることはできない。
+    #[test]
+    fn a_gitfile_cannot_be_repointed_at_a_fake_git_directory() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        std::fs::remove_dir_all(a.ws.join(".git")).unwrap();
+        let gitfile = format!("gitdir: {}/real-gitdir\n", a.outside.display());
+        std::fs::write(a.ws.join(".git"), &gitfile).unwrap();
+        let p = workspace_write(&a, true);
+
+        assert!(
+            run(&p, "echo a > ok.txt"),
+            "the sandbox must still start in a worktree"
+        );
+        let _ = run(
+            &p,
+            "mkdir -p fake/hooks && printf 'gitdir: %s/fake\\n' \"$PWD\" > .git",
+        );
+        let _ = run(&p, "mv .git .gitfile.bak; printf 'gitdir: fake\\n' > .git");
+        let _ = run(
+            &p,
+            "rm -f .git; mkdir -p .git/hooks; echo pwn > .git/hooks/pre-commit",
+        );
+        assert_eq!(std::fs::read_to_string(a.ws.join(".git")).unwrap(), gitfile);
     }
 }

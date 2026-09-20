@@ -9,6 +9,8 @@ use crate::permission_rules::{RuleSet, Verdict};
 pub struct SessionPolicy {
     pub always_tools: HashSet<String>,
     pub always_commands: HashSet<String>,
+    /// このセッション中に `(p)` で保存した allow ルール。次回以降は設定ファイルから読まれる。
+    pub saved_rules: Vec<crate::permission_rules::Rule>,
 }
 
 pub struct PermissionGate {
@@ -141,7 +143,11 @@ impl PermissionGate {
             Some(Verdict::Deny(_) | Verdict::Unverifiable(_)) | None => {}
         }
         if let Ok(p) = self.policy.lock() {
-            if p.always_tools.contains(tool_name) {
+            if p.always_tools.contains(tool_name)
+                || p.saved_rules
+                    .iter()
+                    .any(|r| r.allows(tool_name, args, &self.cwd))
+            {
                 return Some(Decision::Allow);
             }
             if tool_name == "Bash"
@@ -183,7 +189,12 @@ impl PermissionGate {
     ) -> bool {
         let summary = summarize(tool_name, args);
         // 保存しても意図どおりに効かない呼び出しには (p) を出さない。
-        let persistable = crate::permission_rules::persistable_allow_rule(tool_name, args);
+        // ask ルールに当たる呼び出しは、allow を保存しても毎回尋ねられる (ask が優先)。
+        // 「保存した」と言って効かないものは出さない。
+        let asked_by_rule = self.rules.evaluate(tool_name, args, &self.cwd) == Some(Verdict::Ask);
+        let persistable = (!asked_by_rule)
+            .then(|| crate::permission_rules::persistable_allow_rule(tool_name, args, &self.cwd))
+            .flatten();
         loop {
             let _ = writeln!(
                 stdout,
@@ -243,16 +254,12 @@ impl PermissionGate {
                             let _ = writeln!(stdout, "  could not save the rule: {e:#}");
                         }
                     }
-                    // このセッションでも以後は尋ねない。
-                    if let Ok(mut p) = self.policy.lock() {
-                        match args.get("command").and_then(|v| v.as_str()) {
-                            Some(cmd) if tool_name == "Bash" => {
-                                p.always_commands.insert(cmd.to_string());
-                            }
-                            _ => {
-                                p.always_tools.insert(tool_name.to_string());
-                            }
-                        }
+                    // このセッションでも以後は尋ねない。保存したのと**同じ広さ**で効かせる
+                    // (`Edit(src/**)` を保存したのに、セッション中は Edit 全体が通る、にしない)。
+                    if let Ok(mut p) = self.policy.lock()
+                        && let Ok(parsed) = crate::permission_rules::Rule::parse(rule)
+                    {
+                        p.saved_rules.push(parsed);
                     }
                     return true;
                 }
@@ -307,7 +314,7 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
 fn visible(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() {
+            if crate::permission_rules::is_invisible(c) {
                 c.escape_default().to_string()
             } else {
                 c.to_string()
@@ -466,6 +473,54 @@ mod tests {
     }
 
     #[test]
+    fn p_on_a_file_edit_is_scoped_to_its_directory_now_and_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let edit = |p: &str| serde_json::json!({ "path": p, "old_string": "a", "new_string": "b" });
+        let mut out = Vec::new();
+        assert!(gate.prompt_with(
+            "Edit",
+            &edit("src/agent/loop.rs"),
+            &mut "p\n".as_bytes(),
+            &mut out,
+            true
+        ));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("`Edit(src/agent/**)`")
+        );
+        // セッション中も、保存したのと同じ広さでしか通らない。
+        assert_eq!(
+            gate.decide_quietly("Edit", &edit("src/agent/subagent.rs"), true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(gate.decide_quietly("Edit", &edit("Cargo.toml"), true), None);
+        assert_eq!(
+            gate.decide_quietly("Write", &edit("src/agent/x.rs"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn p_is_not_offered_for_a_call_an_ask_rule_will_keep_asking_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.ask = vec!["Bash(cargo *)".into()];
+        let gate = PermissionGate::from_config(&cfg, dir.path(), true).unwrap();
+        let mut out = Vec::new();
+        assert!(gate.prompt_with(
+            "Bash",
+            &bash("cargo test --lib"),
+            &mut "p\ny\n".as_bytes(),
+            &mut out,
+            true
+        ));
+        assert!(!String::from_utf8(out).unwrap().contains("(p)"));
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
+    }
+
+    #[test]
     fn p_is_not_offered_when_the_saved_rule_would_not_mean_the_same_thing() {
         let dir = tempfile::tempdir().unwrap();
         let gate = gate_in(dir.path());
@@ -497,7 +552,7 @@ mod tests {
         );
         // そして、そういうコマンドには (p) を出さない。
         assert_eq!(
-            crate::permission_rules::persistable_allow_rule("Bash", &bash(sneaky)),
+            crate::permission_rules::persistable_allow_rule("Bash", &bash(sneaky), Path::new("/")),
             None
         );
     }

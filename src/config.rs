@@ -587,13 +587,16 @@ pub fn append_local_allow_rule(cwd: &Path, rule: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let body = toml::to_string_pretty(&table).context("serializing local config")?;
     // 途中で落ちても既存の設定を壊さないよう、別名で書いてから置き換える。
-    let tmp = dir.join(format!("{LOCAL_CONFIG_FILE}.tmp"));
+    let tmp = dir.join(format!(".{LOCAL_CONFIG_FILE}.{}.tmp", std::process::id()));
     std::fs::write(
         &tmp,
         format!("# lodan が管理する個人用のプロジェクト設定。コミットしないこと (.gitignore に追加)。\n{body}"),
     )
     .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    }
     Ok(path)
 }
 

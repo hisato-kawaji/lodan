@@ -105,7 +105,9 @@ impl Rule {
                 (tool.trim(), Some(pattern))
             }
         };
-        if tool.is_empty() || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        // MCP のツール名はサーバが決める (`mcp__context7__get-library-docs` など)。`-` と `.` も通す。
+        let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+        if tool.is_empty() || !tool.chars().all(name_char) {
             bail!("permission rule `{raw}`: `{tool}` is not a tool name");
         }
 
@@ -168,6 +170,11 @@ impl Rule {
                 && tool
                     .strip_prefix(self.tool.as_str())
                     .is_some_and(|rest| rest.starts_with("__")))
+    }
+
+    /// allow ルールとしてこの呼び出しに一致するか (ゲートがセッション中に保存したルール用)。
+    pub fn allows(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> bool {
+        self.permits(tool, args, cwd)
     }
 
     /// allow / ask として一致するか。追い切れない Bash コマンドには一致しない。
@@ -619,32 +626,70 @@ fn scan_command(command: &str) -> (Vec<String>, bool) {
 ///   しないので対象外。`*` を含むコマンドは、保存するとワイルドカードとして解釈されて意図より
 ///   広く一致するので対象外。`:*` で終わるコマンドも同じ理由で対象外
 /// - それ以外: ツール名 (そのツールの全呼び出し)。セッション中の「(a) always」と同じ広さ
-pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value) -> Option<String> {
+pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value, cwd: &Path) -> Option<String> {
     // 計画の承認は毎回目を通すもの。保存して自動承認にはさせない。
     if tool == "ExitPlanMode" {
         return None;
     }
-    if tool != "Bash" {
-        return Some(tool.to_string());
-    }
-    let command = bash_command(args)?.trim();
-    let simple = matches!(split_command(command), Some(parts) if parts.len() == 1);
-    // 制御文字 (ANSI エスケープ・CR・タブなど) を含むコマンドは保存しない。モデルが渡す文字列なので、
-    // エスケープで承認プロンプトの表示を一部隠し、見えているのと違うものを永続化させ得る。
-    let hidden = command.chars().any(char::is_control);
-    if !simple
-        || hidden
-        || command.contains('*')
-        || command.ends_with(':')
-        || command.contains(['(', ')'])
-    {
-        return None;
-    }
-    let rule = format!("Bash({command})");
-    // 保存したものが読めて、同じ呼び出しに一致することを確かめてから返す。
+    let rule = if tool == "Bash" {
+        let command = bash_command(args)?.trim();
+        let simple = matches!(split_command(command), Some(parts) if parts.len() == 1);
+        if !simple || command.contains(['*', '(', ')']) || command.chars().any(is_invisible) {
+            return None;
+        }
+        format!("Bash({command})")
+    } else if PATH_TOOLS.contains(&tool) {
+        // ツール全体ではなく、そのファイルのあるディレクトリ以下に絞る。1 回の承認が
+        // 「どのパスへの Edit も永久に許可」になるのは広すぎる。cwd の外は保存しない。
+        let path = normalize(&cwd.join(args.get("path").and_then(|v| v.as_str())?));
+        let dir = path.parent()?.strip_prefix(cwd).ok()?.to_str()?.to_string();
+        if dir.contains(['*', '?', '[', ']', '{', '}', '(', ')']) || dir.chars().any(is_invisible) {
+            return None;
+        }
+        if dir.is_empty() {
+            // cwd 直下のファイル。`Tool(**)` は cwd 以下の全てになってしまうので、そのファイルだけ。
+            let name = path.file_name()?.to_str()?;
+            if name.contains(['*', '?', '[', ']', '{', '}', '(', ')'])
+                || name.chars().any(is_invisible)
+            {
+                return None;
+            }
+            format!("{tool}(./{name})")
+        } else {
+            format!("{tool}({dir}/**)")
+        }
+    } else if tool == "WebFetch" {
+        format!("WebFetch(domain:{})", url_host(args)?)
+    } else {
+        // それ以外 (MCP ツールなど) は絞る軸が無いので、そのツールの全呼び出し。
+        tool.to_string()
+    };
+    // 保存したものが読めて、同じ呼び出しに一致することを確かめてから返す。読めないルールを
+    // 保存すると、次の起動が設定エラーで止まる。
     let parsed = Rule::parse(&rule).ok()?;
     parsed.check_usable_as_allow().ok()?;
-    parsed.permits(tool, args, Path::new("/")).then_some(rule)
+    parsed.permits(tool, args, cwd).then_some(rule)
+}
+
+/// 表示されない、または表示順を変える文字。モデルが渡した文字列を承認プロンプトに出すとき、
+/// これらが混ざっていると「見えているもの」と「実行されるもの」が食い違う。
+/// 制御文字 (Cc) に加えて、書式文字 (Cf) のうち実害のあるもの — 双方向テキストの上書き
+/// (U+202E など)、ゼロ幅文字、ソフトハイフン、タグ文字 — を含める。
+pub fn is_invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
 }
 
 /// ルールだけで決まる判定。どのルールにも当たらなければ `None` (既定の扱いに任せる)。
@@ -1209,7 +1254,8 @@ mod tests {
 
     #[test]
     fn only_calls_whose_saved_rule_would_mean_the_same_thing_can_be_persisted() {
-        let rule = |cmd: &str| persistable_allow_rule("Bash", &json!({ "command": cmd }));
+        let cwd = Path::new("/work");
+        let rule = |cmd: &str| persistable_allow_rule("Bash", &json!({ "command": cmd }), cwd);
         assert_eq!(
             rule("cargo test --lib").as_deref(),
             Some("Bash(cargo test --lib)")
@@ -1219,30 +1265,27 @@ mod tests {
             rule("git commit -m 'a; b'").as_deref(),
             Some("Bash(git commit -m 'a; b')")
         );
+        assert_eq!(
+            rule("npm run test:unit").as_deref(),
+            Some("Bash(npm run test:unit)")
+        );
         // 保存すると意味が変わるもの、決して一致しないものは出さない。
         for cmd in [
             "ls && rm -rf build",        // 複合: allow として一致しない
             "echo $(date)",              // 追い切れない
             "echo hi > out.txt",         // リダイレクト
             "ls *.rs",                   // `*` がワイルドカードになり、意図より広く一致する
-            "npm run test:",             // `:*` と紛らわしい
             "(cd x; ls)",                // 括弧はルールの構文と衝突する
-            "ls\x1b[2K\x1b[1Gecho safe", // エスケープで表示を書き換えるコマンド
+            "ls\x1b[2K\x1b[1Gecho safe", // エスケープで表示を書き換える
             "ls\tfoo",
+            "ls \u{202E}fdp.exe", // 双方向テキストの上書き
+            "ls\u{200B}",         // ゼロ幅
             "",
         ] {
             assert_eq!(rule(cmd), None, "{cmd:?}");
         }
         assert_eq!(
-            persistable_allow_rule("Edit", &json!({ "path": "a" })).as_deref(),
-            Some("Edit")
-        );
-        assert_eq!(
-            persistable_allow_rule("mcp__github__create_issue", &json!({})).as_deref(),
-            Some("mcp__github__create_issue")
-        );
-        assert_eq!(
-            persistable_allow_rule("ExitPlanMode", &json!({ "plan": "x" })),
+            persistable_allow_rule("ExitPlanMode", &json!({ "plan": "x" }), cwd),
             None
         );
 
@@ -1251,6 +1294,76 @@ mod tests {
         let set = rules(&[&saved], &[], &[]);
         assert_eq!(bash(&set, "cargo test --lib"), Some(Verdict::Allow));
         assert_eq!(bash(&set, "cargo test --lib && rm -rf /"), None);
+    }
+
+    #[test]
+    fn a_saved_file_rule_covers_the_directory_not_the_whole_tool() {
+        let cwd = Path::new("/work");
+        let edit = |path: &str| persistable_allow_rule("Edit", &json!({ "path": path }), cwd);
+        assert_eq!(
+            edit("src/agent/loop.rs").as_deref(),
+            Some("Edit(src/agent/**)")
+        );
+        assert_eq!(edit("/work/src/lib.rs").as_deref(), Some("Edit(src/**)"));
+        assert_eq!(
+            edit("src/agent/../lib.rs").as_deref(),
+            Some("Edit(src/**)"),
+            "`..` is folded first"
+        );
+        // cwd 直下は、そのファイルだけ (`Edit(**)` にはしない)。
+        assert_eq!(edit("Cargo.toml").as_deref(), Some("Edit(./Cargo.toml)"));
+        // cwd の外、glob の文字を含むディレクトリ、不可視文字は保存しない。
+        assert_eq!(edit("/etc/hosts"), None);
+        assert_eq!(edit("../outside/x.rs"), None);
+        assert_eq!(edit("we[i]rd/x.rs"), None);
+        assert_eq!(edit("src\u{202E}/x.rs"), None);
+
+        // 読み直すと、そのディレクトリ以下だけを allow する。
+        let set = rules(&["Edit(src/agent/**)", "Edit(./Cargo.toml)"], &[], &[]);
+        assert_eq!(
+            file(&set, "Edit", "src/agent/subagent.rs"),
+            Some(Verdict::Allow)
+        );
+        assert_eq!(file(&set, "Edit", "src/lib.rs"), None);
+        assert_eq!(file(&set, "Edit", "Cargo.toml"), Some(Verdict::Allow));
+        assert_eq!(file(&set, "Edit", "Cargo.lock"), None);
+        assert_eq!(
+            file(&set, "Write", "src/agent/x.rs"),
+            None,
+            "a rule is per tool"
+        );
+    }
+
+    #[test]
+    fn other_tools_are_saved_only_in_a_form_that_loads_again() {
+        let cwd = Path::new("/work");
+        let fetch =
+            persistable_allow_rule("WebFetch", &json!({ "url": "https://Docs.RS/tokio" }), cwd);
+        assert_eq!(fetch.as_deref(), Some("WebFetch(domain:docs.rs)"));
+        assert_eq!(
+            persistable_allow_rule("WebFetch", &json!({ "url": "not a url" }), cwd),
+            None
+        );
+        // MCP のツール名はサーバが決める。`-` や `.` を含む実在の名前が読み込めること
+        // (読めないルールを保存すると次の起動が止まる)。
+        for name in [
+            "mcp__context7__get-library-docs",
+            "mcp__srv__ns.tool",
+            "mcp__github__create_issue",
+        ] {
+            let saved = persistable_allow_rule(name, &json!({}), cwd).expect(name);
+            assert_eq!(saved, name);
+            assert!(RuleSet::parse(&[saved], &[], &[]).is_ok(), "{name}");
+        }
+        // 構文と衝突する名前は保存しない。
+        assert_eq!(
+            persistable_allow_rule("mcp__srv__weird name", &json!({}), cwd),
+            None
+        );
+        assert_eq!(
+            persistable_allow_rule("mcp__srv__a(b)", &json!({}), cwd),
+            None
+        );
     }
 
     #[test]

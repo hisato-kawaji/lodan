@@ -559,6 +559,13 @@ pub const LOCAL_CONFIG_FILE: &str = "config.local.toml";
 pub fn append_local_allow_rule(cwd: &Path, rule: &str) -> Result<PathBuf> {
     let dir = cwd.join(LOCAL_CONFIG_DIR);
     let path = dir.join(LOCAL_CONFIG_FILE);
+    // symlink の先を書き換えない。リポジトリに仕込まれた `.lodan/config.local.toml -> ~/.config/…`
+    // や `.lodan -> /somewhere` を辿ると、承認 1 回で別の設定ファイルを上書きしてしまう。
+    for p in [&dir, &path] {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!("{} is a symlink; refusing to write through it", p.display());
+        }
+    }
     let mut table: toml::Table = match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
@@ -579,11 +586,14 @@ pub fn append_local_allow_rule(cwd: &Path, rule: &str) -> Result<PathBuf> {
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let body = toml::to_string_pretty(&table).context("serializing local config")?;
+    // 途中で落ちても既存の設定を壊さないよう、別名で書いてから置き換える。
+    let tmp = dir.join(format!("{LOCAL_CONFIG_FILE}.tmp"));
     std::fs::write(
-        &path,
+        &tmp,
         format!("# lodan が管理する個人用のプロジェクト設定。コミットしないこと (.gitignore に追加)。\n{body}"),
     )
-    .with_context(|| format!("writing {}", path.display()))?;
+    .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(path)
 }
 
@@ -873,6 +883,34 @@ mod tests {
             "existing rules survive the rewrite"
         );
         assert_eq!(cfg.agent.max_iterations, 40);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_local_config_is_never_written_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.toml");
+        std::fs::write(&victim, "[agent]\nmax_iterations = 7\n").unwrap();
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(cwd.join(LOCAL_CONFIG_DIR)).unwrap();
+        std::os::unix::fs::symlink(&victim, cwd.join(LOCAL_CONFIG_DIR).join(LOCAL_CONFIG_FILE))
+            .unwrap();
+
+        let err = append_local_allow_rule(&cwd, "Edit").unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "[agent]\nmax_iterations = 7\n"
+        );
+
+        // `.lodan` 自体が symlink でも同じ。
+        let cwd2 = dir.path().join("repo2");
+        std::fs::create_dir_all(&cwd2).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cwd2.join(LOCAL_CONFIG_DIR)).unwrap();
+        assert!(append_local_allow_rule(&cwd2, "Edit").is_err());
+        assert!(!elsewhere.join(LOCAL_CONFIG_FILE).exists());
     }
 
     #[test]

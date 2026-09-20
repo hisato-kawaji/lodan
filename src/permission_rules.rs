@@ -629,7 +629,15 @@ pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value) -> Option<St
     }
     let command = bash_command(args)?.trim();
     let simple = matches!(split_command(command), Some(parts) if parts.len() == 1);
-    if !simple || command.contains('*') || command.ends_with(':') || command.contains(['(', ')']) {
+    // 制御文字 (ANSI エスケープ・CR・タブなど) を含むコマンドは保存しない。モデルが渡す文字列なので、
+    // エスケープで承認プロンプトの表示を一部隠し、見えているのと違うものを永続化させ得る。
+    let hidden = command.chars().any(char::is_control);
+    if !simple
+        || hidden
+        || command.contains('*')
+        || command.ends_with(':')
+        || command.contains(['(', ')'])
+    {
         return None;
     }
     let rule = format!("Bash({command})");
@@ -1213,12 +1221,14 @@ mod tests {
         );
         // 保存すると意味が変わるもの、決して一致しないものは出さない。
         for cmd in [
-            "ls && rm -rf build", // 複合: allow として一致しない
-            "echo $(date)",       // 追い切れない
-            "echo hi > out.txt",  // リダイレクト
-            "ls *.rs",            // `*` がワイルドカードになり、意図より広く一致する
-            "npm run test:",      // `:*` と紛らわしい
-            "(cd x; ls)",         // 括弧はルールの構文と衝突する
+            "ls && rm -rf build",        // 複合: allow として一致しない
+            "echo $(date)",              // 追い切れない
+            "echo hi > out.txt",         // リダイレクト
+            "ls *.rs",                   // `*` がワイルドカードになり、意図より広く一致する
+            "npm run test:",             // `:*` と紛らわしい
+            "(cd x; ls)",                // 括弧はルールの構文と衝突する
+            "ls\x1b[2K\x1b[1Gecho safe", // エスケープで表示を書き換えるコマンド
+            "ls\tfoo",
             "",
         ] {
             assert_eq!(rule(cmd), None, "{cmd:?}");

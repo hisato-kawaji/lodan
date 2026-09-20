@@ -288,7 +288,7 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
         "Bash" => args
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|s| format!("`{s}`"))
+            .map(|s| format!("`{}`", visible(s)))
             .unwrap_or_else(|| args.to_string()),
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => args
             .get("path")
@@ -299,6 +299,21 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
         "ExitPlanMode" => "approve the plan above and exit plan mode".to_string(),
         _ => args.to_string(),
     }
+}
+
+/// 制御文字を `\u{1b}` のような見える形にする。承認プロンプトに出すのはモデルが渡した文字列で、
+/// ANSI エスケープや CR をそのまま端末へ流すと、行を消したり上書きしたりして「承認しようと
+/// しているもの」を偽れる。
+fn visible(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// cwd 配下のパスは相対表示にする (#42 P5)。cwd 外・取得失敗時はそのまま。
@@ -466,6 +481,25 @@ mod tests {
         assert!(!allowed);
         assert!(!String::from_utf8(out).unwrap().contains("(p)"));
         assert!(!dir.path().join(".lodan/config.local.toml").exists());
+    }
+
+    #[test]
+    fn the_prompt_shows_control_characters_instead_of_obeying_them() {
+        let sneaky = "rm -rf ~\x1b[2K\x1b[1Gls";
+        let shown = summarize("Bash", &bash(sneaky));
+        assert!(
+            !shown.contains('\x1b'),
+            "raw escape reached the terminal: {shown:?}"
+        );
+        assert!(
+            shown.contains("rm -rf ~") && shown.contains("\\u{1b}"),
+            "{shown}"
+        );
+        // そして、そういうコマンドには (p) を出さない。
+        assert_eq!(
+            crate::permission_rules::persistable_allow_rule("Bash", &bash(sneaky)),
+            None
+        );
     }
 
     #[test]

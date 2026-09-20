@@ -113,7 +113,11 @@ impl Runtime {
                 cwd.clone(),
                 cfg.agent.max_iterations,
             )
-            .with_rules(rules),
+            .with_rules(rules)
+            .with_hooks(
+                crate::hooks::effective(&cfg.hooks, &cfg.disabled_hooks),
+                cfg.hooks_compat,
+            ),
         ));
 
         // Skill ツール: モデルが名前で手順書を読み込める。skill が無ければ登録しない。

@@ -144,6 +144,28 @@ impl PermissionGate {
         }
     }
 
+    /// この呼び出しは、誰かの承認が無いと通らないか (尋ねる相手がいるかどうかは問わない)。
+    /// PermissionRequest hook を発火するかどうかの判断に使う。副作用は無い。
+    pub fn needs_approval(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> bool {
+        use crate::hooks::PermissionHint;
+        match self.decide_quietly(tool_name, args, destructive) {
+            Some(Decision::Deny(_)) => false,
+            Some(Decision::Allow) => hint == Some(PermissionHint::Ask),
+            None => hint != Some(PermissionHint::Allow) || self.dont_ask,
+        }
+    }
+
+    /// 承認プロンプトを実際に出せるか (REPL で、`dont-ask` でもない)。
+    pub fn can_prompt(&self) -> bool {
+        !self.non_interactive
+    }
+
     /// 尋ねて決める。尋ねる相手がいなければ拒否。
     fn ask_user(&self, tool_name: &str, args: &serde_json::Value, once_only: bool) -> Decision {
         if self.non_interactive {
@@ -811,6 +833,61 @@ mod tests {
         assert!(!dir.path().join(".lodan/config.local.toml").exists());
         // 「常に許可」が記録されていないので、同じ呼び出しは次も尋ねる必要がある。
         assert_eq!(gate.decide_quietly("Bash", &args, true), None);
+    }
+
+    /// モード × ルール × hook の希望 の表。尋ねる相手のいないゲートで見るので、「尋ねる」は拒否になる。
+    /// どのマスでも、ルールの deny が消えないこと・hook の allow が ask ルールと dont-ask を
+    /// 越えないこと・hook の ask が自動承認を止めることを確かめる。
+    #[test]
+    fn the_hinted_decision_table() {
+        use crate::config::PermissionMode::{AcceptEdits, Bypass, Default as Normal, DontAsk};
+        use crate::hooks::PermissionHint::{Allow, Ask};
+        let args = bash("cargo test");
+        let gate = |mode, rule: &str| {
+            let mut cfg = crate::config::Config::default();
+            cfg.permissions.mode = mode;
+            match rule {
+                "deny" => cfg.permissions.deny = vec!["Bash".into()],
+                "ask" => cfg.permissions.ask = vec!["Bash".into()],
+                "allow" => cfg.permissions.allow = vec!["Bash".into()],
+                _ => {}
+            }
+            PermissionGate::from_config(&cfg, Path::new("/work"), false).unwrap()
+        };
+        // (mode, rule, hint) -> 通るか
+        let table = [
+            (Normal, "none", None, false),
+            (Normal, "none", Some(Allow), true),
+            (Normal, "none", Some(Ask), false),
+            (Normal, "allow", None, true),
+            (Normal, "allow", Some(Ask), false),
+            (Normal, "ask", Some(Allow), false),
+            (Normal, "deny", Some(Allow), false),
+            (AcceptEdits, "none", Some(Allow), true),
+            (DontAsk, "none", Some(Allow), false),
+            (DontAsk, "allow", Some(Allow), true),
+            (Bypass, "none", None, true),
+            (Bypass, "none", Some(Ask), false),
+            (Bypass, "ask", Some(Allow), true),
+            (Bypass, "deny", None, false),
+            (Bypass, "deny", Some(Allow), false),
+        ];
+        for (mode, rule, hint, expected) in table {
+            let decision = gate(mode, rule).decide_hinted("Bash", &args, true, hint);
+            assert_eq!(
+                decision == Decision::Allow,
+                expected,
+                "{mode:?} / {rule} rule / hook {hint:?} -> {decision:?}"
+            );
+        }
+
+        // 確かめきれなかった deny (`Unverifiable`) は、自動承認でも hook の allow でも通らない。
+        let bypass = gate(Bypass, "none");
+        let unverifiable = Some(Verdict::Unverifiable("Grep(**/.env)".into()));
+        assert!(matches!(
+            bypass.quiet_decision(unverifiable, "Grep", &serde_json::json!({}), false),
+            Some(Decision::Deny(_))
+        ));
     }
 
     #[test]

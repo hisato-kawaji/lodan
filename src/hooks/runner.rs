@@ -193,14 +193,14 @@ fn read_stdout(hook: &HookConfig, lc: Lifecycle, stdout: &str) -> HookOutcome {
             return HookOutcome::default();
         }
     };
-    if lc == Lifecycle::PreToolUse {
+    if matches!(lc, Lifecycle::PreToolUse | Lifecycle::PermissionRequest) {
         // どの hook かは利用者に伝える。モデルへ返す理由には、コマンドの絶対パスを載せない。
         warn(
             hook,
             &format!("{problem}; blocking the tool call to be safe"),
         );
         return HookOutcome::blocked(format!(
-            "a PreToolUse hook printed a decision lodan could not read ({problem}); blocking to be safe"
+            "a hook printed a decision lodan could not read ({problem}); blocking to be safe"
         ));
     }
     warn(hook, &format!("{problem}; ignoring it"));
@@ -243,6 +243,27 @@ fn interpret(lc: Lifecycle, value: &serde_json::Value) -> Result<HookOutcome, St
     if value.get("decision").and_then(|v| v.as_str()) == Some("block") {
         out.block =
             Some(text(value, "reason").unwrap_or_else(|| "hook denied (no message)".to_string()));
+        return Ok(out);
+    }
+
+    // PermissionRequest の判断は `hookSpecificOutput.decision`。文字列 ("allow" / "deny") でも、
+    // `{ "behavior": "allow" | "deny", "message": … }` の形でも受ける。
+    if lc == Lifecycle::PermissionRequest
+        && let Some(decision) = specific.and_then(|s| s.get("decision"))
+    {
+        let behavior = decision
+            .as_str()
+            .or_else(|| decision.get("behavior").and_then(|b| b.as_str()));
+        match behavior {
+            Some("allow") => out.permission = Some(PermissionHint::Allow),
+            Some("deny") => {
+                let why = text(decision, "message")
+                    .or_else(|| specific.and_then(|s| text(s, "reason")))
+                    .unwrap_or_else(|| "hook denied (no message)".to_string());
+                out.block = Some(why);
+            }
+            _ => return Err(format!("unknown PermissionRequest decision {decision}")),
+        }
         return Ok(out);
     }
 
@@ -295,6 +316,7 @@ mod tests {
 
     fn hook(event: Lifecycle, matcher: &str, command: &str) -> HookConfig {
         HookConfig {
+            id: None,
             event,
             matcher: matcher.to_string(),
             command: command.to_string(),

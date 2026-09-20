@@ -197,15 +197,28 @@ fn temp_dirs_from(tmpdir: Option<PathBuf>, cwd: &Path, home: Option<&Path>) -> V
 /// サブモジュールの git ディレクトリ (`.git/modules/`) も、それぞれが hooks と config を持つ。
 /// (パス, ディレクトリごとか)。
 fn protected_paths(cwd: &Path) -> Vec<(PathBuf, bool)> {
-    vec![
+    let mut paths = vec![
         (cwd.join(".lodan"), true),
-        (cwd.join(".git").join("hooks"), true),
-        (cwd.join(".git").join("modules"), true),
-        (cwd.join(".git").join("config"), false),
-        (cwd.join(".git").join("config.worktree"), false),
         (cwd.join(".mcp.json"), false),
         (cwd.join(".env"), false),
-    ]
+    ];
+    // 規則はパスの文字列で照合される。`.git` が symlink のリポジトリでは、リンク先の実パスを
+    // 直接書かれると `.git/hooks` という名前の保護をすり抜けるので、実体の側も並べる。
+    let dot_git = cwd.join(".git");
+    let mut git_dirs = vec![dot_git.clone()];
+    if dot_git.is_symlink()
+        && let Ok(real) = std::fs::canonicalize(&dot_git)
+        && real.is_dir()
+    {
+        git_dirs.push(real);
+    }
+    for git_dir in git_dirs {
+        paths.push((git_dir.join("hooks"), true));
+        paths.push((git_dir.join("modules"), true));
+        paths.push((git_dir.join("config"), false));
+        paths.push((git_dir.join("config.worktree"), false));
+    }
+    paths
 }
 
 /// SBPL の文字列リテラル。パスに `"` や `\` が入っていてもプロファイルを壊させない。
@@ -818,5 +831,24 @@ mod tests {
             "rm -f .git; mkdir -p .git/hooks; echo pwn > .git/hooks/pre-commit",
         );
         assert_eq!(std::fs::read_to_string(a.ws.join(".git")).unwrap(), gitfile);
+    }
+
+    /// `.git` が最初から symlink のリポジトリ。リンク先を実パスで直接書いても hooks は置けない。
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_git_directory_is_protected_at_its_real_path_too() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        std::fs::rename(a.ws.join(".git"), a.ws.join("realgit")).unwrap();
+        std::os::unix::fs::symlink("realgit", a.ws.join(".git")).unwrap();
+        let p = workspace_write(&a, true);
+        let _ = run(&p, "echo pwn > realgit/hooks/pre-commit");
+        let _ = run(&p, "echo pwn > .git/hooks/pre-commit");
+        assert!(!a.ws.join("realgit/hooks/pre-commit").exists());
+        assert!(
+            run(&p, "echo x > realgit/index"),
+            "git's own files stay writable"
+        );
     }
 }

@@ -107,6 +107,10 @@ impl Recorder {
         Ok(())
     }
 
+    pub fn transcript_path(&self) -> PathBuf {
+        self.dir.join("transcript.jsonl")
+    }
+
     pub fn id(&self) -> &str {
         // dir 名 = id。
         self.dir

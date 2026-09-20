@@ -37,6 +37,8 @@ pub struct Config {
     pub sandbox: crate::sandbox::SandboxConfig,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
+    /// hook の終了コードの解釈。`"v1"` で「非 0 は全てブロック」の旧挙動に戻す。
+    pub hooks_compat: crate::hooks::HooksCompat,
 }
 
 /// 承認が要る呼び出しをどう扱うか (#74)。deny ルールはどのモードでも効く。
@@ -957,6 +959,26 @@ mod tests {
             origins["agent.max_iterations"],
             Origin::File(PathBuf::from("explicit.toml"))
         );
+    }
+
+    #[test]
+    fn hooks_compat_defaults_to_v2_and_can_be_set_back() {
+        assert_eq!(
+            Config::default().hooks_compat,
+            crate::hooks::HooksCompat::V2
+        );
+        let cfg: Config = toml::from_str(
+            r#"
+            hooks_compat = "v1"
+            [[hooks]]
+            event = "PreToolUse"
+            command = "guard.sh"
+            timeout_secs = 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.hooks_compat, crate::hooks::HooksCompat::V1);
+        assert_eq!(cfg.hooks[0].timeout_secs, Some(5));
     }
 
     #[test]

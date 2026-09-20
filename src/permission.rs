@@ -17,6 +17,9 @@ pub struct PermissionGate {
     auto_approve: bool,
     /// 尋ねる相手がいない (ヘッドレス実行) か、`dont-ask` モード。承認が要る呼び出しは尋ねずに拒否する。
     non_interactive: bool,
+    /// `dont-ask` モード。利用者が「承認が要るものは通すな」と書いたもので、hook の allow でも覆らない
+    /// (単に尋ねる相手がいない `-p` とは区別する)。
+    dont_ask: bool,
     /// `accept-edits` モード: ファイル編集ツールは尋ねずに通す。
     accept_edits: bool,
     rules: RuleSet,
@@ -55,6 +58,7 @@ impl PermissionGate {
         Self {
             auto_approve,
             non_interactive: false,
+            dont_ask: false,
             accept_edits: false,
             rules: RuleSet::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -75,6 +79,7 @@ impl PermissionGate {
         Ok(Self {
             auto_approve: cfg.agent.auto_approve || mode == PermissionMode::Bypass,
             non_interactive: !interactive || mode == PermissionMode::DontAsk,
+            dont_ask: mode == PermissionMode::DontAsk,
             accept_edits: mode == PermissionMode::AcceptEdits,
             rules: RuleSet::parse(&p.allow, &p.deny, &p.ask)?,
             cwd: cwd.to_path_buf(),
@@ -87,6 +92,7 @@ impl PermissionGate {
     pub fn non_interactive(auto_approve: bool) -> Self {
         Self {
             non_interactive: true,
+            dont_ask: false,
             ..Self::new(auto_approve)
         }
     }
@@ -101,10 +107,49 @@ impl PermissionGate {
         if let Some(decision) = self.decide_quietly(tool_name, args, destructive) {
             return decision;
         }
+        self.ask_user(tool_name, args, false)
+    }
+
+    /// PreToolUse hook の希望を踏まえて決める。
+    ///
+    /// - `Ask`: 他の条件で通る呼び出しでも尋ねる (`--yes` でも)。deny は deny のまま。ここで出す
+    ///   プロンプトは yes / no だけ — 「常に許可」を選ばせても、次回また hook が尋ねさせるので効かない。
+    /// - `Allow`: 既定なら尋ねるところを省く。**deny ルール・ask ルール・`dont-ask` モードには
+    ///   勝てない** — hook はプロジェクトの設定からも足せるので、利用者が書いた「禁止」「必ず尋ねる」
+    ///   「承認が要るものは通すな」を覆させない。尋ねる相手がいないだけの `-p` では、hook が承認役になる。
+    pub fn decide_hinted(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> Decision {
+        use crate::hooks::PermissionHint;
+        // ルールの評価はファイルツリーを歩くことがある。1 回だけ行って使い回す。
+        let verdict = self.rules.evaluate(tool_name, args, &self.cwd);
+        let asked_by_rule = verdict == Some(Verdict::Ask);
+        let quiet = self.quiet_decision(verdict, tool_name, args, destructive);
+        match (hint, quiet) {
+            (_, Some(Decision::Deny(why))) => Decision::Deny(why),
+            (Some(PermissionHint::Allow), None) if !asked_by_rule && !self.dont_ask => {
+                Decision::Allow
+            }
+            (Some(PermissionHint::Ask), Some(Decision::Allow)) => {
+                self.ask_user(tool_name, args, true)
+            }
+            (_, Some(Decision::Allow)) => Decision::Allow,
+            // もともと尋ねる呼び出しでも、hook が確認を求めているなら yes / no だけ
+            // (「常に許可」を保存しても、次回また hook が尋ねさせる)。
+            (hint, None) => self.ask_user(tool_name, args, hint == Some(PermissionHint::Ask)),
+        }
+    }
+
+    /// 尋ねて決める。尋ねる相手がいなければ拒否。
+    fn ask_user(&self, tool_name: &str, args: &serde_json::Value, once_only: bool) -> Decision {
         if self.non_interactive {
             return Decision::Deny(DENIED_NON_INTERACTIVE.to_string());
         }
-        if self.prompt(tool_name, args) {
+        if self.prompt(tool_name, args, once_only) {
             Decision::Allow
         } else {
             Decision::Deny(DENIED_BY_USER.to_string())
@@ -124,6 +169,17 @@ impl PermissionGate {
         destructive: bool,
     ) -> Option<Decision> {
         let verdict = self.rules.evaluate(tool_name, args, &self.cwd);
+        self.quiet_decision(verdict, tool_name, args, destructive)
+    }
+
+    /// `decide_quietly` の本体。ルールの評価結果を受け取る (呼び出し側が使い回せるように)。
+    fn quiet_decision(
+        &self,
+        verdict: Option<Verdict>,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+    ) -> Option<Decision> {
         // deny は `--yes` にも勝つ。「全部通す」と「これだけは絶対に通さない」を両立させるため。
         if let Some(Verdict::Deny(rule)) = &verdict {
             return Some(Decision::Deny(format!(
@@ -163,22 +219,24 @@ impl PermissionGate {
         None
     }
 
-    fn prompt(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+    fn prompt(&self, tool_name: &str, args: &serde_json::Value, once_only: bool) -> bool {
         use std::io::IsTerminal;
         let stdin = io::stdin();
         // Enter だけで yes になるのは、人が端末で答えているときだけ。パイプされた入力の
         // 空行は答えではない (`printf 'do it\n\n' | lodan` が無承認で通ってしまう)。
         let enter_means_yes = stdin.is_terminal();
-        self.prompt_with(
+        self.prompt_full(
             tool_name,
             args,
             &mut stdin.lock(),
             &mut io::stdout().lock(),
             enter_means_yes,
+            once_only,
         )
     }
 
-    /// `prompt` の本体。入出力を差し替えられるようにしてある (テスト用)。
+    /// 通常の承認プロンプト。入出力を差し替えられるようにしてある (テスト用)。
+    #[cfg(test)]
     fn prompt_with(
         &self,
         tool_name: &str,
@@ -186,6 +244,19 @@ impl PermissionGate {
         input: &mut dyn BufRead,
         stdout: &mut dyn Write,
         enter_means_yes: bool,
+    ) -> bool {
+        self.prompt_full(tool_name, args, input, stdout, enter_means_yes, false)
+    }
+
+    /// `prompt` の本体。`once_only` は hook が確認を求めた場合: 選べるのは yes / no だけ。
+    fn prompt_full(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        input: &mut dyn BufRead,
+        stdout: &mut dyn Write,
+        enter_means_yes: bool,
+        once_only: bool,
     ) -> bool {
         let summary = summarize(tool_name, args);
         // MCP ツールの名前はサーバが決める。プロンプトに出すのは無害化した形。
@@ -214,6 +285,8 @@ impl PermissionGate {
                 stdout,
                 "{}",
                 crate::term::dim(&match &persistable {
+                    _ if once_only =>
+                        "  a hook asked for confirmation:  (y) yes once  (n) no".to_string(),
                     Some(rule) => format!(
                         "  (y) yes once  (n) no  (a) always allow {tool_label}  (e) always allow this exact  \
                          (p) always allow `{rule}` in this project"
@@ -235,13 +308,13 @@ impl PermissionGate {
                 "" if !enter_means_yes => continue,
                 "y" | "Y" | "" => return true,
                 "n" | "N" => return false,
-                "a" | "A" => {
+                "a" | "A" if !once_only => {
                     if let Ok(mut p) = self.policy.lock() {
                         p.always_tools.insert(tool_name.to_string());
                     }
                     return true;
                 }
-                "p" | "P" if persistable.is_some() => {
+                "p" | "P" if persistable.is_some() && !once_only => {
                     let rule = persistable.as_deref().unwrap_or_default();
                     match crate::config::append_local_allow_rule(&self.cwd, rule) {
                         Ok(path) => {
@@ -272,7 +345,7 @@ impl PermissionGate {
                     }
                     return true;
                 }
-                "e" | "E" => {
+                "e" | "E" if !once_only => {
                     if tool_name == "Bash"
                         && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
                     {
@@ -712,6 +785,58 @@ mod tests {
             .err()
             .unwrap();
         assert!(format!("{err:#}").contains("Bash(rm *"), "{err:#}");
+    }
+
+    /// hook が確認を求めた呼び出しでは、「常に許可」を選ばせない (選んでも、次回また hook が
+    /// 尋ねさせるので効かない。(p) はファイルにまで書いてしまう)。
+    #[test]
+    fn a_prompt_requested_by_a_hook_offers_only_yes_and_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let args = bash("cargo test");
+        let mut out = Vec::new();
+        // a / e / p は答えとして受け付けず、尋ね直す。最後の n で拒否。
+        let allowed = gate.prompt_full(
+            "Bash",
+            &args,
+            &mut "a\ne\np\nn\n".as_bytes(),
+            &mut out,
+            true,
+            true,
+        );
+        assert!(!allowed);
+        let shown = String::from_utf8_lossy(&out);
+        assert!(shown.contains("a hook asked for confirmation"), "{shown}");
+        assert!(!shown.contains("(a)") && !shown.contains("(p)"), "{shown}");
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
+        // 「常に許可」が記録されていないので、同じ呼び出しは次も尋ねる必要がある。
+        assert_eq!(gate.decide_quietly("Bash", &args, true), None);
+    }
+
+    #[test]
+    fn a_hook_allow_does_not_override_dont_ask_mode() {
+        use crate::hooks::PermissionHint;
+        let args = bash("cargo test");
+        let dont_ask = gate_with(crate::config::PermissionMode::DontAsk, &[], &[], &[]);
+        assert!(matches!(
+            dont_ask.decide_hinted("Bash", &args, true, Some(PermissionHint::Allow)),
+            Decision::Deny(_)
+        ));
+        // 尋ねる相手がいないだけの実行 (`-p`) では、hook が承認役になれる。
+        let headless = PermissionGate::from_config(
+            &crate::config::Config::default(),
+            Path::new("/work"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            headless.decide_hinted("Bash", &args, true, Some(PermissionHint::Allow)),
+            Decision::Allow
+        );
+        assert!(matches!(
+            headless.decide_hinted("Bash", &args, true, None),
+            Decision::Deny(_)
+        ));
     }
 
     fn answer(input: &str, enter_means_yes: bool) -> bool {

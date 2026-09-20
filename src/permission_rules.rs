@@ -1327,6 +1327,8 @@ mod tests {
         assert_eq!(file(&set, "Edit", "src/lib.rs"), None);
         assert_eq!(file(&set, "Edit", "Cargo.toml"), Some(Verdict::Allow));
         assert_eq!(file(&set, "Edit", "Cargo.lock"), None);
+        // `./` つきは cwd 直下のそのファイルだけ。`/` の無いパターン (どの階層にも一致) とは違う。
+        assert_eq!(file(&set, "Edit", "crates/app/Cargo.toml"), None);
         assert_eq!(
             file(&set, "Write", "src/agent/x.rs"),
             None,

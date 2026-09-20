@@ -470,11 +470,34 @@ fn real_cwd(cwd: &Path) -> PathBuf {
 /// 「`src/link -> /outside` の下に**新しい**ファイルを Write する」が字句上のパスだけで
 /// `Write(src/**)` に一致し、cwd の外へ書けてしまう。
 fn resolve_through_symlinks(lexical: &Path) -> PathBuf {
+    resolve_with_budget(lexical, MAX_SYMLINK_HOPS)
+}
+
+/// 行き先の無い symlink をたどる回数の上限 (ループ対策)。
+const MAX_SYMLINK_HOPS: u32 = 16;
+
+/// 解決しきれなかったときに返す、どの allow にも一致しないパス。
+const UNRESOLVABLE: &str = "/\u{0}unresolvable-symlink";
+
+fn resolve_with_budget(lexical: &Path, hops_left: u32) -> PathBuf {
     let mut tail = Vec::new();
     let mut probe = lexical;
     loop {
         if let Ok(real) = std::fs::canonicalize(probe) {
             return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        // 実在しないように見えても、**行き先がまだ無い symlink** かもしれない。書き込みは
+        // symlink をたどってリンク先にファイルを作るので、リンク先のパスで判定し直す。
+        if let Ok(target) = std::fs::read_link(probe) {
+            if hops_left == 0 {
+                return PathBuf::from(UNRESOLVABLE);
+            }
+            let base = probe.parent().unwrap_or(Path::new("/"));
+            let mut next = normalize(&base.join(target));
+            for part in tail.iter().rev() {
+                next.push(part);
+            }
+            return resolve_with_budget(&next, hops_left - 1);
         }
         match (probe.parent(), probe.file_name()) {
             (Some(parent), Some(name)) => {
@@ -1372,6 +1395,34 @@ mod tests {
         ));
         // そして (p) は出さない (保存したルールが同じ呼び出しを allow しないので)。
         assert_eq!(persistable_allow_rule("Write", &new_file, &cwd), None);
+
+        // 行き先がまだ無い symlink。書き込みはリンクをたどって cwd の外にファイルを作る。
+        std::os::unix::fs::symlink(outside.join("not-yet.txt"), cwd.join("src/dangling.txt"))
+            .unwrap();
+        let dangling = json!({ "path": "src/dangling.txt" });
+        assert_eq!(allow.evaluate("Write", &dangling, &cwd), None);
+        assert!(matches!(
+            deny.evaluate("Write", &dangling, &cwd),
+            Some(Verdict::Deny(_))
+        ));
+        // 相対のリンク先と、ループ。
+        std::os::unix::fs::symlink("../../outside/rel.txt", cwd.join("src/rel.txt")).unwrap();
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/rel.txt" }), &cwd),
+            None
+        );
+        std::os::unix::fs::symlink("loop-b", cwd.join("src/loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", cwd.join("src/loop-b")).unwrap();
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/loop-a" }), &cwd),
+            None
+        );
+        // cwd の中を指す、行き先の無い symlink は問題ない。
+        std::os::unix::fs::symlink("real/inside.txt", cwd.join("src/inside-link.txt")).unwrap();
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/inside-link.txt" }), &cwd),
+            Some(Verdict::Allow)
+        );
     }
 
     #[test]

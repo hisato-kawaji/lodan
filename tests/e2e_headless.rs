@@ -36,12 +36,18 @@ fn start_mock(demo_dir: &Path) -> MockServer {
 
 /// `text` を挨拶の代わりに返す mock。敵対的な文字列を本文として流すテスト用。
 fn start_mock_saying(demo_dir: &Path, text: Option<&str>) -> MockServer {
+    let envs: Vec<(&str, &str)> = text.map(|t| ("MOCK_LLM_TEXT", t)).into_iter().collect();
+    start_mock_with(demo_dir, &envs)
+}
+
+/// mock の振る舞いを環境変数で差し替えて起動する (`mock_llm.py` の冒頭を参照)。
+fn start_mock_with(demo_dir: &Path, envs: &[(&str, &str)]) -> MockServer {
     let script: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_llm.py");
     let mut child = Command::new("python3")
         .arg(script)
         .arg("0")
         .arg(demo_dir)
-        .envs(text.map(|t| ("MOCK_LLM_TEXT", t)))
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -952,4 +958,26 @@ fn the_trust_notice_is_printed_once() {
         1,
         "{stderr}"
     );
+}
+
+/// `--sandbox` が設定 → セッション → Bash ツールまで届いている。read-only なら、承認済み
+/// (`--yes`) のコマンドでも作業ディレクトリに書けない。
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sandbox_flag_reaches_the_bash_tool() {
+    let run = |extra: &[&str]| {
+        let home = tempfile::tempdir().unwrap();
+        let server = start_mock_with(home.path(), &[("MOCK_LLM_BASH", "echo a > written.txt")]);
+        let mut args = vec!["--yes", "-p", "run the demo", "--output-format", "json"];
+        args.extend_from_slice(extra);
+        let out = lodan(home.path(), server.port, &args, Stdin::OpenAndSilent);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        home.path().join("work/written.txt").exists()
+    };
+    assert!(run(&[]), "positive control: the command writes the file");
+    assert!(!run(&["--sandbox", "read-only"]));
 }

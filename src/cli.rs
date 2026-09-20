@@ -68,6 +68,14 @@ pub struct Cli {
     )]
     pub fallback_provider: Option<Provider>,
 
+    /// Confine Bash with the OS sandbox: off (default), workspace-write, read-only
+    #[arg(long, env = "LODAN_SANDBOX", value_enum, value_name = "MODE")]
+    pub sandbox: Option<crate::sandbox::SandboxMode>,
+
+    /// Allow network access from sandboxed Bash commands (default true; ignored when the sandbox is off)
+    #[arg(long, env = "LODAN_SANDBOX_NETWORK", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub sandbox_network: Option<bool>,
+
     /// How calls that need approval are handled: default, accept-edits, plan, dont-ask, bypass (= --yes)
     #[arg(long, env = "LODAN_PERMISSION_MODE", value_enum)]
     pub permission_mode: Option<crate::config::PermissionMode>,
@@ -177,6 +185,8 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,
         parallel_tools: args.parallel_tools,
+        sandbox: args.sandbox,
+        sandbox_network: args.sandbox_network,
         permission_mode: args.permission_mode,
         allowed_tools: args.allowed_tools,
         disallowed_tools: args.disallowed_tools,

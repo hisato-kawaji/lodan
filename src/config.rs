@@ -34,6 +34,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
     pub permissions: PermissionsConfig,
+    pub sandbox: crate::sandbox::SandboxConfig,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
 }
@@ -492,6 +493,14 @@ impl Config {
             self.agent.dup_suppress = v;
             mark("agent.dup_suppress".into());
         }
+        if let Some(v) = o.sandbox {
+            self.sandbox.mode = v;
+            mark("sandbox.mode".into());
+        }
+        if let Some(v) = o.sandbox_network {
+            self.sandbox.network = v;
+            mark("sandbox.network".into());
+        }
         if let Some(v) = o.permission_mode {
             self.permissions.mode = v;
             mark("permissions.mode".into());
@@ -544,6 +553,8 @@ pub struct Overrides {
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,
     pub parallel_tools: Option<bool>,
+    pub sandbox: Option<crate::sandbox::SandboxMode>,
+    pub sandbox_network: Option<bool>,
     pub permission_mode: Option<PermissionMode>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,

@@ -61,8 +61,13 @@ impl Tool for Bash {
             return self.spawn_background(command, ctx).await;
         }
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&command).current_dir(&ctx.cwd);
+        let (program, program_args) = match crate::sandbox::wrap(&ctx.sandbox, &command) {
+            Ok(wrapped) => wrapped,
+            // サンドボックスを頼まれたのに道具が無い。外で走らせずに失敗させる。
+            Err(why) => return Ok(ToolOutput::error(why)),
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(program_args).current_dir(&ctx.cwd);
         // foreground 実行はタイムアウトや Ctrl-C 中断で future を破棄したとき
         // 子プロセスを残さない (tokio の既定は kill_on_drop=false)。
         cmd.kill_on_drop(true);
@@ -81,9 +86,15 @@ impl Tool for Bash {
         let stderr = truncate(String::from_utf8_lossy(&output.stderr).into_owned());
         let code = output.status.code().unwrap_or(-1);
 
-        let body = format!(
+        let mut body = format!(
             "$ {command}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- exit ---\n{code}\n"
         );
+        // 末尾の `--- exit ---` は表示側が読むので崩さない。注記は stderr の直後に差し込む。
+        if let Some(hint) =
+            crate::sandbox::denial_hint(&ctx.sandbox, &stderr, output.status.success())
+        {
+            body = body.replacen("\n--- exit ---\n", &format!("\n{hint}\n--- exit ---\n"), 1);
+        }
         Ok(if output.status.success() {
             ToolOutput::ok(body)
         } else {
@@ -103,9 +114,12 @@ impl Bash {
         command: String,
         ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&command)
+        let (program, program_args) = match crate::sandbox::wrap(&ctx.sandbox, &command) {
+            Ok(wrapped) => wrapped,
+            Err(why) => return Ok(ToolOutput::error(why)),
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(program_args)
             .current_dir(&ctx.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -376,5 +390,27 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("bash_404"));
+    }
+
+    /// サンドボックスに拒否された失敗には、モデル向けの注記が `--- exit ---` の前に入る。
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_sandboxed_write_is_refused_and_explained() {
+        use crate::sandbox::{SandboxConfig, SandboxMode, SandboxPolicy};
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = SandboxConfig {
+            mode: SandboxMode::ReadOnly,
+            network: true,
+        };
+        let ctx = ToolCtx::new(tmp.path().to_path_buf())
+            .with_sandbox(SandboxPolicy::new(&cfg, tmp.path()));
+        let out = Bash
+            .execute(serde_json::json!({"command": "echo a > blocked.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(!tmp.path().join("blocked.txt").exists());
+        let hint = out.content.find("[sandbox]").expect("hint");
+        assert!(hint < out.content.find("--- exit ---").unwrap());
     }
 }

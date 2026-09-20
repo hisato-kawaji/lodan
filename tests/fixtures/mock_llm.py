@@ -24,6 +24,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 def build_steps(demo_dir):
+    # MOCK_LLM_BASH: demo を「この Bash コマンド 1 回」に差し替える (サンドボックスの e2e 用)。
+    bash_only = os.environ.get("MOCK_LLM_BASH")
+    if bash_only:
+        return [("Bash", {"command": bash_only})]
     return [
         ("Write", {"path": f"{demo_dir}/hello.txt", "content": "hi"}),
         ("Read",  {"path": f"{demo_dir}/hello.txt"}),

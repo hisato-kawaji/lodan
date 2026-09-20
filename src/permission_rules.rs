@@ -105,7 +105,9 @@ impl Rule {
                 (tool.trim(), Some(pattern))
             }
         };
-        if tool.is_empty() || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        // MCP のツール名はサーバが決める (`mcp__context7__get-library-docs` など)。`-` と `.` も通す。
+        let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+        if tool.is_empty() || !tool.chars().all(name_char) {
             bail!("permission rule `{raw}`: `{tool}` is not a tool name");
         }
 
@@ -168,6 +170,11 @@ impl Rule {
                 && tool
                     .strip_prefix(self.tool.as_str())
                     .is_some_and(|rest| rest.starts_with("__")))
+    }
+
+    /// allow ルールとしてこの呼び出しに一致するか (ゲートがセッション中に保存したルール用)。
+    pub fn allows(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> bool {
+        self.permits(tool, args, &real_cwd(cwd))
     }
 
     /// allow / ask として一致するか。追い切れない Bash コマンドには一致しない。
@@ -440,14 +447,80 @@ fn path_candidates(tool: &str, args: &serde_json::Value, cwd: &Path) -> Vec<Path
         None if SEARCH_TOOLS.contains(&tool) => ".",
         None => return Vec::new(),
     };
-    let lexical = normalize(&cwd.join(raw));
+    let joined = cwd.join(raw);
+    let lexical = normalize(&joined);
     let mut out = vec![lexical.clone()];
-    if let Ok(real) = std::fs::canonicalize(&lexical)
-        && real != lexical
-    {
+    // 解決は `..` を畳む**前**のパスに対して行う。OS は左から順にたどるので、
+    // `src/link/../evil.txt` の `..` は link をたどった先の親を指す。先に畳むと link が消える。
+    let real = resolve_through_symlinks(&joined);
+    if real != lexical {
         out.push(real);
     }
     out
+}
+
+/// cwd 自身を symlink 解決した形。パスの候補は symlink を解決して比べるので、基準の cwd も
+/// 揃えておかないと、cwd が symlink 越し (macOS の `/var` → `/private/var` など) のときに
+/// 「cwd 以下」の判定が食い違い、相対パターンの allow が一切効かなくなる。
+/// (モデルが symlink 越しの綴りで絶対パスを渡した場合、字句上の候補は cwd の外に見えるので
+/// allow は一致せず尋ねる側に倒れる。deny は解決後の候補で効く。)
+fn real_cwd(cwd: &Path) -> PathBuf {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// 行き先をたどる回数の上限 (ループ対策)。
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+/// 解決しきれなかったときに返す、どの allow にも一致しないパス。
+const UNRESOLVABLE: &str = "/\u{0}unresolvable-symlink";
+
+/// OS がこのパスをたどったときに実際に行き着く場所。**まだ存在しないファイルでも**求まる。
+///
+/// `canonicalize` はパス全体が実在しないと失敗するので使わない。要素を左から 1 つずつ見て、
+/// symlink ならリンク先 (相対なら、そこまでに解決した場所が基準) に置き換える。これで次の
+/// 3 つが同じ規則で片づく — どれも、字句上は `src/` の下に見えるのに書き込みは cwd の外へ行く:
+///
+/// - 途中のディレクトリが symlink: `src/link/new.txt` (`src/link -> /outside`)
+/// - 最後の要素が、行き先のまだ無い symlink: `src/x -> /outside/new.txt`
+/// - symlink の後ろの `..`: `src/link/../evil.txt` は `/outside` の親に着地する
+fn resolve_through_symlinks(path: &Path) -> PathBuf {
+    let mut hops = MAX_SYMLINK_HOPS;
+    resolve_components(path, &mut hops).unwrap_or_else(|| PathBuf::from(UNRESOLVABLE))
+}
+
+/// `path` は絶対パスであること。相対だと最初の `read_link` がプロセスの cwd 基準になり、
+/// ゲートの cwd と食い違う (呼び出し元は必ず `cwd.join(raw)` を渡す)。
+fn resolve_components(path: &Path, hops_left: &mut u32) -> Option<PathBuf> {
+    debug_assert!(
+        path.is_absolute(),
+        "resolve_components needs an absolute path: {path:?}"
+    );
+    let mut real = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => real.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                real.pop();
+            }
+            Component::Normal(name) => {
+                let next = real.join(name);
+                match std::fs::read_link(&next) {
+                    Ok(target) => {
+                        if *hops_left == 0 {
+                            return None;
+                        }
+                        *hops_left -= 1;
+                        // 相対のリンク先は、リンクのあるディレクトリ (= ここまでの real) が基準。
+                        real = resolve_components(&real.join(target), hops_left)?;
+                    }
+                    // symlink でない (実在するか、まだ無いか)。そのまま進む。
+                    Err(_) => real = next,
+                }
+            }
+        }
+    }
+    Some(real)
 }
 
 /// `.` と `..` を字句的に畳む (ファイルシステムには触らない)。
@@ -612,6 +685,90 @@ fn scan_command(command: &str) -> (Vec<String>, bool) {
     (parts, opaque)
 }
 
+/// 承認プロンプトの「このプロジェクトで常に許可」が保存するルール。保存しても意図どおりに
+/// 効かない呼び出しには `None` (選択肢を出さない)。
+///
+/// - Bash: そのコマンドの完全一致。複合コマンドや追い切れない構文は、allow として決して一致
+///   しないので対象外。`*` を含むコマンドは、保存するとワイルドカードとして解釈されて意図より
+///   広く一致するので対象外。`:*` で終わるコマンドも同じ理由で対象外
+/// - それ以外: ツール名 (そのツールの全呼び出し)。セッション中の「(a) always」と同じ広さ
+pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value, cwd: &Path) -> Option<String> {
+    let cwd = &real_cwd(cwd);
+    // 計画の承認は毎回目を通すもの。保存して自動承認にはさせない。
+    if tool == "ExitPlanMode" {
+        return None;
+    }
+    let rule = if tool == "Bash" {
+        let command = bash_command(args)?.trim();
+        let simple = matches!(split_command(command), Some(parts) if parts.len() == 1);
+        if !simple || command.contains(['*', '(', ')']) || command.chars().any(is_invisible) {
+            return None;
+        }
+        format!("Bash({command})")
+    } else if PATH_TOOLS.contains(&tool) {
+        // ツール全体ではなく、そのファイルのあるディレクトリ以下に絞る。1 回の承認が
+        // 「どのパスへの Edit も永久に許可」になるのは広すぎる。cwd の外は保存しない。
+        let raw = args.get("path").and_then(|v| v.as_str())?;
+        // プロンプトに表示されるのはこのパス。不可視文字が混ざっていたら保存させない。
+        if raw.chars().any(is_invisible) {
+            return None;
+        }
+        let path = normalize(&cwd.join(raw));
+        let dir = path.parent()?.strip_prefix(cwd).ok()?.to_str()?.to_string();
+        if dir.contains(['*', '?', '[', ']', '{', '}', '(', ')']) || dir.chars().any(is_invisible) {
+            return None;
+        }
+        if dir.is_empty() {
+            // cwd 直下のファイル。`Tool(**)` は cwd 以下の全てになってしまうので、そのファイルだけ。
+            let name = path.file_name()?.to_str()?;
+            if name.contains(['*', '?', '[', ']', '{', '}', '(', ')'])
+                || name.chars().any(is_invisible)
+            {
+                return None;
+            }
+            format!("{tool}(./{name})")
+        } else {
+            format!("{tool}({dir}/**)")
+        }
+    } else if tool == "WebFetch" {
+        format!("WebFetch(domain:{})", url_host(args)?)
+    } else {
+        // それ以外 (MCP ツールなど) は絞る軸が無いので、そのツールの全呼び出し。
+        tool.to_string()
+    };
+    // 保存したものが読めて、同じ呼び出しに一致することを確かめてから返す。読めないルールを
+    // 保存すると、次の起動が設定エラーで止まる。
+    let parsed = Rule::parse(&rule).ok()?;
+    parsed.check_usable_as_allow().ok()?;
+    parsed.permits(tool, args, cwd).then_some(rule)
+}
+
+/// 表示されない、または表示順を変える文字。モデルが渡した文字列を承認プロンプトに出すとき、
+/// これらが混ざっていると「見えているもの」と「実行されるもの」が食い違う。
+/// 制御文字 (Cc) に加えて、書式文字 (Cf) のうち実害のあるもの — 双方向テキストの上書き
+/// (U+202E など)、ゼロ幅文字、ソフトハイフン、タグ文字 — を含める。
+pub fn is_invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
 /// ルールだけで決まる判定。どのルールにも当たらなければ `None` (既定の扱いに任せる)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -670,6 +827,7 @@ impl RuleSet {
         cwd: &Path,
         deadline: std::time::Instant,
     ) -> Option<Verdict> {
+        let cwd = &real_cwd(cwd);
         let mut unverifiable = None;
         for rule in &self.deny {
             match rule.forbids(tool, args, cwd, deadline) {
@@ -1168,6 +1326,209 @@ mod tests {
         );
         assert_eq!(
             all.evaluate("Grep", &json!({ "pattern": "x", "path": ".." }), &cwd),
+            None
+        );
+    }
+
+    #[test]
+    fn only_calls_whose_saved_rule_would_mean_the_same_thing_can_be_persisted() {
+        let cwd = Path::new("/work");
+        let rule = |cmd: &str| persistable_allow_rule("Bash", &json!({ "command": cmd }), cwd);
+        assert_eq!(
+            rule("cargo test --lib").as_deref(),
+            Some("Bash(cargo test --lib)")
+        );
+        assert_eq!(rule("  git status  ").as_deref(), Some("Bash(git status)"));
+        assert_eq!(
+            rule("git commit -m 'a; b'").as_deref(),
+            Some("Bash(git commit -m 'a; b')")
+        );
+        assert_eq!(
+            rule("npm run test:unit").as_deref(),
+            Some("Bash(npm run test:unit)")
+        );
+        // 保存すると意味が変わるもの、決して一致しないものは出さない。
+        for cmd in [
+            "ls && rm -rf build",        // 複合: allow として一致しない
+            "echo $(date)",              // 追い切れない
+            "echo hi > out.txt",         // リダイレクト
+            "ls *.rs",                   // `*` がワイルドカードになり、意図より広く一致する
+            "(cd x; ls)",                // 括弧はルールの構文と衝突する
+            "ls\x1b[2K\x1b[1Gecho safe", // エスケープで表示を書き換える
+            "ls\tfoo",
+            "ls \u{202E}fdp.exe", // 双方向テキストの上書き
+            "ls\u{200B}",         // ゼロ幅
+            "",
+        ] {
+            assert_eq!(rule(cmd), None, "{cmd:?}");
+        }
+        assert_eq!(
+            persistable_allow_rule("ExitPlanMode", &json!({ "plan": "x" }), cwd),
+            None
+        );
+
+        // 保存したルールは、読み直すと同じ呼び出しを allow する。
+        let saved = rule("cargo test --lib").unwrap();
+        let set = rules(&[&saved], &[], &[]);
+        assert_eq!(bash(&set, "cargo test --lib"), Some(Verdict::Allow));
+        assert_eq!(bash(&set, "cargo test --lib && rm -rf /"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_under_a_symlinked_directory_is_judged_by_where_it_would_really_land() {
+        // pr-review #99: まだ存在しないファイルは canonicalize できないので、字句上のパスだけで
+        // allow に一致して cwd の外へ書けていた。
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (cwd, outside) = (root.join("work"), root.join("outside"));
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("src/link")).unwrap();
+
+        let new_file = json!({ "path": "src/link/new.txt" });
+        let deep_new = json!({ "path": "src/link/a/b/new.txt" });
+        let allow = rules(&["Write(src/**)"], &[], &[]);
+        assert_eq!(
+            allow.evaluate("Write", &new_file, &cwd),
+            None,
+            "it would land outside src/"
+        );
+        assert_eq!(allow.evaluate("Write", &deep_new, &cwd), None);
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/real/new.txt" }), &cwd),
+            Some(Verdict::Allow),
+            "a not-yet-existing file in a real directory is still allowed"
+        );
+        // deny は着地点でも効く。
+        let deny = rules(&[], &[&format!("Write({}/**)", outside.display())], &[]);
+        assert!(matches!(
+            deny.evaluate("Write", &new_file, &cwd),
+            Some(Verdict::Deny(_))
+        ));
+        // そして (p) は出さない (保存したルールが同じ呼び出しを allow しないので)。
+        assert_eq!(persistable_allow_rule("Write", &new_file, &cwd), None);
+
+        // 行き先がまだ無い symlink。書き込みはリンクをたどって cwd の外にファイルを作る。
+        std::os::unix::fs::symlink(outside.join("not-yet.txt"), cwd.join("src/dangling.txt"))
+            .unwrap();
+        let dangling = json!({ "path": "src/dangling.txt" });
+        assert_eq!(allow.evaluate("Write", &dangling, &cwd), None);
+        assert!(matches!(
+            deny.evaluate("Write", &dangling, &cwd),
+            Some(Verdict::Deny(_))
+        ));
+        // 相対のリンク先と、ループ。
+        std::os::unix::fs::symlink("../../outside/rel.txt", cwd.join("src/rel.txt")).unwrap();
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/rel.txt" }), &cwd),
+            None
+        );
+        std::os::unix::fs::symlink("loop-b", cwd.join("src/loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", cwd.join("src/loop-b")).unwrap();
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/loop-a" }), &cwd),
+            None
+        );
+        // symlink の後ろの `..`。字句的には src/evil.txt だが、着地するのは outside の親。
+        let dotdot = json!({ "path": "src/link/../evil.txt" });
+        assert_eq!(allow.evaluate("Write", &dotdot, &cwd), None);
+        let parent_deny = rules(&[], &[&format!("Write({}/evil.txt)", root.display())], &[]);
+        assert!(matches!(
+            parent_deny.evaluate("Write", &dotdot, &cwd),
+            Some(Verdict::Deny(_))
+        ));
+        assert_eq!(persistable_allow_rule("Write", &dotdot, &cwd), None);
+        assert_eq!(
+            persistable_allow_rule(
+                "Write",
+                &json!({ "path": "src/link/../outside/z.txt" }),
+                &cwd
+            ),
+            None
+        );
+        // symlink の絡まない `..` は従来どおり。
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/real/../ok.txt" }), &cwd),
+            Some(Verdict::Allow)
+        );
+
+        // cwd の中を指す、行き先の無い symlink は問題ない。
+        std::os::unix::fs::symlink("real/inside.txt", cwd.join("src/inside-link.txt")).unwrap();
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/inside-link.txt" }), &cwd),
+            Some(Verdict::Allow)
+        );
+    }
+
+    #[test]
+    fn a_saved_file_rule_covers_the_directory_not_the_whole_tool() {
+        let cwd = Path::new("/work");
+        let edit = |path: &str| persistable_allow_rule("Edit", &json!({ "path": path }), cwd);
+        assert_eq!(
+            edit("src/agent/loop.rs").as_deref(),
+            Some("Edit(src/agent/**)")
+        );
+        assert_eq!(edit("/work/src/lib.rs").as_deref(), Some("Edit(src/**)"));
+        assert_eq!(
+            edit("src/agent/../lib.rs").as_deref(),
+            Some("Edit(src/**)"),
+            "`..` is folded first"
+        );
+        // cwd 直下は、そのファイルだけ (`Edit(**)` にはしない)。
+        assert_eq!(edit("Cargo.toml").as_deref(), Some("Edit(./Cargo.toml)"));
+        // cwd の外、glob の文字を含むディレクトリ、不可視文字は保存しない。
+        assert_eq!(edit("/etc/hosts"), None);
+        assert_eq!(edit("../outside/x.rs"), None);
+        assert_eq!(edit("we[i]rd/x.rs"), None);
+        assert_eq!(edit("src\u{202E}/x.rs"), None);
+
+        // 読み直すと、そのディレクトリ以下だけを allow する。
+        let set = rules(&["Edit(src/agent/**)", "Edit(./Cargo.toml)"], &[], &[]);
+        assert_eq!(
+            file(&set, "Edit", "src/agent/subagent.rs"),
+            Some(Verdict::Allow)
+        );
+        assert_eq!(file(&set, "Edit", "src/lib.rs"), None);
+        assert_eq!(file(&set, "Edit", "Cargo.toml"), Some(Verdict::Allow));
+        assert_eq!(file(&set, "Edit", "Cargo.lock"), None);
+        // `./` つきは cwd 直下のそのファイルだけ。`/` の無いパターン (どの階層にも一致) とは違う。
+        assert_eq!(file(&set, "Edit", "crates/app/Cargo.toml"), None);
+        assert_eq!(
+            file(&set, "Write", "src/agent/x.rs"),
+            None,
+            "a rule is per tool"
+        );
+    }
+
+    #[test]
+    fn other_tools_are_saved_only_in_a_form_that_loads_again() {
+        let cwd = Path::new("/work");
+        let fetch =
+            persistable_allow_rule("WebFetch", &json!({ "url": "https://Docs.RS/tokio" }), cwd);
+        assert_eq!(fetch.as_deref(), Some("WebFetch(domain:docs.rs)"));
+        assert_eq!(
+            persistable_allow_rule("WebFetch", &json!({ "url": "not a url" }), cwd),
+            None
+        );
+        // MCP のツール名はサーバが決める。`-` や `.` を含む実在の名前が読み込めること
+        // (読めないルールを保存すると次の起動が止まる)。
+        for name in [
+            "mcp__context7__get-library-docs",
+            "mcp__srv__ns.tool",
+            "mcp__github__create_issue",
+        ] {
+            let saved = persistable_allow_rule(name, &json!({}), cwd).expect(name);
+            assert_eq!(saved, name);
+            assert!(RuleSet::parse(&[saved], &[], &[]).is_ok(), "{name}");
+        }
+        // 構文と衝突する名前は保存しない。
+        assert_eq!(
+            persistable_allow_rule("mcp__srv__weird name", &json!({}), cwd),
+            None
+        );
+        assert_eq!(
+            persistable_allow_rule("mcp__srv__a(b)", &json!({}), cwd),
             None
         );
     }

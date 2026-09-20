@@ -141,7 +141,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 ## 設定
 
-階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `--config <path>` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
+階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `$CWD/.lodan/config.local.toml` (個人用・コミットしない) ← `--config <path>` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
 
 ユーザ設定の場所は OS の流儀に従う (`directories` crate): Linux は `~/.config/lodan/config.toml`、**macOS は `~/Library/Application Support/lodan/config.toml`**。以下 `~/.config/lodan/` と書いている箇所は macOS では後者に読み替えること。
 
@@ -244,6 +244,8 @@ hi を書きました。
 lodan> /exit
 ```
 
+cwd の中のファイルや単純な Bash コマンドでは、5 つ目の選択肢 `(p) always allow … in this project` も出る (この例は cwd の外の `/tmp` なので出ない。詳細は[権限ルールとモード](#権限ルールとモード))。
+
 承認プロンプトは **Enter だけで yes** だが、それは stdin が端末のときに限る。プロンプトをパイプで渡した実行 (`echo "..." | lodan`) では、空行は答えとして扱わず、誰も答えないまま入力が尽きた (EOF) 承認は `(no input — denied)` で**拒否**する。無人実行で破壊的ツールを通したいときは `--yes` を明示すること。
 
 組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept` `/undo`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
@@ -308,6 +310,19 @@ deny  = ["Read(**/.env)", "Grep(**/.env)", "Glob(**/.env)", "Read(~/.ssh/**)", "
 - ルールはユーザ設定 → プロジェクト設定 → `--config` の間で**連結**される。プロジェクト設定はユーザ設定の deny を消せない。**ただし広げることはできる**: プロジェクトの `.lodan/config.toml` は `allow = ["Bash(*)"]` を足すことも `mode = "bypass"` にすることもできる (信頼していないリポジトリで lodan を起動しない、という既存の前提のまま。未信頼ディレクトリの設定を読む前に確認する workspace trust は #75)。`--allowed-tools <RULE>` / `--disallowed-tools <RULE>` (繰り返し可) も足すだけで、置き換えない
 - 解釈できないルールが 1 つでもあれば**起動時にエラー**。権限の設定を黙って読み飛ばさない
 
+**承認プロンプトから保存する**: プロンプトの `(p) always allow … in this project` を選ぶと、その呼び出しの allow ルールが `$CWD/.lodan/config.local.toml` に追記され、次のセッションからは尋ねられない (選んだセッションでも以後は尋ねない)。
+
+- 保存されるのは、プロンプトに表示された**そのルール**。広さはツールごとに違う:
+  - Bash: **そのコマンドの完全一致** (`Bash(cargo test --lib)`)
+  - ファイルのツール (Edit / Write / …): **そのファイルのあるディレクトリ以下** (`Edit(src/agent/**)`。cwd 直下のファイルならそのファイルだけ `Edit(./Cargo.toml)`)。cwd の外のパスは保存できない
+  - WebFetch: そのホスト (`WebFetch(domain:docs.rs)`)
+  - それ以外 (MCP ツールなど): そのツールの全呼び出し
+- 選んだセッションでも、保存したのと同じ広さでしか通らない (`Edit(src/**)` を保存して Edit 全体が通る、にはならない)
+- 保存しても意図どおりに効かない呼び出しには `(p)` を出さない: 複合コマンド・`$(…)`・リダイレクト (allow として決して一致しない)、`*` や括弧を含むコマンド (保存するとワイルドカードや構文として解釈され、意味が変わる)、**ask ルールに当たる呼び出し** (ask が優先されるので、保存しても毎回尋ねられる)、計画の承認 (`ExitPlanMode` — 毎回目を通すもの)、不可視の文字を含むもの (下記)
+- プロンプトに出るコマンドやパスは**モデルが渡した文字列**。ANSI エスケープ・CR・双方向テキストの上書き (U+202E)・ゼロ幅文字などは `\u{1b}` のような見える形で表示する — そのまま端末へ流すと、行を書き換えて「承認しようとしているもの」を偽れるため
+- 保存の前に、そのルールが読み直せて同じ呼び出しを allow することを確かめる (読めないルールを保存すると、次の起動が設定エラーで止まる)
+- `config.local.toml` は**個人用**で、共有の `.lodan/config.toml` とは別のレイヤー (プロジェクト設定の後、`--config` の前)。`.gitignore` に入れること。lodan が書き戻すのでコメントは残らない。広げすぎたら、このファイルから行を消せばよい
+
 **ルールの構文** (Claude Code の `permissions` と同じ `Tool` / `Tool(pattern)`):
 
 | 例 | 意味 |
@@ -319,13 +334,13 @@ deny  = ["Read(**/.env)", "Grep(**/.env)", "Glob(**/.env)", "Read(~/.ssh/**)", "
 | `Read(src/**)` / `Edit(*.md)` | パスの glob。相対パターンは cwd 基準。`/` の無いパターンはどの階層のファイル名にも一致 (gitignore と同じ)。対象: Read / Write / Edit / MultiEdit / NotebookEdit / Glob / Grep |
 | `Write(/etc/**)` / `Read(~/.ssh/**)` | 絶対パス / ホーム基準 |
 | `WebFetch(domain:docs.rs)` | ホスト名だけを書く (サブドメインを含む。大文字・末尾ドット・IDN は URL 側と同じ形に正規化される)。判定するのは**最初の URL** だけで、リダイレクト先は見ない |
-| `mcp__github` / `mcp__github__create_issue` | その MCP サーバの全ツール / 1 つだけ |
+| `mcp__github` / `mcp__github__create_issue` | その MCP サーバの全ツール / 1 つだけ (ツール名には英数字と `_` `-` `.` が使える) |
 
 **Bash の複合コマンド**: `Bash(git *)` を allow していても `git status && rm -rf /` は通らない。コマンドを `&&` `||` `;` `|` `&` と改行で分割し、**全ての部分が allow に一致したときだけ**通す。`$(…)`・バッククォート・プロセス置換・リダイレクト (`>` `<`) を含むコマンドは中身を追い切れないので、allow には決して一致させず尋ねる。deny は逆に、コマンド全体か**いずれかの部分**が一致すれば効く。
 
 **検索ツール (Grep / Glob)** は `path` 以下を丸ごと読む (`path` 省略時は cwd)。deny / ask は、**その検索が実際に触れるファイルの中に一致するものがあれば**効く: `deny = ["Grep(secrets/**)"]` は `path` 無しの Grep も止める。判定は Grep / Glob と同じ走査 (`.gitignore` を尊重、隠しファイルは含む) で行うので、`Grep(**/.env)` は `.env` のあるディレクトリの検索だけを止め、gitignore された `.env` は上の階層からの検索では読まれないので止めない (ignore されたディレクトリ自体を起点に指定した検索は中を読むので、止める)。確認は 5 万エントリ / 1 回の判定あたり合計 0.3 秒 (ルールが何個あっても) で打ち切り、確かめきれなかった範囲は通さない (モデルには「`path` を狭めてやり直せ」と返る。`$HOME` 全体のような検索がこれに当たる)。
 
-**パス**: `src/../.env` のような `..` は畳んでから照合する。deny / ask は大文字小文字を無視する (macOS / Windows では `.GITHUB/x` への書き込みが `.github/x` に着地するため)。allow は綴りどおり。Unicode の正規化 (NFC と NFD) は揃えない: macOS の APFS では `café.key` の合成形と分解形が同じファイルを指すが、ルールは書かれた形としか一致しない。非 ASCII のファイル名を deny で守るなら、ディレクトリ単位 (`Write(keys/**)`) で書くこと。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。
+**パス**: `src/../.env` のような `..` は畳んでから照合する。deny / ask は大文字小文字を無視する (macOS / Windows では `.GITHUB/x` への書き込みが `.github/x` に着地するため)。allow は綴りどおり。Unicode の正規化 (NFC と NFD) は揃えない: macOS の APFS では `café.key` の合成形と分解形が同じファイルを指すが、ルールは書かれた形としか一致しない。非 ASCII のファイル名を deny で守るなら、ディレクトリ単位 (`Write(keys/**)`) で書くこと。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。解決は OS と同じく左から 1 要素ずつ行い、まだ存在しないファイルでも求まる: `src/link -> /outside` の下の**新しい**ファイル、行き先のまだ無い symlink (`src/x -> /outside/new.txt`)、symlink の後ろの `..` (`src/link/../evil.txt`) は、どれも字句上は `src/` の下に見えるが、着地点で判定されるので `Write(src/**)` を満たせず、着地点への deny は効く。同じ理由で、macOS の `/tmp` や `/var` (それぞれ `/private/tmp`・`/private/var` への symlink) を指す**絶対パスの allow** は一致しない (`Write(/tmp/**)` は字句上の見え方にしか、`Write(/private/tmp/**)` は解決後の見え方にしか一致せず、allow は両方を要求する)。deny はどちらの綴りでも効く。
 
 **モード** (`[permissions] mode` / `--permission-mode` / `LODAN_PERMISSION_MODE`):
 

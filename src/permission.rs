@@ -9,6 +9,8 @@ use crate::permission_rules::{RuleSet, Verdict};
 pub struct SessionPolicy {
     pub always_tools: HashSet<String>,
     pub always_commands: HashSet<String>,
+    /// このセッション中に `(p)` で保存した allow ルール。次回以降は設定ファイルから読まれる。
+    pub saved_rules: Vec<crate::permission_rules::Rule>,
 }
 
 pub struct PermissionGate {
@@ -141,7 +143,11 @@ impl PermissionGate {
             Some(Verdict::Deny(_) | Verdict::Unverifiable(_)) | None => {}
         }
         if let Ok(p) = self.policy.lock() {
-            if p.always_tools.contains(tool_name) {
+            if p.always_tools.contains(tool_name)
+                || p.saved_rules
+                    .iter()
+                    .any(|r| r.allows(tool_name, args, &self.cwd))
+            {
                 return Some(Decision::Allow);
             }
             if tool_name == "Bash"
@@ -182,6 +188,13 @@ impl PermissionGate {
         enter_means_yes: bool,
     ) -> bool {
         let summary = summarize(tool_name, args);
+        // 保存しても意図どおりに効かない呼び出しには (p) を出さない。
+        // ask ルールに当たる呼び出しは、allow を保存しても毎回尋ねられる (ask が優先)。
+        // 「保存した」と言って効かないものは出さない。
+        let asked_by_rule = self.rules.evaluate(tool_name, args, &self.cwd) == Some(Verdict::Ask);
+        let persistable = (!asked_by_rule)
+            .then(|| crate::permission_rules::persistable_allow_rule(tool_name, args, &self.cwd))
+            .flatten();
         loop {
             let _ = writeln!(
                 stdout,
@@ -195,9 +208,15 @@ impl PermissionGate {
             let _ = writeln!(
                 stdout,
                 "{}",
-                crate::term::dim(&format!(
-                    "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
-                ))
+                crate::term::dim(&match &persistable {
+                    Some(rule) => format!(
+                        "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact  \
+                         (p) always allow `{rule}` in this project"
+                    ),
+                    None => format!(
+                        "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
+                    ),
+                })
             );
             let _ = write!(stdout, "{} ", crate::term::yellow(">"));
             let _ = stdout.flush();
@@ -214,6 +233,33 @@ impl PermissionGate {
                 "a" | "A" => {
                     if let Ok(mut p) = self.policy.lock() {
                         p.always_tools.insert(tool_name.to_string());
+                    }
+                    return true;
+                }
+                "p" | "P" if persistable.is_some() => {
+                    let rule = persistable.as_deref().unwrap_or_default();
+                    match crate::config::append_local_allow_rule(&self.cwd, rule) {
+                        Ok(path) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                crate::term::dim(&format!(
+                                    "  saved `{rule}` to {} (keep this file out of version control)",
+                                    path.display()
+                                ))
+                            );
+                        }
+                        // 保存できなくても今回の承認は有効。次回また尋ねることになるだけ。
+                        Err(e) => {
+                            let _ = writeln!(stdout, "  could not save the rule: {e:#}");
+                        }
+                    }
+                    // このセッションでも以後は尋ねない。保存したのと**同じ広さ**で効かせる
+                    // (`Edit(src/**)` を保存したのに、セッション中は Edit 全体が通る、にしない)。
+                    if let Ok(mut p) = self.policy.lock()
+                        && let Ok(parsed) = crate::permission_rules::Rule::parse(rule)
+                    {
+                        p.saved_rules.push(parsed);
                     }
                     return true;
                 }
@@ -249,17 +295,38 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
         "Bash" => args
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|s| format!("`{s}`"))
+            .map(|s| format!("`{}`", visible(s)))
             .unwrap_or_else(|| args.to_string()),
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => args
             .get("path")
             .and_then(|v| v.as_str())
-            .map(rel_path)
+            .map(|p| visible(&rel_path(p)))
             .unwrap_or_else(|| args.to_string()),
         // 計画本文は直前に表示済みなので、プロンプトには要旨だけ出す。
         "ExitPlanMode" => "approve the plan above and exit plan mode".to_string(),
-        _ => args.to_string(),
+        // serde は C0 の制御文字はエスケープするが、U+202E のような書式文字は素通しする。
+        _ => visible(&args.to_string()),
     }
+}
+
+/// 制御文字を `\u{1b}` のような見える形にする。承認プロンプトに出すのはモデルが渡した文字列で、
+/// ANSI エスケープや CR をそのまま端末へ流すと、行を消したり上書きしたりして「承認しようと
+/// しているもの」を偽れる。
+fn visible(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if crate::permission_rules::is_invisible(c) {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// プレビュー用。コードにはタブが普通にあるので、タブだけはそのまま出す。
+fn visible_line(line: &str) -> String {
+    line.split('\t').map(visible).collect::<Vec<_>>().join("\t")
 }
 
 /// cwd 配下のパスは相対表示にする (#42 P5)。cwd 外・取得失敗時はそのまま。
@@ -313,7 +380,7 @@ fn preview(tool: &str, args: &serde_json::Value) -> Option<String> {
                 if i > 0 {
                     out.push('\n');
                 }
-                out.push_str(&crate::term::green(&format!("  + {line}")));
+                out.push_str(&crate::term::green(&format!("  + {}", visible_line(line))));
             }
             let total = content.lines().count();
             if total > PREVIEW_MAX_LINES {
@@ -338,7 +405,7 @@ fn diff_block(old: &str, new: &str) -> String {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(&color(&format!("  {sign} {line}")));
+            out.push_str(&color(&format!("  {sign} {}", visible_line(line))));
         }
         if total > PREVIEW_MAX_LINES {
             out.push_str(&crate::term::dim(&format!(
@@ -372,6 +439,158 @@ mod tests {
 
     fn bash(cmd: &str) -> serde_json::Value {
         serde_json::json!({ "command": cmd })
+    }
+
+    fn gate_in(cwd: &Path) -> PermissionGate {
+        PermissionGate::from_config(&crate::config::Config::default(), cwd, true).unwrap()
+    }
+
+    #[test]
+    fn p_saves_a_project_rule_and_stops_asking_for_the_rest_of_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let args = bash("cargo test --lib");
+        let mut out = Vec::new();
+        assert!(gate.prompt_with("Bash", &args, &mut "p\n".as_bytes(), &mut out, true));
+        let shown = String::from_utf8(out).unwrap();
+        assert!(
+            shown.contains("(p) always allow `Bash(cargo test --lib)` in this project"),
+            "{shown}"
+        );
+
+        let saved = std::fs::read_to_string(dir.path().join(".lodan/config.local.toml")).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.permissions.allow, ["Bash(cargo test --lib)"]);
+        // このセッションではもう尋ねない。
+        assert_eq!(
+            gate.decide_quietly("Bash", &args, true),
+            Some(Decision::Allow)
+        );
+        // 次のセッション (設定から組み直したゲート) でも尋ねない。
+        let next = PermissionGate::from_config(&cfg, dir.path(), true).unwrap();
+        assert_eq!(
+            next.decide_quietly("Bash", &args, true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            next.decide_quietly("Bash", &bash("cargo publish"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn p_on_a_file_edit_is_scoped_to_its_directory_now_and_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let edit = |p: &str| serde_json::json!({ "path": p, "old_string": "a", "new_string": "b" });
+        let mut out = Vec::new();
+        assert!(gate.prompt_with(
+            "Edit",
+            &edit("src/agent/loop.rs"),
+            &mut "p\n".as_bytes(),
+            &mut out,
+            true
+        ));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("`Edit(src/agent/**)`")
+        );
+        // セッション中も、保存したのと同じ広さでしか通らない。
+        assert_eq!(
+            gate.decide_quietly("Edit", &edit("src/agent/subagent.rs"), true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(gate.decide_quietly("Edit", &edit("Cargo.toml"), true), None);
+        assert_eq!(
+            gate.decide_quietly("Write", &edit("src/agent/x.rs"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn p_is_not_offered_for_a_call_an_ask_rule_will_keep_asking_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.ask = vec!["Bash(cargo *)".into()];
+        let gate = PermissionGate::from_config(&cfg, dir.path(), true).unwrap();
+        let mut out = Vec::new();
+        assert!(gate.prompt_with(
+            "Bash",
+            &bash("cargo test --lib"),
+            &mut "p\ny\n".as_bytes(),
+            &mut out,
+            true
+        ));
+        assert!(!String::from_utf8(out).unwrap().contains("(p)"));
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
+    }
+
+    #[test]
+    fn p_is_not_offered_when_the_saved_rule_would_not_mean_the_same_thing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let mut out = Vec::new();
+        // (p) は無視されて再プロンプト、次の n で拒否。
+        let allowed = gate.prompt_with(
+            "Bash",
+            &bash("ls && rm -rf build"),
+            &mut "p\nn\n".as_bytes(),
+            &mut out,
+            true,
+        );
+        assert!(!allowed);
+        assert!(!String::from_utf8(out).unwrap().contains("(p)"));
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
+    }
+
+    #[test]
+    fn paths_and_previews_are_escaped_too() {
+        let esc = "\x1b[2K\x1b[1G";
+        let edit = serde_json::json!({
+            "path": format!("src/{esc}harmless.rs"),
+            "old_string": format!("a{esc}b"),
+            "new_string": "fn x() {\n\tlet y = 1;\n}",
+        });
+        let write =
+            serde_json::json!({ "path": "x", "content": format!("\x1b[2A{esc}looks fine") });
+        for shown in [
+            summarize("Edit", &edit),
+            preview("Edit", &edit).unwrap(),
+            preview("Write", &write).unwrap(),
+        ] {
+            // 着色のための SGR (`\x1b[..m`) 以外のエスケープが端末へ出てはいけない。
+            let stripped = shown.replace("\x1b[0m", "");
+            let raw_escapes = stripped.matches('\x1b').filter(|_| true).count();
+            let sgr = stripped.matches("\x1b[3").count() + stripped.matches("\x1b[2m").count();
+            assert_eq!(raw_escapes, sgr, "unescaped control sequence in {shown:?}");
+        }
+        // タブはコードに普通にあるので、プレビューではそのまま。
+        assert!(preview("Edit", &edit).unwrap().contains("\tlet y = 1;"));
+        // 不可視文字入りのパスには (p) を出さない。
+        assert_eq!(
+            crate::permission_rules::persistable_allow_rule("Edit", &edit, Path::new("/work")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_prompt_shows_control_characters_instead_of_obeying_them() {
+        let sneaky = "rm -rf ~\x1b[2K\x1b[1Gls";
+        let shown = summarize("Bash", &bash(sneaky));
+        assert!(
+            !shown.contains('\x1b'),
+            "raw escape reached the terminal: {shown:?}"
+        );
+        assert!(
+            shown.contains("rm -rf ~") && shown.contains("\\u{1b}"),
+            "{shown}"
+        );
+        // そして、そういうコマンドには (p) を出さない。
+        assert_eq!(
+            crate::permission_rules::persistable_allow_rule("Bash", &bash(sneaky), Path::new("/")),
+            None
+        );
     }
 
     #[test]

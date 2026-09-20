@@ -413,6 +413,17 @@ impl Config {
             layers.push((p, table));
         }
 
+        // 個人用のプロジェクト設定 (コミットしない)。承認プロンプトの「このプロジェクトで常に
+        // 許可」がここへ書く。共有の config.toml を汚さないために分けてある。
+        let local_path = std::env::current_dir()
+            .ok()
+            .map(|p| p.join(LOCAL_CONFIG_DIR).join(LOCAL_CONFIG_FILE));
+        if let Some(p) = local_path
+            && let Some(table) = read_toml(&p)?
+        {
+            layers.push((p, table));
+        }
+
         if let Some(p) = explicit {
             let table =
                 read_toml(p)?.with_context(|| format!("config file not found: {}", p.display()))?;
@@ -538,6 +549,55 @@ pub struct Overrides {
 
 fn user_config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "lodan").map(|d| d.config_dir().join("config.toml"))
+}
+
+pub const LOCAL_CONFIG_DIR: &str = ".lodan";
+pub const LOCAL_CONFIG_FILE: &str = "config.local.toml";
+
+/// `<cwd>/.lodan/config.local.toml` の `[permissions] allow` に `rule` を足す (既にあれば何もしない)。
+/// ファイルは lodan が管理するもので、書き戻しでコメントは失われる。
+pub fn append_local_allow_rule(cwd: &Path, rule: &str) -> Result<PathBuf> {
+    let dir = cwd.join(LOCAL_CONFIG_DIR);
+    let path = dir.join(LOCAL_CONFIG_FILE);
+    // symlink の先を書き換えない。リポジトリに仕込まれた `.lodan/config.local.toml -> ~/.config/…`
+    // や `.lodan -> /somewhere` を辿ると、承認 1 回で別の設定ファイルを上書きしてしまう。
+    for p in [&dir, &path] {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!("{} is a symlink; refusing to write through it", p.display());
+        }
+    }
+    let mut table: toml::Table = match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let permissions = table
+        .entry("permissions")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .with_context(|| format!("{}: `permissions` is not a table", path.display()))?;
+    let allow = permissions
+        .entry("allow")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .with_context(|| format!("{}: `permissions.allow` is not an array", path.display()))?;
+    if !allow.iter().any(|v| v.as_str() == Some(rule)) {
+        allow.push(toml::Value::String(rule.to_string()));
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let body = toml::to_string_pretty(&table).context("serializing local config")?;
+    // 途中で落ちても既存の設定を壊さないよう、別名で書いてから置き換える。
+    let tmp = dir.join(format!(".{LOCAL_CONFIG_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(
+        &tmp,
+        format!("# lodan が管理する個人用のプロジェクト設定。コミットしないこと (.gitignore に追加)。\n{body}"),
+    )
+    .with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    }
+    Ok(path)
 }
 
 /// キー (`llm.kimi.model` のようなドット区切り) → その値を最後に決めたもの。
@@ -800,6 +860,72 @@ mod tests {
             cfg.permissions.deny.len(),
             3,
             "runtime rules add to the file's, never replace"
+        );
+    }
+
+    #[test]
+    fn appending_a_local_allow_rule_is_idempotent_and_keeps_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join(LOCAL_CONFIG_DIR).join(LOCAL_CONFIG_FILE);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local,
+            "[agent]\nmax_iterations = 40\n\n[permissions]\ndeny = [\"Read(.env)\"]\n",
+        )
+        .unwrap();
+
+        append_local_allow_rule(dir.path(), "Bash(git status)").unwrap();
+        append_local_allow_rule(dir.path(), "Bash(git status)").unwrap();
+        append_local_allow_rule(dir.path(), "Edit").unwrap();
+
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        assert_eq!(cfg.permissions.allow, ["Bash(git status)", "Edit"]);
+        assert_eq!(
+            cfg.permissions.deny,
+            ["Read(.env)"],
+            "existing rules survive the rewrite"
+        );
+        assert_eq!(cfg.agent.max_iterations, 40);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_local_config_is_never_written_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.toml");
+        std::fs::write(&victim, "[agent]\nmax_iterations = 7\n").unwrap();
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(cwd.join(LOCAL_CONFIG_DIR)).unwrap();
+        std::os::unix::fs::symlink(&victim, cwd.join(LOCAL_CONFIG_DIR).join(LOCAL_CONFIG_FILE))
+            .unwrap();
+
+        let err = append_local_allow_rule(&cwd, "Edit").unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "[agent]\nmax_iterations = 7\n"
+        );
+
+        // `.lodan` 自体が symlink でも同じ。
+        let cwd2 = dir.path().join("repo2");
+        std::fs::create_dir_all(&cwd2).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cwd2.join(LOCAL_CONFIG_DIR)).unwrap();
+        assert!(append_local_allow_rule(&cwd2, "Edit").is_err());
+        assert!(!elsewhere.join(LOCAL_CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn a_broken_local_config_is_an_error_not_an_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join(LOCAL_CONFIG_DIR).join(LOCAL_CONFIG_FILE);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "this is not toml [").unwrap();
+        assert!(append_local_allow_rule(dir.path(), "Edit").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&local).unwrap(),
+            "this is not toml ["
         );
     }
 

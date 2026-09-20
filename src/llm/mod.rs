@@ -5,7 +5,7 @@ pub mod openai;
 pub mod sakana;
 pub mod sakura;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -98,6 +98,27 @@ pub fn build_metered(cfg: &Config) -> Result<(Arc<dyn LlmClient>, Arc<metered::L
         Arc::new(metered::MeteredClient::new(inner, ledger.clone())) as Arc<dyn LlmClient>
     })?;
     Ok((client, ledger))
+}
+
+/// `/goal` の評価器を別のモデルにする設定があれば、そのクライアントとモデル名。同じ台帳に載せるので、
+/// 評価器の呼び出しも `/cost` と予算に入る。設定が無ければ None (作業側のクライアントを使う)。
+pub fn build_goal_evaluator(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
+    let goal = &cfg.goal;
+    if goal.evaluator_provider.is_none() && goal.evaluator_model.is_none() {
+        return Ok(None);
+    }
+    let provider = goal.evaluator_provider.unwrap_or(cfg.llm.provider);
+    let inner = build_for(provider, cfg)
+        .with_context(|| format!("building the /goal evaluator ({})", provider.as_str()))?;
+    let model = goal
+        .evaluator_model
+        .clone()
+        .unwrap_or_else(|| cfg.llm.get(provider).model.clone());
+    let client: Arc<dyn LlmClient> = Arc::new(metered::MeteredClient::new(inner, ledger.clone()));
+    Ok(Some((client, model)))
 }
 
 /// 計上なしのクライアント。**本体では使わない** (使用量も予算も効かなくなる) — `build_metered` を使うこと。

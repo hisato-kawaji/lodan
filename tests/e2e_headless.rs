@@ -1192,3 +1192,64 @@ fn find_transcript(home: &Path, session_id: &str) -> PathBuf {
     }
     walk(home, session_id).unwrap_or_else(|| panic!("no session dir for {session_id}"))
 }
+
+// ---- #84: /goal の永続化と再開 ----
+
+/// 未達のまま止まった goal はセッションに残り、`--resume` で paused として戻り、`/goal resume` で
+/// 続きから走って達成できる。達成したら記録は消える。
+#[test]
+fn a_paused_goal_survives_the_session_and_can_be_resumed() {
+    let home = tempfile::tempdir().unwrap();
+    // 1 回目: 評価器の返事が判定として読めない → 安全側で停止し、goal は paused で残る。
+    let vague = start_mock_saying(home.path(), Some("I think it is going well."));
+    let first = lodan(
+        home.path(),
+        vague.port,
+        &[],
+        Stdin::Piped("/goal make the tests pass\n/exit\n"),
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let said = stdout(&first);
+    let session_id = said
+        .lines()
+        .find_map(|l| l.strip_prefix("session: "))
+        .unwrap_or_else(|| panic!("no session id in:\n{said}"))
+        .trim()
+        .to_string();
+    let goal_file = find_transcript(home.path(), &session_id).with_file_name("goal.json");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&goal_file).expect("goal.json")).unwrap();
+    assert_eq!(saved["condition"], "make the tests pass");
+    assert_eq!(saved["total_turns"], 1);
+    drop(vague);
+
+    // 2 回目: 再開したセッションに goal が戻っている。今度の評価器は達成と判定する。
+    let decisive = start_mock_saying(home.path(), Some(r#"{"met": true, "reason": "all green"}"#));
+    let second = lodan(
+        home.path(),
+        decisive.port,
+        &["--resume", &session_id],
+        Stdin::Piped("/goal\n/goal resume\n/exit\n"),
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let said = stdout(&second);
+    assert!(
+        said.contains("[goal] restored (paused after 1 turn(s)): make the tests pass"),
+        "{said}"
+    );
+    assert!(said.contains("goal (paused):"), "{said}");
+    assert!(said.contains("[goal] resumed after 1 turn(s)"), "{said}");
+    assert!(
+        said.contains("[goal] achieved after 2 turn(s): all green"),
+        "{said}"
+    );
+    assert!(!goal_file.exists(), "an achieved goal is not kept");
+}

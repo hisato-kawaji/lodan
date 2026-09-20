@@ -41,8 +41,29 @@ pub struct Config {
     /// 名指しで外せる。逆も同じ)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_hooks: Vec<String>,
+    #[serde(skip_serializing_if = "GoalConfig::is_unset")]
+    pub goal: GoalConfig,
     /// hook の終了コードの解釈。`"v1"` で「非 0 は全てブロック」の旧挙動に戻す。
     pub hooks_compat: crate::hooks::HooksCompat,
+}
+
+/// `[goal]`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalConfig {
+    /// `/goal` の達成判定に使う provider。未設定なら作業しているモデルが自分で判定する。
+    /// 別のモデルにすると「自分の仕事を自分で合格にする」偏りを避けられる (#84)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluator_provider: Option<Provider>,
+    /// 判定に使うモデル。未設定ならその provider の `model`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluator_model: Option<String>,
+}
+
+impl GoalConfig {
+    fn is_unset(&self) -> bool {
+        self.evaluator_provider.is_none() && self.evaluator_model.is_none()
+    }
 }
 
 /// 承認が要る呼び出しをどう扱うか (#74)。deny ルールはどのモードでも効く。
@@ -1121,6 +1142,22 @@ mod tests {
         assert_eq!(
             origins["llm.local.extra_body.top_k"],
             Origin::File(PathBuf::from("project.toml"))
+        );
+    }
+
+    #[test]
+    fn the_goal_evaluator_can_be_pointed_at_another_provider() {
+        let cfg: Config = toml::from_str(
+            "[goal]\nevaluator_provider = \"kimi\"\nevaluator_model = \"kimi-k3\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.goal.evaluator_provider, Some(Provider::Kimi));
+        assert_eq!(cfg.goal.evaluator_model.as_deref(), Some("kimi-k3"));
+        // 未設定なら `lodan config` にも出ない。
+        assert!(
+            !toml::to_string(&Config::default())
+                .unwrap()
+                .contains("goal")
         );
     }
 

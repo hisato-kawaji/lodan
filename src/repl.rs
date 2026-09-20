@@ -27,6 +27,8 @@ const BUILTINS: &[&str] = &[
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
 const GOAL_CLEAR_ALIASES: &[&str] = &["clear", "stop", "off", "reset", "none", "cancel"];
+/// `/goal resume`: paused の goal を続きから走らせる。
+const GOAL_RESUME_ALIASES: &[&str] = &["resume", "continue"];
 
 /// rustyline の補完ヘルパ (#42 P7)。行頭の `/…` は slash コマンド名を、
 /// それ以外の語は FilenameCompleter でパスを補完する。
@@ -206,6 +208,27 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     // /goal の状態。上限到達などで未達のまま止まった goal は paused として残り、
     // `/goal` (状態表示) と `/goal clear` (解除) の対象になる。
     let mut goal_state: Option<crate::goal::Goal> = None;
+    // 再開したセッションに goal が残っていれば、paused として戻す (勝手には走らせない)。
+    if let Some(rec) = recorder.as_ref() {
+        match rec
+            .load_goal()
+            .and_then(|r| r.map(crate::goal::Goal::from_record).transpose())
+        {
+            Ok(Some(goal)) => {
+                println!(
+                    "{}",
+                    crate::term::dim(&format!(
+                        "[goal] restored (paused after {} turn(s)): {} — /goal resume to continue, /goal clear to drop",
+                        goal.total_turns,
+                        crate::term::sanitize(&first_line(&goal.condition))
+                    ))
+                );
+                goal_state = Some(goal);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("session: ignoring the saved goal: {e:#}"),
+        }
+    }
 
     // SessionStart hook: 起動を通知する。ブロックされても起動は止めず警告のみ。
     let session_source = if resume.is_some() {
@@ -362,12 +385,22 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
 
             // /goal も session/llm を要するためここで処理する。
             if head == "goal" {
+                let evaluator = match &runtime.goal_evaluator {
+                    Some((client, model)) => crate::goal::Evaluator {
+                        llm: client.as_ref(),
+                        model,
+                    },
+                    None => crate::goal::Evaluator {
+                        llm: llm_client.as_ref(),
+                        model: &cfg.llm.active().model,
+                    },
+                };
                 handle_goal(
                     args,
                     &mut goal_state,
                     &mut session,
                     llm_client.as_ref(),
-                    &cfg.llm.active().model,
+                    evaluator,
                     &gate,
                     &mut recorder,
                 )
@@ -433,7 +466,30 @@ async fn handle_goal(
     goal_state: &mut Option<crate::goal::Goal>,
     session: &mut agent::Session,
     llm: &dyn llm::LlmClient,
-    model: &str,
+    evaluator: crate::goal::Evaluator<'_>,
+    gate: &PermissionGate,
+    recorder: &mut Option<Recorder>,
+) {
+    run_goal_command(args, goal_state, session, llm, evaluator, gate, recorder).await;
+    // どの経路で抜けても、残った状態 (paused の goal、または「無い」) をセッションに残す。
+    save_goal_state(recorder.as_ref(), goal_state.as_ref());
+}
+
+/// goal の状態をセッションに保存する。失敗しても作業は止めない。
+fn save_goal_state(recorder: Option<&Recorder>, goal: Option<&crate::goal::Goal>) {
+    if let Some(rec) = recorder
+        && let Err(e) = rec.save_goal(goal.map(crate::goal::Goal::to_record).as_ref())
+    {
+        eprintln!("session: could not save the goal: {e:#}");
+    }
+}
+
+async fn run_goal_command(
+    args: &str,
+    goal_state: &mut Option<crate::goal::Goal>,
+    session: &mut agent::Session,
+    llm: &dyn llm::LlmClient,
+    evaluator: crate::goal::Evaluator<'_>,
     gate: &PermissionGate,
     recorder: &mut Option<Recorder>,
 ) {
@@ -442,7 +498,8 @@ async fn handle_goal(
     // 状態表示
     if args.is_empty() {
         match goal_state {
-            Some(g) => println!("goal (paused):\n{}", g.describe()),
+            // 条件文は保存されたファイルから戻ってくることもある。
+            Some(g) => println!("goal (paused):\n{}", crate::term::sanitize(&g.describe())),
             None => println!("no active goal — set one with /goal <condition>"),
         }
         return;
@@ -451,40 +508,69 @@ async fn handle_goal(
     // 解除
     if GOAL_CLEAR_ALIASES.contains(&args) {
         match goal_state.take() {
-            Some(g) => println!("goal cleared: {}", first_line(&g.condition)),
+            Some(g) => println!(
+                "goal cleared: {}",
+                crate::term::sanitize(&first_line(&g.condition))
+            ),
             None => println!("no active goal to clear"),
         }
         return;
     }
 
-    // 設定＋実行
-    let mut goal = match Goal::new(args) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("{}", crate::term::red_err(&shown_error("goal", &e)));
+    // 再開: paused の goal を、新しい上限の枠で続きから走らせる。
+    let mut goal = if GOAL_RESUME_ALIASES.contains(&args) {
+        let Some(mut paused) = goal_state.take() else {
+            println!("no paused goal to resume — set one with /goal <condition>");
             return;
+        };
+        paused.begin_new_window();
+        println!(
+            "{}",
+            crate::term::dim(&format!(
+                "[goal] resumed after {} turn(s) (limits for this run: {} turns / {}s): {}",
+                paused.total_turns,
+                paused.max_turns,
+                paused.max_duration.as_secs(),
+                crate::term::sanitize(&first_line(&paused.condition))
+            ))
+        );
+        paused
+    } else {
+        // 設定＋実行
+        let goal = match Goal::new(args) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("{}", crate::term::red_err(&shown_error("goal", &e)));
+                return;
+            }
+        };
+        if let Some(old) = goal_state.take() {
+            println!(
+                "goal replaced: {}",
+                crate::term::sanitize(&first_line(&old.condition))
+            );
         }
+        println!(
+            "{}",
+            crate::term::dim(&format!(
+                "[goal] started (limits: {} turns / {}s). destructive tools still ask for approval unless --yes",
+                goal.max_turns,
+                goal.max_duration.as_secs()
+            ))
+        );
+        goal
     };
-    if let Some(old) = goal_state.take() {
-        println!("goal replaced: {}", first_line(&old.condition));
-    }
-    println!(
-        "{}",
-        crate::term::dim(&format!(
-            "[goal] started (limits: {} turns / {}s). destructive tools still ask for approval unless --yes",
-            goal.max_turns,
-            goal.max_duration.as_secs()
-        ))
-    );
 
     // Ctrl-C で自律ループごと中断できるようにする (ターン途中なら履歴を修復)。
     let outcome = {
-        let fut = crate::goal::drive(&mut goal, session, llm, model, gate, |s| {
+        let fut = crate::goal::drive_with(&mut goal, session, llm, evaluator, gate, |s, g| {
             if let Some(rec) = recorder.as_mut()
                 && let Err(e) = rec.sync(s.history())
             {
                 eprintln!("session: save failed: {e}");
             }
+            // 途中で落ちても、ここまでの goal が paused として残るように。
+            save_goal_state(recorder.as_ref(), Some(g));
         });
         tokio::pin!(fut);
         tokio::select! {
@@ -493,6 +579,8 @@ async fn handle_goal(
         }
     };
     let Some(outcome) = outcome else {
+        // 中断されると `drive_with` の後始末を通らないので、ここで時計を止める。
+        goal.pause();
         session.interrupt_repair();
         if let Some(rec) = recorder.as_mut()
             && let Err(e) = rec.sync(session.history())

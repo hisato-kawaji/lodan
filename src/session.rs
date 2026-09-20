@@ -111,6 +111,44 @@ impl Recorder {
         self.dir.join("transcript.jsonl")
     }
 
+    fn goal_path(&self) -> PathBuf {
+        self.dir.join("goal.json")
+    }
+
+    /// `/goal` の状態をセッションと一緒に残す (`--resume` で paused として戻る)。
+    /// `None` は「goal は無い」: 達成・解除のあとに古い状態が残らないよう、ファイルを消す。
+    pub fn save_goal(&self, goal: Option<&crate::goal::GoalRecord>) -> Result<()> {
+        let path = self.goal_path();
+        match goal {
+            Some(record) => {
+                // 毎ターン書き直すので、途中で落ちても前の内容が残るよう、別名で書いてから差し替える。
+                let tmp = path.with_extension("json.tmp");
+                fs::write(&tmp, serde_json::to_string_pretty(record)?)
+                    .context("write goal.json")?;
+                // 条件文には作業の中身が書かれる。transcript と同じ扱いにする。
+                restrict(&tmp, 0o600);
+                fs::rename(&tmp, &path).context("replace goal.json")?;
+            }
+            None => match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("remove goal.json"),
+            },
+        }
+        Ok(())
+    }
+
+    /// 保存された goal。無ければ None。壊れたファイルは無いものとして扱う (警告は呼び出し側)。
+    pub fn load_goal(&self) -> Result<Option<crate::goal::GoalRecord>> {
+        match fs::read_to_string(self.goal_path()) {
+            Ok(text) => Ok(Some(
+                serde_json::from_str(&text).context("parse goal.json")?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("read goal.json"),
+        }
+    }
+
     pub fn id(&self) -> &str {
         // dir 名 = id。
         self.dir
@@ -385,5 +423,34 @@ mod tests {
             },
         ];
         assert_eq!(valid_prefix_len(&messages), 4);
+    }
+
+    #[test]
+    fn a_goal_is_saved_with_the_session_and_removed_when_it_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recorder {
+            dir: tmp.path().to_path_buf(),
+            persisted: 0,
+        };
+        assert_eq!(rec.load_goal().unwrap(), None);
+
+        let goal = crate::goal::GoalRecord {
+            condition: "make the tests pass".into(),
+            total_turns: 3,
+            elapsed_secs: 90,
+        };
+        rec.save_goal(Some(&goal)).unwrap();
+        assert_eq!(rec.load_goal().unwrap(), Some(goal));
+
+        // 達成・解除のあとは残さない。2 回消してもエラーにしない。
+        rec.save_goal(None).unwrap();
+        rec.save_goal(None).unwrap();
+        assert_eq!(rec.load_goal().unwrap(), None);
+
+        std::fs::write(tmp.path().join("goal.json"), "{not json").unwrap();
+        assert!(
+            rec.load_goal().is_err(),
+            "a broken file is reported, not silently dropped"
+        );
     }
 }

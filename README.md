@@ -697,6 +697,7 @@ REPL セッションは自動的に保存され、後から再開できます。
 - 保存先: `<データディレクトリ>/lodan/sessions/<id>/`（macOS なら `~/Library/Application Support/lodan/sessions/`）
   - `meta.json`: id / 作成時刻 / cwd / provider / model
   - `transcript.jsonl`: 各メッセージを 1 行 1 件でターンごとに追記
+  - `goal.json`: 未達の `/goal` があるときだけ（条件・通算ターン数・走っていた時間。[後述](#ゴール駆動の自律継続goal)）
 - `lodan sessions` — 保存済みセッションを一覧表示
 - `lodan --resume <id>` — 指定 id を再開（`--resume last` で直近を再開）
 
@@ -804,17 +805,28 @@ lodan> /goal cargo test が exit 0 で通る。または 10 ターンで諦め�
 ```
 
 - `/goal <条件>` — 条件（最大 4,000 字）を設定して即座にループ開始。条件は「測定可能な終了状態＋確認手段」で書くと堅い（例: 「`cargo test` が exit 0」）。
-- `/goal` — 現在の状態（条件・消化ターン数・経過時間）を表示。
+- `/goal` — 現在の状態（条件・今回の枠と通算のターン数・経過時間）を表示。
+- `/goal resume`（別名 `continue`）— paused の goal を**続きから**走らせる。ターン数と時間の上限は走らせるたびに新しい枠になり、通算は引き継ぐ。モデルには「既に N ターン使っている。やり直さず続きから」と伝える。
 - `/goal clear`（別名 `stop` / `off` / `reset` / `none` / `cancel`）— 解除。
 
-動作: ターン完了ごとに評価器（**active モデルを流用**、ツールなし・トランスクリプトのみ参照）が `{"met": bool, "reason": string}` を返す。未達なら `reason` を次ターンの入力として注入して継続、達成なら解除して報告する。
+動作: ターン完了ごとに評価器（既定は **active モデルを流用**、ツールなし・トランスクリプトのみ参照）が `{"met": bool, "reason": string}` を返す。未達なら `reason` を次ターンの入力として注入して継続、達成なら解除して報告する。
 
-- **暴走防止（ハード上限）**: 20 ターン / 30 分。到達すると必ず停止し、goal は paused として残る（`/goal` で確認、`/goal clear` で破棄）。
+- **暴走防止（ハード上限）**: 1 回の実行につき 20 ターン / 30 分。到達すると必ず停止し、goal は paused として残る（`/goal` で確認、`/goal resume` で再開、`/goal clear` で破棄）。
 - **評価器の出力がパース不能なときは安全側で停止する**（根拠のない自律継続はしない）。
 - **承認ポリシー**: 破壊的ツール（Write / Edit / Bash …）は goal 中も**既定で通常どおり承認プロンプトを出す**。完全自律にしたい場合のみ `--yes`（または `agent.auto_approve`）を明示する。
-- **Ctrl-C で自律ループを中断できる**。中断した goal は paused として残る（`/goal` で確認、`/goal clear` で破棄）。
+- **Ctrl-C で自律ループを中断できる**（= 一時停止）。中断した goal は paused として残る（`/goal` で確認、`/goal resume` で再開、`/goal clear` で破棄）。
+- **goal はセッションと一緒に保存される**（セッションのディレクトリの `goal.json`。各ターンの後と、停止・解除のたびに更新）。経過時間として数えるのは goal が**走っていた時間だけ**で、一時停止中に REPL を開いていた時間は入らない。`--resume` で開き直すと paused として戻り、`/goal resume` するまで勝手には走らない。達成・解除した goal は残さない。
+- **評価器を別のモデルにできる**。作業したモデルが自分で合否を決めると甘くなりがちなので、判定だけ別のモデルに任せられる:
+
+  ```toml
+  [goal]
+  evaluator_provider = "kimi"      # 省略時は作業している provider
+  evaluator_model = "kimi-k3"       # 省略時はその provider の model
+  ```
+
+  設定したのに組めない（API キーが無いなど）ときは起動時エラー（`/goal` を使わない `-p` の実行でも。黙って作業側の自己判定に戻ると、気づけないため）。評価器には fallback provider は付かない: 評価器の呼び出しが失敗したら goal は paused で止まり、`/goal resume` でやり直せる。
 - 評価器の呼び出しも `/cost` と[予算](#予算)に `goal_eval` として計上される。
-- 制限: `-p` 非対話・resume 復元はスコープ外。
+- 制限: `-p` 非対話での `/goal` はスコープ外。
 
 ## ファイル変更の巻き戻し（`/undo`）
 

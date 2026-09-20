@@ -42,7 +42,12 @@ def build_steps(demo_dir):
 def make_handler(demo_dir):
     steps = build_steps(demo_dir)
 
-    def decide(messages):
+    def decide(messages, model=None):
+        # MOCK_LLM_JUDGE_MODEL / MOCK_LLM_JUDGE_TEXT: このモデル名で来たリクエストにだけ別の返事をする
+        # (`/goal` の評価器を別モデルにする設定が、本当にそのモデルへ尋ねているかを見る)。
+        judge = os.environ.get("MOCK_LLM_JUDGE_MODEL")
+        if judge and model == judge:
+            return ("text", os.environ.get("MOCK_LLM_JUDGE_TEXT", ""))
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -148,7 +153,7 @@ def make_handler(demo_dir):
 
             messages = req.get("messages", [])
             stream = bool(req.get("stream"))
-            decision = decide(messages)
+            decision = decide(messages, req.get("model"))
 
             if not stream:
                 resp = non_streaming_body(decision)

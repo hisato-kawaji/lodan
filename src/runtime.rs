@@ -39,6 +39,8 @@ pub struct Runtime {
     pub llm: Arc<dyn LlmClient>,
     /// `llm` を通った全ての呼び出しの使用量と予算 (`/cost`、`-p` の結果)。
     pub ledger: Arc<llm::metered::Ledger>,
+    /// `/goal` の評価器を別のモデルにする設定があるとき、そのクライアントとモデル名。
+    pub goal_evaluator: Option<(Arc<dyn LlmClient>, String)>,
     pub registry: Arc<ToolRegistry>,
     /// MCP サーバが公開する prompt (`/mcp__<server>__<prompt>`)。
     pub mcp_prompts: BTreeMap<String, McpPrompt>,
@@ -77,6 +79,7 @@ impl Runtime {
         }
 
         let (llm, ledger) = llm::build_metered(cfg)?;
+        let goal_evaluator = llm::build_goal_evaluator(cfg, &ledger)?;
 
         let mut registry = default_registry();
         // sampling は opt-in サーバにのみ active モデルの LLM を貸す。
@@ -167,6 +170,7 @@ impl Runtime {
             cwd,
             llm,
             ledger,
+            goal_evaluator,
             registry: Arc::new(registry),
             mcp_prompts,
             _mcp_clients: mcp_outcome.clients,

@@ -1192,3 +1192,151 @@ fn find_transcript(home: &Path, session_id: &str) -> PathBuf {
     }
     walk(home, session_id).unwrap_or_else(|| panic!("no session dir for {session_id}"))
 }
+
+// ---- #84: /goal の永続化と再開 ----
+
+/// 未達のまま止まった goal はセッションに残り、`--resume` で paused として戻り、`/goal resume` で
+/// 続きから走って達成できる。達成したら記録は消える。
+#[test]
+fn a_paused_goal_survives_the_session_and_can_be_resumed() {
+    let home = tempfile::tempdir().unwrap();
+    // 1 回目: 評価器の返事が判定として読めない → 安全側で停止し、goal は paused で残る。
+    let vague = start_mock_saying(home.path(), Some("I think it is going well."));
+    let first = lodan(
+        home.path(),
+        vague.port,
+        &[],
+        Stdin::Piped("/goal make the tests pass\n/exit\n"),
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let said = stdout(&first);
+    let session_id = said
+        .lines()
+        .find_map(|l| l.strip_prefix("session: "))
+        .unwrap_or_else(|| panic!("no session id in:\n{said}"))
+        .trim()
+        .to_string();
+    let goal_file = find_transcript(home.path(), &session_id).with_file_name("goal.json");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&goal_file).expect("goal.json")).unwrap();
+    assert_eq!(saved["condition"], "make the tests pass");
+    assert_eq!(saved["total_turns"], 1);
+    drop(vague);
+
+    // 2 回目: 再開したセッションに goal が戻っている。今度の評価器は達成と判定する。
+    let decisive = start_mock_saying(home.path(), Some(r#"{"met": true, "reason": "all green"}"#));
+    let second = lodan(
+        home.path(),
+        decisive.port,
+        &["--resume", &session_id],
+        Stdin::Piped("/goal\n/goal resume\n/exit\n"),
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let said = stdout(&second);
+    assert!(
+        said.contains("[goal] restored (paused after 1 turn(s)): make the tests pass"),
+        "{said}"
+    );
+    assert!(said.contains("goal (paused):"), "{said}");
+    assert!(said.contains("[goal] resumed after 1 turn(s)"), "{said}");
+    assert!(
+        said.contains("[goal] achieved after 2 turn(s): all green"),
+        "{said}"
+    );
+    assert!(!goal_file.exists(), "an achieved goal is not kept");
+}
+
+/// 同じプロセスの中で、上限で止まった goal を `/goal resume` で走らせ直せる。再開で新しい枠が
+/// 始まらなければ、再開した瞬間にまた上限で止まる (レビューの変異試験で、テストが 1 つも
+/// 落ちなかった箇所)。
+#[test]
+fn a_goal_stopped_by_the_turn_limit_runs_again_when_resumed_in_the_same_session() {
+    let home = tempfile::tempdir().unwrap();
+    let never = start_mock_saying(
+        home.path(),
+        Some(r#"{"met": false, "reason": "keep going"}"#),
+    );
+    let out = lodan(
+        home.path(),
+        never.port,
+        &[],
+        Stdin::Piped("/goal keep going\n/goal resume\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = stdout(&out);
+    assert_eq!(said.matches("turn limit (20) reached").count(), 2, "{said}");
+    let after_resume = said
+        .split("[goal] resumed after 20 turn(s)")
+        .nth(1)
+        .unwrap_or_else(|| panic!("never resumed:\n{said}"));
+    assert!(
+        after_resume.contains("[goal] turn 1/20: not met"),
+        "the resumed run did no work:\n{after_resume}"
+    );
+
+    let session_id = said
+        .lines()
+        .find_map(|l| l.strip_prefix("session: "))
+        .unwrap()
+        .trim()
+        .to_string();
+    let goal_file = find_transcript(home.path(), &session_id).with_file_name("goal.json");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(goal_file).unwrap()).unwrap();
+    assert_eq!(saved["total_turns"], 40);
+}
+
+/// `[goal] evaluator_model` を書いたら、達成の判定は本当にそのモデルに尋ねる。作業側の返事は
+/// 判定として読めないので、評価器が作業側のままなら goal は達成されない。
+#[test]
+fn the_configured_evaluator_model_is_the_one_that_is_asked() {
+    let run = |config: &str| {
+        let home = tempfile::tempdir().unwrap();
+        let work = home.path().join("work/.lodan");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("config.toml"), config).unwrap();
+        let server = start_mock_with(
+            home.path(),
+            &[
+                ("MOCK_LLM_TEXT", "I am working on it."),
+                ("MOCK_LLM_JUDGE_MODEL", "the-judge"),
+                (
+                    "MOCK_LLM_JUDGE_TEXT",
+                    r#"{"met": true, "reason": "the judge agrees"}"#,
+                ),
+            ],
+        );
+        let out = lodan(
+            home.path(),
+            server.port,
+            &[],
+            Stdin::Piped("/goal finish the work\n/exit\n"),
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr))
+    };
+    let judged = run("[goal]\nevaluator_model = \"the-judge\"\n");
+    assert!(
+        judged.contains("[goal] achieved after 1 turn(s): the judge agrees"),
+        "{judged}"
+    );
+    // 陽性対照: 設定が無ければ作業側が自分で判定し、その返事は判定として読めない。
+    let unjudged = run("");
+    assert!(unjudged.contains("evaluator failed"), "{unjudged}");
+}

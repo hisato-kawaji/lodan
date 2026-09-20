@@ -6,7 +6,7 @@
 //! 安全側に倒して停止する (根拠のない自律継続をしない)。
 
 use anyhow::{Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 use crate::agent::Session;
@@ -27,13 +27,33 @@ pub const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
 const TRANSCRIPT_MAX_CHARS: usize = 12_000;
 
 /// アクティブな goal の状態。上限はフィールドで持ち、テストから上書きできる。
+///
+/// ターン数と経過時間の上限は**走らせるたびの枠**: `/goal <条件>` と `/goal resume` のたびに
+/// 新しい枠が始まる (上限で止まった goal を再開できなければ、再開の意味が無い)。通算は別に持つ。
 #[derive(Debug)]
 pub struct Goal {
     pub condition: String,
+    /// 今回の枠で使ったターン数。
     pub turns_used: u32,
-    pub started_at: Instant,
+    /// 今回の枠の開始時刻。走っている間だけ Some — 一時停止中の goal は時計を進めない
+    /// (開いたまま放置した時間や `/goal` で眺めた時間を、作業時間に数えない)。
+    pub started_at: Option<Instant>,
+    /// 直近に終わった枠の長さ (一時停止中の `/goal` の表示用)。
+    pub last_window: Duration,
     pub max_turns: u32,
     pub max_duration: Duration,
+    /// これまでの全ての枠の合計ターン数。
+    pub total_turns: u32,
+    /// 以前の枠で経過した時間 (今回の枠は含まない)。
+    pub prior_elapsed: Duration,
+}
+
+/// セッションと一緒に保存する goal の状態 (`goal.json`)。`--resume` で paused として戻る。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalRecord {
+    pub condition: String,
+    pub total_turns: u32,
+    pub elapsed_secs: u64,
 }
 
 impl Goal {
@@ -52,21 +72,67 @@ impl Goal {
         Ok(Self {
             condition: condition.to_string(),
             turns_used: 0,
-            started_at: Instant::now(),
+            started_at: None,
+            last_window: Duration::ZERO,
             max_turns: DEFAULT_MAX_TURNS,
             max_duration: DEFAULT_MAX_DURATION,
+            total_turns: 0,
+            prior_elapsed: Duration::ZERO,
         })
+    }
+
+    /// 保存された状態から、paused の goal として戻す。
+    pub fn from_record(record: GoalRecord) -> Result<Self> {
+        let mut goal = Self::new(&record.condition)?;
+        goal.total_turns = record.total_turns;
+        goal.prior_elapsed = Duration::from_secs(record.elapsed_secs);
+        Ok(goal)
+    }
+
+    pub fn to_record(&self) -> GoalRecord {
+        GoalRecord {
+            condition: self.condition.clone(),
+            total_turns: self.total_turns,
+            elapsed_secs: self.total_elapsed().as_secs(),
+        }
+    }
+
+    /// 今回の枠で経過した時間。一時停止中は、直近の枠の長さ。
+    pub fn window_elapsed(&self) -> Duration {
+        self.started_at.map_or(self.last_window, |at| at.elapsed())
+    }
+
+    /// 全ての枠を通した、**走っていた**時間。
+    pub fn total_elapsed(&self) -> Duration {
+        self.prior_elapsed + self.started_at.map_or(Duration::ZERO, |at| at.elapsed())
+    }
+
+    /// 新しい枠を始める (`/goal <条件>` の直後と `/goal resume`)。通算は引き継ぐ。
+    pub fn begin_new_window(&mut self) {
+        self.pause();
+        self.started_at = Some(Instant::now());
+        self.turns_used = 0;
+    }
+
+    /// 時計を止める。走っていた分を通算に畳む。止まっていれば何もしない。
+    pub fn pause(&mut self) {
+        if let Some(at) = self.started_at.take() {
+            self.last_window = at.elapsed();
+            self.prior_elapsed += self.last_window;
+        }
     }
 
     /// `/goal` (引数なし) の状態表示用文字列。
     pub fn describe(&self) -> String {
         format!(
-            "condition: {}\nturns: {}/{}, elapsed: {}s (limit {}s)",
+            "condition: {}\nturns: {}/{}, elapsed: {}s (limit {}s)\nin total: {} turn(s), {}s",
             self.condition,
             self.turns_used,
             self.max_turns,
-            self.started_at.elapsed().as_secs(),
+            self.window_elapsed().as_secs(),
             self.max_duration.as_secs(),
+            self.total_turns,
+            self.total_elapsed().as_secs(),
         )
     }
 }
@@ -102,17 +168,64 @@ pub async fn drive(
     llm: &dyn LlmClient,
     model: &str,
     gate: &PermissionGate,
-    mut after_turn: impl FnMut(&Session),
+    after_turn: impl FnMut(&Session, &Goal),
 ) -> GoalOutcome {
-    let mut input = format!(
-        "Work toward this goal. When you believe it is met, say so and stop.\nGoal: {}",
-        goal.condition
-    );
+    let evaluator = Evaluator { llm, model };
+    drive_with(goal, session, llm, evaluator, gate, after_turn).await
+}
+
+/// [`drive`] の本体。評価器を作業側と別に渡せる。走っている間だけ goal の時計を進める。
+pub async fn drive_with(
+    goal: &mut Goal,
+    session: &mut Session,
+    llm: &dyn LlmClient,
+    evaluator: Evaluator<'_>,
+    gate: &PermissionGate,
+    after_turn: impl FnMut(&Session, &Goal),
+) -> GoalOutcome {
+    if goal.started_at.is_none() {
+        goal.begin_new_window();
+    }
+    let outcome = run_window(goal, session, llm, evaluator, gate, after_turn).await;
+    goal.pause();
+    outcome
+}
+
+/// 達成を判定する側。作業するモデルと同じでもよいが、別のモデルにすれば「自分の仕事を自分で
+/// 合格にする」偏りを避けられる (`[goal] evaluator_provider`)。
+#[derive(Clone, Copy)]
+pub struct Evaluator<'a> {
+    pub llm: &'a dyn LlmClient,
+    pub model: &'a str,
+}
+
+async fn run_window(
+    goal: &mut Goal,
+    session: &mut Session,
+    llm: &dyn LlmClient,
+    evaluator: Evaluator<'_>,
+    gate: &PermissionGate,
+    mut after_turn: impl FnMut(&Session, &Goal),
+) -> GoalOutcome {
+    // 再開 (通算ターンがある) なら、やり直しではなく続きであることを伝える。
+    let mut input = if goal.total_turns == 0 {
+        format!(
+            "Work toward this goal. When you believe it is met, say so and stop.\nGoal: {}",
+            goal.condition
+        )
+    } else {
+        format!(
+            "Resume working toward this goal (you already spent {} turn(s) on it; build on what \
+             is done instead of starting over). When you believe it is met, say so and stop.\n\
+             Goal: {}",
+            goal.total_turns, goal.condition
+        )
+    };
     loop {
         if goal.turns_used >= goal.max_turns {
             return GoalOutcome::TurnLimit;
         }
-        if goal.started_at.elapsed() >= goal.max_duration {
+        if goal.window_elapsed() >= goal.max_duration {
             return GoalOutcome::TimeLimit;
         }
 
@@ -120,14 +233,22 @@ pub async fn drive(
             return GoalOutcome::TurnFailed(e);
         }
         goal.turns_used += 1;
-        after_turn(session);
+        goal.total_turns += 1;
+        after_turn(session, goal);
 
-        match evaluate(llm, model, &goal.condition, session.history()).await {
+        match evaluate(
+            evaluator.llm,
+            evaluator.model,
+            &goal.condition,
+            session.history(),
+        )
+        .await
+        {
             Err(e) => return GoalOutcome::EvaluatorFailed(e),
             Ok(v) if v.met => {
                 return GoalOutcome::Achieved {
                     reason: v.reason,
-                    turns: goal.turns_used,
+                    turns: goal.total_turns,
                 };
             }
             Ok(v) => {
@@ -339,6 +460,155 @@ mod tests {
         Session::new(Config::default(), Arc::new(default_registry()))
     }
 
+    /// 上限で止まった goal を再開すると、新しい枠で続きから走る (通算は引き継ぐ)。保存形式を
+    /// 経由しても同じ。
+    #[tokio::test]
+    async fn a_goal_stopped_by_its_limit_resumes_with_a_fresh_window() {
+        let llm = GoalLlm {
+            verdicts: vec![
+                r#"{"met": false, "reason": "not yet"}"#,
+                r#"{"met": false, "reason": "not yet"}"#,
+                r#"{"met": true, "reason": "done"}"#,
+            ],
+            eval_calls: AtomicUsize::new(0),
+        };
+        let mut session = test_session();
+        let gate = PermissionGate::new(true);
+        let mut goal = Goal::new("ship it").unwrap();
+        goal.max_turns = 2;
+        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_, _| {}).await;
+        assert!(matches!(out, GoalOutcome::TurnLimit), "{out:?}");
+
+        // セッションに保存され、別のプロセスで読み戻された、という経路。
+        let record = goal.to_record();
+        assert_eq!(
+            (record.total_turns, record.condition.as_str()),
+            (2, "ship it")
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        let mut goal = Goal::from_record(serde_json::from_str(&json).unwrap()).unwrap();
+        goal.max_turns = 2;
+        assert_eq!((goal.turns_used, goal.total_turns), (0, 2));
+
+        // `/goal resume` は新しい枠を始める (読み戻した直後でも、同じプロセスで止まった後でも同じ)。
+        goal.begin_new_window();
+        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_, _| {}).await;
+        match out {
+            GoalOutcome::Achieved { turns, .. } => assert_eq!(turns, 3, "turns are cumulative"),
+            other => panic!("{other:?}"),
+        }
+        // 再開のターンでは「続きから」と伝えている。
+        let resumed_prompt = session
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .find(|c| c.starts_with("Resume working toward this goal"))
+            .expect("the resume prompt");
+        assert!(
+            resumed_prompt.contains("already spent 2 turn(s)"),
+            "{resumed_prompt}"
+        );
+    }
+
+    /// 一時停止中の goal は時計を進めない。`/goal` で眺めただけで経過時間が増えたり、開いたまま
+    /// 放置した時間が作業時間に数えられたりしない。
+    #[tokio::test]
+    async fn a_paused_goal_does_not_age() {
+        let mut goal = Goal::from_record(GoalRecord {
+            condition: "ship it".into(),
+            total_turns: 3,
+            elapsed_secs: 90,
+        })
+        .unwrap();
+        assert!(goal.started_at.is_none(), "restored as paused");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(goal.total_elapsed(), Duration::from_secs(90));
+        assert_eq!(goal.to_record().elapsed_secs, 90);
+
+        // 走らせると進み、止めるとまた止まる。
+        goal.begin_new_window();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        goal.pause();
+        let after_run = goal.total_elapsed();
+        assert!(
+            after_run > Duration::from_secs(90)
+                && goal.window_elapsed() >= Duration::from_millis(30)
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(goal.total_elapsed(), after_run);
+    }
+
+    /// `drive` を抜けたら、どの終わり方でも時計は止まっている。
+    #[tokio::test]
+    async fn the_clock_stops_when_the_run_ends() {
+        let llm = GoalLlm {
+            verdicts: vec![r#"{"met": false, "reason": "no"}"#],
+            eval_calls: AtomicUsize::new(0),
+        };
+        let mut session = test_session();
+        let mut goal = Goal::new("x").unwrap();
+        goal.max_turns = 1;
+        let out = drive(
+            &mut goal,
+            &mut session,
+            &llm,
+            "m",
+            &PermissionGate::new(true),
+            |_, g| {
+                assert!(
+                    g.started_at.is_some(),
+                    "running while turns are being taken"
+                );
+            },
+        )
+        .await;
+        assert!(matches!(out, GoalOutcome::TurnLimit));
+        assert!(goal.started_at.is_none());
+    }
+
+    /// 評価器を別のクライアントにすると、判定はそちらに尋ねる (作業側には尋ねない)。
+    #[tokio::test]
+    async fn a_separate_evaluator_is_the_one_that_judges() {
+        let worker = GoalLlm {
+            verdicts: vec![r#"{"met": true, "reason": "I say I am done"}"#],
+            eval_calls: AtomicUsize::new(0),
+        };
+        let judge = GoalLlm {
+            verdicts: vec![
+                r#"{"met": false, "reason": "no tests were run"}"#,
+                r#"{"met": true, "reason": "tests pass"}"#,
+            ],
+            eval_calls: AtomicUsize::new(0),
+        };
+        let mut session = test_session();
+        let gate = PermissionGate::new(true);
+        let mut goal = Goal::new("run the tests").unwrap();
+        let evaluator = Evaluator {
+            llm: &judge,
+            model: "judge-model",
+        };
+        let out = drive_with(
+            &mut goal,
+            &mut session,
+            &worker,
+            evaluator,
+            &gate,
+            |_, _| {},
+        )
+        .await;
+        match out {
+            GoalOutcome::Achieved { turns, reason } => {
+                assert_eq!((turns, reason.as_str()), (2, "tests pass"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(worker.eval_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(judge.eval_calls.load(Ordering::SeqCst), 2);
+    }
+
     /// 未達 → 達成の順で評価されると、2 ターンで Achieved になる。
     #[tokio::test]
     async fn drive_continues_until_achieved() {
@@ -353,7 +623,7 @@ mod tests {
         let gate = PermissionGate::new(true);
         let mut goal = Goal::new("run the tests").unwrap();
         let mut persisted = 0;
-        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_| {
+        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_, _| {
             persisted += 1;
         })
         .await;
@@ -384,7 +654,7 @@ mod tests {
         let gate = PermissionGate::new(true);
         let mut goal = Goal::new("never satisfied").unwrap();
         goal.max_turns = 3;
-        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_| {}).await;
+        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_, _| {}).await;
         assert!(matches!(out, GoalOutcome::TurnLimit), "got {out:?}");
         assert_eq!(goal.turns_used, 3);
     }
@@ -400,7 +670,7 @@ mod tests {
         let gate = PermissionGate::new(true);
         let mut goal = Goal::new("whatever").unwrap();
         goal.max_duration = Duration::ZERO;
-        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_| {}).await;
+        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_, _| {}).await;
         assert!(matches!(out, GoalOutcome::TimeLimit), "got {out:?}");
         assert_eq!(goal.turns_used, 0, "no turn should run past the deadline");
     }
@@ -415,7 +685,7 @@ mod tests {
         let mut session = test_session();
         let gate = PermissionGate::new(true);
         let mut goal = Goal::new("anything").unwrap();
-        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_| {}).await;
+        let out = drive(&mut goal, &mut session, &llm, "m", &gate, |_, _| {}).await;
         assert!(
             matches!(out, GoalOutcome::EvaluatorFailed(_)),
             "got {out:?}"

@@ -22,6 +22,17 @@ pub const KIND_GOAL_EVAL: &str = "goal_eval";
 pub const KIND_COMPACT: &str = "compact";
 pub const KIND_MCP_SAMPLING: &str = "mcp_sampling";
 
+/// モデルへの注意書きの書き出し。
+pub const BUDGET_REMINDER_PREFIX: &str = "[budget]";
+/// 注意書きの固定文。履歴から注意書きを見分けるときは、書き出しだけでなくここまで照合する
+/// (`[budget]` で始まる文を利用者が自分で書くことはあり得る)。
+const BUDGET_REMINDER_BODY: &str = "It will be cut off when the budget runs out. Wrap up:";
+
+/// `text` は lodan が足した予算の注意書きそのものか。
+pub fn is_budget_reminder(text: &str) -> bool {
+    text.starts_with(BUDGET_REMINDER_PREFIX) && text.contains(BUDGET_REMINDER_BODY)
+}
+
 /// 予算の何割を使ったら、モデルに一度だけ知らせるか。
 const REMINDER_PERCENT: u64 = 80;
 
@@ -63,6 +74,30 @@ fn current_kind() -> &'static str {
 pub struct Budget {
     pub max_requests: Option<u64>,
     pub max_total_tokens: Option<u64>,
+}
+
+/// `[pricing."<model>"]`。100 万トークンあたりの単価 (通貨は書いた人の単位のまま)。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelPrice {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+}
+
+impl ModelPrice {
+    /// 単価は有限で 0 以上。`nan` や負の値を通すと `/cost` が `~NaN` や負の金額になる。
+    pub fn validate(&self, model: &str) -> Result<(), String> {
+        for (name, value) in [
+            ("input_per_mtok", self.input_per_mtok),
+            ("output_per_mtok", self.output_per_mtok),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "[pricing.\"{model}\"] {name} = {value} is not a price (it must be a finite number, 0 or more)"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 予算を使い切ったので、次のリクエストを送らなかった。
@@ -108,6 +143,8 @@ struct LedgerState {
     /// 送ったリクエストの数。失敗したものも含む (無料枠はリクエスト数で数えられる)。
     requests: u64,
     by_kind: BTreeMap<&'static str, KindUsage>,
+    /// モデル名ごとの使用量 (単価はモデルごとに違う。fallback や `/goal` の評価器は別モデル)。
+    by_model: BTreeMap<String, KindUsage>,
     reminded: bool,
     /// 予算が無くて見送った再試行 (あれば)。
     retry_refused: Option<BudgetExceededError>,
@@ -117,6 +154,7 @@ struct LedgerState {
 #[derive(Debug, Default)]
 pub struct Ledger {
     budget: Budget,
+    pricing: BTreeMap<String, ModelPrice>,
     state: Mutex<LedgerState>,
 }
 
@@ -124,8 +162,40 @@ impl Ledger {
     pub fn new(budget: Budget) -> Self {
         Self {
             budget,
+            pricing: BTreeMap::new(),
             state: Mutex::default(),
         }
+    }
+
+    /// `/cost` に金額を出すための単価表。
+    pub fn with_pricing(mut self, pricing: BTreeMap<String, ModelPrice>) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    /// 単価の分かっているモデルの使用量から見積もった金額。単価表が空なら None。
+    /// 第 2 要素は、使ったのに単価が無くて金額に入っていないモデル。
+    pub fn cost(&self) -> Option<(f64, Vec<String>)> {
+        self.cost_of(&self.state())
+    }
+
+    /// [`Self::cost`] の本体。既にロックを持っている呼び出し側 (`describe`) が取り直さずに済むように。
+    fn cost_of(&self, state: &LedgerState) -> Option<(f64, Vec<String>)> {
+        if self.pricing.is_empty() {
+            return None;
+        }
+        let mut total = 0.0;
+        let mut unpriced = Vec::new();
+        for (model, usage) in &state.by_model {
+            match self.pricing.get(model) {
+                Some(price) => {
+                    total += usage.prompt_tokens as f64 / 1e6 * price.input_per_mtok
+                        + usage.completion_tokens as f64 / 1e6 * price.output_per_mtok;
+                }
+                None => unpriced.push(model.clone()),
+            }
+        }
+        Some((total, unpriced))
     }
 
     pub fn budget(&self) -> Budget {
@@ -163,10 +233,12 @@ impl Ledger {
         Ok(())
     }
 
-    fn record(&self, kind: &'static str, usage: Usage, estimated: bool) {
-        self.state()
-            .by_kind
-            .entry(kind)
+    fn record(&self, kind: &'static str, model: &str, usage: Usage, estimated: bool) {
+        let mut state = self.state();
+        state.by_kind.entry(kind).or_default().add(usage, estimated);
+        state
+            .by_model
+            .entry(model.to_string())
             .or_default()
             .add(usage, estimated);
     }
@@ -190,6 +262,13 @@ impl Ledger {
             return None;
         }
         let tokens = total(&state.by_kind).total_tokens;
+        // もう 1 件も送れないなら、知らせても畳む機会が無い (履歴に宙に浮いた注意書きが残るだけ)。
+        let spent = |used: u64, limit: Option<u64>| limit.is_some_and(|l| used >= l);
+        if spent(state.requests, self.budget.max_requests)
+            || spent(tokens, self.budget.max_total_tokens)
+        {
+            return None;
+        }
         // u64 のまま掛けると、巨大な上限 (`--max-requests 18446744073709551615`) であふれる。
         let near = |used: u64, limit: Option<u64>| {
             limit.is_some_and(|l| {
@@ -215,10 +294,18 @@ impl Ledger {
         }
         state.reminded = true;
         Some(format!(
-            "[budget] This run has used {}. It will be cut off when the budget runs out. Wrap up: \
+            "{BUDGET_REMINDER_PREFIX} This run has used {}. {BUDGET_REMINDER_BODY} \
              finish the most important remaining step and report what is done and what is not.",
             parts.join(" and ")
         ))
+    }
+
+    /// テスト用: 予算を 8 割まで使ったことにして、実際の注意書きを取り出す。
+    #[cfg(test)]
+    pub(crate) fn force_reminder_for_tests(&self) -> String {
+        let limit = self.budget.max_requests.expect("a request budget");
+        self.state().requests = limit * 4 / 5;
+        self.take_reminder().expect("80% of the budget is used")
     }
 
     /// `/cost` 用の表示。
@@ -260,6 +347,17 @@ impl Ledger {
                 crate::agent::r#loop::ESTIMATE_CHARS_PER_TOKEN
             ));
         }
+        if let Some((cost, unpriced)) = self.cost_of(&state) {
+            out.push_str(&format!("\ncost: ~{cost:.4} (from [pricing])"));
+            if !unpriced.is_empty() {
+                // モデル名は設定や環境変数から来る文字列。端末に出すので無害化する。
+                let names: Vec<String> = unpriced
+                    .iter()
+                    .map(|m| crate::term::sanitize(m).into_owned())
+                    .collect();
+                out.push_str(&format!("; no price for {}", names.join(", ")));
+            }
+        }
         out.extend(limit(state.requests, self.budget.max_requests, "requests"));
         out.extend(limit(
             all.total_tokens,
@@ -298,14 +396,14 @@ impl MeteredClient {
         }
     }
 
-    fn record(&self, history: &[Message], resp: &ChatResponse) {
+    fn record(&self, model: &str, history: &[Message], resp: &ChatResponse) {
         let (usage, estimated) = match resp.usage {
             Some(u) if u.prompt_tokens + u.completion_tokens + u.total_tokens > 0 => {
                 (u.normalized(), false)
             }
             _ => (crate::agent::r#loop::estimate_usage(history, resp), true),
         };
-        self.ledger.record(current_kind(), usage, estimated);
+        self.ledger.record(current_kind(), model, usage, estimated);
     }
 }
 
@@ -326,7 +424,7 @@ impl LlmClient for MeteredClient {
             )
             .await
             .map_err(|e| self.explain(e))?;
-        self.record(history, &resp);
+        self.record(model, history, &resp);
         Ok(resp)
     }
 
@@ -343,7 +441,7 @@ impl LlmClient for MeteredClient {
         let forward = async {
             while let Some(event) = rx.recv().await {
                 if let ChatEvent::Done(resp) = &event {
-                    self.record(history, resp);
+                    self.record(model, history, resp);
                 }
                 // 受け手が先にいなくなっても (Ctrl-C)、内側の送信は最後まで吸い出す。
                 let _ = sink.send(event);
@@ -448,6 +546,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cost_is_estimated_per_model_from_the_pricing_table() {
+        let pricing = BTreeMap::from([(
+            "big".to_string(),
+            ModelPrice {
+                input_per_mtok: 2.0,
+                output_per_mtok: 10.0,
+            },
+        )]);
+        let ledger = Arc::new(Ledger::new(Budget::default()).with_pricing(pricing));
+        let client = MeteredClient::new(
+            Arc::new(Fixed {
+                usage: usage(1_000_000, 100_000),
+                fail: false,
+            }),
+            ledger.clone(),
+        );
+        client.chat(&[], &[], "big", None).await.unwrap();
+        let (cost, unpriced) = ledger.cost().unwrap();
+        assert!((cost - 3.0).abs() < 1e-9, "2.0 in + 1.0 out = {cost}");
+        assert!(unpriced.is_empty());
+
+        // 単価の無いモデル (fallback など) は金額に入れず、入っていないことを言う。
+        client.chat(&[], &[], "small-local", None).await.unwrap();
+        let (cost, unpriced) = ledger.cost().unwrap();
+        assert!((cost - 3.0).abs() < 1e-9);
+        assert_eq!(unpriced, ["small-local"]);
+        let shown = ledger.describe();
+        assert!(
+            shown.contains("cost: ~3.0000") && shown.contains("no price for small-local"),
+            "{shown}"
+        );
+
+        // 単価表が無ければ、金額の行そのものを出さない。
+        let (plain, plain_ledger) = metered(usage(10, 10), Budget::default());
+        plain.chat(&[], &[], "big", None).await.unwrap();
+        assert!(plain_ledger.cost().is_none() && !plain_ledger.describe().contains("cost:"));
+    }
+
+    #[test]
+    fn a_price_must_be_a_finite_non_negative_number() {
+        let price = |input, output| ModelPrice {
+            input_per_mtok: input,
+            output_per_mtok: output,
+        };
+        assert!(price(0.0, 2.5).validate("m").is_ok());
+        for bad in [
+            price(-5.0, 1.0),
+            price(1.0, f64::NAN),
+            price(f64::INFINITY, 1.0),
+        ] {
+            let err = bad.validate("kimi-k3").unwrap_err();
+            assert!(err.contains("kimi-k3"), "{err}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_missing_usage_is_estimated_and_flagged() {
         let (client, ledger) = metered(None, Budget::default());
         let history = [Message::User {
@@ -535,6 +689,17 @@ mod tests {
         let reminder = ledger.take_reminder().expect("4 of 5 is 80%");
         assert!(reminder.contains("4 of 5 LLM requests"), "{reminder}");
         assert_eq!(ledger.take_reminder(), None, "only once");
+
+        // 使い切ってからでは遅い: 次のリクエストは送られないので、知らせない。
+        let (client, ledger) = metered(
+            usage(10, 0),
+            Budget {
+                max_requests: Some(1),
+                max_total_tokens: None,
+            },
+        );
+        client.chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(ledger.take_reminder(), None);
 
         let unlimited = Ledger::new(Budget::default());
         assert_eq!(unlimited.take_reminder(), None);

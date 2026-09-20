@@ -319,6 +319,8 @@ impl Report {
             "completion_tokens": total.completion_tokens,
             "total_tokens": total.total_tokens,
             "by_kind": by_kind,
+            // `[pricing]` があるときだけ数値。単価の無いモデルの分は入っていない。
+            "cost": ledger.cost().map(|(cost, _)| cost),
         });
         self
     }

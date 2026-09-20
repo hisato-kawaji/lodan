@@ -38,6 +38,8 @@ pub struct Session {
     hook_env: HookEnv,
     /// hook が寄せた追加文脈のうち、まだモデルに渡していないもの。次のユーザ入力に添える。
     pending_context: Vec<String>,
+    /// プロセス全体の使用量の台帳。予算が残り少なくなったら、モデルに一度だけ知らせる (#84)。
+    ledger: Option<Arc<crate::llm::metered::Ledger>>,
 }
 
 /// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
@@ -55,10 +57,12 @@ impl Session {
     /// 保存済みセッションから復元する。`prior` の System メッセージは捨て、
     /// 現環境のツール一覧で system prompt を作り直してから残りを引き継ぐ。
     pub fn resume(cfg: Config, registry: Arc<ToolRegistry>, prior: Vec<Message>) -> Self {
-        let prior: Vec<Message> = prior
+        let mut prior: Vec<Message> = prior
             .into_iter()
             .filter(|m| !matches!(m, Message::System { .. }))
             .collect();
+        // 予算は実行ごとのもの。前の実行の「残りわずか、畳め」を、新しい実行のモデルに読ませない。
+        strip_budget_reminders(&mut prior);
         Self::with_prior(cfg, registry, prior)
     }
 
@@ -82,7 +86,12 @@ impl Session {
             active_hooks,
             hook_env: HookEnv::default(),
             pending_context: Vec::new(),
+            ledger: None,
         }
+    }
+
+    pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
+        self.ledger = Some(ledger);
     }
 
     pub fn set_hook_env(&mut self, env: HookEnv) {
@@ -229,6 +238,24 @@ impl Session {
                 }
                 Mode::Normal => self.registry.tool_specs(),
             };
+            // 予算の 8 割を使ったら、打ち切られる前に畳めるよう一度だけ知らせる。ここは必ず
+            // User か Tool の直後なので、履歴は API に投げられる形のまま。
+            if let Some(reminder) = self.ledger.as_ref().and_then(|l| l.take_reminder()) {
+                crate::say!("{}", crate::term::dim(&reminder));
+                crate::runlog::record(
+                    "budget_reminder",
+                    serde_json::json!({ "turn": self.turn_seq, "iter": iterations }),
+                );
+                // ターンの最初の呼び出しでは直前が利用者の入力。user を 2 つ続けると、役割の交互を
+                // 要求するチャットテンプレートに拒否されるので、その入力の後ろに添える。
+                match self.history.last_mut() {
+                    Some(Message::User { content }) => {
+                        content.push_str("\n\n");
+                        content.push_str(&reminder);
+                    }
+                    _ => self.history.push(Message::User { content: reminder }),
+                }
+            }
             let resp =
                 stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
             let (u, estimated) = resolve_usage(&resp, &self.history);
@@ -693,11 +720,15 @@ impl Session {
     }
 
     /// 直近のコンテキストサイズがしきい値 (context_window の
-    /// `AUTO_COMPACT_THRESHOLD_PERCENT`%) に達したか。`context_window = 0` は無効。
+    /// `agent.auto_compact_percent`%) に達したか。`context_window = 0` は無効。
     pub fn should_auto_compact(&self) -> bool {
         let window = self.cfg.llm.active().context_window;
+        let percent = self.cfg.agent.auto_compact_percent;
+        // 0 は「無効」。そのまま計算すると「常に発火」になってしまう (隣の `context_window = 0` が
+        // 無効化の意味なので、0 をそのつもりで書く人がいる)。
         window > 0
-            && self.usage.last_context_tokens * 100 >= window * AUTO_COMPACT_THRESHOLD_PERCENT
+            && percent > 0
+            && self.usage.last_context_tokens * 100 >= window * u64::from(percent)
     }
 
     /// しきい値超過時の自動圧縮。ターン終端で呼ぶ。圧縮に失敗しても
@@ -711,7 +742,7 @@ impl Session {
             "{}",
             crate::term::dim(&format!(
                 "[auto-compact] context ~{} tokens ≥ {}% of {} window",
-                self.usage.last_context_tokens, AUTO_COMPACT_THRESHOLD_PERCENT, window
+                self.usage.last_context_tokens, self.cfg.agent.auto_compact_percent, window
             ))
         );
         // compact() 内の要約呼び出しで last_context_tokens は要約プロンプト分に
@@ -942,7 +973,11 @@ impl Session {
             .history
             .iter()
             .enumerate()
-            .filter(|(_, m)| matches!(m, Message::User { .. }))
+            // ツール往復の途中に足した予算の注意書きは user メッセージだが、利用者のターンではない。
+            .filter(|(_, m)| {
+                matches!(m, Message::User { content }
+                    if !crate::llm::metered::is_budget_reminder(content))
+            })
             .map(|(i, _)| i)
             .collect();
         if user_idxs.len() <= KEEP_RECENT_USER_TURNS {
@@ -1028,9 +1063,6 @@ const KEEP_RECENT_USER_TURNS: usize = 2;
 /// hook に伝える圧縮のきっかけ (PreCompact / PostCompact の matcher と payload の `trigger`)。
 const COMPACT_MANUAL: &str = "manual";
 const COMPACT_AUTO: &str = "auto";
-
-/// 自動圧縮を発火するコンテキスト使用率 (context_window に対する %)。
-const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
 /// usage 概算フォールバックの 1 トークンあたり文字数。英語 ~4 文字/トークン、
 /// 日本語 ~1-2 文字/トークンの間を取った粗い近似 (桁が合えば十分)。
@@ -1190,6 +1222,29 @@ enum Prefetched {
         /// PreToolUse hook の `additionalContext`。
         context: Vec<String>,
     },
+}
+
+/// 履歴から、予算の注意書きを取り除く。入力の末尾に添えたものは切り落とし、単独のメッセージ
+/// (ツール結果の後に足したもの) は丸ごと外す — 外しても Tool → Assistant の並びで、API に投げられる形のまま。
+fn strip_budget_reminders(history: &mut Vec<Message>) {
+    use crate::llm::metered::{BUDGET_REMINDER_PREFIX, is_budget_reminder};
+    // 書き出しの `[budget]` だけで決めない: 利用者が自分でそう書くことはあり得る。注意書きの
+    // 固定文まで照合し、合わないものには触らない。
+    history.retain_mut(|message| {
+        let Message::User { content } = message else {
+            return true;
+        };
+        if is_budget_reminder(content) {
+            return false;
+        }
+        // 添えるのは常に末尾なので、最後の区切りから後ろが注意書きのときだけ切り落とす。
+        if let Some(at) = content.rfind(&format!("\n\n{BUDGET_REMINDER_PREFIX} "))
+            && is_budget_reminder(&content[at + 2..])
+        {
+            content.truncate(at);
+        }
+        true
+    });
 }
 
 /// hook が寄せた文脈をモデルに渡すときの枠。利用者の言葉やツールの出力と取り違えさせない。
@@ -1972,6 +2027,239 @@ mod tests {
             .await
             .unwrap();
         assert!(!below.should_auto_compact(), "79/100 must not trigger");
+    }
+
+    /// しきい値は `agent.auto_compact_percent` で変えられる。
+    #[tokio::test]
+    async fn the_auto_compact_threshold_is_configurable() {
+        let gate = PermissionGate::new(true);
+        let mut early = session_with_window(100);
+        early.cfg.agent.auto_compact_percent = 50;
+        early
+            .run_turn("hi", &llm_with_prompt_tokens(50), &gate)
+            .await
+            .unwrap();
+        assert!(early.should_auto_compact(), "50/100 triggers at 50%");
+
+        let mut default = session_with_window(100);
+        default
+            .run_turn("hi", &llm_with_prompt_tokens(50), &gate)
+            .await
+            .unwrap();
+        assert!(!default.should_auto_compact(), "but not at the default 80%");
+    }
+
+    /// ツール往復が何回も続くターンの途中で 8 割を超えても、注意書きは 1 回だけ。ツール結果の
+    /// 後なので単独の user メッセージになる (tool の直後に assistant 以外が来るのはこの形だけ)。
+    #[tokio::test]
+    async fn a_long_tool_loop_gets_exactly_one_reminder() {
+        use crate::llm::metered::{Budget, Ledger, MeteredClient};
+        /// 18 回ツールを呼んでから答える。
+        struct FiveCalls(AtomicUsize);
+        #[async_trait]
+        impl LlmClient for FiveCalls {
+            async fn chat(
+                &self,
+                _h: &[Message],
+                _t: &[ToolSpec<'_>],
+                _m: &str,
+                _mt: Option<u32>,
+            ) -> Result<ChatResponse> {
+                unreachable!("not used")
+            }
+            async fn chat_stream(
+                &self,
+                _h: &[Message],
+                _t: &[ToolSpec<'_>],
+                _m: &str,
+                sink: mpsc::UnboundedSender<ChatEvent>,
+            ) -> Result<()> {
+                let n = self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                let resp = if n < 18 {
+                    ChatResponse {
+                        content: None,
+                        tool_calls: vec![tool_call_with_args(
+                            &format!("c{n}"),
+                            "Ser",
+                            &format!(r#"{{"n": {n}}}"#),
+                        )],
+                        usage: None,
+                    }
+                } else {
+                    ChatResponse {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                    }
+                };
+                let _ = sink.send(ChatEvent::Done(resp));
+                Ok(())
+            }
+        }
+        // 予算 20 なら 16〜19 件目の前の 4 回が「8 割以上で、まだ送れる」。毎回入れてしまう実装は
+        // ここで 4 つ入れる (予算 6 だと該当が 1 回しかなく、「1 回だけ」を確かめられなかった)。
+        let ledger = Arc::new(Ledger::new(Budget {
+            max_requests: Some(20),
+            max_total_tokens: None,
+        }));
+        let llm = MeteredClient::new(Arc::new(FiveCalls(AtomicUsize::new(0))), ledger.clone());
+        let (mut session, _stats) = probe_session(Config::default());
+        session.set_ledger(ledger);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+
+        let roles: Vec<&str> = session
+            .history()
+            .iter()
+            .map(|m| match m {
+                Message::System { .. } => "system",
+                Message::User { content } if content.starts_with("[budget]") => "reminder",
+                Message::User { .. } => "user",
+                Message::Assistant { .. } => "assistant",
+                Message::Tool { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(
+            roles.iter().filter(|r| **r == "reminder").count(),
+            1,
+            "{roles:?}"
+        );
+        let at = roles.iter().position(|r| *r == "reminder").unwrap();
+        assert_eq!(
+            (roles[at - 1], roles[at + 1]),
+            ("tool", "assistant"),
+            "{roles:?}"
+        );
+
+        // 再開したセッションには、前の実行の注意書きを持ち込まない (履歴は API-valid のまま)。
+        let resumed = Session::resume(
+            Config::default(),
+            Arc::new(default_registry()),
+            session.history().to_vec(),
+        );
+        assert!(
+            resumed
+                .history()
+                .iter()
+                .all(|m| !matches!(m, Message::User { content } if content.contains("[budget]")))
+        );
+        assert_eq!(resumed.history().len(), session.history().len() - 1);
+    }
+
+    /// 台帳が実際に出す注意書き (文面をテストに写さない)。
+    fn real_reminder(ledger: &crate::llm::metered::Ledger) -> String {
+        ledger.force_reminder_for_tests()
+    }
+
+    #[test]
+    fn a_reminder_attached_to_a_prompt_is_cut_off_on_resume() {
+        let ledger = crate::llm::metered::Ledger::new(crate::llm::metered::Budget {
+            max_requests: Some(5),
+            max_total_tokens: None,
+        });
+        let reminder = real_reminder(&ledger);
+        // 利用者が自分で書いた `[budget]` は、先頭にあっても、段落の頭にあっても、触らない
+        // (レビューで、メッセージごと消える・後半が切れるの両方が実際に起きた)。
+        let own_words = [
+            "[budget] how much have I used so far?",
+            "review the README section on budgets\n\n[budget] is the literal tag I mean; keep it",
+            "talk about the [budget] feature",
+        ];
+        let mut history: Vec<Message> = own_words
+            .iter()
+            .map(|w| Message::User {
+                content: w.to_string(),
+            })
+            .collect();
+        history.push(Message::User {
+            content: format!("fix the bug\n\n{reminder}"),
+        });
+        history.push(Message::User {
+            content: reminder.clone(),
+        });
+        strip_budget_reminders(&mut history);
+        let left: Vec<&str> = history
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => content.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            left,
+            [own_words[0], own_words[1], own_words[2], "fix the bug"]
+        );
+    }
+
+    /// 0 は「無効」。「常に発火」ではない。
+    #[tokio::test]
+    async fn an_auto_compact_percent_of_zero_turns_it_off() {
+        let mut session = session_with_window(100);
+        session.cfg.agent.auto_compact_percent = 0;
+        session
+            .run_turn(
+                "hi",
+                &llm_with_prompt_tokens(99),
+                &PermissionGate::new(true),
+            )
+            .await
+            .unwrap();
+        assert!(!session.should_auto_compact());
+    }
+
+    /// 予算の 8 割を使ったら、次の LLM 呼び出しの前に一度だけモデルへ知らせる。
+    #[tokio::test]
+    async fn the_model_is_told_once_when_the_budget_is_nearly_spent() {
+        use crate::llm::metered::{Budget, Ledger, MeteredClient};
+        let ledger = Arc::new(Ledger::new(Budget {
+            max_requests: Some(5),
+            max_total_tokens: None,
+        }));
+        let llm = MeteredClient::new(
+            Arc::new(FinalTextLlm {
+                text: "ok".into(),
+                usage: None,
+            }),
+            ledger.clone(),
+        );
+        let mut session = session_with_stop_hook(None);
+        session.set_ledger(ledger.clone());
+        let gate = PermissionGate::new(true);
+        let reminders = |s: &Session| {
+            s.history()
+                .iter()
+                .filter(|m| matches!(m, Message::User { content } if content.contains("[budget]")))
+                .count()
+        };
+        for prompt in ["t1", "t2", "t3", "t4"] {
+            session.run_turn(prompt, &llm, &gate).await.unwrap();
+        }
+        assert_eq!(
+            reminders(&session),
+            0,
+            "4 of 5 used, but nothing was sent since"
+        );
+
+        session.run_turn("t5", &llm, &gate).await.unwrap();
+        assert_eq!(reminders(&session), 1);
+        // 注意書きは、そのターンの入力に添えられる (user メッセージを 2 つ続けない)。
+        let tail: Vec<&Message> = session.history().iter().rev().take(3).collect();
+        assert!(matches!(tail[0], Message::Assistant { .. }));
+        assert!(matches!(
+            tail[1],
+            Message::User { content }
+                if content.starts_with("t5\n\n[budget]") && content.contains("4 of 5 LLM requests")
+        ));
+        assert!(
+            matches!(tail[2], Message::Assistant { .. }),
+            "no second user message"
+        );
+
+        // 予算を使い切った後のターンは送られず、注意書きも増えない。
+        assert!(session.run_turn("t6", &llm, &gate).await.is_err());
+        assert_eq!(reminders(&session), 1);
     }
 
     /// しきい値超過中にターンを重ねると、ターン終端の自動圧縮で要約に畳まれる。

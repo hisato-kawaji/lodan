@@ -505,7 +505,7 @@ impl Session {
                     Some(event) => self.fire_hook(event, Some(&name), post_payload).await?,
                     None => HookOutcome::default(),
                 };
-                if let Some(reason) = post.block.as_ref().filter(|_| !output.is_error) {
+                if let Some(reason) = &post.block {
                     // 実行後なので取り消せない。理由をツール出力へ追記し、
                     // history 経由でモデルへフィードバックする。
                     crate::say!("post-tool hook: {}", crate::term::sanitize(reason));
@@ -906,12 +906,7 @@ impl Session {
         instruction: &str,
     ) -> Result<CompactOutcome> {
         // 畳むものが無いときは hook も鳴らさない (「圧縮の前」ではないので)。
-        let user_turns = self
-            .history
-            .iter()
-            .filter(|m| matches!(m, Message::User { .. }))
-            .count();
-        if user_turns <= KEEP_RECENT_USER_TURNS {
+        if self.compact_boundary().is_none() {
             return Ok(CompactOutcome::Skipped);
         }
         let pre = self
@@ -941,11 +936,8 @@ impl Session {
         Ok(outcome)
     }
 
-    async fn compact_now(
-        &mut self,
-        llm: &dyn LlmClient,
-        instruction: &str,
-    ) -> Result<CompactOutcome> {
+    /// 要約で畳む範囲の終わり (`history[1..boundary]` が対象)。畳むものが無ければ None。
+    fn compact_boundary(&self) -> Option<usize> {
         let user_idxs: Vec<usize> = self
             .history
             .iter()
@@ -954,13 +946,21 @@ impl Session {
             .map(|(i, _)| i)
             .collect();
         if user_idxs.len() <= KEEP_RECENT_USER_TURNS {
-            return Ok(CompactOutcome::Skipped);
+            return None;
         }
         let boundary = user_idxs[user_idxs.len() - KEEP_RECENT_USER_TURNS];
         // system(index 0) の直後から boundary 手前までが要約対象。
-        if boundary <= 1 {
+        (boundary > 1).then_some(boundary)
+    }
+
+    async fn compact_now(
+        &mut self,
+        llm: &dyn LlmClient,
+        instruction: &str,
+    ) -> Result<CompactOutcome> {
+        let Some(boundary) = self.compact_boundary() else {
             return Ok(CompactOutcome::Skipped);
-        }
+        };
 
         let before = self.history.len();
         let rendered = render_for_summary(&self.history[1..boundary]);
@@ -2812,6 +2812,64 @@ mod tests {
         assert_eq!(run(answer(plain), &["Mut"]).await.0, 1);
         // ask ルールにも勝てない (利用者が「必ず尋ねる」と書いたもの)。
         assert_eq!(run(answer(plain), &["ask:Mut"]).await.0, 1);
+    }
+
+    /// PreToolUse hook が「必ず尋ねろ」と言った呼び出しを、PermissionRequest hook の allow で
+    /// 通してしまわない。
+    #[tokio::test]
+    async fn a_permission_request_allow_cannot_cancel_a_pre_tool_ask() {
+        let mut cfg = Config {
+            hooks: vec![
+                pre_tool_hook("Mut", HOOK_ASKS),
+                HookConfig {
+                    id: None,
+                    event: Lifecycle::PermissionRequest,
+                    matcher: String::new(),
+                    command: r#"cat > /dev/null; printf '%s' '{"hookSpecificOutput":{"decision":"allow"}}'"#.into(),
+                    timeout_secs: None,
+                },
+            ],
+            ..Default::default()
+        };
+        cfg.agent.auto_approve = true;
+        let gate = headless_gate(&cfg);
+        let (mut session, stats) = probe_session(cfg);
+        session
+            .run_turn("go", &batch(&[("Mut", 1)]), &gate)
+            .await
+            .unwrap();
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// 失敗した呼び出しの後でも、hook が述べた理由は捨てずにモデルへ返す (v1 でも v2 でも)。
+    #[tokio::test]
+    async fn a_post_tool_block_on_a_failed_call_still_reaches_the_model() {
+        for (compat, event) in [
+            (hooks::HooksCompat::V1, Lifecycle::PostToolUse),
+            (hooks::HooksCompat::V2, Lifecycle::PostToolUseFailure),
+        ] {
+            let cfg = Config {
+                hooks: vec![HookConfig {
+                    id: None,
+                    event,
+                    matcher: String::new(),
+                    command: "cat > /dev/null; echo 'check the lockfile' >&2; exit 2".into(),
+                    timeout_secs: None,
+                }],
+                hooks_compat: compat,
+                ..Default::default()
+            };
+            let (mut session, _stats) = probe_session(cfg);
+            session
+                .run_turn("go", &batch(&[("Ser", 13)]), &PermissionGate::new(true))
+                .await
+                .unwrap();
+            let reply = &tool_replies(&session)[0].1;
+            assert!(
+                reply.contains("unlucky") && reply.contains("[post-tool hook] check the lockfile"),
+                "{compat:?}: {reply}"
+            );
+        }
     }
 
     #[tokio::test]

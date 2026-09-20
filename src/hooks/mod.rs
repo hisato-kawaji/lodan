@@ -134,6 +134,15 @@ pub fn effective(hooks: &[HookConfig], disabled: &[String]) -> Vec<HookConfig> {
         .collect()
 }
 
+/// `disabled` のうち、どの hook の `id` でもないもの。綴り違いで「外したつもり」になるのを防ぐ。
+pub fn unknown_disabled<'a>(hooks: &[HookConfig], disabled: &'a [String]) -> Vec<&'a str> {
+    disabled
+        .iter()
+        .filter(|id| !hooks.iter().any(|h| h.id.as_ref() == Some(*id)))
+        .map(String::as_str)
+        .collect()
+}
+
 #[async_trait]
 pub trait Hook: Send + Sync {
     fn name(&self) -> &str;
@@ -215,5 +224,8 @@ mod tests {
             commands(&["lint", "nope"]),
             ["user-anonymous", "user-notify"]
         );
+
+        let disabled = vec!["lint".to_string(), "nope".to_string()];
+        assert_eq!(unknown_disabled(&hooks, &disabled), ["nope"]);
     }
 }

@@ -55,6 +55,13 @@ impl Runtime {
         for hook in &cfg.hooks {
             hook.validate().map_err(|e| anyhow::anyhow!(e))?;
         }
+        // 別のマシンの設定には無い hook を名指しすることもあるので、エラーにはせず知らせるだけ。
+        for id in crate::hooks::unknown_disabled(&cfg.hooks, &cfg.disabled_hooks) {
+            eprintln!(
+                "hooks: disabled_hooks names `{}`, but no hook has that id",
+                crate::term::sanitize(id)
+            );
+        }
 
         // プロジェクトの skill はモデルへの指示を差し込む。信頼済みのディレクトリでだけ読む (#75)。
         let user_skills = if crate::trust::project_trusted() {

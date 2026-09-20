@@ -640,7 +640,7 @@ event = "PostToolUse"
 command = "./scripts/lint-changed.sh"
 ```
 
-`disabled_hooks` もレイヤー間で連結されます。`id` の無い hook は外せません。`lodan config` の `[[hooks]]` は連結したままの一覧で、実際に発火するのは「`disabled_hooks` を除き、同じ `id` は最後の 1 つ」です。
+`disabled_hooks` もレイヤー間で連結されます。`id` の無い hook は外せません。どの hook の `id` でもない名前が書かれていたら、起動時に警告します（綴り違いで「外したつもり」にならないように。別のマシンの設定には無い hook を名指しすることもあるので、エラーにはしません）。置き換えた hook は**後段の hook の位置**で発火します（hook は並び順に実行され、ブロックした時点で残りは実行されないので、順序が効く場面では注意）。`lodan config` の `[[hooks]]` は連結したままの一覧で、実際に発火するのは「`disabled_hooks` を除き、同じ `id` は最後の 1 つ」です。
 
 > ⚠️ これは便利のための仕組みで、**守りにはなりません**。信頼したプロジェクトの設定は、ユーザ設定の guard hook を `disabled_hooks` で外せます（プロジェクトの設定は hook を足せる時点で任意のコマンドを実行できるので、信頼の範囲は変わりません）。
 
@@ -663,9 +663,9 @@ MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memo
 - **UserPromptSubmit**: `prompt`。ブロック時はそのターンを実行せず破棄。
 - **PreToolUse**: `tool_name` / `tool_input`。ブロック時はツールを実行せず、理由をモデルへ返す。
 - **PermissionRequest**: `tool_name` / `tool_input`。**承認プロンプトを出す直前**（= ルールでもモードでも決まらず、誰かの承認が要る呼び出し）に発火。`{"hookSpecificOutput": {"decision": {"behavior": "allow"}}}` で承認、`{"behavior": "deny", "message": "…"}` で拒否（`"decision": "allow"` の文字列形も可）。`allow` の効き方は PreToolUse の `allow` と同じで、deny / ask ルールと `dont-ask` には勝てない。尋ねる相手のいない `-p` でも発火するので、ヘッドレス実行の承認役にできる。
-- **Notification**: `notification_type`（`permission_prompt`）/ `message`。REPL が承認プロンプトを出して**人の入力を待つ直前**に発火（デスクトップ通知などに）。出力は読まない。
+- **Notification**: `notification_type`（`permission_prompt`）/ `message`。REPL が承認プロンプトを出して**人の入力を待つ直前**に発火（デスクトップ通知などに）。出力は読まない。hook の終了を待ってからプロンプトを出すので、時間のかかる通知はコマンドの中でバックグラウンドに回すこと（`notify-send … &`）。
 - **PostToolUse**: `tool_name` / `tool_input` / `tool_response`（旧名 `tool_output` も同じ値）。**成功した実行の後**に発火。実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。
-- **PostToolUseFailure**: PostToolUse の項目に加えて `error`。ツールを**実行して失敗した**ときに発火。hook やゲートが止めて実行に至らなかった呼び出しでは、PostToolUse も PostToolUseFailure も発火しない（`hooks_compat = "v1"` では従来どおり、全ての呼び出しで PostToolUse）。
+- **PostToolUseFailure**: PostToolUse の項目に加えて `error`。ツールを**実行して失敗した**ときに発火。PostToolUse と同じく実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。hook やゲートが止めて実行に至らなかった呼び出しでは、PostToolUse も PostToolUseFailure も発火しない（`hooks_compat = "v1"` では従来どおり、全ての呼び出しで PostToolUse）。
 - **PreCompact** / **PostCompact**: `trigger`（`manual` | `auto`）、PreCompact には `custom_instructions`（`/compact <指示>` の指示）。PreCompact をブロックすると圧縮しない。畳むものが無くて圧縮が見送られるときは発火しない。
 - **SubagentStart** / **SubagentStop**: `agent_type` / `cwd`、Start には `prompt`（依頼文）、Stop には `last_assistant_message`（失敗時は `error`）。`Task` の子エージェントの開始と終了。通知用で、ブロックはできない。`session_id` などの共通フィールドは付かない。
 - **Stop**: `last_assistant_message`（旧名 `last_message` も同じ値）。ターン終端で発火。**ブロックすると停止せず、その理由をユーザー入力として注入し次ターンへ継続する**（暴走は `max_iterations` で停止）。「条件を満たすまで作業を続ける」系の自律ループの土台。

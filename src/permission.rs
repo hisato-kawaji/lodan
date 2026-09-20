@@ -28,6 +28,15 @@ pub struct PermissionGate {
     policy: Mutex<SessionPolicy>,
 }
 
+/// [`PermissionGate::assess`] の結果。
+#[derive(Debug, Clone)]
+pub struct Assessment {
+    /// ask ルールに当たった (hook の allow でも尋ねる)。
+    asked_by_rule: bool,
+    /// 尋ねずに決まるならその結論。
+    quiet: Option<Decision>,
+}
+
 /// ゲートの結論。尋ねる必要があれば `decide` の中で尋ね終えている。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -124,11 +133,54 @@ impl PermissionGate {
         destructive: bool,
         hint: Option<crate::hooks::PermissionHint>,
     ) -> Decision {
-        use crate::hooks::PermissionHint;
-        // ルールの評価はファイルツリーを歩くことがある。1 回だけ行って使い回す。
+        let assessed = self.assess(tool_name, args, destructive);
+        self.decide_assessed(assessed, tool_name, args, hint)
+    }
+
+    /// ルールとモードだけで分かるところまでを調べる。ルールの評価はファイルツリーを歩くことが
+    /// あるので、1 回の呼び出しにつき 1 度だけ行い、結果を [`Self::needs_approval`] と
+    /// [`Self::decide_assessed`] で使い回す。
+    pub fn assess(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+    ) -> Assessment {
         let verdict = self.rules.evaluate(tool_name, args, &self.cwd);
-        let asked_by_rule = verdict == Some(Verdict::Ask);
-        let quiet = self.quiet_decision(verdict, tool_name, args, destructive);
+        Assessment {
+            asked_by_rule: verdict == Some(Verdict::Ask),
+            quiet: self.quiet_decision(verdict, tool_name, args, destructive),
+        }
+    }
+
+    /// hook の希望がこの hint だったとして、誰かの承認が無いと通らないか (尋ねる相手がいるか
+    /// どうかは問わない)。PermissionRequest hook を発火するかどうかの判断に使う。
+    pub fn needs_approval(
+        &self,
+        assessed: &Assessment,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> bool {
+        use crate::hooks::PermissionHint;
+        match &assessed.quiet {
+            Some(Decision::Deny(_)) => false,
+            Some(Decision::Allow) => hint == Some(PermissionHint::Ask),
+            None => hint != Some(PermissionHint::Allow) || assessed.asked_by_rule || self.dont_ask,
+        }
+    }
+
+    /// [`Self::assess`] の結果と hook の希望から結論を出す。必要ならここで尋ねる。
+    pub fn decide_assessed(
+        &self,
+        assessed: Assessment,
+        tool_name: &str,
+        args: &serde_json::Value,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> Decision {
+        use crate::hooks::PermissionHint;
+        let Assessment {
+            asked_by_rule,
+            quiet,
+        } = assessed;
         match (hint, quiet) {
             (_, Some(Decision::Deny(why))) => Decision::Deny(why),
             (Some(PermissionHint::Allow), None) if !asked_by_rule && !self.dont_ask => {
@@ -141,23 +193,6 @@ impl PermissionGate {
             // もともと尋ねる呼び出しでも、hook が確認を求めているなら yes / no だけ
             // (「常に許可」を保存しても、次回また hook が尋ねさせる)。
             (hint, None) => self.ask_user(tool_name, args, hint == Some(PermissionHint::Ask)),
-        }
-    }
-
-    /// この呼び出しは、誰かの承認が無いと通らないか (尋ねる相手がいるかどうかは問わない)。
-    /// PermissionRequest hook を発火するかどうかの判断に使う。副作用は無い。
-    pub fn needs_approval(
-        &self,
-        tool_name: &str,
-        args: &serde_json::Value,
-        destructive: bool,
-        hint: Option<crate::hooks::PermissionHint>,
-    ) -> bool {
-        use crate::hooks::PermissionHint;
-        match self.decide_quietly(tool_name, args, destructive) {
-            Some(Decision::Deny(_)) => false,
-            Some(Decision::Allow) => hint == Some(PermissionHint::Ask),
-            None => hint != Some(PermissionHint::Allow) || self.dont_ask,
         }
     }
 

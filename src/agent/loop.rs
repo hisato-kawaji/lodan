@@ -770,7 +770,8 @@ impl Session {
         let mut hint = pre.permission;
         // 承認が要る呼び出しは、尋ねる前に PermissionRequest hook に諮る。allow の効き方は
         // PreToolUse の allow と同じ (deny / ask ルールと dont-ask には勝てない)。
-        if gate.needs_approval(tool.name(), args, tool.is_destructive(), hint) {
+        let assessed = gate.assess(tool.name(), args, tool.is_destructive());
+        if gate.needs_approval(&assessed, hint) {
             let request = serde_json::json!({ "tool_name": tool.name(), "tool_input": args });
             match self
                 .fire_hook(Lifecycle::PermissionRequest, Some(tool.name()), request)
@@ -789,9 +790,7 @@ impl Session {
                 Err(e) => tracing::warn!("PermissionRequest hook failed: {e:#}"),
             }
             // それでも人に尋ねることになるなら、通知用の hook を鳴らす (結果は見ない)。
-            if gate.can_prompt()
-                && gate.needs_approval(tool.name(), args, tool.is_destructive(), hint)
-            {
+            if gate.can_prompt() && gate.needs_approval(&assessed, hint) {
                 let note = serde_json::json!({
                     "notification_type": "permission_prompt",
                     "message": format!("lodan needs your permission to use {}", tool.name()),
@@ -802,7 +801,7 @@ impl Session {
             }
         }
         // read-only のツールもゲートを通す: deny ルールは Read にも効く (#74)。
-        match gate.decide_hinted(tool.name(), args, tool.is_destructive(), hint) {
+        match gate.decide_assessed(assessed, tool.name(), args, hint) {
             Decision::Deny(why) => {
                 *reason = "denied";
                 ToolOutput::error(why)
@@ -2779,7 +2778,13 @@ mod tests {
                 hooks: vec![hook],
                 ..Default::default()
             };
-            cfg.permissions.deny = deny.iter().map(|s| s.to_string()).collect();
+            // "ask:X" は ask ルール、それ以外は deny ルール。
+            for rule in deny {
+                match rule.strip_prefix("ask:") {
+                    Some(ask) => cfg.permissions.ask.push(ask.to_string()),
+                    None => cfg.permissions.deny.push(rule.to_string()),
+                }
+            }
             async move {
                 let gate = headless_gate(&cfg);
                 let (mut session, stats) = probe_session(cfg);
@@ -2805,6 +2810,8 @@ mod tests {
         let plain = r#"{"hookSpecificOutput":{"decision":"allow"}}"#;
         assert_eq!(run(answer(plain), &[]).await.0, 2);
         assert_eq!(run(answer(plain), &["Mut"]).await.0, 1);
+        // ask ルールにも勝てない (利用者が「必ず尋ねる」と書いたもの)。
+        assert_eq!(run(answer(plain), &["ask:Mut"]).await.0, 1);
     }
 
     #[tokio::test]

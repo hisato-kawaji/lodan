@@ -195,7 +195,9 @@ impl PermissionGate {
         // ask ルールに当たる呼び出しは、allow を保存しても毎回尋ねられる (ask が優先)。
         // 「保存した」と言って効かないものは出さない。
         let asked_by_rule = self.rules.evaluate(tool_name, args, &self.cwd) == Some(Verdict::Ask);
-        let persistable = (!asked_by_rule)
+        // 信頼していないディレクトリでは `.lodan/config.local.toml` を読まないので、保存しても
+        // 次回から効かない。効かない選択肢は出さない。
+        let persistable = (!asked_by_rule && crate::trust::project_trusted())
             .then(|| crate::permission_rules::persistable_allow_rule(tool_name, args, &self.cwd))
             .flatten();
         loop {

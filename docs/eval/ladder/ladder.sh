@@ -152,7 +152,7 @@ for task_file in $TASK_FILES; do
         # shellcheck disable=SC2046  # フラグ列は意図的に単語分割する
         printf '%s\n/exit\n' "$PROMPT" \
           | timeout "$limit" "$LODAN" \
-              --provider "$PROVIDER" --model "$MODEL" --yes \
+              --provider "$PROVIDER" --model "$MODEL" --yes --trust \
               --log-jsonl "$runlog" $(flags_for_config "$config") \
           > "$stdout_log" 2>&1
         rc=$?

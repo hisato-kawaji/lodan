@@ -48,11 +48,15 @@ impl Runtime {
     pub async fn build(cfg: &Config, notices: Notices) -> Result<Self> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let user_skills =
+        // プロジェクトの skill はモデルへの指示を差し込む。信頼済みのディレクトリでだけ読む (#75)。
+        let user_skills = if crate::trust::project_trusted() {
             crate::skills::load_from(&cwd.join(".lodan/skills")).unwrap_or_else(|e| {
                 eprintln!("skills: load failed: {e}");
                 Vec::new()
-            });
+            })
+        } else {
+            Vec::new()
+        };
         if !user_skills.is_empty() {
             notices.say(&format!("skills: {} loaded", user_skills.len()));
         }

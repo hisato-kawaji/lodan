@@ -80,6 +80,10 @@ pub struct Cli {
     #[arg(long = "disallowed-tools", value_name = "RULE")]
     pub disallowed_tools: Vec<String>,
 
+    /// Trust this directory's project settings for this run only (.lodan/, .mcp.json, LODAN.md / CLAUDE.md)
+    #[arg(long, env = "LODAN_TRUST", value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub trust: Option<bool>,
+
     /// Run consecutive parallel-safe tool calls (Read/Grep/Glob/WebFetch/WebSearch/Task) concurrently
     #[arg(long, env = "LODAN_PARALLEL_TOOLS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub parallel_tools: Option<bool>,
@@ -125,10 +129,27 @@ pub enum Command {
     Repl,
     /// List saved sessions
     Sessions,
+    /// Trust the current directory's project settings (or list / remove trusted directories)
+    Trust {
+        /// List trusted directories
+        #[arg(long, conflicts_with = "remove")]
+        list: bool,
+        /// Stop trusting the current directory
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 /// 戻り値はプロセスの終了コード。
 pub async fn dispatch(args: Cli) -> Result<i32> {
+    if let Some(Command::Trust { list, remove }) = &args.cmd {
+        return manage_trust(*list, *remove).map(|()| 0);
+    }
+    // プロジェクトのファイルを読むかどうかは、設定を読む前に決める (設定そのものが対象なので)。
+    // バイナリでは main が `.env` を読む前に済ませている。ここは、それ以外の呼び出し元のための保険
+    // (2 回目の決定は無視される)。
+    decide_project_trust(&args);
+
     let headless_format = args.print.is_some().then_some(args.output_format);
     let stream_json = headless_format == Some(crate::headless::OutputFormat::StreamJson);
 
@@ -191,7 +212,75 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Sessions => list_sessions().map(|()| 0),
+        Command::Trust { .. } => unreachable!("handled before the config is loaded"),
     }
+}
+
+/// このプロセスがプロジェクトのファイルを読んでよいかを決めて固定する (#75)。
+/// 尋ねるのは対話の REPL だけ。`-p` / `config` / パイプ入力では尋ねずに「読まない」側へ倒す。
+pub fn decide_project_trust(args: &Cli) {
+    use std::io::IsTerminal;
+    // main が既に決めている。尋ね直すと、2 回目の答えはこのプロセスには効かないのに
+    // `(y)` の記録だけが残る (1 回目に断った信頼が次回から効いてしまう)。
+    if crate::trust::is_decided() {
+        return;
+    }
+    // 信頼の管理と、プロジェクトのファイルを使わないサブコマンドでは尋ねない。読みもしない。
+    if matches!(args.cmd, Some(Command::Trust { .. } | Command::Sessions)) {
+        crate::trust::set_project_trusted(false);
+        return;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let store = crate::trust::store_path();
+    let is_repl = args.print.is_none() && matches!(args.cmd, None | Some(Command::Repl));
+    let request = crate::trust::Request {
+        cwd: &cwd,
+        store_path: store.as_deref(),
+        trust_flag: args.trust.unwrap_or(false),
+        interactive: is_repl && std::io::stdin().is_terminal(),
+    };
+    // 問い合わせも通知も stderr へ。`-p` の stdout は機械可読な契約。
+    let trusted = crate::trust::decide(
+        &request,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr().lock(),
+    );
+    crate::trust::set_project_trusted(trusted);
+}
+
+fn manage_trust(list: bool, remove: bool) -> Result<()> {
+    let store = crate::trust::store_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot locate the lodan config directory"))?;
+    let cwd = std::env::current_dir()?;
+    if list {
+        for dir in crate::trust::list(&store)? {
+            println!("{}", crate::trust::shown(&dir));
+        }
+    } else if remove {
+        if crate::trust::forget(&store, &cwd)? {
+            println!("no longer trusting {}", crate::trust::shown(&cwd));
+        } else {
+            println!(
+                "{} was not trusted on its own (a parent directory may be; see `lodan trust --list`)",
+                crate::trust::shown(&cwd)
+            );
+        }
+    } else {
+        crate::trust::record(&store, &cwd)?;
+        println!(
+            "trusting {} (and everything under it)",
+            crate::trust::shown(&cwd)
+        );
+        // メモリは祖先のディレクトリからも読まれる。何が効くようになったかを、対話の確認と同じ一覧で見せる。
+        let files = crate::trust::project_files(&cwd);
+        if !files.is_empty() {
+            println!("lodan will now read, when started here:");
+            for file in files {
+                println!("  {file}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// runlog の sink を立てて `run_start` を記録する。計測が本編を壊さないよう、ログファイルを

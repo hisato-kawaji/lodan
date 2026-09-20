@@ -404,10 +404,13 @@ impl Config {
             layers.push((user_path, table));
         }
 
+        // プロジェクトが持ち込む設定は、信頼済みのディレクトリでだけ読む (#75)。
+        let project_trusted = crate::trust::project_trusted();
         let project_path = std::env::current_dir()
             .ok()
             .map(|p| p.join(".lodan").join("config.toml"));
-        if let Some(p) = project_path
+        if project_trusted
+            && let Some(p) = project_path
             && let Some(table) = read_toml(&p)?
         {
             layers.push((p, table));
@@ -418,7 +421,8 @@ impl Config {
         let local_path = std::env::current_dir()
             .ok()
             .map(|p| p.join(LOCAL_CONFIG_DIR).join(LOCAL_CONFIG_FILE));
-        if let Some(p) = local_path
+        if project_trusted
+            && let Some(p) = local_path
             && let Some(table) = read_toml(&p)?
         {
             layers.push((p, table));

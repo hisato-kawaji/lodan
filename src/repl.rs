@@ -171,7 +171,12 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     );
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let user_commands = load_user_commands(&cwd.join(".lodan/commands"));
+    // プロジェクトの slash コマンドも、信頼済みのディレクトリでだけ読む (#75)。
+    let user_commands = if crate::trust::project_trusted() {
+        load_user_commands(&cwd.join(".lodan/commands"))
+    } else {
+        BTreeMap::new()
+    };
     if !user_commands.is_empty() {
         println!("slash: {} user command(s) loaded", user_commands.len());
     }

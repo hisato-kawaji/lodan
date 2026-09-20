@@ -138,7 +138,9 @@ impl PermissionGate {
                 self.ask_user(tool_name, args, true)
             }
             (_, Some(Decision::Allow)) => Decision::Allow,
-            (_, None) => self.ask_user(tool_name, args, false),
+            // もともと尋ねる呼び出しでも、hook が確認を求めているなら yes / no だけ
+            // (「常に許可」を保存しても、次回また hook が尋ねさせる)。
+            (hint, None) => self.ask_user(tool_name, args, hint == Some(PermissionHint::Ask)),
         }
     }
 

@@ -150,9 +150,15 @@ fn parse_object(stdout: &str) -> Option<serde_json::Value> {
         .filter(|v| v.is_object())
 }
 
-/// 判断を伝えようとした形跡のある stdout か (JSON の書き出しで始まる)。
+/// 判断を伝えようとした形跡のある stdout か。先頭にデバッグ出力が 1 行混ざっただけで「ただの
+/// テキスト」に見えてしまわないよう、行単位で見る。NUL を含む出力 (UTF-16 など) も読めない側に倒す。
 fn looks_like_json(stdout: &str) -> bool {
-    stdout.starts_with('{') || stdout.starts_with('[')
+    stdout.contains('\0')
+        || stdout.contains("hookSpecificOutput")
+        || stdout.contains("permissionDecision")
+        || stdout
+            .lines()
+            .any(|line| matches!(line.trim_start().chars().next(), Some('{' | '[')))
 }
 
 /// exit 0 の stdout。JSON なら判断として、UserPromptSubmit / SessionStart の素のテキストなら
@@ -188,9 +194,13 @@ fn read_stdout(hook: &HookConfig, lc: Lifecycle, stdout: &str) -> HookOutcome {
         }
     };
     if lc == Lifecycle::PreToolUse {
+        // どの hook かは利用者に伝える。モデルへ返す理由には、コマンドの絶対パスを載せない。
+        warn(
+            hook,
+            &format!("{problem}; blocking the tool call to be safe"),
+        );
         return HookOutcome::blocked(format!(
-            "hook `{}` printed a decision lodan could not read ({problem}); blocking to be safe",
-            hook.command
+            "a PreToolUse hook printed a decision lodan could not read ({problem}); blocking to be safe"
         ));
     }
     warn(hook, &format!("{problem}; ignoring it"));
@@ -208,6 +218,16 @@ fn interpret(lc: Lifecycle, value: &serde_json::Value) -> Result<HookOutcome, St
     };
     let mut out = HookOutcome::default();
     let specific = value.get("hookSpecificOutput");
+    if specific.is_some_and(|s| !s.is_object()) {
+        return Err("hookSpecificOutput is not a JSON object".to_string());
+    }
+    // `decision` は "block" か、旧形式の "approve" (= 何もしない)。"deny" などの書き間違いを
+    // 「判断なし」と読んで通してしまわない。
+    match value.get("decision") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(d) if matches!(d.as_str(), Some("block" | "approve")) => {}
+        Some(d) => return Err(format!("unknown decision {d}")),
+    }
     // 文脈は、この hook が止めるかどうかに関わらず拾う (使うかどうかは呼び出し側が決める)。
     if let Some(context) = specific.and_then(|s| text(s, "additionalContext")) {
         out.context.push(context);
@@ -509,9 +529,22 @@ mod tests {
         .unwrap();
         assert_eq!(out.context, vec!["today is friday".to_string()]);
 
+        // PreToolUse の素のテキスト (ログを出すだけの hook) は、これまでどおり黙って通る。
         let on_tool = vec![hook(Lifecycle::PreToolUse, "", echo)];
         assert_eq!(
             pre_tool("Bash", &on_tool, HooksCompat::V2).await,
+            HookOutcome::default()
+        );
+        // Claude Code の形式として正しい出力は、知らないフィールドがあっても通る。
+        let extra = vec![hook(
+            Lifecycle::PreToolUse,
+            "",
+            &says(
+                r#"{"suppressOutput":true,"decision":"approve","hookSpecificOutput":{"hookEventName":"PreToolUse","futureField":1}}"#,
+            ),
+        )];
+        assert_eq!(
+            pre_tool("Bash", &extra, HooksCompat::V2).await,
             HookOutcome::default()
         );
     }
@@ -532,6 +565,10 @@ mod tests {
         );
         for unreadable in [
             format!("[{deny}]"),
+            // 先頭のデバッグ行、形の違う hookSpecificOutput、"block" の書き間違い。
+            format!("checking...\n{deny}"),
+            r#"{"hookSpecificOutput":"deny"}"#.to_string(),
+            r#"{"decision":"deny","reason":"typo for block"}"#.to_string(),
             "{not json}".to_string(),
             r#"{"hookSpecificOutput":{"permissionDecision":{"value":"deny"}}}"#.to_string(),
             r#"{"hookSpecificOutput":{"permissionDecision":"dontAsk"}}"#.to_string(),

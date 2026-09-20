@@ -73,6 +73,7 @@ impl SubAgentTool {
             Verdict::Deny(rule) => Some(format!(
                 "denied by permission rule `{rule}`. Do not retry this call or work around it."
             )),
+            Verdict::Unverifiable(rule) => Some(crate::permission::unverifiable_message(&rule)),
             Verdict::Ask => Some(
                 "this call needs the user's approval, which a sub-agent cannot ask for. \
                  Report that it is needed instead of retrying."

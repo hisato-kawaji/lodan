@@ -31,6 +31,15 @@ pub enum Decision {
     Deny(String),
 }
 
+/// 検索範囲が広すぎて deny ルールに当たるか確かめきれなかったときの文面。
+/// 「やり直すな」ではなく「範囲を狭めてやり直せ」— 狭めれば通り得る。
+pub fn unverifiable_message(rule: &str) -> String {
+    format!(
+        "this search covers too much to verify against permission rule `{rule}`. \
+         Retry with `path` set to a smaller directory."
+    )
+}
+
 /// `accept-edits` モードで尋ねずに通すツール。
 const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
@@ -120,13 +129,16 @@ impl PermissionGate {
                  use another approach or report that it is blocked."
             )));
         }
+        if let Some(Verdict::Unverifiable(rule)) = &verdict {
+            return Some(Decision::Deny(unverifiable_message(rule)));
+        }
         if self.auto_approve {
             return Some(Decision::Allow);
         }
         match verdict {
             Some(Verdict::Ask) => return None,
             Some(Verdict::Allow) => return Some(Decision::Allow),
-            Some(Verdict::Deny(_)) | None => {}
+            Some(Verdict::Deny(_) | Verdict::Unverifiable(_)) | None => {}
         }
         if let Ok(p) = self.policy.lock() {
             if p.always_tools.contains(tool_name) {

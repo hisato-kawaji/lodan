@@ -35,6 +35,8 @@ const PATH_TOOLS: &[&str] = &[
 
 /// 検索範囲の確認で見るエントリ数の上限。
 const SEARCH_SCOPE_CHECK_LIMIT: usize = 50_000;
+/// 検索範囲の確認に使う時間の上限。`$HOME` のような広い範囲で対話が秒単位で固まるのを防ぐ。
+const SEARCH_SCOPE_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// ディレクトリ以下を丸ごと読む検索ツール。`path` は検索の起点で、省略時は cwd。
 const SEARCH_TOOLS: &[&str] = &["Glob", "Grep"];
@@ -45,6 +47,15 @@ pub struct Rule {
     matcher: Matcher,
     /// 設定に書かれたままの文字列 (拒否理由に出す)。
     raw: String,
+}
+
+/// deny / ask の照合結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Forbids {
+    No,
+    Yes,
+    /// 検索範囲が広すぎて確かめきれなかった。通す側には倒さない。
+    Unchecked,
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +116,9 @@ impl Rule {
                 Matcher::Path(PathPattern::parse(raw, p.trim())?)
             }
             Some(p) if tool == "WebFetch" => match p.trim().strip_prefix("domain:") {
-                Some(d) if !d.trim().is_empty() => Matcher::Domain(d.trim().to_ascii_lowercase()),
+                Some(d) if !d.trim().is_empty() => {
+                    Matcher::Domain(normalize_domain(raw, d.trim())?)
+                }
                 _ => bail!(
                     "permission rule `{raw}`: WebFetch patterns look like `WebFetch(domain:example.com)`"
                 ),
@@ -180,26 +193,39 @@ impl Rule {
         }
     }
 
-    /// deny として一致するか。疑わしいものは一致させる側に倒す。
-    fn forbids(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> bool {
+    /// deny / ask として一致するか。疑わしいものは一致させる側に倒す。
+    fn forbids(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> Forbids {
         if !self.names(tool) {
-            return false;
+            return Forbids::No;
         }
-        match &self.matcher {
+        let matched = match &self.matcher {
             Matcher::Any => true,
             Matcher::Bash(p) => bash_command(args).is_some_and(|cmd| {
                 p.matches(cmd.trim()) || split_command_lossy(cmd).iter().any(|part| p.matches(part))
             }),
             Matcher::Path(p) => {
                 let candidates = path_candidates(tool, args, cwd);
-                candidates.iter().any(|path| p.matches_any_case(path, cwd))
-                    // 検索ツールはディレクトリ以下を丸ごと読む。範囲そのものが一致しなくても、
-                    // 検索が実際に触れるファイルの中に一致するものがあれば効かせる。
-                    || (SEARCH_TOOLS.contains(&tool)
-                        && candidates.iter().any(|root| p.search_would_touch(root, cwd)))
+                if candidates.iter().any(|path| p.matches_any_case(path, cwd)) {
+                    return Forbids::Yes;
+                }
+                if !SEARCH_TOOLS.contains(&tool) {
+                    return Forbids::No;
+                }
+                // 検索ツールはディレクトリ以下を丸ごと読む。範囲そのものが一致しなくても、
+                // 検索が実際に触れるファイルの中に一致するものがあれば効かせる。
+                let mut worst = Forbids::No;
+                for root in &candidates {
+                    match p.search_would_touch(root, cwd) {
+                        Forbids::Yes => return Forbids::Yes,
+                        Forbids::Unchecked => worst = Forbids::Unchecked,
+                        Forbids::No => {}
+                    }
+                }
+                return worst;
             }
             Matcher::Domain(d) => url_host(args).is_some_and(|h| host_matches(&h, d)),
-        }
+        };
+        if matched { Forbids::Yes } else { Forbids::No }
     }
 }
 
@@ -331,10 +357,28 @@ impl PathPattern {
     /// 「一致し得る」だけで拒否すると、`Grep(**/.env)` のような固定部分の無いパターンが全ての
     /// 検索を止めてしまう。gitignore された `.env` は上の階層からの検索では読まれないので、止める必要も無い。
     /// 走査が上限を超えるほど広い範囲は、確かめきれないので触れる側に倒す。
-    fn search_would_touch(&self, root: &Path, cwd: &Path) -> bool {
+    fn search_would_touch(&self, root: &Path, cwd: &Path) -> Forbids {
+        self.search_would_touch_within(
+            root,
+            cwd,
+            SEARCH_SCOPE_CHECK_LIMIT,
+            SEARCH_SCOPE_CHECK_BUDGET,
+        )
+    }
+
+    fn search_would_touch_within(
+        &self,
+        root: &Path,
+        cwd: &Path,
+        max_entries: usize,
+        budget: std::time::Duration,
+    ) -> Forbids {
         if !self.may_match_under(root, cwd) {
-            return false;
+            return Forbids::No;
         }
+        // この走査は async ランタイムの上で同期的に走る (ゲートの判定は同期関数)。
+        // 件数だけでなく時間でも打ち切り、対話を固めない。
+        let started = std::time::Instant::now();
         let mut seen = 0usize;
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
@@ -342,14 +386,14 @@ impl PathPattern {
             .flatten()
         {
             if self.matches_any_case(entry.path(), cwd) {
-                return true;
+                return Forbids::Yes;
             }
             seen += 1;
-            if seen >= SEARCH_SCOPE_CHECK_LIMIT {
-                return true;
+            if seen >= max_entries || started.elapsed() >= budget {
+                return Forbids::Unchecked;
             }
         }
-        false
+        Forbids::No
     }
 
     /// `root` 以下を検索したとき、このパターンに一致するパスが含まれ得るか。
@@ -423,11 +467,27 @@ fn normalize(path: &Path) -> PathBuf {
 /// 解釈できない URL は `None` = どのドメインルールにも一致しない。
 fn url_host(args: &serde_json::Value) -> Option<String> {
     let raw = args.get("url").and_then(|v| v.as_str())?;
-    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    let url = reqwest::Url::parse(raw).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
     // `internal.example.` (末尾ドット付きの FQDN) は同じホスト。deny をすり抜けさせない。
     let host = host.trim_end_matches('.');
     (!host.is_empty()).then(|| host.to_string())
+}
+
+/// ルール側のドメインも、URL のホストと同じ形に揃える: 小文字、末尾ドット無し、IDN は punycode。
+/// 揃えないと `domain:internal.example.` や `domain:日本.jp` が決して一致しない。
+fn normalize_domain(raw: &str, domain: &str) -> Result<String> {
+    let url = reqwest::Url::parse(&format!("http://{domain}/")).map_err(|e| {
+        anyhow::anyhow!("permission rule `{raw}`: `{domain}` is not a host name ({e})")
+    })?;
+    match url.host_str() {
+        Some(host) if url.path() == "/" && url.port().is_none() && url.username().is_empty() => {
+            Ok(host.to_ascii_lowercase().trim_end_matches('.').to_string())
+        }
+        _ => bail!(
+            "permission rule `{raw}`: write a bare host name, e.g. `WebFetch(domain:docs.rs)`"
+        ),
+    }
 }
 
 fn host_matches(host: &str, domain: &str) -> bool {
@@ -533,6 +593,9 @@ fn scan_command(command: &str) -> (Vec<String>, bool) {
 pub enum Verdict {
     /// 一致した deny ルール。
     Deny(String),
+    /// deny ルールに当たるかを確かめきれなかった (検索範囲が広すぎる)。通さないが、
+    /// 範囲を狭めれば通り得るので、モデルへの文面は Deny と変える。
+    Unverifiable(String),
     Ask,
     Allow,
 }
@@ -569,11 +632,24 @@ impl RuleSet {
     }
 
     pub fn evaluate(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> Option<Verdict> {
-        if let Some(rule) = self.deny.iter().find(|r| r.forbids(tool, args, cwd)) {
-            return Some(Verdict::Deny(rule.raw.clone()));
+        let mut unverifiable = None;
+        for rule in &self.deny {
+            match rule.forbids(tool, args, cwd) {
+                Forbids::Yes => return Some(Verdict::Deny(rule.raw.clone())),
+                Forbids::Unchecked => unverifiable = unverifiable.or(Some(rule.raw.clone())),
+                Forbids::No => {}
+            }
         }
-        // ask は「必ず尋ねる」。疑わしいものも尋ねる側に倒したいので deny と同じ緩い一致を使う。
-        if self.ask.iter().any(|r| r.forbids(tool, args, cwd)) {
+        if let Some(rule) = unverifiable {
+            return Some(Verdict::Unverifiable(rule));
+        }
+        // ask は「必ず尋ねる」。疑わしいものも尋ねる側に倒したいので deny と同じ緩い一致を使う
+        // (確かめきれなかった場合も尋ねる)。
+        if self
+            .ask
+            .iter()
+            .any(|r| r.forbids(tool, args, cwd) != Forbids::No)
+        {
             return Some(Verdict::Ask);
         }
         if self.allow.iter().any(|r| r.permits(tool, args, cwd)) {
@@ -929,6 +1005,67 @@ mod tests {
         // 検索ツール以外は `path` が無ければ一致しない (ツール側が引数エラーにする)。
         let read = rules(&[], &["Read(**/.env)"], &[]);
         assert_eq!(read.evaluate("Read", &json!({}), &cwd), None);
+    }
+
+    #[test]
+    fn a_scope_too_large_to_check_is_unverifiable_not_a_flat_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        for i in 0..20 {
+            std::fs::write(cwd.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let pattern = PathPattern::parse("Grep(**/*.secret)", "**/*.secret").unwrap();
+        let generous = std::time::Duration::from_secs(60);
+        // 全部見られれば「触れない」と言い切れる。
+        assert_eq!(
+            pattern.search_would_touch_within(&cwd, &cwd, 10_000, generous),
+            Forbids::No
+        );
+        // 件数でも時間でも、打ち切ったら「確かめきれない」。通す側には倒さない。
+        assert_eq!(
+            pattern.search_would_touch_within(&cwd, &cwd, 5, generous),
+            Forbids::Unchecked
+        );
+        assert_eq!(
+            pattern.search_would_touch_within(&cwd, &cwd, 10_000, std::time::Duration::ZERO),
+            Forbids::Unchecked
+        );
+        // 文面は「やり直すな」ではなく「範囲を狭めろ」。
+        assert!(crate::permission::unverifiable_message("Grep(x)").contains("smaller directory"));
+    }
+
+    #[test]
+    fn domain_rules_are_normalised_like_the_hosts_they_are_compared_to() {
+        let set = rules(
+            &[],
+            &[
+                "WebFetch(domain:Internal.Example.)",
+                "WebFetch(domain:日本.jp)",
+            ],
+            &[],
+        );
+        let fetch = |url: &str| set.evaluate("WebFetch", &json!({ "url": url }), Path::new("/"));
+        assert!(matches!(
+            fetch("http://internal.example/"),
+            Some(Verdict::Deny(_))
+        ));
+        assert!(matches!(
+            fetch("http://api.internal.example./"),
+            Some(Verdict::Deny(_))
+        ));
+        assert!(matches!(
+            fetch("http://xn--wgv71a.jp/"),
+            Some(Verdict::Deny(_))
+        ));
+        assert!(matches!(fetch("http://日本.jp/"), Some(Verdict::Deny(_))));
+        // ホスト名以外 (パス・ポート・userinfo つき) は書き間違いとして弾く。
+        for bad in [
+            "WebFetch(domain:docs.rs/path)",
+            "WebFetch(domain:docs.rs:443)",
+            "WebFetch(domain:a@b.c)",
+        ] {
+            assert!(Rule::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

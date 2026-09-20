@@ -318,14 +318,14 @@ deny  = ["Read(**/.env)", "Grep(**/.env)", "Glob(**/.env)", "Read(~/.ssh/**)", "
 | `Bash(npm run test:*)` | `npm run test` そのもの、または後に引数が続くもの (`npm run testing` には一致しない) |
 | `Read(src/**)` / `Edit(*.md)` | パスの glob。相対パターンは cwd 基準。`/` の無いパターンはどの階層のファイル名にも一致 (gitignore と同じ)。対象: Read / Write / Edit / MultiEdit / NotebookEdit / Glob / Grep |
 | `Write(/etc/**)` / `Read(~/.ssh/**)` | 絶対パス / ホーム基準 |
-| `WebFetch(domain:docs.rs)` | ホスト名 (サブドメインを含む)。判定するのは**最初の URL** だけで、リダイレクト先は見ない |
+| `WebFetch(domain:docs.rs)` | ホスト名だけを書く (サブドメインを含む。大文字・末尾ドット・IDN は URL 側と同じ形に正規化される)。判定するのは**最初の URL** だけで、リダイレクト先は見ない |
 | `mcp__github` / `mcp__github__create_issue` | その MCP サーバの全ツール / 1 つだけ |
 
 **Bash の複合コマンド**: `Bash(git *)` を allow していても `git status && rm -rf /` は通らない。コマンドを `&&` `||` `;` `|` `&` と改行で分割し、**全ての部分が allow に一致したときだけ**通す。`$(…)`・バッククォート・プロセス置換・リダイレクト (`>` `<`) を含むコマンドは中身を追い切れないので、allow には決して一致させず尋ねる。deny は逆に、コマンド全体か**いずれかの部分**が一致すれば効く。
 
-**検索ツール (Grep / Glob)** は `path` 以下を丸ごと読む (`path` 省略時は cwd)。deny / ask は、**その検索が実際に触れるファイルの中に一致するものがあれば**効く: `deny = ["Grep(secrets/**)"]` は `path` 無しの Grep も止める。判定は Grep / Glob と同じ走査 (`.gitignore` を尊重、隠しファイルは含む) で行うので、`Grep(**/.env)` は `.env` のあるディレクトリの検索だけを止め、gitignore された `.env` は上の階層からの検索では読まれないので止めない (ignore されたディレクトリ自体を起点に指定した検索は中を読むので、止める)。5 万エントリを超える範囲は確かめきれないので止める側に倒す。
+**検索ツール (Grep / Glob)** は `path` 以下を丸ごと読む (`path` 省略時は cwd)。deny / ask は、**その検索が実際に触れるファイルの中に一致するものがあれば**効く: `deny = ["Grep(secrets/**)"]` は `path` 無しの Grep も止める。判定は Grep / Glob と同じ走査 (`.gitignore` を尊重、隠しファイルは含む) で行うので、`Grep(**/.env)` は `.env` のあるディレクトリの検索だけを止め、gitignore された `.env` は上の階層からの検索では読まれないので止めない (ignore されたディレクトリ自体を起点に指定した検索は中を読むので、止める)。確認は 5 万エントリ / 0.3 秒で打ち切り、確かめきれなかった範囲は通さない (モデルには「`path` を狭めてやり直せ」と返る。`$HOME` 全体のような検索がこれに当たる)。
 
-**パス**: `src/../.env` のような `..` は畳んでから照合する。deny / ask は大文字小文字を無視する (macOS / Windows では `.GITHUB/x` への書き込みが `.github/x` に着地するため)。allow は綴りどおり。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。
+**パス**: `src/../.env` のような `..` は畳んでから照合する。deny / ask は大文字小文字を無視する (macOS / Windows では `.GITHUB/x` への書き込みが `.github/x` に着地するため)。allow は綴りどおり。Unicode の正規化 (NFC と NFD) は揃えない: macOS の APFS では `café.key` の合成形と分解形が同じファイルを指すが、ルールは書かれた形としか一致しない。非 ASCII のファイル名を deny で守るなら、ディレクトリ単位 (`Write(keys/**)`) で書くこと。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。
 
 **モード** (`[permissions] mode` / `--permission-mode` / `LODAN_PERMISSION_MODE`):
 

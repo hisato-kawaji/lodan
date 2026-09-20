@@ -43,8 +43,10 @@ impl FallbackClient {
     }
 
     fn announce(&self, primary_error: &anyhow::Error) {
-        // エラーはフィールドで渡す。tracing の fmt は、メッセージ中の ESC はエスケープするが
-        // U+202E のような書式文字は素通しする。フィールドは Debug 経由なのでどちらも落ちる。
+        // tracing の fmt は外から来た文字列を無害化してくれない: メッセージに埋めると U+202E が
+        // 素通しし、`%` (Display) のフィールドは ESC も U+202E も素通しする (`?` の Debug だけが
+        // 両方落とす。実測は pr-review #101)。**安全なのは `sanitize` を通しているから**で、
+        // フィールドにしたからではない。この `sanitize` を外さないこと。
         let error = format!("{primary_error:#}");
         tracing::warn!(
             error = %crate::term::sanitize(&error),

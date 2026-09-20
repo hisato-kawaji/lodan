@@ -811,7 +811,10 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
     let mut map = BTreeMap::new();
     for cmd in cmds {
         if BUILTINS.contains(&cmd.name.as_str()) {
-            eprintln!("slash: /{} shadows a builtin, skipped", cmd.name);
+            eprintln!(
+                "slash: /{} shadows a builtin, skipped",
+                crate::term::sanitize(&cmd.name)
+            );
             continue;
         }
         map.insert(cmd.name.clone(), cmd);

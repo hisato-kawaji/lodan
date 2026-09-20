@@ -254,7 +254,11 @@ impl PermissionGate {
                         }
                         // 保存できなくても今回の承認は有効。次回また尋ねることになるだけ。
                         Err(e) => {
-                            let _ = writeln!(stdout, "  could not save the rule: {e:#}");
+                            let _ = writeln!(
+                                stdout,
+                                "  could not save the rule: {}",
+                                visible(&format!("{e:#}"))
+                            );
                         }
                     }
                     // このセッションでも以後は尋ねない。保存したのと**同じ広さ**で効かせる

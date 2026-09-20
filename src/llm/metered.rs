@@ -22,8 +22,16 @@ pub const KIND_GOAL_EVAL: &str = "goal_eval";
 pub const KIND_COMPACT: &str = "compact";
 pub const KIND_MCP_SAMPLING: &str = "mcp_sampling";
 
-/// モデルへの注意書きの書き出し。再開したセッションの履歴から取り除くときの目印でもある。
+/// モデルへの注意書きの書き出し。
 pub const BUDGET_REMINDER_PREFIX: &str = "[budget]";
+/// 注意書きの固定文。履歴から注意書きを見分けるときは、書き出しだけでなくここまで照合する
+/// (`[budget]` で始まる文を利用者が自分で書くことはあり得る)。
+const BUDGET_REMINDER_BODY: &str = "It will be cut off when the budget runs out. Wrap up:";
+
+/// `text` は lodan が足した予算の注意書きそのものか。
+pub fn is_budget_reminder(text: &str) -> bool {
+    text.starts_with(BUDGET_REMINDER_PREFIX) && text.contains(BUDGET_REMINDER_BODY)
+}
 
 /// 予算の何割を使ったら、モデルに一度だけ知らせるか。
 const REMINDER_PERCENT: u64 = 80;
@@ -286,10 +294,18 @@ impl Ledger {
         }
         state.reminded = true;
         Some(format!(
-            "{BUDGET_REMINDER_PREFIX} This run has used {}. It will be cut off when the budget runs out. Wrap up: \
+            "{BUDGET_REMINDER_PREFIX} This run has used {}. {BUDGET_REMINDER_BODY} \
              finish the most important remaining step and report what is done and what is not.",
             parts.join(" and ")
         ))
+    }
+
+    /// テスト用: 予算を 8 割まで使ったことにして、実際の注意書きを取り出す。
+    #[cfg(test)]
+    pub(crate) fn force_reminder_for_tests(&self) -> String {
+        let limit = self.budget.max_requests.expect("a request budget");
+        self.state().requests = limit * 4 / 5;
+        self.take_reminder().expect("80% of the budget is used")
     }
 
     /// `/cost` 用の表示。

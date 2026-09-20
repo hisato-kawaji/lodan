@@ -973,7 +973,11 @@ impl Session {
             .history
             .iter()
             .enumerate()
-            .filter(|(_, m)| matches!(m, Message::User { .. }))
+            // ツール往復の途中に足した予算の注意書きは user メッセージだが、利用者のターンではない。
+            .filter(|(_, m)| {
+                matches!(m, Message::User { content }
+                    if !crate::llm::metered::is_budget_reminder(content))
+            })
             .map(|(i, _)| i)
             .collect();
         if user_idxs.len() <= KEEP_RECENT_USER_TURNS {
@@ -1223,15 +1227,20 @@ enum Prefetched {
 /// 履歴から、予算の注意書きを取り除く。入力の末尾に添えたものは切り落とし、単独のメッセージ
 /// (ツール結果の後に足したもの) は丸ごと外す — 外しても Tool → Assistant の並びで、API に投げられる形のまま。
 fn strip_budget_reminders(history: &mut Vec<Message>) {
-    use crate::llm::metered::BUDGET_REMINDER_PREFIX;
+    use crate::llm::metered::{BUDGET_REMINDER_PREFIX, is_budget_reminder};
+    // 書き出しの `[budget]` だけで決めない: 利用者が自分でそう書くことはあり得る。注意書きの
+    // 固定文まで照合し、合わないものには触らない。
     history.retain_mut(|message| {
         let Message::User { content } = message else {
             return true;
         };
-        if content.starts_with(BUDGET_REMINDER_PREFIX) {
+        if is_budget_reminder(content) {
             return false;
         }
-        if let Some(at) = content.find(&format!("\n\n{BUDGET_REMINDER_PREFIX} ")) {
+        // 添えるのは常に末尾なので、最後の区切りから後ろが注意書きのときだけ切り落とす。
+        if let Some(at) = content.rfind(&format!("\n\n{BUDGET_REMINDER_PREFIX} "))
+            && is_budget_reminder(&content[at + 2..])
+        {
             content.truncate(at);
         }
         true
@@ -2045,7 +2054,7 @@ mod tests {
     #[tokio::test]
     async fn a_long_tool_loop_gets_exactly_one_reminder() {
         use crate::llm::metered::{Budget, Ledger, MeteredClient};
-        /// 5 回ツールを呼んでから答える。
+        /// 18 回ツールを呼んでから答える。
         struct FiveCalls(AtomicUsize);
         #[async_trait]
         impl LlmClient for FiveCalls {
@@ -2066,7 +2075,7 @@ mod tests {
                 sink: mpsc::UnboundedSender<ChatEvent>,
             ) -> Result<()> {
                 let n = self.0.fetch_add(1, AtomicOrdering::SeqCst);
-                let resp = if n < 5 {
+                let resp = if n < 18 {
                     ChatResponse {
                         content: None,
                         tool_calls: vec![tool_call_with_args(
@@ -2087,8 +2096,10 @@ mod tests {
                 Ok(())
             }
         }
+        // 予算 20 なら 16〜19 件目の前の 4 回が「8 割以上で、まだ送れる」。毎回入れてしまう実装は
+        // ここで 4 つ入れる (予算 6 だと該当が 1 回しかなく、「1 回だけ」を確かめられなかった)。
         let ledger = Arc::new(Ledger::new(Budget {
-            max_requests: Some(6),
+            max_requests: Some(20),
             max_total_tokens: None,
         }));
         let llm = MeteredClient::new(Arc::new(FiveCalls(AtomicUsize::new(0))), ledger.clone());
@@ -2137,22 +2148,48 @@ mod tests {
         assert_eq!(resumed.history().len(), session.history().len() - 1);
     }
 
+    /// 台帳が実際に出す注意書き (文面をテストに写さない)。
+    fn real_reminder(ledger: &crate::llm::metered::Ledger) -> String {
+        ledger.force_reminder_for_tests()
+    }
+
     #[test]
     fn a_reminder_attached_to_a_prompt_is_cut_off_on_resume() {
-        let mut history = vec![
-            Message::User {
-                content: "fix the bug\n\n[budget] This run has used 4 of 5 LLM requests. Wrap up."
-                    .into(),
-            },
-            Message::User {
-                content: "talk about the [budget] feature".into(),
-            },
+        let ledger = crate::llm::metered::Ledger::new(crate::llm::metered::Budget {
+            max_requests: Some(5),
+            max_total_tokens: None,
+        });
+        let reminder = real_reminder(&ledger);
+        // 利用者が自分で書いた `[budget]` は、先頭にあっても、段落の頭にあっても、触らない
+        // (レビューで、メッセージごと消える・後半が切れるの両方が実際に起きた)。
+        let own_words = [
+            "[budget] how much have I used so far?",
+            "review the README section on budgets\n\n[budget] is the literal tag I mean; keep it",
+            "talk about the [budget] feature",
         ];
+        let mut history: Vec<Message> = own_words
+            .iter()
+            .map(|w| Message::User {
+                content: w.to_string(),
+            })
+            .collect();
+        history.push(Message::User {
+            content: format!("fix the bug\n\n{reminder}"),
+        });
+        history.push(Message::User {
+            content: reminder.clone(),
+        });
         strip_budget_reminders(&mut history);
-        assert!(matches!(&history[0], Message::User { content } if content == "fix the bug"));
-        assert!(
-            matches!(&history[1], Message::User { content } if content.contains("[budget] feature")),
-            "only a reminder is removed, not any text that mentions the word"
+        let left: Vec<&str> = history
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => content.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            left,
+            [own_words[0], own_words[1], own_words[2], "fix the bug"]
         );
     }
 

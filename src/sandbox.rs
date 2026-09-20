@@ -245,9 +245,9 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
                 a.extend(["--ro-bind-try".into(), path.clone(), path]);
             }
         }
-        // 読み取り専用でも /tmp が無いと動かないプログラムが多い。中身の残らない tmpfs を見せる。
-        SandboxMode::ReadOnly => a.extend(["--tmpfs".into(), "/tmp".into()]),
-        SandboxMode::Off => {}
+        // 読み取り専用では何も bind し直さない。`--tmpfs /tmp` で書ける一時領域を見せる手もあるが、
+        // /tmp の中身 (作業ディレクトリがそこにあればそれごと) を隠してしまい、macOS とも揃わない。
+        SandboxMode::ReadOnly | SandboxMode::Off => {}
     }
     if !policy.network {
         a.push("--unshare-net".into());
@@ -373,10 +373,7 @@ mod tests {
             &[PathBuf::from("/tmp")],
         )
         .join(" ");
-        assert!(
-            !ro.contains("--bind /work") && ro.contains("--tmpfs /tmp"),
-            "{ro}"
-        );
+        assert!(!ro.contains("--bind") && !ro.contains("tmpfs"), "{ro}");
         assert!(!ro.contains("--unshare-net"));
     }
 
@@ -413,6 +410,12 @@ mod tests {
             usable || !cfg!(target_os = "macos"),
             "sandbox-exec should work on macOS"
         );
+        if !usable {
+            // 飛ばしたことが `--nocapture` で分かるようにする (黙って green にしない)。
+            eprintln!(
+                "skipped: no usable OS sandbox here (bwrap missing or user namespaces blocked)"
+            );
+        }
         usable.then_some(a)
     }
 

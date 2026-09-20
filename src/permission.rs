@@ -304,7 +304,8 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
             .unwrap_or_else(|| args.to_string()),
         // 計画本文は直前に表示済みなので、プロンプトには要旨だけ出す。
         "ExitPlanMode" => "approve the plan above and exit plan mode".to_string(),
-        _ => args.to_string(),
+        // serde は C0 の制御文字はエスケープするが、U+202E のような書式文字は素通しする。
+        _ => visible(&args.to_string()),
     }
 }
 

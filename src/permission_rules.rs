@@ -447,9 +447,12 @@ fn path_candidates(tool: &str, args: &serde_json::Value, cwd: &Path) -> Vec<Path
         None if SEARCH_TOOLS.contains(&tool) => ".",
         None => return Vec::new(),
     };
-    let lexical = normalize(&cwd.join(raw));
+    let joined = cwd.join(raw);
+    let lexical = normalize(&joined);
     let mut out = vec![lexical.clone()];
-    let real = resolve_through_symlinks(&lexical);
+    // 解決は `..` を畳む**前**のパスに対して行う。OS は左から順にたどるので、
+    // `src/link/../evil.txt` の `..` は link をたどった先の親を指す。先に畳むと link が消える。
+    let real = resolve_through_symlinks(&joined);
     if real != lexical {
         out.push(real);
     }
@@ -465,49 +468,53 @@ fn real_cwd(cwd: &Path) -> PathBuf {
     std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
 }
 
-/// symlink を解決したパス。**まだ存在しないファイルでも**、実在する最も深い祖先までを解決して
-/// 残りを付け直す。`canonicalize` はパス全体が実在しないと失敗するので、それだけに頼ると
-/// 「`src/link -> /outside` の下に**新しい**ファイルを Write する」が字句上のパスだけで
-/// `Write(src/**)` に一致し、cwd の外へ書けてしまう。
-fn resolve_through_symlinks(lexical: &Path) -> PathBuf {
-    resolve_with_budget(lexical, MAX_SYMLINK_HOPS)
-}
-
-/// 行き先の無い symlink をたどる回数の上限 (ループ対策)。
-const MAX_SYMLINK_HOPS: u32 = 16;
+/// 行き先をたどる回数の上限 (ループ対策)。
+const MAX_SYMLINK_HOPS: u32 = 40;
 
 /// 解決しきれなかったときに返す、どの allow にも一致しないパス。
 const UNRESOLVABLE: &str = "/\u{0}unresolvable-symlink";
 
-fn resolve_with_budget(lexical: &Path, hops_left: u32) -> PathBuf {
-    let mut tail = Vec::new();
-    let mut probe = lexical;
-    loop {
-        if let Ok(real) = std::fs::canonicalize(probe) {
-            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
-        }
-        // 実在しないように見えても、**行き先がまだ無い symlink** かもしれない。書き込みは
-        // symlink をたどってリンク先にファイルを作るので、リンク先のパスで判定し直す。
-        if let Ok(target) = std::fs::read_link(probe) {
-            if hops_left == 0 {
-                return PathBuf::from(UNRESOLVABLE);
+/// OS がこのパスをたどったときに実際に行き着く場所。**まだ存在しないファイルでも**求まる。
+///
+/// `canonicalize` はパス全体が実在しないと失敗するので使わない。要素を左から 1 つずつ見て、
+/// symlink ならリンク先 (相対なら、そこまでに解決した場所が基準) に置き換える。これで次の
+/// 3 つが同じ規則で片づく — どれも、字句上は `src/` の下に見えるのに書き込みは cwd の外へ行く:
+///
+/// - 途中のディレクトリが symlink: `src/link/new.txt` (`src/link -> /outside`)
+/// - 最後の要素が、行き先のまだ無い symlink: `src/x -> /outside/new.txt`
+/// - symlink の後ろの `..`: `src/link/../evil.txt` は `/outside` の親に着地する
+fn resolve_through_symlinks(path: &Path) -> PathBuf {
+    let mut hops = MAX_SYMLINK_HOPS;
+    resolve_components(path, &mut hops).unwrap_or_else(|| PathBuf::from(UNRESOLVABLE))
+}
+
+fn resolve_components(path: &Path, hops_left: &mut u32) -> Option<PathBuf> {
+    let mut real = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => real.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                real.pop();
             }
-            let base = probe.parent().unwrap_or(Path::new("/"));
-            let mut next = normalize(&base.join(target));
-            for part in tail.iter().rev() {
-                next.push(part);
+            Component::Normal(name) => {
+                let next = real.join(name);
+                match std::fs::read_link(&next) {
+                    Ok(target) => {
+                        if *hops_left == 0 {
+                            return None;
+                        }
+                        *hops_left -= 1;
+                        // 相対のリンク先は、リンクのあるディレクトリ (= ここまでの real) が基準。
+                        real = resolve_components(&real.join(target), hops_left)?;
+                    }
+                    // symlink でない (実在するか、まだ無いか)。そのまま進む。
+                    Err(_) => real = next,
+                }
             }
-            return resolve_with_budget(&next, hops_left - 1);
-        }
-        match (probe.parent(), probe.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_os_string());
-                probe = parent;
-            }
-            // ルートまで何も実在しない (あり得ないが) なら字句上のパスのまま。
-            _ => return lexical.to_path_buf(),
         }
     }
+    Some(real)
 }
 
 /// `.` と `..` を字句的に畳む (ファイルシステムには触らない)。
@@ -1417,6 +1424,29 @@ mod tests {
             allow.evaluate("Write", &json!({ "path": "src/loop-a" }), &cwd),
             None
         );
+        // symlink の後ろの `..`。字句的には src/evil.txt だが、着地するのは outside の親。
+        let dotdot = json!({ "path": "src/link/../evil.txt" });
+        assert_eq!(allow.evaluate("Write", &dotdot, &cwd), None);
+        let parent_deny = rules(&[], &[&format!("Write({}/evil.txt)", root.display())], &[]);
+        assert!(matches!(
+            parent_deny.evaluate("Write", &dotdot, &cwd),
+            Some(Verdict::Deny(_))
+        ));
+        assert_eq!(persistable_allow_rule("Write", &dotdot, &cwd), None);
+        assert_eq!(
+            persistable_allow_rule(
+                "Write",
+                &json!({ "path": "src/link/../outside/z.txt" }),
+                &cwd
+            ),
+            None
+        );
+        // symlink の絡まない `..` は従来どおり。
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/real/../ok.txt" }), &cwd),
+            Some(Verdict::Allow)
+        );
+
         // cwd の中を指す、行き先の無い symlink は問題ない。
         std::os::unix::fs::symlink("real/inside.txt", cwd.join("src/inside-link.txt")).unwrap();
         assert_eq!(

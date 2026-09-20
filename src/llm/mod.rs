@@ -90,6 +90,9 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
 /// 設定どおりのクライアントと、その使用量の台帳。台帳は provider ごとのクライアントの**内側**で
 /// 共有するので、fallback に切り替わって送り直したリクエストも 1 件ずつ数えられる。
 pub fn build_metered(cfg: &Config) -> Result<(Arc<dyn LlmClient>, Arc<metered::Ledger>)> {
+    for (model, price) in &cfg.pricing {
+        price.validate(model).map_err(|e| anyhow::anyhow!(e))?;
+    }
     let ledger = Arc::new(
         metered::Ledger::new(metered::Budget {
             max_requests: cfg.agent.max_requests,

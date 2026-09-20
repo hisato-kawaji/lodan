@@ -22,6 +22,9 @@ pub const KIND_GOAL_EVAL: &str = "goal_eval";
 pub const KIND_COMPACT: &str = "compact";
 pub const KIND_MCP_SAMPLING: &str = "mcp_sampling";
 
+/// モデルへの注意書きの書き出し。再開したセッションの履歴から取り除くときの目印でもある。
+pub const BUDGET_REMINDER_PREFIX: &str = "[budget]";
+
 /// 予算の何割を使ったら、モデルに一度だけ知らせるか。
 const REMINDER_PERCENT: u64 = 80;
 
@@ -70,6 +73,23 @@ pub struct Budget {
 pub struct ModelPrice {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
+}
+
+impl ModelPrice {
+    /// 単価は有限で 0 以上。`nan` や負の値を通すと `/cost` が `~NaN` や負の金額になる。
+    pub fn validate(&self, model: &str) -> Result<(), String> {
+        for (name, value) in [
+            ("input_per_mtok", self.input_per_mtok),
+            ("output_per_mtok", self.output_per_mtok),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "[pricing.\"{model}\"] {name} = {value} is not a price (it must be a finite number, 0 or more)"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 予算を使い切ったので、次のリクエストを送らなかった。
@@ -148,10 +168,14 @@ impl Ledger {
     /// 単価の分かっているモデルの使用量から見積もった金額。単価表が空なら None。
     /// 第 2 要素は、使ったのに単価が無くて金額に入っていないモデル。
     pub fn cost(&self) -> Option<(f64, Vec<String>)> {
+        self.cost_of(&self.state())
+    }
+
+    /// [`Self::cost`] の本体。既にロックを持っている呼び出し側 (`describe`) が取り直さずに済むように。
+    fn cost_of(&self, state: &LedgerState) -> Option<(f64, Vec<String>)> {
         if self.pricing.is_empty() {
             return None;
         }
-        let state = self.state();
         let mut total = 0.0;
         let mut unpriced = Vec::new();
         for (model, usage) in &state.by_model {
@@ -262,7 +286,7 @@ impl Ledger {
         }
         state.reminded = true;
         Some(format!(
-            "[budget] This run has used {}. It will be cut off when the budget runs out. Wrap up: \
+            "{BUDGET_REMINDER_PREFIX} This run has used {}. It will be cut off when the budget runs out. Wrap up: \
              finish the most important remaining step and report what is done and what is not.",
             parts.join(" and ")
         ))
@@ -307,14 +331,17 @@ impl Ledger {
                 crate::agent::r#loop::ESTIMATE_CHARS_PER_TOKEN
             ));
         }
-        drop(state);
-        if let Some((cost, unpriced)) = self.cost() {
+        if let Some((cost, unpriced)) = self.cost_of(&state) {
             out.push_str(&format!("\ncost: ~{cost:.4} (from [pricing])"));
             if !unpriced.is_empty() {
-                out.push_str(&format!("; no price for {}", unpriced.join(", ")));
+                // モデル名は設定や環境変数から来る文字列。端末に出すので無害化する。
+                let names: Vec<String> = unpriced
+                    .iter()
+                    .map(|m| crate::term::sanitize(m).into_owned())
+                    .collect();
+                out.push_str(&format!("; no price for {}", names.join(", ")));
             }
         }
-        let state = self.state();
         out.extend(limit(state.requests, self.budget.max_requests, "requests"));
         out.extend(limit(
             all.total_tokens,
@@ -539,6 +566,23 @@ mod tests {
         let (plain, plain_ledger) = metered(usage(10, 10), Budget::default());
         plain.chat(&[], &[], "big", None).await.unwrap();
         assert!(plain_ledger.cost().is_none() && !plain_ledger.describe().contains("cost:"));
+    }
+
+    #[test]
+    fn a_price_must_be_a_finite_non_negative_number() {
+        let price = |input, output| ModelPrice {
+            input_per_mtok: input,
+            output_per_mtok: output,
+        };
+        assert!(price(0.0, 2.5).validate("m").is_ok());
+        for bad in [
+            price(-5.0, 1.0),
+            price(1.0, f64::NAN),
+            price(f64::INFINITY, 1.0),
+        ] {
+            let err = bad.validate("kimi-k3").unwrap_err();
+            assert!(err.contains("kimi-k3"), "{err}");
+        }
     }
 
     #[tokio::test]

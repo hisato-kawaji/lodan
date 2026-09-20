@@ -57,10 +57,12 @@ impl Session {
     /// 保存済みセッションから復元する。`prior` の System メッセージは捨て、
     /// 現環境のツール一覧で system prompt を作り直してから残りを引き継ぐ。
     pub fn resume(cfg: Config, registry: Arc<ToolRegistry>, prior: Vec<Message>) -> Self {
-        let prior: Vec<Message> = prior
+        let mut prior: Vec<Message> = prior
             .into_iter()
             .filter(|m| !matches!(m, Message::System { .. }))
             .collect();
+        // 予算は実行ごとのもの。前の実行の「残りわずか、畳め」を、新しい実行のモデルに読ませない。
+        strip_budget_reminders(&mut prior);
         Self::with_prior(cfg, registry, prior)
     }
 
@@ -721,9 +723,12 @@ impl Session {
     /// `agent.auto_compact_percent`%) に達したか。`context_window = 0` は無効。
     pub fn should_auto_compact(&self) -> bool {
         let window = self.cfg.llm.active().context_window;
+        let percent = self.cfg.agent.auto_compact_percent;
+        // 0 は「無効」。そのまま計算すると「常に発火」になってしまう (隣の `context_window = 0` が
+        // 無効化の意味なので、0 をそのつもりで書く人がいる)。
         window > 0
-            && self.usage.last_context_tokens * 100
-                >= window * u64::from(self.cfg.agent.auto_compact_percent)
+            && percent > 0
+            && self.usage.last_context_tokens * 100 >= window * u64::from(percent)
     }
 
     /// しきい値超過時の自動圧縮。ターン終端で呼ぶ。圧縮に失敗しても
@@ -1213,6 +1218,24 @@ enum Prefetched {
         /// PreToolUse hook の `additionalContext`。
         context: Vec<String>,
     },
+}
+
+/// 履歴から、予算の注意書きを取り除く。入力の末尾に添えたものは切り落とし、単独のメッセージ
+/// (ツール結果の後に足したもの) は丸ごと外す — 外しても Tool → Assistant の並びで、API に投げられる形のまま。
+fn strip_budget_reminders(history: &mut Vec<Message>) {
+    use crate::llm::metered::BUDGET_REMINDER_PREFIX;
+    history.retain_mut(|message| {
+        let Message::User { content } = message else {
+            return true;
+        };
+        if content.starts_with(BUDGET_REMINDER_PREFIX) {
+            return false;
+        }
+        if let Some(at) = content.find(&format!("\n\n{BUDGET_REMINDER_PREFIX} ")) {
+            content.truncate(at);
+        }
+        true
+    });
 }
 
 /// hook が寄せた文脈をモデルに渡すときの枠。利用者の言葉やツールの出力と取り違えさせない。
@@ -2015,6 +2038,138 @@ mod tests {
             .await
             .unwrap();
         assert!(!default.should_auto_compact(), "but not at the default 80%");
+    }
+
+    /// ツール往復が何回も続くターンの途中で 8 割を超えても、注意書きは 1 回だけ。ツール結果の
+    /// 後なので単独の user メッセージになる (tool の直後に assistant 以外が来るのはこの形だけ)。
+    #[tokio::test]
+    async fn a_long_tool_loop_gets_exactly_one_reminder() {
+        use crate::llm::metered::{Budget, Ledger, MeteredClient};
+        /// 5 回ツールを呼んでから答える。
+        struct FiveCalls(AtomicUsize);
+        #[async_trait]
+        impl LlmClient for FiveCalls {
+            async fn chat(
+                &self,
+                _h: &[Message],
+                _t: &[ToolSpec<'_>],
+                _m: &str,
+                _mt: Option<u32>,
+            ) -> Result<ChatResponse> {
+                unreachable!("not used")
+            }
+            async fn chat_stream(
+                &self,
+                _h: &[Message],
+                _t: &[ToolSpec<'_>],
+                _m: &str,
+                sink: mpsc::UnboundedSender<ChatEvent>,
+            ) -> Result<()> {
+                let n = self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                let resp = if n < 5 {
+                    ChatResponse {
+                        content: None,
+                        tool_calls: vec![tool_call_with_args(
+                            &format!("c{n}"),
+                            "Ser",
+                            &format!(r#"{{"n": {n}}}"#),
+                        )],
+                        usage: None,
+                    }
+                } else {
+                    ChatResponse {
+                        content: Some("done".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                    }
+                };
+                let _ = sink.send(ChatEvent::Done(resp));
+                Ok(())
+            }
+        }
+        let ledger = Arc::new(Ledger::new(Budget {
+            max_requests: Some(6),
+            max_total_tokens: None,
+        }));
+        let llm = MeteredClient::new(Arc::new(FiveCalls(AtomicUsize::new(0))), ledger.clone());
+        let (mut session, _stats) = probe_session(Config::default());
+        session.set_ledger(ledger);
+        session
+            .run_turn("go", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+
+        let roles: Vec<&str> = session
+            .history()
+            .iter()
+            .map(|m| match m {
+                Message::System { .. } => "system",
+                Message::User { content } if content.starts_with("[budget]") => "reminder",
+                Message::User { .. } => "user",
+                Message::Assistant { .. } => "assistant",
+                Message::Tool { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(
+            roles.iter().filter(|r| **r == "reminder").count(),
+            1,
+            "{roles:?}"
+        );
+        let at = roles.iter().position(|r| *r == "reminder").unwrap();
+        assert_eq!(
+            (roles[at - 1], roles[at + 1]),
+            ("tool", "assistant"),
+            "{roles:?}"
+        );
+
+        // 再開したセッションには、前の実行の注意書きを持ち込まない (履歴は API-valid のまま)。
+        let resumed = Session::resume(
+            Config::default(),
+            Arc::new(default_registry()),
+            session.history().to_vec(),
+        );
+        assert!(
+            resumed
+                .history()
+                .iter()
+                .all(|m| !matches!(m, Message::User { content } if content.contains("[budget]")))
+        );
+        assert_eq!(resumed.history().len(), session.history().len() - 1);
+    }
+
+    #[test]
+    fn a_reminder_attached_to_a_prompt_is_cut_off_on_resume() {
+        let mut history = vec![
+            Message::User {
+                content: "fix the bug\n\n[budget] This run has used 4 of 5 LLM requests. Wrap up."
+                    .into(),
+            },
+            Message::User {
+                content: "talk about the [budget] feature".into(),
+            },
+        ];
+        strip_budget_reminders(&mut history);
+        assert!(matches!(&history[0], Message::User { content } if content == "fix the bug"));
+        assert!(
+            matches!(&history[1], Message::User { content } if content.contains("[budget] feature")),
+            "only a reminder is removed, not any text that mentions the word"
+        );
+    }
+
+    /// 0 は「無効」。「常に発火」ではない。
+    #[tokio::test]
+    async fn an_auto_compact_percent_of_zero_turns_it_off() {
+        let mut session = session_with_window(100);
+        session.cfg.agent.auto_compact_percent = 0;
+        session
+            .run_turn(
+                "hi",
+                &llm_with_prompt_tokens(99),
+                &PermissionGate::new(true),
+            )
+            .await
+            .unwrap();
+        assert!(!session.should_auto_compact());
     }
 
     /// 予算の 8 割を使ったら、次の LLM 呼び出しの前に一度だけモデルへ知らせる。

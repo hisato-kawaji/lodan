@@ -570,13 +570,15 @@ timeout_secs = 30        # 省略可（既定 30）
 | `2` | **ブロック**。理由は stderr。JSON で `allow` と言っていても止まる |
 | その他の非 0 | hook 自身の失敗。**警告を出して続行**（ブロックしない） |
 
-> ⚠️ **v0.1 からの破壊的変更**: 以前は「非 0 は全てブロック」でした。`exit 1` で止めていた hook は `exit 2` に直すか、設定のトップレベルに `hooks_compat = "v1"` を書いて旧挙動（非 0 は全てブロック・stdout の JSON は読まない）に戻してください。
+> ⚠️ **v0.1 からの破壊的変更**
+> - 以前は「非 0 は全てブロック」でした。`exit 1` で止めていた hook は `exit 2` に直すか、設定のトップレベルに `hooks_compat = "v1"` を書いて旧挙動（非 0 は全てブロック・stdout の JSON は読まない）に戻してください。
+> - **SessionStart の `matcher` が効くようになりました**（以前は無視）。照合する相手は `startup` / `resume` です。SessionStart の hook に `matcher = "Bash"` のような値が残っていると、**一度も発火しなくなります**。matcher を消すか `startup|resume` にしてください。
 
 タイムアウトした hook はブロック扱いです（guard が固まったときに素通しにしないため。ここは Claude Code と異なります）。hook の起動自体に失敗した場合は警告のみで続行します（fail-open）。
 
 ### stdout の JSON
 
-`{` で始まり `}` で終わる stdout だけを JSON として読みます。
+`{` で始まり `}` で終わる stdout だけを JSON として読みます（先頭の BOM は無視）。**JSON らしいのに読み取れない出力は黙って捨てません**: 配列で包まれている、構文が壊れている、`permissionDecision` が知らない値、`updatedInput` がオブジェクトでない、といった場合、PreToolUse では**ブロック**し（deny を言おうとして形を間違えた guard を素通しにしないため）、他のイベントでは警告して続行します。
 
 ```json
 {
@@ -592,14 +594,15 @@ timeout_secs = 30        # 省略可（既定 30）
 
 | フィールド | 効くイベント | 効果 |
 | --- | --- | --- |
-| `hookSpecificOutput.permissionDecision` | PreToolUse | `deny`: 実行せず理由をモデルへ返す / `ask`: 他の条件で通る呼び出しでも**必ず尋ねる**（`--yes` でも。尋ねる相手のいない `-p` では拒否） / `allow`: 承認プロンプトを省く |
+| `hookSpecificOutput.permissionDecision` | PreToolUse | `deny`: 実行せず理由をモデルへ返す / `ask`: 他の条件で通る呼び出しでも**必ず尋ねる**（`--yes` でも。尋ねる相手のいない `-p` では拒否） / `allow`: 承認プロンプトを省く。尋ねる相手のいない `-p` では hook が承認役になる（`--yes` 無しでも通る） |
 | `hookSpecificOutput.updatedInput` | PreToolUse | ツール入力を差し替える（JSON オブジェクトのみ）。**権限ルールと承認は差し替え後の入力を見ます** |
-| `hookSpecificOutput.additionalContext` | 全て | モデルに見せる追加の文脈。Pre/PostToolUse ではツール結果に、UserPromptSubmit / SessionStart では次のユーザ入力に `<hook-context>` で添える |
+| `hookSpecificOutput.additionalContext` | 全て | モデルに見せる追加の文脈。Pre/PostToolUse ではツール結果に、UserPromptSubmit / SessionStart / Stop では次のユーザ入力に `<hook-context>` で添える。同じ出力でブロックした場合は使われない |
 | `decision: "block"` + `reason` | 全て | exit 2 と同じ |
 | `continue: false` + `stopReason` | Stop 以外 | ブロック（Stop では「止まってよい」の意味なので何もしない） |
 | `systemMessage` | 全て | 利用者への警告として stderr に表示 |
 
-- hook の **`allow` は deny ルールにも ask ルールにも勝てません**。hook はプロジェクトの設定からも足せるので、利用者が[権限ルール](#権限ルールとモード)で書いた「禁止」「必ず尋ねる」を覆させないためです。
+- hook の **`allow` は deny ルール・ask ルール・`dont-ask` モードに勝てません**。hook はプロジェクトの設定からも足せるので、利用者が[権限ルール](#権限ルールとモード)で書いた「禁止」「必ず尋ねる」「承認が要るものは通すな」を覆させないためです。
+- hook の `ask` で出るプロンプトは yes / no だけです（「常に許可」や `(p)` を選んでも、次回また hook が尋ねさせるので効かないため）。
 - 複数の hook が違う希望を出したら `deny` > `ask` > `allow`。ブロックした時点で残りの hook は実行しません。
 - UserPromptSubmit と SessionStart では、JSON でない素の stdout もそのまま追加の文脈になります。
 

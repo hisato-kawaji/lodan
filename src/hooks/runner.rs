@@ -112,13 +112,16 @@ async fn run_one(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // PowerShell や Python の `utf-8-sig` は先頭に BOM を付ける。`trim` は BOM を落とさない。
+    let stdout = stdout.trim().trim_start_matches('\u{feff}').trim_start();
     match output.status.code() {
-        Some(0) => Ok(read_stdout(hook, lc, stdout.trim())),
+        Some(0) => Ok(read_stdout(hook, lc, stdout)),
         // 終了コード 2 は JSON の中身に関わらず止める (JSON の `allow` でも覆せない)。理由は JSON が
         // ブロックを述べていればそれ、無ければ stderr。
         Some(EXIT_BLOCK) => {
-            let from_json = parse_object(stdout.trim())
-                .and_then(|v| interpret(lc, &v).block)
+            let from_json = parse_object(stdout)
+                .and_then(|v| interpret(lc, &v).ok())
+                .and_then(|o| o.block)
                 .filter(|r| !r.is_empty());
             Ok(HookOutcome::blocked(
                 from_json.unwrap_or_else(|| pick_reason(&output.stderr, &[])),
@@ -147,36 +150,56 @@ fn parse_object(stdout: &str) -> Option<serde_json::Value> {
         .filter(|v| v.is_object())
 }
 
+/// 判断を伝えようとした形跡のある stdout か (JSON の書き出しで始まる)。
+fn looks_like_json(stdout: &str) -> bool {
+    stdout.starts_with('{') || stdout.starts_with('[')
+}
+
 /// exit 0 の stdout。JSON なら判断として、UserPromptSubmit / SessionStart の素のテキストなら
 /// モデルへの追加文脈として読む。それ以外のイベントの素のテキストは捨てる。
+///
+/// JSON らしいのに読み取れない出力を**黙って捨てない**。deny を言おうとして形を間違えた guard が
+/// 素通しになるのが一番まずいので、PreToolUse ではブロックに倒し、他のイベントでは警告する。
 fn read_stdout(hook: &HookConfig, lc: Lifecycle, stdout: &str) -> HookOutcome {
     if stdout.is_empty() {
         return HookOutcome::default();
     }
-    if let Some(value) = parse_object(stdout) {
-        if let Some(msg) = value.get("systemMessage").and_then(|v| v.as_str()) {
-            warn(hook, msg);
+    let problem = match parse_object(stdout) {
+        Some(value) => {
+            if let Some(msg) = value.get("systemMessage").and_then(|v| v.as_str()) {
+                warn(hook, msg);
+            }
+            match interpret(lc, &value) {
+                Ok(outcome) => return outcome,
+                Err(problem) => problem,
+            }
         }
-        return interpret(lc, &value);
+        None if looks_like_json(stdout) => {
+            "stdout looks like JSON but is not a JSON object lodan can read".to_string()
+        }
+        None => {
+            if matches!(lc, Lifecycle::UserPromptSubmit | Lifecycle::SessionStart) {
+                return HookOutcome {
+                    context: vec![stdout.to_string()],
+                    ..HookOutcome::default()
+                };
+            }
+            return HookOutcome::default();
+        }
+    };
+    if lc == Lifecycle::PreToolUse {
+        return HookOutcome::blocked(format!(
+            "hook `{}` printed a decision lodan could not read ({problem}); blocking to be safe",
+            hook.command
+        ));
     }
-    if stdout.starts_with('{') && stdout.ends_with('}') {
-        warn(
-            hook,
-            "stdout looks like JSON but does not parse; ignoring it",
-        );
-        return HookOutcome::default();
-    }
-    if matches!(lc, Lifecycle::UserPromptSubmit | Lifecycle::SessionStart) {
-        return HookOutcome {
-            context: vec![stdout.to_string()],
-            ..HookOutcome::default()
-        };
-    }
+    warn(hook, &format!("{problem}; ignoring it"));
     HookOutcome::default()
 }
 
-/// hook の JSON 出力 (Claude Code の形式) を読む。
-fn interpret(lc: Lifecycle, value: &serde_json::Value) -> HookOutcome {
+/// hook の JSON 出力 (Claude Code の形式) を読む。形は合っているのに値が読めないとき
+/// (`permissionDecision` が文字列でない、知らない値) は `Err`。
+fn interpret(lc: Lifecycle, value: &serde_json::Value) -> Result<HookOutcome, String> {
     let text = |v: &serde_json::Value, key: &str| {
         v.get(key)
             .and_then(|x| x.as_str())
@@ -184,47 +207,50 @@ fn interpret(lc: Lifecycle, value: &serde_json::Value) -> HookOutcome {
             .filter(|s| !s.is_empty())
     };
     let mut out = HookOutcome::default();
+    let specific = value.get("hookSpecificOutput");
+    // 文脈は、この hook が止めるかどうかに関わらず拾う (使うかどうかは呼び出し側が決める)。
+    if let Some(context) = specific.and_then(|s| text(s, "additionalContext")) {
+        out.context.push(context);
+    }
 
     // `continue: false` は「先へ進めるな」。Stop では「止まってよい」の意味になるので、ブロック
     // (= 会話を続けさせる) には読み替えない。
     if value.get("continue").and_then(|v| v.as_bool()) == Some(false) && lc != Lifecycle::Stop {
         out.block =
             Some(text(value, "stopReason").unwrap_or_else(|| "hook requested a stop".to_string()));
-        return out;
+        return Ok(out);
     }
     if value.get("decision").and_then(|v| v.as_str()) == Some("block") {
         out.block =
             Some(text(value, "reason").unwrap_or_else(|| "hook denied (no message)".to_string()));
-        return out;
+        return Ok(out);
     }
 
-    let Some(specific) = value.get("hookSpecificOutput") else {
-        return out;
+    let Some(specific) = specific.filter(|_| lc == Lifecycle::PreToolUse) else {
+        return Ok(out);
     };
-    if let Some(context) = text(specific, "additionalContext") {
-        out.context.push(context);
-    }
-    if lc != Lifecycle::PreToolUse {
-        return out;
-    }
-    match specific.get("permissionDecision").and_then(|v| v.as_str()) {
-        Some("deny") => {
-            out.block = Some(
-                text(specific, "permissionDecisionReason")
-                    .unwrap_or_else(|| "hook denied (no message)".to_string()),
-            );
-            return out;
-        }
-        Some("allow") => out.permission = Some(PermissionHint::Allow),
-        Some("ask") => out.permission = Some(PermissionHint::Ask),
-        _ => {}
+    match specific.get("permissionDecision") {
+        None => {}
+        Some(decision) => match decision.as_str() {
+            Some("deny") => {
+                out.block = Some(
+                    text(specific, "permissionDecisionReason")
+                        .unwrap_or_else(|| "hook denied (no message)".to_string()),
+                );
+                return Ok(out);
+            }
+            Some("allow") => out.permission = Some(PermissionHint::Allow),
+            Some("ask") => out.permission = Some(PermissionHint::Ask),
+            _ => return Err(format!("unknown permissionDecision {decision}")),
+        },
     }
     // ツール入力は JSON オブジェクト。それ以外の形に書き換えられたものは採らない。
-    out.updated_input = specific
-        .get("updatedInput")
-        .filter(|v| v.is_object())
-        .cloned();
-    out
+    match specific.get("updatedInput") {
+        None => {}
+        Some(input) if input.is_object() => out.updated_input = Some(input.clone()),
+        Some(_) => return Err("updatedInput is not a JSON object".to_string()),
+    }
+    Ok(out)
 }
 
 fn pick_reason(stderr: &[u8], stdout: &[u8]) -> String {
@@ -396,17 +422,15 @@ mod tests {
         assert_eq!(out.updated_input, Some(json!({ "command": "ls -la" })));
         assert_eq!(out.context, vec!["be careful".to_string()]);
 
+        // 形の違う書き換えは採らない。何をしたかったのか分からないので、実行もしない。
         let not_an_object = vec![hook(
             Lifecycle::PreToolUse,
             "",
             &says(r#"{"hookSpecificOutput":{"updatedInput":"rm -rf /"}}"#),
         )];
-        assert_eq!(
-            pre_tool("Bash", &not_an_object, HooksCompat::V2)
-                .await
-                .updated_input,
-            None
-        );
+        let out = pre_tool("Bash", &not_an_object, HooksCompat::V2).await;
+        assert_eq!(out.updated_input, None);
+        assert!(out.block.unwrap().contains("updatedInput"));
     }
 
     #[tokio::test]
@@ -492,13 +516,57 @@ mod tests {
         );
     }
 
+    /// deny を言おうとして形を間違えた guard を、黙って素通しにしない (レビューで実際に通った)。
     #[tokio::test]
-    async fn malformed_json_is_ignored_not_fatal() {
-        let hooks = vec![hook(Lifecycle::PreToolUse, "", &says("{not json}"))];
+    async fn a_pre_tool_decision_that_cannot_be_read_blocks_instead_of_passing_silently() {
+        let deny = r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"bom deny"}}"#;
+        // BOM つき (PowerShell / Python の utf-8-sig) は読める。
+        let bom = vec![hook(
+            Lifecycle::PreToolUse,
+            "",
+            &format!("cat > /dev/null; printf '\\357\\273\\277%s' '{deny}'"),
+        )];
         assert_eq!(
-            pre_tool("Bash", &hooks, HooksCompat::V2).await,
-            HookOutcome::default()
+            pre_tool("Bash", &bom, HooksCompat::V2).await.block,
+            Some("bom deny".to_string())
         );
+        for unreadable in [
+            format!("[{deny}]"),
+            "{not json}".to_string(),
+            r#"{"hookSpecificOutput":{"permissionDecision":{"value":"deny"}}}"#.to_string(),
+            r#"{"hookSpecificOutput":{"permissionDecision":"dontAsk"}}"#.to_string(),
+        ] {
+            let hooks = vec![hook(Lifecycle::PreToolUse, "", &says(&unreadable))];
+            let out = pre_tool("Bash", &hooks, HooksCompat::V2).await;
+            assert!(
+                out.block
+                    .as_deref()
+                    .is_some_and(|r| r.contains("could not read")),
+                "{unreadable} -> {out:?}"
+            );
+        }
+        // PreToolUse 以外では止めるものが無いので、警告して続行。
+        let on_stop = vec![hook(Lifecycle::Stop, "", &says("{not json}"))];
+        let out = dispatch(Lifecycle::Stop, None, &json!({}), &on_stop, HooksCompat::V2)
+            .await
+            .unwrap();
+        assert_eq!(out, HookOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn context_is_kept_even_when_the_same_output_blocks_or_lets_a_stop_through() {
+        let stop = vec![hook(
+            Lifecycle::Stop,
+            "",
+            &says(
+                r#"{"continue":false,"hookSpecificOutput":{"additionalContext":"remember to push"}}"#,
+            ),
+        )];
+        let out = dispatch(Lifecycle::Stop, None, &json!({}), &stop, HooksCompat::V2)
+            .await
+            .unwrap();
+        assert_eq!(out.block, None);
+        assert_eq!(out.context, vec!["remember to push".to_string()]);
     }
 
     #[tokio::test]

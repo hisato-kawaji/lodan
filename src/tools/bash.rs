@@ -66,6 +66,7 @@ impl Tool for Bash {
             // サンドボックスを頼まれたのに道具が無い。外で走らせずに失敗させる。
             Err(why) => return Ok(ToolOutput::error(why)),
         };
+        let unguarded = crate::sandbox::unguarded(&ctx.sandbox);
         let mut cmd = Command::new(program);
         cmd.args(program_args).current_dir(&ctx.cwd);
         // foreground 実行はタイムアウトや Ctrl-C 中断で future を破棄したとき
@@ -86,15 +87,25 @@ impl Tool for Bash {
         let stderr = truncate(String::from_utf8_lossy(&output.stderr).into_owned());
         let code = output.status.code().unwrap_or(-1);
 
-        let mut body = format!(
-            "$ {command}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- exit ---\n{code}\n"
-        );
-        // 末尾の `--- exit ---` は表示側が読むので崩さない。注記は stderr の直後に差し込む。
+        // 末尾の `--- exit ---` は表示側が読むので崩さない。サンドボックスの注記は stderr の直後に
+        // 組み立てる (後から置換で差し込むと、出力に同じ区切りを混ぜたコマンドに位置を決められる)。
+        let mut notes = String::new();
         if let Some(hint) =
             crate::sandbox::denial_hint(&ctx.sandbox, &stderr, output.status.success())
         {
-            body = body.replacen("\n--- exit ---\n", &format!("\n{hint}\n--- exit ---\n"), 1);
+            notes.push_str(&hint);
+            notes.push('\n');
         }
+        let planted = crate::sandbox::planted(&unguarded);
+        if !planted.is_empty() {
+            let warning = crate::sandbox::planted_warning(&planted);
+            eprintln!("{}", crate::term::red_err(&warning));
+            notes.push_str(&warning);
+            notes.push('\n');
+        }
+        let body = format!(
+            "$ {command}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n{notes}--- exit ---\n{code}\n"
+        );
         Ok(if output.status.success() {
             ToolOutput::ok(body)
         } else {

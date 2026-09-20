@@ -91,22 +91,39 @@ impl SandboxPolicy {
 /// `sh -c <command>` を方針に従って包んだ (プログラム, 引数)。off ならそのまま `sh -c`。
 /// サンドボックスが要るのに道具が無ければ `Err` (呼び出し側は実行せずにエラーを返す)。
 pub fn wrap(policy: &SandboxPolicy, command: &str) -> Result<(String, Vec<String>), String> {
-    wrap_with(policy, command, &temp_dirs())
+    wrap_with(
+        policy,
+        command,
+        &temp_dirs(&policy.cwd),
+        sandbox_tool().as_deref(),
+    )
+}
+
+/// この OS でサンドボックスを起動するプログラム。無ければ None。
+fn sandbox_tool() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let exe = "/usr/bin/sandbox-exec";
+        Path::new(exe).exists().then(|| exe.to_string())
+    } else if cfg!(target_os = "linux") {
+        find_in_path("bwrap")
+    } else {
+        None
+    }
 }
 
 fn wrap_with(
     policy: &SandboxPolicy,
     command: &str,
     temp_dirs: &[PathBuf],
+    tool: Option<&str>,
 ) -> Result<(String, Vec<String>), String> {
     if !policy.is_on() {
         return Ok(("sh".into(), vec!["-c".into(), command.into()]));
     }
+    let Some(exe) = tool else {
+        return Err(unavailable(policy));
+    };
     if cfg!(target_os = "macos") {
-        let exe = "/usr/bin/sandbox-exec";
-        if !Path::new(exe).exists() {
-            return Err(unavailable(policy, "sandbox-exec"));
-        }
         return Ok((
             exe.into(),
             vec![
@@ -118,19 +135,18 @@ fn wrap_with(
             ],
         ));
     }
-    if cfg!(target_os = "linux") {
-        let Some(exe) = find_in_path("bwrap") else {
-            return Err(unavailable(policy, "bwrap (bubblewrap)"));
-        };
-        return Ok((exe, bwrap_args(policy, command, temp_dirs)));
-    }
-    Err(unavailable(
-        policy,
-        "a supported sandbox (macOS sandbox-exec or Linux bwrap)",
-    ))
+    prepare_workspace(policy);
+    Ok((exe.into(), bwrap_args(policy, command, temp_dirs)))
 }
 
-fn unavailable(policy: &SandboxPolicy, what: &str) -> String {
+fn unavailable(policy: &SandboxPolicy) -> String {
+    let what = if cfg!(target_os = "macos") {
+        "sandbox-exec"
+    } else if cfg!(target_os = "linux") {
+        "bwrap (bubblewrap)"
+    } else {
+        "a supported sandbox (macOS sandbox-exec or Linux bwrap)"
+    };
     format!(
         "sandbox.mode = \"{}\" but {what} is not available on this system. Refusing to run the \
          command unsandboxed. Install it, or set sandbox.mode = \"off\".",
@@ -147,15 +163,29 @@ fn find_in_path(name: &str) -> Option<String> {
 }
 
 /// 書き込みを許す一時ディレクトリ (実パス)。コンパイラやテストランナーは TMPDIR に書く。
-fn temp_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("/private/tmp"), PathBuf::from("/tmp")];
-    if let Some(t) = std::env::var_os("TMPDIR") {
-        dirs.push(PathBuf::from(t));
+fn temp_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    temp_dirs_from(
+        std::env::var_os("TMPDIR").map(PathBuf::from),
+        cwd,
+        home.as_deref(),
+    )
+}
+
+/// `TMPDIR` は環境変数なので鵜呑みにしない。`/` やホーム、作業ディレクトリを含む場所を指していたら、
+/// 「一時ディレクトリは書ける」がそのまま「どこでも書ける」になり、保護したパスの意味も消える。
+fn temp_dirs_from(tmpdir: Option<PathBuf>, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let real_path = |d: PathBuf| std::fs::canonicalize(&d).unwrap_or(d);
+    let mut real: Vec<PathBuf> = vec![
+        real_path(PathBuf::from("/private/tmp")),
+        real_path(PathBuf::from("/tmp")),
+    ];
+    if let Some(dir) = tmpdir.map(real_path) {
+        let swallows = |inner: &Path| real_path(inner.to_path_buf()).starts_with(&dir);
+        if dir.is_absolute() && !swallows(cwd) && !home.is_some_and(swallows) {
+            real.push(dir);
+        }
     }
-    let mut real: Vec<PathBuf> = dirs
-        .into_iter()
-        .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
-        .collect();
     real.sort();
     real.dedup();
     real
@@ -164,11 +194,13 @@ fn temp_dirs() -> Vec<PathBuf> {
 /// 作業ディレクトリの中でも書かせない場所。ここに書けると、サンドボックスの中のコマンドが
 /// **次に外で動くもの**を仕込める: lodan の設定 (`sandbox.mode = "off"` や hooks)、起動時に読む
 /// `.env`、MCP サーバの定義、git が実行する hooks と `core.fsmonitor` など。
+/// サブモジュールの git ディレクトリ (`.git/modules/`) も、それぞれが hooks と config を持つ。
 /// (パス, ディレクトリごとか)。
 fn protected_paths(cwd: &Path) -> Vec<(PathBuf, bool)> {
     vec![
         (cwd.join(".lodan"), true),
         (cwd.join(".git").join("hooks"), true),
+        (cwd.join(".git").join("modules"), true),
         (cwd.join(".git").join("config"), false),
         (cwd.join(".mcp.json"), false),
         (cwd.join(".env"), false),
@@ -217,6 +249,13 @@ pub fn seatbelt_profile(policy: &SandboxPolicy, temp_dirs: &[PathBuf]) -> String
                 sbpl_string(&path)
             ));
         }
+        // `.git` という名前そのものも固定する。中身を守っても、`.git` ごと rename して、hooks を
+        // 仕込んだ別のディレクトリ (や symlink) を同じ名前で置かれたら意味が無い。中への書き込み
+        // (index / objects / refs) はこれまでどおり通る。`git init` はサンドボックスの外で。
+        let dot_git = sbpl_string(&policy.cwd.join(".git"));
+        p.push_str(&format!(
+            "(deny file-write-create (literal {dot_git}))\n(deny file-write-unlink (literal {dot_git}))\n"
+        ));
     }
     if !policy.network {
         p.push_str("(deny network*)\n");
@@ -232,14 +271,21 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
         .collect();
     match policy.mode {
         SandboxMode::WorkspaceWrite => {
-            let cwd = policy.cwd.display().to_string();
-            a.extend(["--bind".into(), cwd.clone(), cwd]);
+            // 順序が効く: 後の bind は、その下にある前の mount を覆い隠す。作業ディレクトリが
+            // /tmp 以下にあるとき、一時ディレクトリを後から bind すると下の保護がまるごと消える。
             for dir in temp_dirs {
                 let dir = dir.display().to_string();
                 a.extend(["--bind-try".into(), dir.clone(), dir]);
             }
-            // bind し直せるのは既にあるパスだけ (`-try` は無ければ黙って飛ばす)。まだ無い
-            // `.lodan/` を新しく作られるのは bwrap では止められない — README に明記している。
+            let cwd = policy.cwd.display().to_string();
+            a.extend(["--bind".into(), cwd.clone(), cwd]);
+            // `.git` をそれ自身に bind して mount point にする。mount point は rename も削除も
+            // できない (EBUSY) ので、`.git` ごと差し替えて hooks の保護を外す回り道が塞がる。
+            let dot_git = policy.cwd.join(".git").display().to_string();
+            a.extend(["--bind-try".into(), dot_git.clone(), dot_git]);
+            // bind し直せるのは既にあるパスだけ (`-try` は無ければ黙って飛ばす)。だからディレクトリは
+            // `prepare_workspace` が先に作っておく。まだ無い**ファイル**は止められないので、
+            // 実行後に `planted` で検出して知らせる。
             for (path, _) in protected_paths(&policy.cwd) {
                 let path = path.display().to_string();
                 a.extend(["--ro-bind-try".into(), path.clone(), path]);
@@ -262,23 +308,86 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
     a
 }
 
+/// bwrap は無いパスを守れないので、守りたいディレクトリを先に作っておく (Linux の workspace-write
+/// だけ)。空の `.lodan/`・`.git/hooks/`・`.git/modules/` は無害で、どれも lodan / git が普通に作るもの。
+/// 作れなければ諦める (その場合は `planted` の検出だけが残る)。
+fn prepare_workspace(policy: &SandboxPolicy) {
+    if policy.mode != SandboxMode::WorkspaceWrite {
+        return;
+    }
+    let _ = std::fs::create_dir_all(policy.cwd.join(".lodan"));
+    let dot_git = policy.cwd.join(".git");
+    if dot_git.is_dir() {
+        let _ = std::fs::create_dir_all(dot_git.join("hooks"));
+        let _ = std::fs::create_dir_all(dot_git.join("modules"));
+    }
+}
+
+/// 実行前に呼ぶ: 守りたいのに OS では守れない (= まだ存在しない) パス。macOS では seatbelt が
+/// 作成そのものを止めるので常に空。
+pub fn unguarded(policy: &SandboxPolicy) -> Vec<PathBuf> {
+    if !cfg!(target_os = "linux") || policy.mode != SandboxMode::WorkspaceWrite {
+        return Vec::new();
+    }
+    // 自分で作る分を先に済ませる (後から現れると、仕込まれたものと区別がつかない)。
+    prepare_workspace(policy);
+    let mut paths: Vec<PathBuf> = protected_paths(&policy.cwd)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    paths.push(policy.cwd.join(".git"));
+    paths.retain(|p| std::fs::symlink_metadata(p).is_err());
+    paths
+}
+
+/// 実行後に呼ぶ: `unguarded` のうち、コマンドの実行中に現れたもの。
+pub fn planted(unguarded: &[PathBuf]) -> Vec<PathBuf> {
+    unguarded
+        .iter()
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .cloned()
+        .collect()
+}
+
+/// `planted` が空でないときにツール出力と利用者の両方へ出す警告。
+pub fn planted_warning(paths: &[PathBuf]) -> String {
+    let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    format!(
+        "[sandbox] WARNING: this command created {} — a file lodan or git acts on OUTSIDE the \
+         sandbox next time. The Linux sandbox cannot block the creation of paths that did not \
+         exist yet. Review it before running lodan or git here again.",
+        list.join(", ")
+    )
+}
+
 /// サンドボックスに拒否されたらしい失敗に添える注記。モデルが同じコマンドを繰り返したり、
 /// 回り道を探したりしないように、何が起きたかを伝える。
 pub fn denial_hint(policy: &SandboxPolicy, stderr: &str, succeeded: bool) -> Option<String> {
     if !policy.is_on() || succeeded {
         return None;
     }
-    let blocked_write = stderr.contains("Operation not permitted")
-        || stderr.contains("Read-only file system")
-        || stderr.contains("Permission denied");
+    // 注記は助言にすぎないので、取りこぼすより広めに拾う (ただの `chmod` 忘れにも付くことがある)。
+    let stderr = stderr.to_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|m| stderr.contains(m));
+    let blocked_write = mentions(&[
+        "operation not permitted",
+        "read-only file system",
+        "permission denied",
+        "eacces",
+        "eperm",
+        "erofs",
+        "device or resource busy",
+    ]);
     let blocked_net = !policy.network
-        && [
-            "Could not resolve host",
-            "Network is unreachable",
-            "Operation not permitted",
-        ]
-        .iter()
-        .any(|m| stderr.contains(m));
+        && mentions(&[
+            "could not resolve host",
+            "network is unreachable",
+            "enotfound",
+            "no such host",
+            "name resolution",
+            "name or service not known",
+            "connection refused",
+        ]);
     (blocked_write || blocked_net).then(|| {
         format!(
             "[sandbox] This command ran under sandbox.mode = \"{}\" (network {}). Writes outside {} \
@@ -436,7 +545,12 @@ mod tests {
 
     /// サンドボックスの中で走らせ、成功したかを返す。
     fn run(policy: &SandboxPolicy, command: &str) -> bool {
-        let (exe, args) = wrap_with(policy, command, &[]).expect("sandbox tool");
+        run_with_temp(policy, command, &[])
+    }
+
+    fn run_with_temp(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) -> bool {
+        let (exe, args) =
+            wrap_with(policy, command, temp_dirs, sandbox_tool().as_deref()).expect("sandbox tool");
         std::process::Command::new(exe)
             .args(args)
             .current_dir(&policy.cwd)
@@ -454,7 +568,7 @@ mod tests {
             network: true,
             cwd: a.ws.clone(),
         };
-        match wrap_with(&probe, "true", &[]) {
+        match wrap_with(&probe, "true", &[], sandbox_tool().as_deref()) {
             Ok((exe, args)) => std::process::Command::new(exe)
                 .args(args)
                 .current_dir(&a.ws)
@@ -547,5 +661,110 @@ mod tests {
             "positive control: reachable when the network is allowed"
         );
         assert!(!run(&workspace_write(&a, false), &connect));
+    }
+
+    #[test]
+    fn without_the_os_tool_nothing_runs_unsandboxed() {
+        let on = policy(SandboxMode::WorkspaceWrite, true);
+        let err = wrap_with(&on, "echo hi", &[], None).unwrap_err();
+        assert!(err.contains("Refusing to run"), "{err}");
+        // off は道具が無くても影響を受けない。
+        assert!(wrap_with(&SandboxPolicy::off(), "echo hi", &[], None).is_ok());
+    }
+
+    #[test]
+    fn a_tmpdir_that_swallows_the_workspace_or_home_is_ignored() {
+        let cwd = Path::new("/work/proj");
+        let home = Some(Path::new("/home/me"));
+        let has = |tmpdir: &str| {
+            temp_dirs_from(Some(PathBuf::from(tmpdir)), cwd, home).contains(&PathBuf::from(tmpdir))
+        };
+        assert!(has("/var/scratch"));
+        for hostile in [
+            "/",
+            "/work",
+            "/work/proj",
+            "/home",
+            "/home/me",
+            "relative/tmp",
+        ] {
+            assert!(!has(hostile), "{hostile}");
+        }
+    }
+
+    /// `.git` の中身を守っても、`.git` ごと別物に差し替えられたら意味が無い (レビューで実際に通った)。
+    #[test]
+    fn the_git_directory_cannot_be_swapped_for_one_with_hooks() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        let p = workspace_write(&a, true);
+        let _ = run(
+            &p,
+            "mkdir -p st/hooks && echo pwn > st/hooks/pre-commit && mv .git .gitold && mv st .git",
+        );
+        let _ = run(
+            &p,
+            "mv .git .gold; ln -s .gold .git; echo pwn > .git/hooks/pre-commit",
+        );
+        let _ = run(
+            &p,
+            "mkdir -p .git/modules/sub/hooks && echo pwn > .git/modules/sub/hooks/pre-commit",
+        );
+        assert!(a.ws.join(".git").is_dir() && !a.ws.join(".git").is_symlink());
+        assert!(!a.ws.join(".git/hooks/pre-commit").exists());
+        assert!(!a.ws.join(".git/modules/sub/hooks/pre-commit").exists());
+        // git の普段の書き込み先は生きている。
+        assert!(run(&p, "echo x > .git/index && mkdir -p .git/objects/ab"));
+    }
+
+    /// 作業ディレクトリが一時ディレクトリの下にあっても (CI やスクラッチではよくある)、
+    /// 一時ディレクトリへの許可が保護を上書きしない。
+    #[test]
+    fn a_workspace_under_the_temp_dir_keeps_its_protection() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        let p = workspace_write(&a, true);
+        let temp = [a.ws.parent().unwrap().to_path_buf()];
+        assert!(run_with_temp(&p, "echo a > ok.txt", &temp));
+        assert!(!run_with_temp(&p, "echo x > .lodan/config.toml", &temp));
+        assert!(!run_with_temp(&p, "echo x > .git/hooks/pre-commit", &temp));
+        assert!(!a.ws.join(".lodan/config.toml").exists());
+    }
+
+    /// まだ無い `.lodan/` を作って設定を置く、という一番ありそうな形。
+    #[test]
+    fn a_config_directory_that_does_not_exist_yet_cannot_be_planted() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        std::fs::remove_dir_all(a.ws.join(".lodan")).unwrap();
+        let p = workspace_write(&a, true);
+        let _ = run(
+            &p,
+            "mkdir -p .lodan && echo 'mode = \"off\"' > .lodan/config.toml",
+        );
+        assert!(!a.ws.join(".lodan/config.toml").exists());
+    }
+
+    /// Linux では、まだ無い**ファイル**の作成は止められない。止められない代わりに必ず気づく。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_a_planted_file_is_at_least_reported() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        let p = workspace_write(&a, true);
+        let before = unguarded(&p);
+        assert!(before.contains(&a.ws.join(".env")), "{before:?}");
+        assert!(
+            !before.contains(&a.ws.join(".lodan")),
+            "exists, so it is guarded"
+        );
+        assert!(planted(&before).is_empty());
+        assert!(run(&p, "echo LODAN_SANDBOX=off > .env"));
+        assert_eq!(planted(&before), vec![a.ws.join(".env")]);
+        assert!(planted_warning(&planted(&before)).contains(".env"));
     }
 }

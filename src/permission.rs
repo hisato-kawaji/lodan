@@ -315,7 +315,7 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
 fn visible(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if crate::permission_rules::is_invisible(c) {
+            if crate::term::is_invisible(c) {
                 c.escape_default().to_string()
             } else {
                 c.to_string()

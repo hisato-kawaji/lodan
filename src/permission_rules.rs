@@ -743,31 +743,7 @@ pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value, cwd: &Path) 
     parsed.permits(tool, args, cwd).then_some(rule)
 }
 
-/// 表示されない、または表示順を変える文字。モデルが渡した文字列を承認プロンプトに出すとき、
-/// これらが混ざっていると「見えているもの」と「実行されるもの」が食い違う。
-/// 制御文字 (Cc) に加えて、書式文字 (Cf) のうち実害のあるもの — 双方向テキストの上書き
-/// (U+202E など)、ゼロ幅文字、ソフトハイフン、タグ文字 — を含める。
-pub fn is_invisible(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{115F}'..='\u{1160}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{2029}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{2800}'
-                | '\u{3164}'
-                | '\u{FEFF}'
-                | '\u{FFA0}'
-                | '\u{FFF9}'..='\u{FFFB}'
-                | '\u{E0000}'..='\u{E007F}'
-        )
-}
+pub use crate::term::is_invisible;
 
 /// ルールだけで決まる判定。どのルールにも当たらなければ `None` (既定の扱いに任せる)。
 #[derive(Debug, Clone, PartialEq, Eq)]

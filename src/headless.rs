@@ -211,6 +211,16 @@ fn usage_json(usage: &crate::agent::r#loop::SessionUsage) -> serde_json::Value {
     })
 }
 
+/// text モードの最終応答。stdout がパイプなら**無加工** (呼び出し側との契約)。端末に直接出るなら
+/// 人が読む画面なので、モデルの書いたエスケープ列で画面を書き換えさせない (#100)。
+fn text_for_stdout(text: &str, stdout_is_terminal: bool) -> std::borrow::Cow<'_, str> {
+    if stdout_is_terminal {
+        crate::term::sanitize(text)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 struct Report {
     exit_code: i32,
     result: Option<String>,
@@ -289,7 +299,7 @@ impl Report {
         match format {
             OutputFormat::Text => {
                 if let Some(text) = &self.result {
-                    println!("{text}");
+                    println!("{}", text_for_stdout(text, crate::term::is_terminal()));
                 }
             }
             OutputFormat::Json => {
@@ -316,6 +326,13 @@ mod tests {
         assert!(wants_stdin("do it", true));
         assert!(wants_stdin("", false));
         assert!(wants_stdin("  ", false));
+    }
+
+    #[test]
+    fn the_text_result_is_verbatim_for_pipes_and_defused_for_a_terminal() {
+        let result = "ok\x1b[2Kforged";
+        assert_eq!(text_for_stdout(result, false), result);
+        assert_eq!(text_for_stdout(result, true), "ok\\u{1b}[2Kforged");
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub struct Cli {
     #[arg(long, env = "LODAN_TEMPERATURE")]
     pub temperature: Option<f32>,
 
+    /// Reasoning effort sent to the active provider as-is (e.g. low, medium, high; "none" turns thinking off on Ollama)
+    #[arg(long, env = "LODAN_REASONING_EFFORT", value_name = "LEVEL")]
+    pub reasoning_effort: Option<String>,
+
     /// Nudge the model to self-verify once before finishing (#63)
     #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub finish_nudge: Option<bool>,
@@ -180,6 +184,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         model: args.model,
         api_key: args.api_key,
         temperature: args.temperature,
+        reasoning_effort: args.reasoning_effort,
         auto_approve: args.yes,
         finish_nudge: args.finish_nudge,
         malformed_retry: args.malformed_retry,
@@ -313,6 +318,7 @@ fn init_runlog(path: Option<&std::path::Path>, stream_json: bool, cfg: Option<&C
             "version": env!("CARGO_PKG_VERSION"),
             "provider": cfg.map(|c| c.llm.provider.as_str()),
             "model": cfg.map(|c| c.llm.active().model.as_str()),
+            "reasoning_effort": cfg.and_then(|c| c.llm.active().reasoning_effort.as_deref()),
             "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
         }),
     );

@@ -35,7 +35,8 @@ const PATH_TOOLS: &[&str] = &[
 
 /// 検索範囲の確認で見るエントリ数の上限。
 const SEARCH_SCOPE_CHECK_LIMIT: usize = 50_000;
-/// 検索範囲の確認に使う時間の上限。`$HOME` のような広い範囲で対話が秒単位で固まるのを防ぐ。
+/// 1 回の判定 (`RuleSet::evaluate`) が検索範囲の確認に使える時間。全ルールで共有する。
+/// `$HOME` のような広い範囲で対話が秒単位で固まるのを防ぐ。
 const SEARCH_SCOPE_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// ディレクトリ以下を丸ごと読む検索ツール。`path` は検索の起点で、省略時は cwd。
@@ -194,7 +195,13 @@ impl Rule {
     }
 
     /// deny / ask として一致するか。疑わしいものは一致させる側に倒す。
-    fn forbids(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> Forbids {
+    fn forbids(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        cwd: &Path,
+        deadline: std::time::Instant,
+    ) -> Forbids {
         if !self.names(tool) {
             return Forbids::No;
         }
@@ -215,7 +222,7 @@ impl Rule {
                 // 検索が実際に触れるファイルの中に一致するものがあれば効かせる。
                 let mut worst = Forbids::No;
                 for root in &candidates {
-                    match p.search_would_touch(root, cwd) {
+                    match p.search_would_touch(root, cwd, deadline) {
                         Forbids::Yes => return Forbids::Yes,
                         Forbids::Unchecked => worst = Forbids::Unchecked,
                         Forbids::No => {}
@@ -301,7 +308,8 @@ impl PathPattern {
             .take_while(|part| !part.contains(['*', '?', '[', '{']))
             .collect::<Vec<_>>()
             .join("/");
-        let whole_subtree = body == "**"
+        // `Grep(**)` は `/` を含まないので上で `**/**` に書き換わっている。
+        let whole_subtree = body == "**/**"
             || body
                 .strip_suffix("/**")
                 .is_some_and(|base| !base.contains(['*', '?', '[', '{']));
@@ -357,28 +365,24 @@ impl PathPattern {
     /// 「一致し得る」だけで拒否すると、`Grep(**/.env)` のような固定部分の無いパターンが全ての
     /// 検索を止めてしまう。gitignore された `.env` は上の階層からの検索では読まれないので、止める必要も無い。
     /// 走査が上限を超えるほど広い範囲は、確かめきれないので触れる側に倒す。
-    fn search_would_touch(&self, root: &Path, cwd: &Path) -> Forbids {
-        self.search_would_touch_within(
-            root,
-            cwd,
-            SEARCH_SCOPE_CHECK_LIMIT,
-            SEARCH_SCOPE_CHECK_BUDGET,
-        )
+    fn search_would_touch(&self, root: &Path, cwd: &Path, deadline: std::time::Instant) -> Forbids {
+        self.search_would_touch_within(root, cwd, SEARCH_SCOPE_CHECK_LIMIT, deadline)
     }
 
+    /// `deadline` は 1 回の `RuleSet::evaluate` 全体で共有する。ルールごとに時間を取り直すと、
+    /// 決して一致しないルールが 5 つあるだけで待ち時間が 5 倍になる。
     fn search_would_touch_within(
         &self,
         root: &Path,
         cwd: &Path,
         max_entries: usize,
-        budget: std::time::Duration,
+        deadline: std::time::Instant,
     ) -> Forbids {
         if !self.may_match_under(root, cwd) {
             return Forbids::No;
         }
         // この走査は async ランタイムの上で同期的に走る (ゲートの判定は同期関数)。
         // 件数だけでなく時間でも打ち切り、対話を固めない。
-        let started = std::time::Instant::now();
         let mut seen = 0usize;
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
@@ -389,7 +393,7 @@ impl PathPattern {
                 return Forbids::Yes;
             }
             seen += 1;
-            if seen >= max_entries || started.elapsed() >= budget {
+            if seen >= max_entries || std::time::Instant::now() >= deadline {
                 return Forbids::Unchecked;
             }
         }
@@ -477,11 +481,24 @@ fn url_host(args: &serde_json::Value) -> Option<String> {
 /// ルール側のドメインも、URL のホストと同じ形に揃える: 小文字、末尾ドット無し、IDN は punycode。
 /// 揃えないと `domain:internal.example.` や `domain:日本.jp` が決して一致しない。
 fn normalize_domain(raw: &str, domain: &str) -> Result<String> {
+    // ホスト名以外のものを先に弾く。URL として解釈できてしまう値を受理すると、
+    // `deny = ["WebFetch(domain:*.example.com)"]` のような**何も守らないルール**が黙って通る
+    // (`*` はホスト名に使える文字なので、`*.example.com` という名前のホストとしか一致しない)。
+    let bracketed_ipv6 = domain.starts_with('[') && domain.ends_with(']');
+    if domain.contains('*') {
+        bail!(
+            "permission rule `{raw}`: wildcards are not supported in domains. Subdomains are already \
+             included — write `WebFetch(domain:example.com)` to cover `*.example.com`"
+        );
+    }
+    if !bracketed_ipv6 && domain.contains(['/', '?', '#', '@', ':', '\\', ' ', '\t']) {
+        bail!("permission rule `{raw}`: write a bare host name, e.g. `WebFetch(domain:docs.rs)`");
+    }
     let url = reqwest::Url::parse(&format!("http://{domain}/")).map_err(|e| {
         anyhow::anyhow!("permission rule `{raw}`: `{domain}` is not a host name ({e})")
     })?;
     match url.host_str() {
-        Some(host) if url.path() == "/" && url.port().is_none() && url.username().is_empty() => {
+        Some(host) if url.path() == "/" && url.port().is_none() => {
             Ok(host.to_ascii_lowercase().trim_end_matches('.').to_string())
         }
         _ => bail!(
@@ -632,9 +649,11 @@ impl RuleSet {
     }
 
     pub fn evaluate(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> Option<Verdict> {
+        // 検索範囲の確認に使える時間は、この 1 回の判定全体でこれだけ。
+        let deadline = std::time::Instant::now() + SEARCH_SCOPE_CHECK_BUDGET;
         let mut unverifiable = None;
         for rule in &self.deny {
-            match rule.forbids(tool, args, cwd) {
+            match rule.forbids(tool, args, cwd, deadline) {
                 Forbids::Yes => return Some(Verdict::Deny(rule.raw.clone())),
                 Forbids::Unchecked => unverifiable = unverifiable.or(Some(rule.raw.clone())),
                 Forbids::No => {}
@@ -648,7 +667,7 @@ impl RuleSet {
         if self
             .ask
             .iter()
-            .any(|r| r.forbids(tool, args, cwd) != Forbids::No)
+            .any(|r| r.forbids(tool, args, cwd, deadline) != Forbids::No)
         {
             return Some(Verdict::Ask);
         }
@@ -1015,7 +1034,7 @@ mod tests {
             std::fs::write(cwd.join(format!("f{i}.txt")), "x").unwrap();
         }
         let pattern = PathPattern::parse("Grep(**/*.secret)", "**/*.secret").unwrap();
-        let generous = std::time::Duration::from_secs(60);
+        let generous = std::time::Instant::now() + std::time::Duration::from_secs(60);
         // 全部見られれば「触れない」と言い切れる。
         assert_eq!(
             pattern.search_would_touch_within(&cwd, &cwd, 10_000, generous),
@@ -1027,7 +1046,7 @@ mod tests {
             Forbids::Unchecked
         );
         assert_eq!(
-            pattern.search_would_touch_within(&cwd, &cwd, 10_000, std::time::Duration::ZERO),
+            pattern.search_would_touch_within(&cwd, &cwd, 10_000, std::time::Instant::now()),
             Forbids::Unchecked
         );
         // 文面は「やり直すな」ではなく「範囲を狭めろ」。
@@ -1062,10 +1081,49 @@ mod tests {
         for bad in [
             "WebFetch(domain:docs.rs/path)",
             "WebFetch(domain:docs.rs:443)",
+            "WebFetch(domain:docs.rs:80)",
             "WebFetch(domain:a@b.c)",
+            "WebFetch(domain:@docs.rs)",
+            "WebFetch(domain:docs.rs#x)",
+            "WebFetch(domain:docs.rs?x)",
+            "WebFetch(domain:*.example.com)",
         ] {
             assert!(Rule::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_wildcard_domain_is_rejected_with_the_way_to_write_it() {
+        let err = Rule::parse("WebFetch(domain:*.example.com)").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Subdomains are already included"),
+            "{err:#}"
+        );
+        // IPv6 リテラルはコロンを含むが受理する。
+        assert!(Rule::parse("WebFetch(domain:[::1])").is_ok());
+    }
+
+    #[test]
+    fn the_scope_check_deadline_is_shared_by_every_rule_in_one_evaluation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(cwd.join("a.txt"), "x").unwrap();
+        // 期限が既に過ぎていれば、何個ルールがあっても 1 エントリ見ただけで打ち切る。
+        let expired = std::time::Instant::now();
+        for pattern in ["**/*.one", "**/*.two", "**/*.three"] {
+            let rule = Rule::parse(&format!("Grep({pattern})")).unwrap();
+            let args = json!({ "pattern": "x" });
+            assert_eq!(
+                rule.forbids("Grep", &args, &cwd, expired),
+                Forbids::Unchecked
+            );
+        }
+        // `Grep(**)` は cwd 以下の全て。cwd そのものを起点にした検索も allow に含む。
+        let all = rules(&["Grep(**)"], &[], &[]);
+        assert_eq!(
+            all.evaluate("Grep", &json!({ "pattern": "x" }), &cwd),
+            Some(Verdict::Allow)
+        );
     }
 
     #[test]

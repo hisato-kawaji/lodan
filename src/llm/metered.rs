@@ -471,6 +471,7 @@ mod tests {
             content: Some("ok".into()),
             tool_calls: vec![],
             usage,
+            reasoning: None,
         }
     }
 

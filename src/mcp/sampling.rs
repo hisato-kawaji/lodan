@@ -60,6 +60,7 @@ impl SamplingProvider {
                 history.push(Message::Assistant {
                     content: Some(content),
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 });
             } else {
                 history.push(Message::User { content });
@@ -98,6 +99,7 @@ mod tests {
                 content: Some("stub reply".into()),
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning: None,
             })
         }
 

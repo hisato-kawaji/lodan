@@ -185,6 +185,7 @@ mod tests {
                     content: Some(format!("from {model}")),
                     tool_calls: Vec::new(),
                     usage: None,
+                    reasoning: None,
                 }),
                 Outcome::Transient => Err(TransientLlmError("HTTP 503".into()).into()),
                 Outcome::Permanent => Err(anyhow::anyhow!("LLM HTTP 401: bad key")),

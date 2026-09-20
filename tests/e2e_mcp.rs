@@ -114,6 +114,7 @@ impl LlmClient for StubLlm {
             content: Some("sampled-ok".into()),
             tool_calls: Vec::new(),
             usage: None,
+            reasoning: None,
         })
     }
 

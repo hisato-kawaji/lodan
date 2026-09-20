@@ -220,6 +220,7 @@ fn final_text(history: &[Message]) -> Option<String> {
         Message::Assistant {
             content: Some(text),
             tool_calls,
+            ..
         } if tool_calls.is_empty() => Some(text.clone()),
         _ => None,
     }
@@ -418,6 +419,7 @@ mod tests {
             Message::Assistant {
                 content: Some("answer".into()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
         ];
         assert_eq!(final_text(&done).as_deref(), Some("answer"));
@@ -439,6 +441,7 @@ mod tests {
             Message::Assistant {
                 content: Some("earlier answer".into()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
         ];
         assert_eq!(final_text(added_this_turn(&resumed, resumed.len())), None);

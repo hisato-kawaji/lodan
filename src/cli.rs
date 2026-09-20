@@ -51,6 +51,10 @@ pub struct Cli {
     #[arg(long, env = "LODAN_REASONING_EFFORT", value_name = "LEVEL")]
     pub reasoning_effort: Option<String>,
 
+    /// Stream the model's reasoning (thinking) text in full instead of a one-line summary
+    #[arg(long, env = "LODAN_SHOW_REASONING", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub show_reasoning: Option<bool>,
+
     /// Nudge the model to self-verify once before finishing (#63)
     #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub finish_nudge: Option<bool>,
@@ -193,6 +197,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         api_key: args.api_key,
         temperature: args.temperature,
         reasoning_effort: args.reasoning_effort,
+        show_reasoning: args.show_reasoning,
         auto_approve: args.yes,
         finish_nudge: args.finish_nudge,
         malformed_retry: args.malformed_retry,

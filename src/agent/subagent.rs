@@ -167,6 +167,7 @@ impl SubAgentTool {
             history.push(Message::Assistant {
                 content: resp.content.clone(),
                 tool_calls: tool_calls.clone(),
+                reasoning_content: None,
             });
 
             if tool_calls.is_empty() {
@@ -294,6 +295,7 @@ mod tests {
                 content: Some("(no more script)".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             }))
         }
 
@@ -353,11 +355,13 @@ mod tests {
                     content: None,
                     tool_calls: vec![self.call.clone()],
                     usage: None,
+                    reasoning: None,
                 },
                 Some(output) => ChatResponse {
                     content: Some(output),
                     tool_calls: Vec::new(),
                     usage: None,
+                    reasoning: None,
                 },
             })
         }
@@ -447,6 +451,7 @@ mod tests {
             content: Some(text.into()),
             tool_calls: vec![],
             usage,
+            reasoning: None,
         };
         let ledger = Arc::new(Ledger::new(Budget {
             max_requests: Some(2),
@@ -497,6 +502,7 @@ mod tests {
                 content: Some("the answer is 42".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             }],
             tmp.path().to_path_buf(),
         )
@@ -534,6 +540,7 @@ mod tests {
                 content: Some("the answer is 42".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             }],
             tmp.path().to_path_buf(),
         );
@@ -553,11 +560,13 @@ mod tests {
                     &serde_json::json!({ "pattern": "needle", "path": tmp.path() }).to_string(),
                 )],
                 usage: None,
+                reasoning: None,
             },
             ChatResponse {
                 content: Some("found the needle".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             },
         ];
         let sub = subagent(steps, tmp.path().to_path_buf());
@@ -574,6 +583,7 @@ mod tests {
                 content: None,
                 tool_calls: vec![tool_call("Grep", r#"{"pattern":"x","path":"."}"#)],
                 usage: None,
+                reasoning: None,
             })
             .collect();
         let sub = subagent(looping, tmp.path().to_path_buf());

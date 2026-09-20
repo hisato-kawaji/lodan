@@ -43,6 +43,9 @@ pub struct Config {
     pub disabled_hooks: Vec<String>,
     #[serde(skip_serializing_if = "GoalConfig::is_unset")]
     pub goal: GoalConfig,
+    /// モデルごとの単価 (`[pricing."<model>"]`)。書いたモデルだけ `/cost` に金額が出る。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pricing: std::collections::BTreeMap<String, crate::llm::metered::ModelPrice>,
     /// hook の終了コードの解釈。`"v1"` で「非 0 は全てブロック」の旧挙動に戻す。
     pub hooks_compat: crate::hooks::HooksCompat,
 }
@@ -271,6 +274,9 @@ pub struct AgentConfig {
     /// 同じく合計トークン数の上限。判定は各リクエストの前なので、超過は最後の 1 回ぶんまで。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u64>,
+    /// 自動圧縮を発火するコンテキスト使用率 (`context_window` に対する %)。既定 80。
+    /// 小さい窓のモデルでは、1 回のツール出力で残りを使い切る前に畳めるよう下げるとよい。
+    pub auto_compact_percent: u8,
     pub auto_approve: bool,
     /// ターン終了直前に 1 回だけ自己検証を促す (#63)。小型ローカルモデルの
     /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
@@ -329,6 +335,9 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 32_768;
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 /// 再試行待ちの起点 (ミリ秒) の既定値。500 → 1000 → 2000ms と伸びる。
 pub const DEFAULT_RETRY_BASE_MS: u64 = 500;
+
+/// 自動圧縮を発火する既定のコンテキスト使用率 (%)。
+pub const DEFAULT_AUTO_COMPACT_PERCENT: u8 = 80;
 
 /// Kimi の既定 timeout。reasoning_effort 既定 (max) の思考込みで 120 秒を超え得る。
 const KIMI_TIMEOUT_SECS: u64 = 600;
@@ -409,6 +418,7 @@ impl Default for AgentConfig {
             max_iterations: 25,
             max_requests: None,
             max_total_tokens: None,
+            auto_compact_percent: DEFAULT_AUTO_COMPACT_PERCENT,
             auto_approve: false,
             finish_nudge: false,
             malformed_retry: true,
@@ -1158,6 +1168,28 @@ mod tests {
             !toml::to_string(&Config::default())
                 .unwrap()
                 .contains("goal")
+        );
+    }
+
+    #[test]
+    fn pricing_and_the_auto_compact_threshold_parse_and_stay_out_of_the_dump_when_unset() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [agent]
+            auto_compact_percent = 60
+            [pricing."kimi-k3"]
+            input_per_mtok = 0.6
+            output_per_mtok = 2.5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.agent.auto_compact_percent, 60);
+        assert_eq!(cfg.pricing["kimi-k3"].output_per_mtok, 2.5);
+        assert_eq!(Config::default().agent.auto_compact_percent, 80);
+        assert!(
+            !toml::to_string(&Config::default())
+                .unwrap()
+                .contains("pricing")
         );
     }
 

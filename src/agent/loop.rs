@@ -38,6 +38,8 @@ pub struct Session {
     hook_env: HookEnv,
     /// hook が寄せた追加文脈のうち、まだモデルに渡していないもの。次のユーザ入力に添える。
     pending_context: Vec<String>,
+    /// プロセス全体の使用量の台帳。予算が残り少なくなったら、モデルに一度だけ知らせる (#84)。
+    ledger: Option<Arc<crate::llm::metered::Ledger>>,
 }
 
 /// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
@@ -82,7 +84,12 @@ impl Session {
             active_hooks,
             hook_env: HookEnv::default(),
             pending_context: Vec::new(),
+            ledger: None,
         }
+    }
+
+    pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
+        self.ledger = Some(ledger);
     }
 
     pub fn set_hook_env(&mut self, env: HookEnv) {
@@ -229,6 +236,16 @@ impl Session {
                 }
                 Mode::Normal => self.registry.tool_specs(),
             };
+            // 予算の 8 割を使ったら、打ち切られる前に畳めるよう一度だけ知らせる。ここは必ず
+            // User か Tool の直後なので、User メッセージを足しても履歴は API に投げられる形のまま。
+            if let Some(reminder) = self.ledger.as_ref().and_then(|l| l.take_reminder()) {
+                crate::say!("{}", crate::term::dim(&reminder));
+                crate::runlog::record(
+                    "budget_reminder",
+                    serde_json::json!({ "turn": self.turn_seq, "iter": iterations }),
+                );
+                self.history.push(Message::User { content: reminder });
+            }
             let resp =
                 stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
             let (u, estimated) = resolve_usage(&resp, &self.history);
@@ -693,11 +710,12 @@ impl Session {
     }
 
     /// 直近のコンテキストサイズがしきい値 (context_window の
-    /// `AUTO_COMPACT_THRESHOLD_PERCENT`%) に達したか。`context_window = 0` は無効。
+    /// `agent.auto_compact_percent`%) に達したか。`context_window = 0` は無効。
     pub fn should_auto_compact(&self) -> bool {
         let window = self.cfg.llm.active().context_window;
         window > 0
-            && self.usage.last_context_tokens * 100 >= window * AUTO_COMPACT_THRESHOLD_PERCENT
+            && self.usage.last_context_tokens * 100
+                >= window * u64::from(self.cfg.agent.auto_compact_percent)
     }
 
     /// しきい値超過時の自動圧縮。ターン終端で呼ぶ。圧縮に失敗しても
@@ -711,7 +729,7 @@ impl Session {
             "{}",
             crate::term::dim(&format!(
                 "[auto-compact] context ~{} tokens ≥ {}% of {} window",
-                self.usage.last_context_tokens, AUTO_COMPACT_THRESHOLD_PERCENT, window
+                self.usage.last_context_tokens, self.cfg.agent.auto_compact_percent, window
             ))
         );
         // compact() 内の要約呼び出しで last_context_tokens は要約プロンプト分に
@@ -1028,9 +1046,6 @@ const KEEP_RECENT_USER_TURNS: usize = 2;
 /// hook に伝える圧縮のきっかけ (PreCompact / PostCompact の matcher と payload の `trigger`)。
 const COMPACT_MANUAL: &str = "manual";
 const COMPACT_AUTO: &str = "auto";
-
-/// 自動圧縮を発火するコンテキスト使用率 (context_window に対する %)。
-const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
 /// usage 概算フォールバックの 1 トークンあたり文字数。英語 ~4 文字/トークン、
 /// 日本語 ~1-2 文字/トークンの間を取った粗い近似 (桁が合えば十分)。
@@ -1972,6 +1987,76 @@ mod tests {
             .await
             .unwrap();
         assert!(!below.should_auto_compact(), "79/100 must not trigger");
+    }
+
+    /// しきい値は `agent.auto_compact_percent` で変えられる。
+    #[tokio::test]
+    async fn the_auto_compact_threshold_is_configurable() {
+        let gate = PermissionGate::new(true);
+        let mut early = session_with_window(100);
+        early.cfg.agent.auto_compact_percent = 50;
+        early
+            .run_turn("hi", &llm_with_prompt_tokens(50), &gate)
+            .await
+            .unwrap();
+        assert!(early.should_auto_compact(), "50/100 triggers at 50%");
+
+        let mut default = session_with_window(100);
+        default
+            .run_turn("hi", &llm_with_prompt_tokens(50), &gate)
+            .await
+            .unwrap();
+        assert!(!default.should_auto_compact(), "but not at the default 80%");
+    }
+
+    /// 予算の 8 割を使ったら、次の LLM 呼び出しの前に一度だけモデルへ知らせる。
+    #[tokio::test]
+    async fn the_model_is_told_once_when_the_budget_is_nearly_spent() {
+        use crate::llm::metered::{Budget, Ledger, MeteredClient};
+        let ledger = Arc::new(Ledger::new(Budget {
+            max_requests: Some(5),
+            max_total_tokens: None,
+        }));
+        let llm = MeteredClient::new(
+            Arc::new(FinalTextLlm {
+                text: "ok".into(),
+                usage: None,
+            }),
+            ledger.clone(),
+        );
+        let mut session = session_with_stop_hook(None);
+        session.set_ledger(ledger.clone());
+        let gate = PermissionGate::new(true);
+        let reminders = |s: &Session| {
+            s.history()
+                .iter()
+                .filter(
+                    |m| matches!(m, Message::User { content } if content.starts_with("[budget]")),
+                )
+                .count()
+        };
+        for prompt in ["t1", "t2", "t3", "t4"] {
+            session.run_turn(prompt, &llm, &gate).await.unwrap();
+        }
+        assert_eq!(
+            reminders(&session),
+            0,
+            "4 of 5 used, but nothing was sent since"
+        );
+
+        session.run_turn("t5", &llm, &gate).await.unwrap();
+        assert_eq!(reminders(&session), 1);
+        // 注意書きは、そのターンの入力の直後・モデルの応答の前に入る。
+        let tail: Vec<&Message> = session.history().iter().rev().take(3).collect();
+        assert!(matches!(tail[0], Message::Assistant { .. }));
+        assert!(
+            matches!(tail[1], Message::User { content } if content.contains("4 of 5 LLM requests"))
+        );
+        assert!(matches!(tail[2], Message::User { content } if content == "t5"));
+
+        // 予算を使い切った後のターンは送られず、注意書きも増えない。
+        assert!(session.run_turn("t6", &llm, &gate).await.is_err());
+        assert_eq!(reminders(&session), 1);
     }
 
     /// しきい値超過中にターンを重ねると、ターン終端の自動圧縮で要約に畳まれる。

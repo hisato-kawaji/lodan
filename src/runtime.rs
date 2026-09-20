@@ -188,6 +188,8 @@ impl Runtime {
             Some(arg) => resume_session(arg, &self.cwd, cfg, &self.registry, notices),
             None => new_session(&self.cwd, cfg, &self.registry, notices),
         };
+        // 予算が残り少なくなったことを、ループがモデルに伝えられるように。
+        session.set_ledger(Arc::clone(&self.ledger));
         // hook の payload に載せる (`session_id` / `transcript_path`)。
         session.set_hook_env(agent::HookEnv {
             session_id: recorder.as_ref().map(|r| r.id().to_string()),

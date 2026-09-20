@@ -790,7 +790,7 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 ### 自動圧縮（しきい値トリガ）
 
-直近 LLM 呼び出しのコンテキストサイズ（`last_context_tokens`、トークン会計由来）が **`context_window` の 80%** に達すると、ターン終端で自動的に `/compact` 相当の圧縮を実行する（`[auto-compact] ...` と dim 表示）。
+直近 LLM 呼び出しのコンテキストサイズ（`last_context_tokens`、トークン会計由来）が **`context_window` の 80%**（`[agent] auto_compact_percent` で変更可）に達すると、ターン終端で自動的に `/compact` 相当の圧縮を実行する（`[auto-compact] ...` と dim 表示）。
 
 - しきい値の分母は provider 設定の `context_window`（既定 32768）。**サービング側の実効窓**（例: ollama は既定 `num_ctx=4096`）と一致させること。`context_window = 0` で自動圧縮を無効化できる。
 - 圧縮に失敗（要約 LLM エラー等）してもターンは成功扱いで、次ターン終端に再試行する。
@@ -899,7 +899,15 @@ last context: 1200 prompt tokens
 - 非ストリームは応答 body の `usage`、ストリームは `stream_options: {"include_usage": true}` を付けて最終チャンクの `usage` から取得する（OpenAI / vLLM / llama.cpp 対応）。`total_tokens` を返さないサーバは `prompt + completion` で補完する。
 - **usage 非対応サーバへのフォールバック**: usage が取れない呼び出しは文字数ベース（約 3 文字 / トークン）で概算し、`/cost` に概算だった呼び出し数を注記する。桁を合わせるのが目的の粗い近似。
 - `last context` は直近呼び出しの prompt_tokens で、現在のコンテキストサイズの近似。自動圧縮のしきい値判定（前節）に使っている。
-- ローカル / Sakana / さくらのAI / Kimi では単価を持たないため、料金換算はせずトークン数のみ表示する。
+- 金額は、単価を設定したモデルについてだけ出す（lodan は単価を内蔵しない）:
+
+  ```toml
+  [pricing."kimi-k3"]          # モデル名ごと。100 万トークンあたり
+  input_per_mtok = 0.6
+  output_per_mtok = 2.5
+  ```
+
+  `/cost` に `cost: ~0.1234 (from [pricing])` が付く（通貨は書いた単価の単位のまま）。集計はモデルごとなので、fallback provider や `/goal` の評価器が別モデルなら、それぞれの単価で計算する。単価の無いモデルを使っていたら `no price for <model>` と添えて、金額に入っていないことを示す。見積もりであって請求額ではない（キャッシュ割引などは知らない）。
 - 累積はメモリ上のみ（transcript には保存しない）。`--resume` 後の `/cost` は 0 から数え直す。
 - `-p` の `json` / `stream-json` の `usage` も同じ台帳から出る（`requests` と `by_kind` が増えた。`llm_calls` などの既存フィールドは、これまで漏れていたサブエージェントなどの分も含む合計になる）。
 
@@ -913,6 +921,7 @@ max_total_tokens = 200000   # 同じく合計トークン数の上限
 
 CLI は `--max-requests <N>` / `--max-tokens <N>`、環境変数は `LODAN_MAX_REQUESTS` / `LODAN_MAX_TOKENS`。既定はどちらも無制限。
 
+- 予算の **8 割**を使ったら、次の LLM 呼び出しの前に一度だけモデルへ知らせる（`[budget] This run has used 32 of 40 LLM requests. … Wrap up: …`）。打ち切られる前に、一番大事な残りを片づけて何が済んで何が済んでいないかを報告させるため。`--log-jsonl` には `budget_reminder` が残る。
 - 上限に達したら、**次のリクエストを送らずに**ターンを打ち切る。止まるのは必ず LLM 呼び出しの直前なので、履歴は tool_call と結果の対が揃ったまま保存され、`--resume` でそのまま続けられる。`-p` の終了コードは **4**。
 - リクエスト数は**プロバイダへ実際に送った数**（プロバイダの無料枠はリクエスト数で数えられるため）。失敗したものも、再試行（`max_retries`）で送り直したものも、fallback provider へ送り直したものも、それぞれ 1 件。予算が残っていなければ再試行もせず、その失敗は予算切れ（終了コード 4）として報告する。
 - トークンの判定は各リクエストの**前**に行うので、超過は最後の 1 回ぶんまであり得る。

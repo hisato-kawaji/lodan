@@ -697,6 +697,7 @@ REPL セッションは自動的に保存され、後から再開できます。
 - 保存先: `<データディレクトリ>/lodan/sessions/<id>/`（macOS なら `~/Library/Application Support/lodan/sessions/`）
   - `meta.json`: id / 作成時刻 / cwd / provider / model
   - `transcript.jsonl`: 各メッセージを 1 行 1 件でターンごとに追記
+  - `goal.json`: 未達の `/goal` があるときだけ（条件・通算ターン数・走っていた時間。[後述](#ゴール駆動の自律継続goal)）
 - `lodan sessions` — 保存済みセッションを一覧表示
 - `lodan --resume <id>` — 指定 id を再開（`--resume last` で直近を再開）
 
@@ -814,7 +815,7 @@ lodan> /goal cargo test が exit 0 で通る。または 10 ターンで諦め�
 - **評価器の出力がパース不能なときは安全側で停止する**（根拠のない自律継続はしない）。
 - **承認ポリシー**: 破壊的ツール（Write / Edit / Bash …）は goal 中も**既定で通常どおり承認プロンプトを出す**。完全自律にしたい場合のみ `--yes`（または `agent.auto_approve`）を明示する。
 - **Ctrl-C で自律ループを中断できる**（= 一時停止）。中断した goal は paused として残る（`/goal` で確認、`/goal resume` で再開、`/goal clear` で破棄）。
-- **goal はセッションと一緒に保存される**（セッションのディレクトリの `goal.json`。各ターンの後と、停止・解除のたびに更新）。`--resume` で開き直すと paused として戻り、`/goal resume` するまで勝手には走らない。達成・解除した goal は残さない。
+- **goal はセッションと一緒に保存される**（セッションのディレクトリの `goal.json`。各ターンの後と、停止・解除のたびに更新）。経過時間として数えるのは goal が**走っていた時間だけ**で、一時停止中に REPL を開いていた時間は入らない。`--resume` で開き直すと paused として戻り、`/goal resume` するまで勝手には走らない。達成・解除した goal は残さない。
 - **評価器を別のモデルにできる**。作業したモデルが自分で合否を決めると甘くなりがちなので、判定だけ別のモデルに任せられる:
 
   ```toml
@@ -823,7 +824,7 @@ lodan> /goal cargo test が exit 0 で通る。または 10 ターンで諦め�
   evaluator_model = "kimi-k3"       # 省略時はその provider の model
   ```
 
-  設定したのに組めない（API キーが無いなど）ときは起動時エラー。
+  設定したのに組めない（API キーが無いなど）ときは起動時エラー（`/goal` を使わない `-p` の実行でも。黙って作業側の自己判定に戻ると、気づけないため）。評価器には fallback provider は付かない: 評価器の呼び出しが失敗したら goal は paused で止まり、`/goal resume` でやり直せる。
 - 評価器の呼び出しも `/cost` と[予算](#予算)に `goal_eval` として計上される。
 - 制限: `-p` 非対話での `/goal` はスコープ外。
 

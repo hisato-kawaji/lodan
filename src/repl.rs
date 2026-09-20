@@ -579,6 +579,8 @@ async fn run_goal_command(
         }
     };
     let Some(outcome) = outcome else {
+        // 中断されると `drive_with` の後始末を通らないので、ここで時計を止める。
+        goal.pause();
         session.interrupt_repair();
         if let Some(rec) = recorder.as_mut()
             && let Err(e) = rec.sync(session.history())

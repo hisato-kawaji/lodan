@@ -121,10 +121,13 @@ impl Recorder {
         let path = self.goal_path();
         match goal {
             Some(record) => {
-                fs::write(&path, serde_json::to_string_pretty(record)?)
+                // 毎ターン書き直すので、途中で落ちても前の内容が残るよう、別名で書いてから差し替える。
+                let tmp = path.with_extension("json.tmp");
+                fs::write(&tmp, serde_json::to_string_pretty(record)?)
                     .context("write goal.json")?;
                 // 条件文には作業の中身が書かれる。transcript と同じ扱いにする。
-                restrict(&path, 0o600);
+                restrict(&tmp, 0o600);
+                fs::rename(&tmp, &path).context("replace goal.json")?;
             }
             None => match fs::remove_file(&path) {
                 Ok(()) => {}

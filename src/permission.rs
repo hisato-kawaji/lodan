@@ -111,6 +111,42 @@ impl PermissionGate {
         }
     }
 
+    /// PreToolUse hook の希望を踏まえて決める。
+    ///
+    /// - `Ask`: 他の条件で通る呼び出しでも尋ねる (`--yes` でも)。deny は deny のまま。
+    /// - `Allow`: 既定なら尋ねるところを省く。**deny ルールと ask ルールには勝てない** — hook は
+    ///   プロジェクトの設定からも足せるので、利用者が書いた「必ず尋ねる」を覆させない。
+    pub fn decide_hinted(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> Decision {
+        use crate::hooks::PermissionHint;
+        let quiet = self.decide_quietly(tool_name, args, destructive);
+        let ask_rule = || {
+            matches!(
+                self.rules.evaluate(tool_name, args, &self.cwd),
+                Some(Verdict::Ask)
+            )
+        };
+        match (hint, quiet) {
+            (_, Some(Decision::Deny(why))) => Decision::Deny(why),
+            (Some(PermissionHint::Allow), None) if !ask_rule() => Decision::Allow,
+            (Some(PermissionHint::Ask), Some(Decision::Allow)) => {
+                if self.non_interactive {
+                    Decision::Deny(DENIED_NON_INTERACTIVE.to_string())
+                } else if self.prompt(tool_name, args) {
+                    Decision::Allow
+                } else {
+                    Decision::Deny(DENIED_BY_USER.to_string())
+                }
+            }
+            _ => self.decide(tool_name, args, destructive),
+        }
+    }
+
     /// 尋ねずに決まるならその結論、尋ねる必要があるなら `None`。
     /// 並列の先行実行はこれが `Allow` の呼び出しだけを対象にする (尋ねながら並列にはできないし、
     /// deny ルールに当たる Read を先に読んでしまってもいけない)。

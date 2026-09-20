@@ -981,3 +981,119 @@ fn the_sandbox_flag_reaches_the_bash_tool() {
     assert!(run(&[]), "positive control: the command writes the file");
     assert!(!run(&["--sandbox", "read-only"]));
 }
+
+// ---- #76: hooks v2 ----
+
+/// Claude Code のドキュメントにある `block-rm.sh` を**無改変で**置く。
+const BLOCK_RM_SH: &str = r#"#!/bin/bash
+# .claude/hooks/block-rm.sh
+COMMAND=$(jq -r '.tool_input.command')
+
+if echo "$COMMAND" | grep -q 'rm -rf'; then
+  jq -n '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: "Destructive command blocked by hook"
+    }
+  }'
+else
+  exit 0  # no decision; normal permission flow applies
+fi
+"#;
+
+fn jq_is_installed() -> bool {
+    Command::new("jq")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `--yes` で Bash を 1 回呼ばせ、(victim が残ったか, ツール結果の本文) を返す。
+fn run_bash_under_block_rm(command_template: &str) -> (bool, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(work.join(".lodan")).unwrap();
+    let victim = work.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    let script = work.join("block-rm.sh");
+    std::fs::write(&script, BLOCK_RM_SH).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        work.join(".lodan/config.toml"),
+        format!(
+            "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Bash\"\ncommand = \"{}\"\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let command = command_template.replace("{victim}", &victim.display().to_string());
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_BASH", &command)]);
+    let log = home.path().join("run.jsonl");
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "-p",
+            "run the demo",
+            "--log-jsonl",
+            log.to_str().unwrap(),
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reasons: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["event"] == "tool_result")
+        .map(|e| e["reason"].as_str().unwrap_or_default().to_string())
+        .collect();
+    (victim.exists(), reasons.join(","))
+}
+
+#[test]
+fn the_claude_code_block_rm_hook_works_unmodified() {
+    if !jq_is_installed() {
+        eprintln!("skipped: the documented hook script needs jq");
+        return;
+    }
+    let (survived, reason) = run_bash_under_block_rm("rm -rf {victim}");
+    assert!(survived, "the hook's JSON deny must stop the command");
+    assert_eq!(reason, "hook_blocked");
+
+    // 陽性対照: hook に当たらない消し方なら、同じ設定で実際に消える。
+    let (survived, reason) = run_bash_under_block_rm("rmdir {victim}");
+    assert!(!survived);
+    assert_eq!(reason, "ok");
+}
+
+#[test]
+fn a_broken_hook_matcher_stops_startup_instead_of_never_firing() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(work.join(".lodan")).unwrap();
+    std::fs::write(
+        work.join(".lodan/config.toml"),
+        "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Bash(\"\ncommand = \"./guard.sh\"\n",
+    )
+    .unwrap();
+    let out = lodan(
+        home.path(),
+        1,
+        &["-p", "hi", "--output-format", "json"],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let error = v["error"].as_str().unwrap();
+    assert!(error.contains("Bash(") && error.contains("guard.sh"), "{v}");
+}

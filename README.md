@@ -14,7 +14,7 @@
   - `WebSearch` も read-only（非破壊）。env `BRAVE_API_KEY` が要り、未設定ならエラーを返す。クエリは外部 (Brave) へ送られるため、上と同じ信頼前提で使うこと。エンドポイントは env `BRAVE_SEARCH_API_URL` で差し替え可能だが（テスト用）、こちらも http/https のみ許可する
 - **Bash のサンドボックス**: `[sandbox] mode = "workspace-write"` で、Bash が起動するプロセスの書き込み先（と任意でネットワーク）を OS の仕組みで制限（macOS seatbelt / Linux bwrap、後述）
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
-- **hooks**: `SessionStart` / `SessionEnd` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` で外部コマンドを発火し、exit code でツール実行やターン停止を制御（後述）
+- **hooks**: `SessionStart` / `SessionEnd` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` で外部コマンドを発火し、終了コードと stdout の JSON（Claude Code 互換）でツール実行の可否・入力の書き換え・モデルへの追加文脈・ターン停止を制御（後述）
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
 - **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
 - **skills**: `.lodan/skills/<name>/SKILL.md` を読み込み、`Skill` ツールとしてモデルへ公開（後述）
@@ -552,26 +552,77 @@ src/
 
 ## hooks
 
-`config.toml` の `[[hooks]]` 配列で、ライフサイクルイベント発火時に外部コマンドを実行できます。
-コマンドはイベントの JSON ペイロードを stdin で受け取り、終了コードで制御します
-（exit 0 = 続行、非 0 = ブロック。理由は stderr → stdout の順で採用）。
+`config.toml` の `[[hooks]]` 配列で、ライフサイクルイベント発火時に外部コマンドを実行できます。コマンドはイベントの JSON ペイロードを stdin で受け取り、**終了コード**と **stdout の JSON** で制御します。プロトコルは Claude Code の hooks に合わせてあり、Claude Code 用に書いた command hook のスクリプトはそのまま動きます（公式ドキュメントの `block-rm.sh` を無改変で動かす e2e テストがあります）。
 
 ```toml
-# Bash 実行前にガードスクリプトを通す。non-zero で実行をブロック。
 [[hooks]]
 event = "PreToolUse"     # SessionStart | SessionEnd | UserPromptSubmit | PreToolUse | PostToolUse | Stop
-matcher = "Bash"         # 省略可: ツール名一致（Pre/PostToolUse のみ）。空 / "*" で全ツール
+matcher = "Edit|Write"   # 省略可。下の「matcher」を参照
 command = "./scripts/guard.sh"
+timeout_secs = 30        # 省略可（既定 30）
 ```
 
-- **SessionStart**: `{"hook_event_name", "cwd"}`。REPL 起動時に発火。ブロックしても起動は止めず警告のみ。
-- **SessionEnd**: `{"hook_event_name"}`。REPL 終了時に発火（ベストエフォート、ブロック不可）。
-- **UserPromptSubmit**: `{"prompt"}`。ブロック時はそのターンを実行せず破棄。
-- **PreToolUse**: `{"tool_name", "tool_input"}`。ブロック時はツールを実行せず、理由をモデルへ返す。
-- **PostToolUse**: `{"tool_name", "tool_input", "tool_output"}`。実行後の観測用（取り消し不可、理由を表示）。
-- **Stop**: `{"hook_event_name", "last_message"}`。ターン終端（最終アシスタントテキスト）で発火。**ブロックすると停止せず、その理由をユーザー入力として注入し次ターンへ継続する**（暴走は `max_iterations` で停止）。「条件を満たすまで作業を続ける」系の自律ループの土台。
+### 終了コード
 
-hook の起動自体に失敗した場合は警告のみで続行（fail-open）、30 秒でタイムアウトします。
+| 終了コード | 意味 |
+| --- | --- |
+| `0` | 続行。stdout が JSON オブジェクトなら判断として読む（下記） |
+| `2` | **ブロック**。理由は stderr。JSON で `allow` と言っていても止まる |
+| その他の非 0 | hook 自身の失敗。**警告を出して続行**（ブロックしない） |
+
+> ⚠️ **v0.1 からの破壊的変更**: 以前は「非 0 は全てブロック」でした。`exit 1` で止めていた hook は `exit 2` に直すか、設定のトップレベルに `hooks_compat = "v1"` を書いて旧挙動（非 0 は全てブロック・stdout の JSON は読まない）に戻してください。
+
+タイムアウトした hook はブロック扱いです（guard が固まったときに素通しにしないため。ここは Claude Code と異なります）。hook の起動自体に失敗した場合は警告のみで続行します（fail-open）。
+
+### stdout の JSON
+
+`{` で始まり `}` で終わる stdout だけを JSON として読みます。
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Destructive command blocked by hook",
+    "updatedInput": { "command": "ls -la" },
+    "additionalContext": "このリポジトリでは pnpm を使う"
+  }
+}
+```
+
+| フィールド | 効くイベント | 効果 |
+| --- | --- | --- |
+| `hookSpecificOutput.permissionDecision` | PreToolUse | `deny`: 実行せず理由をモデルへ返す / `ask`: 他の条件で通る呼び出しでも**必ず尋ねる**（`--yes` でも。尋ねる相手のいない `-p` では拒否） / `allow`: 承認プロンプトを省く |
+| `hookSpecificOutput.updatedInput` | PreToolUse | ツール入力を差し替える（JSON オブジェクトのみ）。**権限ルールと承認は差し替え後の入力を見ます** |
+| `hookSpecificOutput.additionalContext` | 全て | モデルに見せる追加の文脈。Pre/PostToolUse ではツール結果に、UserPromptSubmit / SessionStart では次のユーザ入力に `<hook-context>` で添える |
+| `decision: "block"` + `reason` | 全て | exit 2 と同じ |
+| `continue: false` + `stopReason` | Stop 以外 | ブロック（Stop では「止まってよい」の意味なので何もしない） |
+| `systemMessage` | 全て | 利用者への警告として stderr に表示 |
+
+- hook の **`allow` は deny ルールにも ask ルールにも勝てません**。hook はプロジェクトの設定からも足せるので、利用者が[権限ルール](#権限ルールとモード)で書いた「禁止」「必ず尋ねる」を覆させないためです。
+- 複数の hook が違う希望を出したら `deny` > `ask` > `allow`。ブロックした時点で残りの hook は実行しません。
+- UserPromptSubmit と SessionStart では、JSON でない素の stdout もそのまま追加の文脈になります。
+
+### matcher
+
+| matcher | 解釈 |
+| --- | --- |
+| 空 / `"*"` / 省略 | 常に一致 |
+| 英数と `_` `-` 空白 `,` `\|` だけ | 完全一致。`Edit\|Write` のような並びはどれかに完全一致 |
+| それ以外の文字を含む | 正規表現（**部分一致**）。`Edit.*` は `NotebookEdit` にも当たる。全体一致は `^Edit$` |
+
+MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memory` だけだと完全一致扱いで何にも当たりません）。正規表現として壊れている matcher は**起動時にエラー**にします（一度も発火しない guard を黙って受け入れないため）。matcher が照合するのは Pre/PostToolUse ではツール名、SessionStart では `startup` / `resume` です。
+
+### ペイロード
+
+全イベント共通: `session_id` / `transcript_path`（永続化が無効なら null）/ `cwd` / `permission_mode`（`default` | `accept-edits` | `plan` | `dont-ask` | `bypass`）/ `hook_event_name`。
+
+- **SessionStart**: `source`（`startup` | `resume`）。REPL / `-p` の開始時。ブロックしても起動は止めず警告のみ。
+- **SessionEnd**: 終了時（ベストエフォート、ブロック不可）。
+- **UserPromptSubmit**: `prompt`。ブロック時はそのターンを実行せず破棄。
+- **PreToolUse**: `tool_name` / `tool_input`。ブロック時はツールを実行せず、理由をモデルへ返す。
+- **PostToolUse**: `tool_name` / `tool_input` / `tool_response`（旧名 `tool_output` も同じ値）。実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。
+- **Stop**: `last_assistant_message`（旧名 `last_message` も同じ値）。ターン終端で発火。**ブロックすると停止せず、その理由をユーザー入力として注入し次ターンへ継続する**（暴走は `max_iterations` で停止）。「条件を満たすまで作業を続ける」系の自律ループの土台。
 
 > ⚠️ **信頼前提**: hook コマンドは `sh -c` で実行され、パーミッションゲートを経ません。プロジェクトの `config.toml` の hook が動くのは、そのディレクトリを[信頼した](#workspace-trust--信頼していないディレクトリの設定は読まない)ときだけです。信頼するのは中身を確認したリポジトリに限ってください（任意コード実行になります）。
 

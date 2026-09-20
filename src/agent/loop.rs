@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::messages::Message;
 use crate::config::Config;
-use crate::hooks::{self, HookOutcome, Lifecycle};
+use crate::hooks::{self, HookOutcome, Lifecycle, PermissionHint};
 use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
 use crate::permission::{Decision, PermissionGate};
 use crate::prompt;
@@ -32,6 +32,17 @@ pub struct Session {
     undo: crate::undo::UndoLog,
     /// run_turn ごとに増える通し番号 (undo 台帳のターン識別に使う)。
     turn_seq: u64,
+    /// hook の payload に載せるセッションの素性 (永続化が無効なら空)。
+    hook_env: HookEnv,
+    /// hook が寄せた追加文脈のうち、まだモデルに渡していないもの。次のユーザ入力に添える。
+    pending_context: Vec<String>,
+}
+
+/// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
+#[derive(Debug, Clone, Default)]
+pub struct HookEnv {
+    pub session_id: Option<String>,
+    pub transcript_path: Option<std::path::PathBuf>,
 }
 
 impl Session {
@@ -65,7 +76,52 @@ impl Session {
             mode: Mode::default(),
             undo: crate::undo::UndoLog::default(),
             turn_seq: 0,
+            hook_env: HookEnv::default(),
+            pending_context: Vec::new(),
         }
+    }
+
+    pub fn set_hook_env(&mut self, env: HookEnv) {
+        self.hook_env = env;
+    }
+
+    /// 次のユーザ入力と一緒にモデルへ渡す文脈を預ける (SessionStart hook の `additionalContext` など)。
+    pub fn add_context(&mut self, text: String) {
+        self.pending_context.push(text);
+    }
+
+    /// 設定された hook を発火する。payload には Claude Code と同じ共通フィールド
+    /// (`session_id` / `transcript_path` / `cwd` / `permission_mode` / `hook_event_name`) を足す。
+    pub async fn fire_hook(
+        &self,
+        lc: Lifecycle,
+        subject: Option<&str>,
+        extra: serde_json::Value,
+    ) -> Result<HookOutcome> {
+        let permission_mode = match self.mode {
+            Mode::Plan => serde_json::json!("plan"),
+            Mode::Normal => {
+                serde_json::to_value(self.cfg.permissions.mode).unwrap_or(serde_json::Value::Null)
+            }
+        };
+        let mut payload = serde_json::json!({
+            "session_id": self.hook_env.session_id,
+            "transcript_path": self.hook_env.transcript_path,
+            "cwd": self.ctx.cwd,
+            "permission_mode": permission_mode,
+            "hook_event_name": lc,
+        });
+        if let (Some(base), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
+            base.extend(extra);
+        }
+        hooks::runner::dispatch(
+            lc,
+            subject,
+            &payload,
+            &self.cfg.hooks,
+            self.cfg.hooks_compat,
+        )
+        .await
     }
 
     pub fn mode(&self) -> Mode {
@@ -110,24 +166,29 @@ impl Session {
         gate: &PermissionGate,
         end: &mut TurnEnd,
     ) -> Result<()> {
-        let prompt_payload = serde_json::json!({ "prompt": user_input });
-        if let HookOutcome::Block(reason) = hooks::runner::dispatch(
-            Lifecycle::UserPromptSubmit,
-            None,
-            &prompt_payload,
-            &self.cfg.hooks,
-        )
-        .await?
-        {
-            crate::say!("prompt blocked by hook: {}", crate::term::sanitize(&reason));
+        let submitted = self
+            .fire_hook(
+                Lifecycle::UserPromptSubmit,
+                None,
+                serde_json::json!({ "prompt": user_input }),
+            )
+            .await?;
+        if let Some(reason) = &submitted.block {
+            crate::say!("prompt blocked by hook: {}", crate::term::sanitize(reason));
             return Ok(());
         }
+        self.pending_context.extend(submitted.context);
         self.turn_seq += 1;
         // Plan 中はモデルに「調査と計画のみ」を毎ターン明示する (system prompt は
         // モード切替で作り直さないため、入力への前置で伝える)。
         let content = match self.mode {
             Mode::Plan => format!("{PLAN_MODE_PREFIX}\n\n{user_input}"),
             Mode::Normal => user_input.to_string(),
+        };
+        // hook が寄せた文脈は、利用者の言葉と区別がつく形で入力の後ろに添える。
+        let content = match std::mem::take(&mut self.pending_context) {
+            context if context.is_empty() => content,
+            context => format!("{content}\n\n{}", hook_context_block(&context.join("\n"))),
         };
         self.history.push(Message::User { content });
 
@@ -245,19 +306,22 @@ impl Session {
                 }
                 // Stop hook: 停止をブロックされたら reason をユーザ入力として注入し継続する。
                 // これが /goal（達成条件までターン継続）の土台になる。
+                // `last_message` は v1 からの名前、`last_assistant_message` は Claude Code の名前。
                 let stop_payload = serde_json::json!({
-                    "hook_event_name": "Stop",
                     "last_message": resp.content,
+                    "last_assistant_message": resp.content,
                 });
-                match hooks::runner::dispatch(Lifecycle::Stop, None, &stop_payload, &self.cfg.hooks)
+                match self
+                    .fire_hook(Lifecycle::Stop, None, stop_payload)
                     .await?
+                    .block
                 {
-                    HookOutcome::Continue => {
+                    None => {
                         self.maybe_auto_compact(llm).await;
                         end.reason = TURN_END_FINAL;
                         return Ok(());
                     }
-                    HookOutcome::Block(reason) => {
+                    Some(reason) => {
                         crate::say!(
                             "{}",
                             crate::term::dim(&format!(
@@ -291,7 +355,10 @@ impl Session {
                 .await?;
             for (call_index, call) in tool_calls.into_iter().enumerate() {
                 let name = call.function.name.clone();
-                let args = parse_tool_args(&call.function.arguments);
+                // PreToolUse hook が `updatedInput` で書き換えることがある。
+                let mut args = parse_tool_args(&call.function.arguments);
+                // hook がこの呼び出しに寄せた、モデル向けの文脈。
+                let mut hook_context: Vec<String> = Vec::new();
 
                 // 何が起きたかを 1 語で記録する (ablation で緩和策の発火回数を数える)。
                 let mut reason = TOOL_REASON_OK;
@@ -353,14 +420,32 @@ impl Session {
                                  unchanged. Use the previous result and take a different next action."
                             ))
                         }
-                        Some(_) if prefetched.contains_key(&call_index) => {
+                        Some(tool) if prefetched.contains_key(&call_index) => {
                             match prefetched.remove(&call_index) {
+                                // hook が入力の書き換えか確認を求めたので、先行実行はしていない。
+                                // hook は発火済みなので、その結果から逐次の経路に合流する。
+                                Some(Prefetched::HookDeferred(pre)) => {
+                                    self.run_after_pre_hook(
+                                        &tool,
+                                        &mut args,
+                                        pre,
+                                        gate,
+                                        &mut reason,
+                                        &mut hook_context,
+                                    )
+                                    .await
+                                }
                                 // hook が止めた呼び出しは実行していないので、並列扱いにしない。
                                 Some(Prefetched::HookBlocked(hook_reason)) => {
                                     reason = "hook_blocked";
                                     ToolOutput::error(format!("blocked by hook: {hook_reason}"))
                                 }
-                                Some(Prefetched::Ran { result, ms }) => {
+                                Some(Prefetched::Ran {
+                                    result,
+                                    ms,
+                                    context,
+                                }) => {
+                                    hook_context.extend(context);
                                     ran_parallel = true;
                                     parallel_ms = Some(ms);
                                     match result {
@@ -377,39 +462,18 @@ impl Session {
                         Some(tool) => {
                             let pre_payload =
                                 serde_json::json!({ "tool_name": name, "tool_input": args });
-                            match hooks::runner::dispatch(
-                                Lifecycle::PreToolUse,
-                                Some(&name),
-                                &pre_payload,
-                                &self.cfg.hooks,
+                            let pre = self
+                                .fire_hook(Lifecycle::PreToolUse, Some(&name), pre_payload)
+                                .await?;
+                            self.run_after_pre_hook(
+                                &tool,
+                                &mut args,
+                                pre,
+                                gate,
+                                &mut reason,
+                                &mut hook_context,
                             )
-                            .await?
-                            {
-                                HookOutcome::Block(hook_reason) => {
-                                    reason = "hook_blocked";
-                                    ToolOutput::error(format!("blocked by hook: {hook_reason}"))
-                                }
-                                // read-only のツールもゲートを通す: deny ルールは Read にも効く (#74)。
-                                HookOutcome::Continue => {
-                                    match gate.decide(tool.name(), &args, tool.is_destructive()) {
-                                        Decision::Deny(why) => {
-                                            reason = "denied";
-                                            ToolOutput::error(why)
-                                        }
-                                        Decision::Allow => {
-                                            // 実行が確定してから変更前を退避する (/undo 用)。
-                                            self.snapshot_for_undo(&name, &args);
-                                            match tool.execute(args.clone(), &self.ctx).await {
-                                                Ok(o) => o,
-                                                Err(e) => {
-                                                    reason = "tool_error";
-                                                    ToolOutput::error(format!("tool error: {e}"))
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            .await
                         }
                     }
                 };
@@ -417,20 +481,26 @@ impl Session {
                 let post_payload = serde_json::json!({
                     "tool_name": name,
                     "tool_input": args,
+                    // `tool_output` は v1 からの名前、`tool_response` は Claude Code の名前。
                     "tool_output": output.content,
+                    "tool_response": output.content,
                 });
-                if let HookOutcome::Block(reason) = hooks::runner::dispatch(
-                    Lifecycle::PostToolUse,
-                    Some(&name),
-                    &post_payload,
-                    &self.cfg.hooks,
-                )
-                .await?
-                {
+                let post = self
+                    .fire_hook(Lifecycle::PostToolUse, Some(&name), post_payload)
+                    .await?;
+                if let Some(reason) = &post.block {
                     // 実行後なので取り消せない。理由をツール出力へ追記し、
                     // history 経由でモデルへフィードバックする。
-                    crate::say!("post-tool hook: {}", crate::term::sanitize(&reason));
+                    crate::say!("post-tool hook: {}", crate::term::sanitize(reason));
                     output.content = format!("{}\n[post-tool hook] {reason}", output.content);
+                }
+                hook_context.extend(post.context);
+                if !hook_context.is_empty() {
+                    output.content = format!(
+                        "{}\n{}",
+                        output.content,
+                        hook_context_block(&hook_context.join("\n"))
+                    );
                 }
 
                 let tag = tool_tag(&name, output.is_error);
@@ -562,36 +632,39 @@ impl Session {
             let name = &calls[i].function.name;
             let args = parse_tool_args(&calls[i].function.arguments);
             let payload = serde_json::json!({ "tool_name": name, "tool_input": args });
-            match hooks::runner::dispatch(
-                Lifecycle::PreToolUse,
-                Some(name),
-                &payload,
-                &self.cfg.hooks,
-            )
-            .await?
-            {
-                HookOutcome::Block(reason) => {
-                    out.insert(i, Prefetched::HookBlocked(reason));
-                }
-                HookOutcome::Continue => {
-                    // eligible の判定で存在は確認済み。
-                    if let Some(tool) = self.registry.get(name) {
-                        to_run.push((i, tool, args));
-                    }
-                }
+            let pre = self
+                .fire_hook(Lifecycle::PreToolUse, Some(name), payload)
+                .await?;
+            if let Some(reason) = pre.block {
+                out.insert(i, Prefetched::HookBlocked(reason));
+            } else if pre.updated_input.is_some() || pre.permission == Some(PermissionHint::Ask) {
+                // ここまでの「尋ねずに通る」という判定は、元の入力と hook の口出し無しが前提。
+                // 先行実行はやめて、逐次の経路でゲートからやり直す。
+                out.insert(i, Prefetched::HookDeferred(pre));
+            } else if let Some(tool) = self.registry.get(name) {
+                // eligible の判定で存在は確認済み。
+                to_run.push((i, tool, args, pre.context));
             }
         }
 
         let ctx = &self.ctx;
-        let results =
-            futures_util::future::join_all(to_run.into_iter().map(|(i, tool, args)| async move {
+        let results = futures_util::future::join_all(to_run.into_iter().map(
+            |(i, tool, args, context)| async move {
                 let started = std::time::Instant::now();
                 let result = tool.execute(args, ctx).await;
-                (i, result, started.elapsed().as_millis() as u64)
-            }))
-            .await;
-        for (i, result, ms) in results {
-            out.insert(i, Prefetched::Ran { result, ms });
+                (i, result, started.elapsed().as_millis() as u64, context)
+            },
+        ))
+        .await;
+        for (i, result, ms, context) in results {
+            out.insert(
+                i,
+                Prefetched::Ran {
+                    result,
+                    ms,
+                    context,
+                },
+            );
         }
         Ok(())
     }
@@ -654,6 +727,47 @@ impl Session {
     /// path はツール本体 (write.rs 等) と同じ規則で解決する: 絶対ならそのまま、
     /// 相対なら ctx.cwd 基準。実行が失敗してもスナップショットは台帳に残るが、
     /// 変更前と同じ内容を書き戻すだけなので undo しても無害。
+    /// PreToolUse hook の結果を受けて、ゲートの判定から実行までを行う。
+    ///
+    /// hook が入力を書き換えたら、**書き換えた後の入力**でゲートを通す (deny ルールも承認プロンプトも
+    /// 実際に実行されるものを見る)。
+    async fn run_after_pre_hook(
+        &mut self,
+        tool: &Arc<dyn crate::tools::Tool>,
+        args: &mut serde_json::Value,
+        pre: HookOutcome,
+        gate: &PermissionGate,
+        reason: &mut &'static str,
+        hook_context: &mut Vec<String>,
+    ) -> ToolOutput {
+        if let Some(hook_reason) = pre.block {
+            *reason = "hook_blocked";
+            return ToolOutput::error(format!("blocked by hook: {hook_reason}"));
+        }
+        if let Some(updated) = pre.updated_input {
+            *args = updated;
+        }
+        hook_context.extend(pre.context);
+        // read-only のツールもゲートを通す: deny ルールは Read にも効く (#74)。
+        match gate.decide_hinted(tool.name(), args, tool.is_destructive(), pre.permission) {
+            Decision::Deny(why) => {
+                *reason = "denied";
+                ToolOutput::error(why)
+            }
+            Decision::Allow => {
+                // 実行が確定してから変更前を退避する (/undo 用)。
+                self.snapshot_for_undo(tool.name(), args);
+                match tool.execute(args.clone(), &self.ctx).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        *reason = "tool_error";
+                        ToolOutput::error(format!("tool error: {e}"))
+                    }
+                }
+            }
+        }
+    }
+
     fn snapshot_for_undo(&mut self, tool_name: &str, args: &serde_json::Value) {
         if !UNDOABLE_FILE_TOOLS.contains(&tool_name) {
             return;
@@ -955,10 +1069,19 @@ const MAX_PARALLEL_TOOL_CALLS: usize = 4;
 enum Prefetched {
     /// PreToolUse hook がブロックした (実行していない)。
     HookBlocked(String),
+    /// PreToolUse hook が入力の書き換えか確認を求めた (実行していない)。逐次の経路で続きをやる。
+    HookDeferred(HookOutcome),
     Ran {
         result: std::result::Result<ToolOutput, crate::tools::ToolError>,
         ms: u64,
+        /// PreToolUse hook の `additionalContext`。
+        context: Vec<String>,
     },
+}
+
+/// hook が寄せた文脈をモデルに渡すときの枠。利用者の言葉やツールの出力と取り違えさせない。
+fn hook_context_block(context: &str) -> String {
+    format!("<hook-context>\n{context}\n</hook-context>")
 }
 
 /// モデルが返した引数文字列を JSON にする。壊れていたら `{"raw": …}` に包んでツールへ渡し、
@@ -1561,6 +1684,7 @@ mod tests {
                 event: Lifecycle::Stop,
                 matcher: String::new(),
                 command,
+                timeout_secs: None,
             }];
         }
         Session::new(cfg, Arc::new(default_registry()))
@@ -1591,7 +1715,7 @@ mod tests {
         let marker = dir.path().join("stop_marker");
         // 初回: marker 無 → 作成し block。2 回目: marker 有 → continue。
         let cmd = format!(
-            "if [ -f '{m}' ]; then exit 0; else : > '{m}'; echo keep-going 1>&2; exit 1; fi",
+            "if [ -f '{m}' ]; then exit 0; else : > '{m}'; echo keep-going 1>&2; exit 2; fi",
             m = marker.display()
         );
         let mut session = session_with_stop_hook(Some(cmd));
@@ -2209,7 +2333,8 @@ mod tests {
             hooks: vec![HookConfig {
                 event: Lifecycle::PreToolUse,
                 matcher: "Par".into(),
-                command: r#"grep -q '"n":2' && { echo "no twos" >&2; exit 1; } || exit 0"#.into(),
+                command: r#"grep -q '"n":2' && { echo "no twos" >&2; exit 2; } || exit 0"#.into(),
+                timeout_secs: None,
             }],
             ..Default::default()
         };
@@ -2233,6 +2358,250 @@ mod tests {
             replies[1].1
         );
         assert_eq!(replies[2].1, "Par 3");
+    }
+
+    // ---- #76: hooks v2 (stdout の JSON で承認・入力・文脈に口を出す) ----
+
+    fn pre_tool_hook(matcher: &str, json: &str) -> HookConfig {
+        HookConfig {
+            event: Lifecycle::PreToolUse,
+            matcher: matcher.into(),
+            command: format!("cat > /dev/null; printf '%s' '{json}'"),
+            timeout_secs: None,
+        }
+    }
+
+    const HOOK_ALLOWS: &str = r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#;
+    const HOOK_ASKS: &str = r#"{"hookSpecificOutput":{"permissionDecision":"ask"}}"#;
+
+    /// 尋ねる相手のいないゲート (`-p` 相当)。承認が要る呼び出しは拒否される。
+    fn headless_gate(cfg: &Config) -> PermissionGate {
+        PermissionGate::from_config(cfg, std::path::Path::new("/work"), false).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_hook_allow_skips_the_prompt_but_never_beats_a_rule() {
+        let run = |deny: &[&str], ask: &[&str]| {
+            let mut cfg = Config {
+                hooks: vec![pre_tool_hook("Mut", HOOK_ALLOWS)],
+                ..Default::default()
+            };
+            cfg.permissions.deny = deny.iter().map(|s| s.to_string()).collect();
+            cfg.permissions.ask = ask.iter().map(|s| s.to_string()).collect();
+            async move {
+                let gate = headless_gate(&cfg);
+                let (mut session, stats) = probe_session(cfg);
+                session
+                    .run_turn("go", &batch(&[("Mut", 1)]), &gate)
+                    .await
+                    .unwrap();
+                stats.runs.load(AtomicOrdering::SeqCst)
+            }
+        };
+        assert_eq!(
+            run(&[], &[]).await,
+            1,
+            "the hook's allow replaces the prompt"
+        );
+        assert_eq!(run(&["Mut"], &[]).await, 0, "a deny rule still wins");
+        assert_eq!(
+            run(&[], &["Mut"]).await,
+            0,
+            "an ask rule still asks (and nobody is there to answer)"
+        );
+
+        // 陽性対照: hook が無ければ、同じ呼び出しは承認待ちで拒否される。
+        let cfg = Config::default();
+        let gate = headless_gate(&cfg);
+        let (mut session, stats) = probe_session(cfg);
+        session
+            .run_turn("go", &batch(&[("Mut", 1)]), &gate)
+            .await
+            .unwrap();
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_hook_ask_makes_even_an_auto_approved_call_wait_for_the_user() {
+        let mut cfg = Config {
+            hooks: vec![pre_tool_hook("Mut|Par", HOOK_ASKS)],
+            ..Default::default()
+        };
+        cfg.agent.auto_approve = true;
+        let gate = headless_gate(&cfg);
+        let (mut session, stats) = probe_session(cfg);
+        // Par は read-only かつ並列可: 先行実行の経路でも、hook の ask を無視して走ってはいけない。
+        session
+            .run_turn("go", &batch(&[("Mut", 1), ("Par", 2), ("Par", 3)]), &gate)
+            .await
+            .unwrap();
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            tool_replies(&session)
+                .iter()
+                .all(|(_, reply)| reply.contains("nobody can approve")),
+            "{:?}",
+            tool_replies(&session)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_input_is_what_runs_and_what_the_rules_judge() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("rewritten-ran");
+        let rewrite = format!(
+            r#"{{"hookSpecificOutput":{{"updatedInput":{{"command":"touch {}"}}}}}}"#,
+            marker.display()
+        );
+        let run = |deny: &[&str]| {
+            let mut cfg = Config {
+                hooks: vec![pre_tool_hook("Bash", &rewrite)],
+                ..Default::default()
+            };
+            cfg.agent.auto_approve = true;
+            cfg.permissions.deny = deny.iter().map(|s| s.to_string()).collect();
+            async move {
+                let gate = headless_gate(&cfg);
+                let mut session = Session::new(cfg, Arc::new(default_registry()));
+                let llm = CallThenDoneLlm::one(tool_call_with_args(
+                    "b1",
+                    "Bash",
+                    r#"{"command": "echo harmless"}"#,
+                ));
+                session.run_turn("go", &llm, &gate).await.unwrap();
+                tool_replies(&session)[0].1.clone()
+            }
+        };
+        // deny は「モデルが頼んだもの」ではなく「実際に走るもの」を見る。
+        let reply = run(&["Bash(touch *)"]).await;
+        assert!(reply.contains("denied by permission rule"), "{reply}");
+        assert!(!marker.exists());
+
+        let reply = run(&[]).await;
+        assert!(
+            marker.exists(),
+            "the rewritten command is what ran: {reply}"
+        );
+        assert!(!reply.contains("harmless"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_inside_a_parallel_span_goes_back_through_the_gate() {
+        let mut cfg = Config {
+            hooks: vec![pre_tool_hook(
+                "Par",
+                r#"{"hookSpecificOutput":{"updatedInput":{"n":99}}}"#,
+            )],
+            ..Default::default()
+        };
+        cfg.agent.auto_approve = true;
+        let gate = headless_gate(&cfg);
+        let (mut session, _stats) = probe_session(cfg);
+        session
+            .run_turn("go", &batch(&[("Par", 1), ("Par", 2)]), &gate)
+            .await
+            .unwrap();
+        let replies = tool_replies(&session);
+        assert_eq!(
+            (replies[0].1.as_str(), replies[1].1.as_str()),
+            ("Par 99", "Par 99")
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_context_reaches_the_model_with_the_prompt_and_with_the_tool_result() {
+        let cfg = Config {
+            hooks: vec![
+                HookConfig {
+                    event: Lifecycle::UserPromptSubmit,
+                    matcher: String::new(),
+                    command: "cat > /dev/null; echo 'branch: main'".into(),
+                    timeout_secs: None,
+                },
+                pre_tool_hook(
+                    "Par",
+                    r#"{"hookSpecificOutput":{"additionalContext":"Par is rate limited"}}"#,
+                ),
+                HookConfig {
+                    event: Lifecycle::PostToolUse,
+                    matcher: "Ser".into(),
+                    command: r#"cat > /dev/null; printf '%s' '{"hookSpecificOutput":{"additionalContext":"lint: 2 warnings"}}'"#.into(),
+                    timeout_secs: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let (mut session, _stats) = probe_session(cfg);
+        session.add_context("from SessionStart".into());
+        session
+            .run_turn(
+                "go",
+                &batch(&[("Par", 1), ("Par", 2), ("Ser", 3)]),
+                &PermissionGate::new(true),
+            )
+            .await
+            .unwrap();
+
+        let user = session
+            .history()
+            .iter()
+            .find_map(|m| match m {
+                Message::User { content } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(user.starts_with("go\n\n<hook-context>"), "{user}");
+        assert!(
+            user.contains("from SessionStart") && user.contains("branch: main"),
+            "{user}"
+        );
+
+        let replies = tool_replies(&session);
+        for reply in &replies[..2] {
+            assert!(
+                reply.1.starts_with("Par ") && reply.1.contains("Par is rate limited"),
+                "{reply:?}"
+            );
+        }
+        assert!(
+            replies[2].1.contains("lint: 2 warnings"),
+            "{:?}",
+            replies[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hook_payload_carries_the_common_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("payload.json");
+        let cfg = Config {
+            hooks: vec![HookConfig {
+                event: Lifecycle::PreToolUse,
+                matcher: String::new(),
+                command: format!("cat > '{}'", seen.display()),
+                timeout_secs: None,
+            }],
+            ..Default::default()
+        };
+        let (mut session, _stats) = probe_session(cfg);
+        session.set_hook_env(HookEnv {
+            session_id: Some("s-1".into()),
+            transcript_path: Some("/sessions/s-1/transcript.jsonl".into()),
+        });
+        session.set_mode(Mode::Plan);
+        session
+            .run_turn("go", &batch(&[("Ser", 7)]), &PermissionGate::new(true))
+            .await
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+        assert_eq!(payload["hook_event_name"], "PreToolUse");
+        assert_eq!(payload["session_id"], "s-1");
+        assert_eq!(payload["transcript_path"], "/sessions/s-1/transcript.jsonl");
+        assert_eq!(payload["permission_mode"], "plan");
+        assert!(payload["cwd"].is_string());
+        assert_eq!(payload["tool_name"], "Ser");
+        assert_eq!(payload["tool_input"]["n"], 7);
     }
 
     /// Normal 中に呼ばれた ExitPlanMode はエラー応答でモードも変わらない。

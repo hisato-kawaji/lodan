@@ -15,7 +15,7 @@ use std::io::{IsTerminal, Read};
 use crate::agent::r#loop::MaxIterationsError;
 use crate::agent::messages::Message;
 use crate::config::Config;
-use crate::hooks::{self, HookOutcome, Lifecycle};
+use crate::hooks::Lifecycle;
 use crate::permission::PermissionGate;
 use crate::runtime::{Notices, Runtime};
 
@@ -96,14 +96,33 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         session.set_mode(crate::agent::Mode::Plan);
     }
 
-    let start_payload = serde_json::json!({
-        "hook_event_name": "SessionStart",
-        "cwd": runtime.cwd.display().to_string(),
-    });
-    if let Ok(HookOutcome::Block(reason)) =
-        hooks::runner::dispatch(Lifecycle::SessionStart, None, &start_payload, &cfg.hooks).await
+    let session_source = if resume.is_some() {
+        "resume"
+    } else {
+        "startup"
+    };
+    match session
+        .fire_hook(
+            Lifecycle::SessionStart,
+            Some(session_source),
+            serde_json::json!({ "source": session_source }),
+        )
+        .await
     {
-        eprintln!("session-start hook: {}", crate::term::sanitize(&reason));
+        Ok(started) => {
+            if let Some(reason) = &started.block {
+                eprintln!("session-start hook: {}", crate::term::sanitize(reason));
+            }
+            // plain な stdout と `additionalContext` は、最初のユーザ入力と一緒にモデルへ渡す。
+            started
+                .context
+                .into_iter()
+                .for_each(|c| session.add_context(c));
+        }
+        Err(e) => eprintln!(
+            "session-start hook: {}",
+            crate::term::sanitize(&e.to_string())
+        ),
     }
 
     // このターンで増えた分だけを最終応答の候補にする (`--resume` では履歴の末尾が
@@ -129,8 +148,9 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         eprintln!("session: save failed: {e}");
     }
 
-    let end_payload = serde_json::json!({ "hook_event_name": "SessionEnd" });
-    let _ = hooks::runner::dispatch(Lifecycle::SessionEnd, None, &end_payload, &cfg.hooks).await;
+    let _ = session
+        .fire_hook(Lifecycle::SessionEnd, None, serde_json::json!({}))
+        .await;
 
     Ok(Report::new(
         &outcome,

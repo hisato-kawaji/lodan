@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::agent;
 use crate::config::Config;
-use crate::hooks::{self, HookOutcome, Lifecycle};
+use crate::hooks::Lifecycle;
 use crate::llm;
 use crate::mcp::prompt::McpPrompt;
 use crate::permission::PermissionGate;
@@ -208,12 +208,33 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut goal_state: Option<crate::goal::Goal> = None;
 
     // SessionStart hook: 起動を通知する。ブロックされても起動は止めず警告のみ。
-    let session_payload =
-        serde_json::json!({ "hook_event_name": "SessionStart", "cwd": cwd.display().to_string() });
-    if let Ok(HookOutcome::Block(reason)) =
-        hooks::runner::dispatch(Lifecycle::SessionStart, None, &session_payload, &cfg.hooks).await
+    let session_source = if resume.is_some() {
+        "resume"
+    } else {
+        "startup"
+    };
+    match session
+        .fire_hook(
+            Lifecycle::SessionStart,
+            Some(session_source),
+            serde_json::json!({ "source": session_source }),
+        )
+        .await
     {
-        eprintln!("session-start hook: {}", crate::term::sanitize(&reason));
+        Ok(started) => {
+            if let Some(reason) = &started.block {
+                eprintln!("session-start hook: {}", crate::term::sanitize(reason));
+            }
+            // plain な stdout と `additionalContext` は、最初のユーザ入力と一緒にモデルへ渡す。
+            started
+                .context
+                .into_iter()
+                .for_each(|c| session.add_context(c));
+        }
+        Err(e) => eprintln!(
+            "session-start hook: {}",
+            crate::term::sanitize(&e.to_string())
+        ),
     }
 
     loop {
@@ -389,8 +410,9 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }
 
     // SessionEnd hook: 終了を通知する（ブロック不能・ベストエフォート）。
-    let end_payload = serde_json::json!({ "hook_event_name": "SessionEnd" });
-    let _ = hooks::runner::dispatch(Lifecycle::SessionEnd, None, &end_payload, &cfg.hooks).await;
+    let _ = session
+        .fire_hook(Lifecycle::SessionEnd, None, serde_json::json!({}))
+        .await;
 
     Ok(())
 }

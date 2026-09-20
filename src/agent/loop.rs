@@ -237,14 +237,22 @@ impl Session {
                 Mode::Normal => self.registry.tool_specs(),
             };
             // 予算の 8 割を使ったら、打ち切られる前に畳めるよう一度だけ知らせる。ここは必ず
-            // User か Tool の直後なので、User メッセージを足しても履歴は API に投げられる形のまま。
+            // User か Tool の直後なので、履歴は API に投げられる形のまま。
             if let Some(reminder) = self.ledger.as_ref().and_then(|l| l.take_reminder()) {
                 crate::say!("{}", crate::term::dim(&reminder));
                 crate::runlog::record(
                     "budget_reminder",
                     serde_json::json!({ "turn": self.turn_seq, "iter": iterations }),
                 );
-                self.history.push(Message::User { content: reminder });
+                // ターンの最初の呼び出しでは直前が利用者の入力。user を 2 つ続けると、役割の交互を
+                // 要求するチャットテンプレートに拒否されるので、その入力の後ろに添える。
+                match self.history.last_mut() {
+                    Some(Message::User { content }) => {
+                        content.push_str("\n\n");
+                        content.push_str(&reminder);
+                    }
+                    _ => self.history.push(Message::User { content: reminder }),
+                }
             }
             let resp =
                 stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
@@ -2030,9 +2038,7 @@ mod tests {
         let reminders = |s: &Session| {
             s.history()
                 .iter()
-                .filter(
-                    |m| matches!(m, Message::User { content } if content.starts_with("[budget]")),
-                )
+                .filter(|m| matches!(m, Message::User { content } if content.contains("[budget]")))
                 .count()
         };
         for prompt in ["t1", "t2", "t3", "t4"] {
@@ -2046,13 +2052,18 @@ mod tests {
 
         session.run_turn("t5", &llm, &gate).await.unwrap();
         assert_eq!(reminders(&session), 1);
-        // 注意書きは、そのターンの入力の直後・モデルの応答の前に入る。
+        // 注意書きは、そのターンの入力に添えられる (user メッセージを 2 つ続けない)。
         let tail: Vec<&Message> = session.history().iter().rev().take(3).collect();
         assert!(matches!(tail[0], Message::Assistant { .. }));
+        assert!(matches!(
+            tail[1],
+            Message::User { content }
+                if content.starts_with("t5\n\n[budget]") && content.contains("4 of 5 LLM requests")
+        ));
         assert!(
-            matches!(tail[1], Message::User { content } if content.contains("4 of 5 LLM requests"))
+            matches!(tail[2], Message::Assistant { .. }),
+            "no second user message"
         );
-        assert!(matches!(tail[2], Message::User { content } if content == "t5"));
 
         // 予算を使い切った後のターンは送られず、注意書きも増えない。
         assert!(session.run_turn("t6", &llm, &gate).await.is_err());

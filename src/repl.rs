@@ -498,7 +498,8 @@ async fn run_goal_command(
     // 状態表示
     if args.is_empty() {
         match goal_state {
-            Some(g) => println!("goal (paused):\n{}", g.describe()),
+            // 条件文は保存されたファイルから戻ってくることもある。
+            Some(g) => println!("goal (paused):\n{}", crate::term::sanitize(&g.describe())),
             None => println!("no active goal — set one with /goal <condition>"),
         }
         return;
@@ -507,7 +508,10 @@ async fn run_goal_command(
     // 解除
     if GOAL_CLEAR_ALIASES.contains(&args) {
         match goal_state.take() {
-            Some(g) => println!("goal cleared: {}", first_line(&g.condition)),
+            Some(g) => println!(
+                "goal cleared: {}",
+                crate::term::sanitize(&first_line(&g.condition))
+            ),
             None => println!("no active goal to clear"),
         }
         return;
@@ -541,7 +545,10 @@ async fn run_goal_command(
             }
         };
         if let Some(old) = goal_state.take() {
-            println!("goal replaced: {}", first_line(&old.condition));
+            println!(
+                "goal replaced: {}",
+                crate::term::sanitize(&first_line(&old.condition))
+            );
         }
         println!(
             "{}",

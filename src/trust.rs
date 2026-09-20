@@ -45,15 +45,7 @@ pub fn is_decided() -> bool {
 /// パスを端末に出す形にする。ディレクトリ名は利用者が付けたとは限らない (clone したリポジトリ、
 /// 展開したアーカイブ)。制御文字や双方向テキストの上書きで警告文を書き換えさせない。
 pub fn shown(path: &Path) -> String {
-    path.display()
-        .to_string()
-        .chars()
-        .map(|c| {
-            let hidden = c.is_control()
-                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}');
-            if hidden { c.escape_default().to_string() } else { c.to_string() }
-        })
-        .collect()
+    crate::term::sanitize(&path.display().to_string()).into_owned()
 }
 
 /// 信頼が要るファイル (表示用の名前)。cwd にあるものに加えて、メモリは cwd の祖先 (ホームまで)
@@ -112,6 +104,10 @@ fn read_store(path: &Path) -> Result<Store> {
 fn write_store(path: &Path, store: &Store) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    // 記録先が symlink なら、その先を書き換えない (`append_local_allow_rule` と同じ構え)。
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        anyhow::bail!("{} is a symlink; refusing to write through it", shown(path));
     }
     let body = toml::to_string_pretty(store).context("serializing trust store")?;
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
@@ -240,6 +236,18 @@ pub fn decide(req: &Request<'_>, input: &mut dyn BufRead, out: &mut dyn Write) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_is_not_written_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.toml");
+        std::fs::write(&victim, "keep = true\n").unwrap();
+        let store = dir.path().join("trusted.toml");
+        std::os::unix::fs::symlink(&victim, &store).unwrap();
+        assert!(record(&store, dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep = true\n");
+    }
 
     fn project(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

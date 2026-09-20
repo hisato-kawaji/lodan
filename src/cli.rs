@@ -271,6 +271,14 @@ fn manage_trust(list: bool, remove: bool) -> Result<()> {
             "trusting {} (and everything under it)",
             crate::trust::shown(&cwd)
         );
+        // メモリは祖先のディレクトリからも読まれる。何が効くようになったかを、対話の確認と同じ一覧で見せる。
+        let files = crate::trust::project_files(&cwd);
+        if !files.is_empty() {
+            println!("lodan will now read, when started here:");
+            for file in files {
+                println!("  {file}");
+            }
+        }
     }
     Ok(())
 }

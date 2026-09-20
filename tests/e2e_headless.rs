@@ -785,6 +785,32 @@ fn trusting_the_directory_makes_the_same_settings_apply() {
     assert!(stdout(&listed).contains("work"), "{}", stdout(&listed));
 }
 
+/// メモリは祖先のディレクトリからも読まれる。`lodan trust` は、信頼した結果として読むように
+/// なるものを (cwd の外にあるものも) 黙って有効にせず、一覧で見せる。
+#[test]
+fn trusting_a_subdirectory_says_which_ancestor_memory_comes_with_it() {
+    let home = tempfile::tempdir().unwrap();
+    let app = home.path().join("repo/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(home.path().join("repo/CLAUDE.md"), "parent memory").unwrap();
+    std::fs::write(app.join("LODAN.md"), "own memory").unwrap();
+    let server = start_mock(home.path());
+    let out = lodan(
+        home.path(),
+        server.port,
+        &["--trust=false", "trust", "<harness:cwd=repo/app"],
+        Stdin::OpenAndSilent,
+    );
+    assert!(out.status.success());
+    let said = stdout(&out);
+    assert!(said.contains("  LODAN.md"), "{said}");
+    let parent = said
+        .lines()
+        .find(|l| l.ends_with("repo/CLAUDE.md"))
+        .unwrap_or_else(|| panic!("the parent's memory file is not announced:\n{said}"));
+    assert!(parent.starts_with("  /"), "shown as a full path: {parent}");
+}
+
 #[test]
 fn a_repository_cannot_trust_itself_through_its_own_dotenv() {
     let home = tempfile::tempdir().unwrap();

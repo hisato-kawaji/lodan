@@ -498,7 +498,14 @@ fn normalize_domain(raw: &str, domain: &str) -> Result<String> {
         anyhow::anyhow!("permission rule `{raw}`: `{domain}` is not a host name ({e})")
     })?;
     match url.host_str() {
-        Some(host) if url.path() == "/" && url.port().is_none() => {
+        // 括弧つき IPv6 は上の文字チェックを通らないので、userinfo はここで見る
+        // (`[x@[::1]` が `[::1]` として受理されてしまう)。
+        Some(host)
+            if url.path() == "/"
+                && url.port().is_none()
+                && url.username().is_empty()
+                && url.password().is_none() =>
+        {
             Ok(host.to_ascii_lowercase().trim_end_matches('.').to_string())
         }
         _ => bail!(
@@ -651,6 +658,18 @@ impl RuleSet {
     pub fn evaluate(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> Option<Verdict> {
         // 検索範囲の確認に使える時間は、この 1 回の判定全体でこれだけ。
         let deadline = std::time::Instant::now() + SEARCH_SCOPE_CHECK_BUDGET;
+        self.evaluate_until(tool, args, cwd, deadline)
+    }
+
+    /// `evaluate` の本体。期限は引数 1 つで、deny も ask も全てのルールがこれを共有する
+    /// (ルールごとに取り直す経路が構造上無い)。
+    fn evaluate_until(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        cwd: &Path,
+        deadline: std::time::Instant,
+    ) -> Option<Verdict> {
         let mut unverifiable = None;
         for rule in &self.deny {
             match rule.forbids(tool, args, cwd, deadline) {
@@ -1087,6 +1106,8 @@ mod tests {
             "WebFetch(domain:docs.rs#x)",
             "WebFetch(domain:docs.rs?x)",
             "WebFetch(domain:*.example.com)",
+            "WebFetch(domain:[x@[::1])",
+            "WebFetch(domain:[a:b@[::1])",
         ] {
             assert!(Rule::parse(bad).is_err(), "{bad}");
         }
@@ -1104,25 +1125,50 @@ mod tests {
     }
 
     #[test]
-    fn the_scope_check_deadline_is_shared_by_every_rule_in_one_evaluation() {
+    fn one_deadline_governs_every_rule_in_an_evaluation() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(cwd.join("a.txt"), "x").unwrap();
-        // 期限が既に過ぎていれば、何個ルールがあっても 1 エントリ見ただけで打ち切る。
+        let args = json!({ "pattern": "x" });
+        let deny = rules(
+            &[],
+            &["Grep(**/*.one)", "Grep(**/*.two)", "Grep(**/*.three)"],
+            &[],
+        );
+
+        // 時間があれば、どのルールにも当たらないと確かめきれる。
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(deny.evaluate_until("Grep", &args, &cwd, later), None);
+        // 期限が切れていれば、判定全体が「確かめきれない」になる。報告されるのは最初のルール。
         let expired = std::time::Instant::now();
-        for pattern in ["**/*.one", "**/*.two", "**/*.three"] {
-            let rule = Rule::parse(&format!("Grep({pattern})")).unwrap();
-            let args = json!({ "pattern": "x" });
-            assert_eq!(
-                rule.forbids("Grep", &args, &cwd, expired),
-                Forbids::Unchecked
-            );
-        }
-        // `Grep(**)` は cwd 以下の全て。cwd そのものを起点にした検索も allow に含む。
+        assert_eq!(
+            deny.evaluate_until("Grep", &args, &cwd, expired),
+            Some(Verdict::Unverifiable("Grep(**/*.one)".into()))
+        );
+        // ask だけのときは、確かめきれなければ尋ねる。
+        let ask = rules(&[], &[], &["Grep(**/*.one)"]);
+        assert_eq!(
+            ask.evaluate_until("Grep", &args, &cwd, expired),
+            Some(Verdict::Ask)
+        );
+    }
+
+    #[test]
+    fn allowing_everything_covers_a_search_rooted_at_the_cwd_but_nothing_outside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
         let all = rules(&["Grep(**)"], &[], &[]);
         assert_eq!(
             all.evaluate("Grep", &json!({ "pattern": "x" }), &cwd),
             Some(Verdict::Allow)
+        );
+        assert_eq!(
+            all.evaluate("Grep", &json!({ "pattern": "x", "path": "/etc" }), &cwd),
+            None
+        );
+        assert_eq!(
+            all.evaluate("Grep", &json!({ "pattern": "x", "path": ".." }), &cwd),
+            None
         );
     }
 

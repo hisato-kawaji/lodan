@@ -125,8 +125,9 @@ impl LlmClient for FallbackClient {
                 .chat_stream(history, tools, &self.fallback_model, sink)
                 .await;
         }
-        // 一時的な失敗は「sink に何も流していない」ことを含意するので、同じ sink を
-        // fallback に渡しても利用者に二重の本文は見えない。
+        // 一時的な失敗は「本文を sink に流していない」ことを含意するので、同じ sink を fallback に
+        // 渡しても利用者に二重の本文は見えない。思考過程は流れていることがあるので、やり直しで
+        // あることを受け手に伝える (表示と文字数を数え直させる)。
         match self
             .primary
             .chat_stream(history, tools, model, sink.clone())
@@ -134,6 +135,7 @@ impl LlmClient for FallbackClient {
         {
             Err(e) if is_transient(&e) => {
                 self.announce(&e);
+                let _ = sink.send(ChatEvent::AttemptRestarted);
                 let result = self
                     .fallback
                     .chat_stream(history, tools, &self.fallback_model, sink)
@@ -185,6 +187,7 @@ mod tests {
                     content: Some(format!("from {model}")),
                     tool_calls: Vec::new(),
                     usage: None,
+                    reasoning: None,
                 }),
                 Outcome::Transient => Err(TransientLlmError("HTTP 503".into()).into()),
                 Outcome::Permanent => Err(anyhow::anyhow!("LLM HTTP 401: bad key")),

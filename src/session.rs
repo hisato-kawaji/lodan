@@ -307,6 +307,7 @@ mod tests {
         history.push(Message::Assistant {
             content: Some("yo".into()),
             tool_calls: vec![],
+            reasoning_content: None,
         });
         rec.sync(&history).unwrap();
         assert_eq!(rec.persisted, 3);
@@ -334,6 +335,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: vec![tool_call("call_1", "Write")],
+                reasoning_content: None,
             },
             Message::Tool {
                 tool_call_id: "call_1".into(),
@@ -368,6 +370,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: vec![tool_call("call_1", "Bash")],
+                reasoning_content: None,
             },
         ];
         rec.sync(&history).unwrap();
@@ -397,6 +400,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: vec![tool_call("c1", "Read")],
+                reasoning_content: None,
             },
             // Tool 結果欠落のまま終端 → Assistant 手前で切る。
         ];
@@ -412,6 +416,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: vec![tool_call("c1", "Read"), tool_call("c2", "Grep")],
+                reasoning_content: None,
             },
             Message::Tool {
                 tool_call_id: "c1".into(),

@@ -42,6 +42,22 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     /// サーバが usage を返さない場合は `None` (呼び出し側で概算フォールバック)。
     pub usage: Option<Usage>,
+    /// モデルの思考過程 (`reasoning_content` / `reasoning`)。返さないサーバでは `None`。
+    pub reasoning: Option<String>,
+}
+
+tokio::task_local! {
+    static PLAN_MODE: bool;
+}
+
+/// `fut` の中の LLM 呼び出しを「プランモード中のもの」として扱う (`plan_reasoning_effort` が効く)。
+/// クライアントはモードを知らないので、呼び出し側が印を付ける (`metered::with_kind` と同じ方式)。
+pub async fn in_plan_mode<F: std::future::Future>(active: bool, fut: F) -> F::Output {
+    PLAN_MODE.scope(active, fut).await
+}
+
+pub fn plan_mode_active() -> bool {
+    PLAN_MODE.try_with(|active| *active).unwrap_or(false)
 }
 
 /// Streaming events emitted by `chat_stream`.
@@ -49,6 +65,11 @@ pub struct ChatResponse {
 pub enum ChatEvent {
     /// Incremental assistant text.
     TextDelta(String),
+    /// 思考過程の断片。本文より先に流れてくる。
+    ReasoningDelta(String),
+    /// 本文を出す前に切れたので、最初からやり直す (再試行、または fallback provider へ)。
+    /// ここまでに流した思考は捨てられた応答のもの — 受け手は数え直すこと。
+    AttemptRestarted,
     /// Final assembled response (sent once at the end).
     Done(ChatResponse),
 }

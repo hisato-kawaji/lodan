@@ -137,6 +137,8 @@ struct ProviderOverlay {
     context_window: Option<u64>,
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
+    plan_reasoning_effort: Option<String>,
+    reasoning_roundtrip: Option<bool>,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     max_retries: Option<u32>,
     retry_base_ms: Option<u64>,
@@ -155,6 +157,8 @@ impl ProviderOverlay {
             context_window,
             temperature,
             reasoning_effort,
+            plan_reasoning_effort,
+            reasoning_roundtrip,
             extra_body,
             max_retries,
             retry_base_ms,
@@ -168,6 +172,8 @@ impl ProviderOverlay {
             context_window: context_window.unwrap_or(base.context_window),
             temperature: temperature.or(base.temperature),
             reasoning_effort: reasoning_effort.or(base.reasoning_effort),
+            plan_reasoning_effort: plan_reasoning_effort.or(base.plan_reasoning_effort),
+            reasoning_roundtrip: reasoning_roundtrip.unwrap_or(base.reasoning_roundtrip),
             // レイヤー間の重ね合わせは `merge_table` がキー単位で済ませている (他のテーブルと同じ)。
             // 組み込みの既定値は常に空なので、ここは「書かれていればそれ」で足りる。
             extra_body: extra_body.unwrap_or_default(),
@@ -223,6 +229,13 @@ pub struct ProviderConfig {
     /// 値は検査しない — 受け付ける語彙はサーバとモデルごとに違う (#78)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// プランモード (`/plan`) の間だけ使う推論の深さ。未設定なら `reasoning_effort` のまま。
+    /// 調査と計画にだけ深い推論を使い、実行は軽く回す、という使い分けのため。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_reasoning_effort: Option<String>,
+    /// ツール往復の間、モデルの思考過程 (`reasoning_content`) を送り返す。既定 true。
+    /// 送り返された思考を拒否するサーバでは false にする。ターンを跨いだ思考はどちらでも送らない。
+    pub reasoning_roundtrip: bool,
     /// リクエスト body にそのまま足すサーバ固有のパラメータ
     /// (例: vLLM / llama.cpp の `chat_template_kwargs = { enable_thinking = false }`)。
     /// lodan 自身が組み立てるキー (`model` / `messages` / `tools` …) は書けない。
@@ -277,6 +290,8 @@ pub struct AgentConfig {
     /// 自動圧縮を発火するコンテキスト使用率 (`context_window` に対する %)。既定 80。
     /// 小さい窓のモデルでは、1 回のツール出力で残りを使い切る前に畳めるよう下げるとよい。
     pub auto_compact_percent: u8,
+    /// モデルの思考過程 (`reasoning_content`) を画面に全文流す。既定は畳んで長さだけ示す (#78)。
+    pub show_reasoning: bool,
     pub auto_approve: bool,
     /// ターン終了直前に 1 回だけ自己検証を促す (#63)。小型ローカルモデルの
     /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
@@ -352,6 +367,8 @@ impl ProviderConfig {
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
             reasoning_effort: None,
+            plan_reasoning_effort: None,
+            reasoning_roundtrip: true,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -368,6 +385,8 @@ impl ProviderConfig {
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
             reasoning_effort: None,
+            plan_reasoning_effort: None,
+            reasoning_roundtrip: true,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -386,6 +405,8 @@ impl ProviderConfig {
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
             reasoning_effort: None,
+            plan_reasoning_effort: None,
+            reasoning_roundtrip: true,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -404,6 +425,8 @@ impl ProviderConfig {
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
             reasoning_effort: None,
+            plan_reasoning_effort: None,
+            reasoning_roundtrip: true,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -419,6 +442,7 @@ impl Default for AgentConfig {
             max_requests: None,
             max_total_tokens: None,
             auto_compact_percent: DEFAULT_AUTO_COMPACT_PERCENT,
+            show_reasoning: false,
             auto_approve: false,
             finish_nudge: false,
             malformed_retry: true,
@@ -590,6 +614,10 @@ impl Config {
             self.permissions.deny.extend(o.disallowed_tools);
             mark("permissions.deny".into());
         }
+        if let Some(v) = o.show_reasoning {
+            self.agent.show_reasoning = v;
+            mark("agent.show_reasoning".into());
+        }
         if let Some(v) = o.parallel_tools {
             self.agent.parallel_tools = v;
             mark("agent.parallel_tools".into());
@@ -638,6 +666,7 @@ pub struct Overrides {
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,
     pub parallel_tools: Option<bool>,
+    pub show_reasoning: Option<bool>,
     pub sandbox: Option<crate::sandbox::SandboxMode>,
     pub sandbox_network: Option<bool>,
     pub max_requests: Option<u64>,

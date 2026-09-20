@@ -21,6 +21,8 @@ pub struct OpenAiClient {
     temperature: Option<f32>,
     /// None は送らない (サーバ既定)。値はそのまま渡す (#78)。
     reasoning_effort: Option<String>,
+    /// プランモードの間だけ `reasoning_effort` の代わりに使う値。
+    plan_reasoning_effort: Option<String>,
     /// body にそのまま足すサーバ固有のパラメータ。`new` で予約キーとの衝突を弾いてある。
     extra_body: serde_json::Map<String, serde_json::Value>,
     retry: RetryPolicy,
@@ -199,6 +201,10 @@ impl OpenAiClient {
                 .reasoning_effort
                 .clone()
                 .filter(|e| !e.trim().is_empty()),
+            plan_reasoning_effort: cfg
+                .plan_reasoning_effort
+                .clone()
+                .filter(|e| !e.trim().is_empty()),
             extra_body: cfg.extra_body.clone(),
             retry: RetryPolicy {
                 max_retries: cfg.max_retries,
@@ -208,6 +214,14 @@ impl OpenAiClient {
                 .then(|| Duration::from_secs(cfg.stream_idle_timeout_secs)),
             http,
         })
+    }
+
+    /// このリクエストに付ける推論の深さ。プランモードの呼び出しで、専用の値があればそちら。
+    fn effort(&self) -> Option<&str> {
+        self.plan_reasoning_effort
+            .as_deref()
+            .filter(|_| super::plan_mode_active())
+            .or(self.reasoning_effort.as_deref())
     }
 
     /// リクエストを送り、成功ステータスの応答を返す。接続エラーと再試行可能な
@@ -332,6 +346,18 @@ struct ChatMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<RawToolCall>,
+    /// 思考過程。DeepSeek / Moonshot / vLLM は `reasoning_content`、Ollama / OpenRouter は `reasoning`。
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+/// 2 通りの名前のうち、来ている方。空文字は「無い」と同じ。
+fn pick_reasoning(reasoning_content: Option<String>, reasoning: Option<String>) -> Option<String> {
+    reasoning_content
+        .filter(|s| !s.is_empty())
+        .or(reasoning.filter(|s| !s.is_empty()))
 }
 
 #[derive(Deserialize, Debug)]
@@ -366,7 +392,7 @@ impl LlmClient for OpenAiClient {
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens,
             temperature: self.temperature,
-            reasoning_effort: self.reasoning_effort.as_deref(),
+            reasoning_effort: self.effort(),
             stream: false,
             stream_options: None,
             extra: &self.extra_body,
@@ -409,10 +435,15 @@ impl LlmClient for OpenAiClient {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("LLM returned no choices"))?;
+        let ChatMessage {
+            content,
+            tool_calls: raw_calls,
+            reasoning_content,
+            reasoning,
+        } = choice.message;
+        let reasoning = pick_reasoning(reasoning_content, reasoning);
 
-        let tool_calls = choice
-            .message
-            .tool_calls
+        let tool_calls = raw_calls
             .into_iter()
             .enumerate()
             .map(|(i, tc)| ToolCall {
@@ -426,9 +457,10 @@ impl LlmClient for OpenAiClient {
             .collect();
 
         Ok(ChatResponse {
-            content: choice.message.content,
+            content,
             tool_calls,
             usage,
+            reasoning,
         })
     }
 
@@ -446,7 +478,7 @@ impl LlmClient for OpenAiClient {
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens: None,
             temperature: self.temperature,
-            reasoning_effort: self.reasoning_effort.as_deref(),
+            reasoning_effort: self.effort(),
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
@@ -457,6 +489,7 @@ impl LlmClient for OpenAiClient {
         let mut budget = RetryBudget::new(self.retry);
         let StreamParts {
             text_buf,
+            reasoning_buf,
             calls,
             usage,
         } = loop {
@@ -472,6 +505,10 @@ impl LlmClient for OpenAiClient {
                             .wait(&format!("stream interrupted: {:#}", f.error), None)
                             .await =>
                 {
+                    // 思考を流していたら、受け手に、やり直しであることを伝える。
+                    if f.emitted_reasoning {
+                        let _ = sink.send(ChatEvent::AttemptRestarted);
+                    }
                     continue;
                 }
                 // 本文を出す前の断は fallback が拾える。出した後は拾わせない (二重表示)。
@@ -505,6 +542,7 @@ impl LlmClient for OpenAiClient {
             },
             tool_calls,
             usage,
+            reasoning: (!reasoning_buf.is_empty()).then_some(reasoning_buf),
         };
         let _ = sink.send(ChatEvent::Done(resp));
         Ok(())
@@ -520,6 +558,7 @@ impl OpenAiClient {
     ) -> std::result::Result<StreamParts, StreamFailure> {
         let mut stream = resp.bytes_stream().eventsource();
         let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
         let mut calls: Vec<PartialCall> = Vec::new();
         let mut usage: Option<Usage> = None;
 
@@ -530,6 +569,7 @@ impl OpenAiClient {
                     Err(_) => {
                         return Err(StreamFailure {
                             emitted_text: !text_buf.is_empty(),
+                            emitted_reasoning: !reasoning_buf.is_empty(),
                             request_timed_out: false,
                             error: anyhow!("LLM stream idle for {}s", idle.as_secs()),
                         });
@@ -547,6 +587,7 @@ impl OpenAiClient {
                     );
                     return Err(StreamFailure {
                         emitted_text: !text_buf.is_empty(),
+                        emitted_reasoning: !reasoning_buf.is_empty(),
                         request_timed_out,
                         // eventsource の Error は source() を実装していないので、`{:#}` では
                         // 「Transport error: error decoding response body」で止まる。
@@ -572,6 +613,14 @@ impl OpenAiClient {
                 usage = Some(u.normalized());
             }
             for choice in chunk.choices {
+                // 思考は本文より先に流れてくる。ここで断が起きても「本文は未出力」のままなので、
+                // 再試行も fallback もこれまでどおり効く (思考の表示が重なるだけ)。
+                if let Some(r) =
+                    pick_reasoning(choice.delta.reasoning_content, choice.delta.reasoning)
+                {
+                    reasoning_buf.push_str(&r);
+                    let _ = sink.send(ChatEvent::ReasoningDelta(r));
+                }
                 if let Some(d) = choice.delta.content
                     && !d.is_empty()
                 {
@@ -604,6 +653,7 @@ impl OpenAiClient {
 
         Ok(StreamParts {
             text_buf,
+            reasoning_buf,
             calls,
             usage,
         })
@@ -612,13 +662,16 @@ impl OpenAiClient {
 
 struct StreamParts {
     text_buf: String,
+    reasoning_buf: String,
     calls: Vec<PartialCall>,
     usage: Option<Usage>,
 }
 
-/// ストリーム途中の失敗。`emitted_text` が false なら利用者には何も見えていない。
+/// ストリーム途中の失敗。`emitted_text` が false なら、利用者に**本文**は見えていない。
 struct StreamFailure {
     emitted_text: bool,
+    /// 思考過程は流していた (やり直すなら、受け手に数え直させる)。
+    emitted_reasoning: bool,
     /// リクエスト全体の `timeout_secs` を使い切った (idle timeout とは別物)。
     request_timed_out: bool,
     error: anyhow::Error,
@@ -663,6 +716,10 @@ struct StreamDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<StreamToolCall>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -978,6 +1035,131 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    /// 思考過程は `reasoning_content` (DeepSeek / Moonshot / vLLM) でも `reasoning` (Ollama /
+    /// OpenRouter) でも来る。本文とは別のイベントで流し、最終応答にまとめて載せる。
+    #[tokio::test]
+    async fn reasoning_is_streamed_apart_from_the_answer_under_either_field_name() {
+        for field in ["reasoning_content", "reasoning"] {
+            let sse = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"{field}\":\"let me \"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"{field}\":\"think\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"42\"}}}}]}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            let ok = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let (url, _hits) = scripted_server(vec![ok]).await;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            client(&url, 0)
+                .chat_stream(&[], &[], "m", tx)
+                .await
+                .unwrap();
+            let (mut thought, mut text, mut done) = (String::new(), String::new(), None);
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    ChatEvent::ReasoningDelta(d) => {
+                        assert!(text.is_empty(), "thinking comes before the answer");
+                        thought.push_str(&d);
+                    }
+                    ChatEvent::TextDelta(d) => text.push_str(&d),
+                    ChatEvent::AttemptRestarted => thought.clear(),
+                    ChatEvent::Done(r) => done = Some(r),
+                }
+            }
+            let done = done.unwrap();
+            assert_eq!(
+                (thought.as_str(), text.as_str()),
+                ("let me think", "42"),
+                "{field}"
+            );
+            assert_eq!(done.reasoning.as_deref(), Some("let me think"), "{field}");
+            assert_eq!(
+                done.content.as_deref(),
+                Some("42"),
+                "the answer does not contain the thinking"
+            );
+        }
+    }
+
+    /// 思考の途中で切れたストリームは送り直す (本文はまだ出していない)。受け手には、ここまでの
+    /// 思考が捨てられた応答のものだと伝える。最終応答の思考は、やり直した分だけ。
+    #[tokio::test]
+    async fn a_stream_cut_mid_reasoning_is_retried_and_the_receiver_is_told() {
+        let cut_body =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"0123456789\"}}]}\n\n";
+        // content-length を実際より長く名乗って、本文の前に接続が切れた形にする。
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{cut_body}",
+            cut_body.len() + 100
+        );
+        let good_body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"01234\"}}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        let good = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{good_body}",
+            good_body.len()
+        );
+        let (url, hits) = scripted_server(vec![cut, good]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        client(&url, 3)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap();
+        let mut kinds = Vec::new();
+        let mut done = None;
+        while let Some(ev) = rx.recv().await {
+            kinds.push(match &ev {
+                ChatEvent::ReasoningDelta(_) => "reasoning",
+                ChatEvent::AttemptRestarted => "restarted",
+                ChatEvent::TextDelta(_) => "text",
+                ChatEvent::Done(_) => "done",
+            });
+            if let ChatEvent::Done(r) = ev {
+                done = Some(r);
+            }
+        }
+        assert_eq!(
+            kinds,
+            ["reasoning", "restarted", "reasoning", "text", "done"]
+        );
+        assert_eq!(done.unwrap().reasoning.as_deref(), Some("01234"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_non_streamed_response_carries_its_reasoning_too() {
+        let body = r#"{"choices":[{"message":{"content":"42","reasoning_content":"6*7"}}]}"#;
+        let (url, _hits) = scripted_server(vec![http("200 OK", "", body)]).await;
+        let resp = client(&url, 0).chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(resp.reasoning.as_deref(), Some("6*7"));
+        // 思考を返さないサーバ (これまでの全て) では None のまま。
+        let (url, _hits) = scripted_server(vec![http("200 OK", "", OK_JSON)]).await;
+        let resp = client(&url, 0).chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(resp.reasoning, None);
+    }
+
+    /// プランモードの呼び出しでだけ、`plan_reasoning_effort` が `reasoning_effort` に取って代わる。
+    #[tokio::test]
+    async fn plan_mode_uses_its_own_effort_when_one_is_set() {
+        let mut cfg = ProviderConfig::default_local();
+        cfg.reasoning_effort = Some("low".into());
+        let plain = OpenAiClient::new(&cfg).unwrap();
+        cfg.plan_reasoning_effort = Some("high".into());
+        let planner = OpenAiClient::new(&cfg).unwrap();
+
+        assert_eq!(planner.effort(), Some("low"), "outside plan mode");
+        crate::llm::in_plan_mode(true, async {
+            assert_eq!(planner.effort(), Some("high"));
+            assert_eq!(plain.effort(), Some("low"), "no plan value: unchanged");
+        })
+        .await;
+        crate::llm::in_plan_mode(false, async {
+            assert_eq!(planner.effort(), Some("low"));
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn stream_retries_failed_status_then_streams() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n";
@@ -997,6 +1179,7 @@ mod tests {
         while let Some(ev) = rx.recv().await {
             match ev {
                 ChatEvent::TextDelta(d) => text.push_str(&d),
+                ChatEvent::ReasoningDelta(_) | ChatEvent::AttemptRestarted => {}
                 ChatEvent::Done(r) => done = Some(r),
             }
         }

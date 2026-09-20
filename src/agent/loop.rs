@@ -198,6 +198,9 @@ impl Session {
             Mode::Plan => format!("{PLAN_MODE_PREFIX}\n\n{user_input}"),
             Mode::Normal => user_input.to_string(),
         };
+        // 前のターンまでの思考過程は落とす。コンテキストを食うだけで、どのプロバイダも要求しない
+        // (DeepSeek は過去のターンの `reasoning_content` が入力にあると 400 を返す)。
+        drop_reasoning(&mut self.history);
         // hook が寄せた文脈は、利用者の言葉と区別がつく形で入力の後ろに添える。
         let content = match std::mem::take(&mut self.pending_context) {
             context if context.is_empty() => content,
@@ -256,8 +259,17 @@ impl Session {
                     _ => self.history.push(Message::User { content: reminder }),
                 }
             }
-            let resp =
-                stream_once(llm, &self.history, &specs, &self.cfg.llm.active().model).await?;
+            let resp = crate::llm::in_plan_mode(
+                self.mode == Mode::Plan,
+                stream_once(
+                    llm,
+                    &self.history,
+                    &specs,
+                    &self.cfg.llm.active().model,
+                    self.cfg.agent.show_reasoning,
+                ),
+            )
+            .await?;
             let (u, estimated) = resolve_usage(&resp, &self.history);
             self.usage.record(u, estimated);
             crate::runlog::record(
@@ -266,6 +278,7 @@ impl Session {
                     "turn": self.turn_seq,
                     "iter": iterations,
                     "text_chars": resp.content.as_deref().map(|t| t.chars().count()).unwrap_or(0),
+                    "reasoning_chars": resp.reasoning.as_deref().map(|t| t.chars().count()).unwrap_or(0),
                     "tool_calls": resp.tool_calls.iter().map(|c| c.function.name.as_str()).collect::<Vec<_>>(),
                     "prompt_tokens": u.prompt_tokens,
                     "completion_tokens": u.completion_tokens,
@@ -274,9 +287,16 @@ impl Session {
             );
 
             let tool_calls = resp.tool_calls.clone();
+            // 思考過程を持ち回るのは、ツール往復が続く間だけ。ツールを呼ばない応答はこのターンの
+            // 最後の発言なので、次のリクエスト (= 次のターン) には要らない。
+            let reasoning_content = resp
+                .reasoning
+                .clone()
+                .filter(|_| !tool_calls.is_empty() && self.cfg.llm.active().reasoning_roundtrip);
             self.history.push(Message::Assistant {
                 content: resp.content.clone(),
                 tool_calls: tool_calls.clone(),
+                reasoning_content,
             });
 
             if tool_calls.is_empty() {
@@ -1131,6 +1151,8 @@ fn resolve_usage(resp: &ChatResponse, prompt_messages: &[Message]) -> (Usage, bo
 pub(crate) fn estimate_usage(prompt_messages: &[Message], resp: &ChatResponse) -> Usage {
     let prompt_chars: u64 = prompt_messages.iter().map(message_chars).sum();
     let mut completion_chars: u64 = resp.content.as_deref().map_or(0, |c| c.chars().count()) as u64;
+    // thinking モデルでは生成のほとんどが思考。数えないと `max_total_tokens` が効かない。
+    completion_chars += resp.reasoning.as_deref().map_or(0, |r| r.chars().count()) as u64;
     for tc in &resp.tool_calls {
         completion_chars +=
             (tc.function.name.chars().count() + tc.function.arguments.chars().count()) as u64;
@@ -1152,8 +1174,11 @@ fn message_chars(m: &Message) -> u64 {
         Message::Assistant {
             content,
             tool_calls,
+            reasoning_content,
         } => {
             content.as_deref().map_or(0, |c| c.chars().count())
+                // 往復中の思考は、リクエストのたびに prompt として送り直している。
+                + reasoning_content.as_deref().map_or(0, |r| r.chars().count())
                 + tool_calls
                     .iter()
                     .map(|tc| {
@@ -1245,6 +1270,19 @@ fn strip_budget_reminders(history: &mut Vec<Message>) {
         }
         true
     });
+}
+
+/// 履歴から思考過程を取り除く。新しいターンの入口で呼ぶ (再開したセッションの transcript に残って
+/// いた分も、最初のターンでここを通って落ちる)。
+fn drop_reasoning(history: &mut [Message]) {
+    for message in history {
+        if let Message::Assistant {
+            reasoning_content, ..
+        } = message
+        {
+            *reasoning_content = None;
+        }
+    }
 }
 
 /// hook が寄せた文脈をモデルに渡すときの枠。利用者の言葉やツールの出力と取り違えさせない。
@@ -1467,6 +1505,7 @@ pub(crate) fn repair_interrupted_history(history: &mut Vec<Message>) {
         history.push(Message::Assistant {
             content: Some(INTERRUPT_NOTE.to_string()),
             tool_calls: vec![],
+            reasoning_content: None,
         });
     }
 }
@@ -1487,6 +1526,7 @@ pub(crate) fn render_for_summary(msgs: &[Message]) -> String {
             Message::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 out.push_str("ASSISTANT: ");
                 if let Some(c) = content {
@@ -1514,15 +1554,32 @@ async fn stream_once(
     history: &[Message],
     tools: &[crate::agent::messages::ToolSpec<'_>],
     model: &str,
+    show_reasoning: bool,
 ) -> Result<ChatResponse> {
     if crate::term::display_to_stderr() {
         // 機械可読な stdout を汚さない。待機インジケータは対話用なので出さない。
         let mut stderr = std::io::stderr();
-        return stream_once_to(llm, history, tools, model, &mut stderr, false).await;
+        let view = StreamView {
+            show_wait: false,
+            show_reasoning,
+        };
+        return stream_once_to(llm, history, tools, model, &mut stderr, view).await;
     }
     let mut stdout = std::io::stdout();
-    let show_wait = crate::term::is_terminal();
-    stream_once_to(llm, history, tools, model, &mut stdout, show_wait).await
+    let view = StreamView {
+        show_wait: crate::term::is_terminal(),
+        show_reasoning,
+    };
+    stream_once_to(llm, history, tools, model, &mut stdout, view).await
+}
+
+/// ストリームの見せ方。
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamView {
+    /// 最初のトークンが来るまで "…thinking" を出す (tty のときだけ)。
+    show_wait: bool,
+    /// モデルの思考過程を全文 (dim で) 流す。false なら畳んで、長さだけを 1 行で示す。
+    show_reasoning: bool,
 }
 
 /// `stream_once` の本体。出力先を差し替えられるようにしてある (テスト用)。
@@ -1532,8 +1589,9 @@ async fn stream_once_to(
     tools: &[crate::agent::messages::ToolSpec<'_>],
     model: &str,
     stdout: &mut dyn Write,
-    show_wait: bool,
+    view: StreamView,
 ) -> Result<ChatResponse> {
+    let show_wait = view.show_wait;
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     let send_fut = llm.chat_stream(history, tools, model, tx);
     tokio::pin!(send_fut);
@@ -1555,18 +1613,58 @@ async fn stream_once_to(
         }
     };
 
+    // 思考過程の表示。全文を流すか、畳んで本文の前に長さだけを示すか。
+    let mut thought_chars = 0usize;
+    let mut thought_closed = false;
+    let mut on_event = |ev: ChatEvent,
+                        stdout: &mut dyn Write,
+                        clear_wait: &mut dyn FnMut(&mut dyn Write),
+                        last_done: &mut Option<ChatResponse>| match ev {
+        ChatEvent::ReasoningDelta(s) => {
+            thought_chars += s.chars().count();
+            if view.show_reasoning {
+                clear_wait(stdout);
+                let _ = stdout.write_all(crate::term::dim(&crate::term::sanitize(&s)).as_bytes());
+                let _ = stdout.flush();
+            }
+        }
+        ChatEvent::TextDelta(s) => {
+            clear_wait(stdout);
+            if thought_chars > 0 && !thought_closed {
+                thought_closed = true;
+                if view.show_reasoning {
+                    let _ = stdout.write_all(b"\n");
+                } else if show_wait {
+                    let note = format!(
+                        "(thought for {thought_chars} chars — --show-reasoning to read it)"
+                    );
+                    let _ = writeln!(stdout, "{}", crate::term::dim(&note));
+                }
+            }
+            let _ = stdout.write_all(crate::term::sanitize(&s).as_bytes());
+            let _ = stdout.flush();
+        }
+        // 再試行 / fallback: ここまでの思考は捨てられた応答のもの。数え直す。
+        ChatEvent::AttemptRestarted => {
+            if view.show_reasoning && thought_chars > 0 {
+                let _ = writeln!(
+                    stdout,
+                    "\n{}",
+                    crate::term::dim("(interrupted — starting over)")
+                );
+            }
+            thought_chars = 0;
+        }
+        ChatEvent::Done(r) => *last_done = Some(r),
+    };
+
     loop {
         tokio::select! {
             // 正常/異常どちらの完了でもインジケータを消してから抜ける。
             res = &mut send_fut => { clear_wait(stdout); res?; break; }
             ev = rx.recv() => {
                 match ev {
-                    Some(ChatEvent::TextDelta(s)) => {
-                        clear_wait(stdout);
-                        let _ = stdout.write_all(crate::term::sanitize(&s).as_bytes());
-                        let _ = stdout.flush();
-                    }
-                    Some(ChatEvent::Done(r)) => last_done = Some(r),
+                    Some(ev) => on_event(ev, stdout, &mut clear_wait, &mut last_done),
                     None => break,
                 }
             }
@@ -1578,12 +1676,16 @@ async fn stream_once_to(
     // 本文デルタも拾う — 捨てると履歴には入るのに画面には出ない (速いサーバでは全文、
     // 通常でも応答の末尾が欠ける)。
     while let Ok(ev) = rx.try_recv() {
-        match ev {
-            ChatEvent::TextDelta(s) => {
-                let _ = stdout.write_all(crate::term::sanitize(&s).as_bytes());
-                let _ = stdout.flush();
-            }
-            ChatEvent::Done(r) => last_done = Some(r),
+        on_event(ev, stdout, &mut clear_wait, &mut last_done);
+    }
+    // 本文が 1 文字も来なかった応答 (thinking モデルでは「ツールを呼ぶだけ」の応答がこれで、
+    // 思考はむしろ一番長い) でも、考えていたことは示す。
+    if thought_chars > 0 && !thought_closed {
+        if view.show_reasoning {
+            let _ = stdout.write_all(b"\n");
+        } else if show_wait {
+            let note = format!("(thought for {thought_chars} chars — --show-reasoning to read it)");
+            let _ = writeln!(stdout, "{}", crate::term::dim(&note));
         }
     }
 
@@ -1711,6 +1813,7 @@ mod tests {
                 content: Some("alpha beta".into()),
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning: None,
             }));
             Ok(())
         }
@@ -1748,6 +1851,7 @@ mod tests {
                 content: Some(ESCAPE_ATTACK.into()),
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning: None,
             }));
             Ok(())
         }
@@ -1767,7 +1871,7 @@ mod tests {
     #[tokio::test]
     async fn streamed_text_is_defused_on_screen_but_kept_verbatim_for_the_model() {
         let mut out = Vec::new();
-        let resp = stream_once_to(&EscapeLlm, &[], &[], "m", &mut out, false)
+        let resp = stream_once_to(&EscapeLlm, &[], &[], "m", &mut out, StreamView::default())
             .await
             .unwrap();
         let shown = String::from_utf8(out).unwrap();
@@ -1786,11 +1890,312 @@ mod tests {
     #[tokio::test]
     async fn stream_once_prints_deltas_still_queued_when_the_sender_finishes() {
         let mut out = Vec::new();
-        let resp = stream_once_to(&BurstLlm, &[], &[], "m", &mut out, false)
+        let resp = stream_once_to(&BurstLlm, &[], &[], "m", &mut out, StreamView::default())
             .await
             .unwrap();
         assert_eq!(resp.content.as_deref(), Some("alpha beta"));
         assert_eq!(String::from_utf8(out).unwrap(), "alpha beta");
+    }
+
+    /// 思考 → 本文の順に流す LLM。
+    struct ThinkingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for ThinkingLlm {
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            _: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("stream_once only streams")
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            for part in ["six times ", "seven\x1b[2K"] {
+                let _ = sink.send(ChatEvent::ReasoningDelta(part.to_string()));
+            }
+            let _ = sink.send(ChatEvent::TextDelta("42".to_string()));
+            let _ = sink.send(ChatEvent::Done(ChatResponse {
+                content: Some("42".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning: Some("six times seven".into()),
+            }));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_is_folded_by_default_and_shown_in_full_on_request() {
+        // パイプ (tty でない) では、畳んだ思考は 1 バイトも出さない。
+        let mut piped = Vec::new();
+        stream_once_to(
+            &ThinkingLlm,
+            &[],
+            &[],
+            "m",
+            &mut piped,
+            StreamView::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(piped).unwrap(), "42");
+
+        // 端末では、本文の前に長さだけを 1 行で示す。
+        let mut folded = Vec::new();
+        let tty = StreamView {
+            show_wait: true,
+            show_reasoning: false,
+        };
+        stream_once_to(&ThinkingLlm, &[], &[], "m", &mut folded, tty)
+            .await
+            .unwrap();
+        let folded = String::from_utf8(folded).unwrap();
+        assert!(folded.contains("(thought for 19 chars"), "{folded:?}");
+        assert!(!folded.contains("six times"), "{folded:?}");
+        assert!(folded.trim_end().ends_with("42"), "{folded:?}");
+
+        // `--show-reasoning`: 全文を流す。モデルの書いた文字列なので無害化する。
+        let mut full = Vec::new();
+        let shown = StreamView {
+            show_wait: false,
+            show_reasoning: true,
+        };
+        stream_once_to(&ThinkingLlm, &[], &[], "m", &mut full, shown)
+            .await
+            .unwrap();
+        let full = String::from_utf8(full).unwrap();
+        assert!(
+            full.contains("six times ") && full.contains("seven\\u{1b}[2K"),
+            "{full:?}"
+        );
+        assert!(
+            !full.contains("seven\x1b[2K"),
+            "raw escape from the model: {full:?}"
+        );
+        assert!(full.ends_with("\n42"), "{full:?}");
+    }
+
+    /// 決まったイベント列を流すだけの LLM。
+    struct EventsLlm(Vec<ChatEvent>);
+
+    #[async_trait::async_trait]
+    impl LlmClient for EventsLlm {
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            _: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("stream_once only streams")
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            for event in &self.0 {
+                let _ = sink.send(event.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn done(content: Option<&str>, reasoning: &str) -> ChatEvent {
+        ChatEvent::Done(ChatResponse {
+            content: content.map(str::to_string),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning: Some(reasoning.to_string()),
+        })
+    }
+
+    async fn on_a_tty(events: Vec<ChatEvent>) -> String {
+        let mut out = Vec::new();
+        let tty = StreamView {
+            show_wait: true,
+            show_reasoning: false,
+        };
+        stream_once_to(&EventsLlm(events), &[], &[], "m", &mut out, tty)
+            .await
+            .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// thinking モデルの「ツールを呼ぶだけ」の応答は本文が 1 文字も無い。思考は一番長いのに、
+    /// 本文の到着を合図にしていると何も表示されない (実モデルで 257 文字の思考が無表示だった)。
+    #[tokio::test]
+    async fn a_response_with_no_text_still_says_that_the_model_thought() {
+        let shown = on_a_tty(vec![
+            ChatEvent::ReasoningDelta("which file? ".into()),
+            ChatEvent::ReasoningDelta("note.txt".into()),
+            done(None, "which file? note.txt"),
+        ])
+        .await;
+        assert!(shown.contains("(thought for 20 chars"), "{shown:?}");
+    }
+
+    /// 思考の途中で切れてやり直した応答では、捨てられた分を数えない。
+    #[tokio::test]
+    async fn a_restarted_attempt_does_not_inflate_the_thought_count() {
+        let shown = on_a_tty(vec![
+            ChatEvent::ReasoningDelta("0123456789".into()),
+            ChatEvent::AttemptRestarted,
+            ChatEvent::ReasoningDelta("01234".into()),
+            ChatEvent::TextDelta("ok".into()),
+            done(Some("ok"), "01234"),
+        ])
+        .await;
+        assert!(shown.contains("(thought for 5 chars"), "{shown:?}");
+        assert_eq!(shown.matches("thought for").count(), 1, "{shown:?}");
+    }
+
+    /// usage を返さないサーバでは文字数から概算する。thinking モデルの生成はほとんどが思考なので、
+    /// 数えないと `max_total_tokens` が効かない。往復中の思考は prompt の側にも乗る。
+    #[test]
+    fn the_usage_estimate_counts_reasoning_on_both_sides() {
+        let thinking = ChatResponse {
+            content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning: Some("x".repeat(300)),
+        };
+        assert_eq!(estimate_usage(&[], &thinking).completion_tokens, 100);
+
+        let in_flight = [Message::Assistant {
+            content: None,
+            tool_calls: Vec::new(),
+            reasoning_content: Some("y".repeat(30)),
+        }];
+        let plain = ChatResponse {
+            reasoning: None,
+            ..thinking
+        };
+        assert_eq!(estimate_usage(&in_flight, &plain).prompt_tokens, 10);
+    }
+
+    /// 思考つきでツールを 1 回呼び、次の応答で答える LLM。送られてきた履歴を記録する。
+    struct ThinkThenCallLlm {
+        seen: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ThinkThenCallLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("not used")
+        }
+
+        async fn chat_stream(
+            &self,
+            history: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(history.to_vec());
+            // 奇数回目の呼び出しはツールを呼び、偶数回目は答える。
+            let resp = if seen.len() % 2 == 1 {
+                ChatResponse {
+                    content: None,
+                    tool_calls: vec![tool_call_with_args("c1", "Ser", r#"{"n": 1}"#)],
+                    usage: None,
+                    reasoning: Some("I should probe first".into()),
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning: Some("the probe said 1".into()),
+                }
+            };
+            let _ = sink.send(ChatEvent::Done(resp));
+            Ok(())
+        }
+    }
+
+    fn reasoning_in(history: &[Message]) -> Vec<&str> {
+        history
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant {
+                    reasoning_content: Some(r),
+                    ..
+                } => Some(r.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reasoning_goes_back_during_the_tool_round_trip_and_is_dropped_at_the_next_turn() {
+        let llm = ThinkThenCallLlm {
+            seen: Default::default(),
+        };
+        let (mut session, _stats) = probe_session(Config::default());
+        let gate = PermissionGate::new(true);
+        session.run_turn("first", &llm, &gate).await.unwrap();
+        session.run_turn("second", &llm, &gate).await.unwrap();
+
+        // 持ち回るのはツールを呼んだ応答の思考だけ。答えた応答の思考 ("the probe said 1") は、
+        // 次のリクエストが次のターンなので、最初から履歴に入れない。
+        assert_eq!(reasoning_in(session.history()), ["I should probe first"]);
+
+        let seen = llm.seen.lock().unwrap();
+        assert!(reasoning_in(&seen[0]).is_empty());
+        // ツール結果を返すリクエストには、そのツールを呼んだときの思考が付いている。
+        assert_eq!(reasoning_in(&seen[1]), ["I should probe first"]);
+        // 次のターンの最初のリクエスト: 前のターンの思考は 1 つも残っていない。
+        assert!(
+            reasoning_in(&seen[2]).is_empty(),
+            "{:?}",
+            reasoning_in(&seen[2])
+        );
+        // 2 ターン目のツール往復では、そのターンの思考だけ。
+        assert_eq!(reasoning_in(&seen[3]), ["I should probe first"]);
+        assert_eq!(
+            seen[3]
+                .iter()
+                .filter(|m| matches!(m, Message::Assistant { .. }))
+                .count(),
+            3,
+            "the earlier assistant messages are still there, just without their reasoning"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_is_never_sent_back_when_the_provider_is_told_not_to() {
+        let llm = ThinkThenCallLlm {
+            seen: Default::default(),
+        };
+        let mut cfg = Config::default();
+        cfg.llm.local.reasoning_roundtrip = false;
+        let (mut session, _stats) = probe_session(cfg);
+        session
+            .run_turn("first", &llm, &PermissionGate::new(true))
+            .await
+            .unwrap();
+        let seen = llm.seen.lock().unwrap();
+        assert!(seen.iter().all(|h| reasoning_in(h).is_empty()));
     }
 
     #[test]
@@ -1840,6 +2245,7 @@ mod tests {
                 content: Some(self.text.clone()),
                 tool_calls: vec![],
                 usage: self.usage,
+                reasoning: None,
             })
         }
 
@@ -1854,6 +2260,7 @@ mod tests {
                 content: Some(self.text.clone()),
                 tool_calls: vec![],
                 usage: self.usage,
+                reasoning: None,
             }));
             Ok(())
         }
@@ -2084,12 +2491,14 @@ mod tests {
                             &format!(r#"{{"n": {n}}}"#),
                         )],
                         usage: None,
+                        reasoning: None,
                     }
                 } else {
                     ChatResponse {
                         content: Some("done".into()),
                         tool_calls: vec![],
                         usage: None,
+                        reasoning: None,
                     }
                 };
                 let _ = sink.send(ChatEvent::Done(resp));
@@ -2313,6 +2722,7 @@ mod tests {
                 content: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             }));
             Ok(())
         }
@@ -2358,12 +2768,14 @@ mod tests {
                     content: None,
                     tool_calls: self.calls.clone(),
                     usage: None,
+                    reasoning: None,
                 }
             } else {
                 ChatResponse {
                     content: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
+                    reasoning: None,
                 }
             };
             let _ = sink.send(ChatEvent::Done(resp));
@@ -3436,6 +3848,7 @@ mod tests {
                 content: Some(self.texts[i].clone()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             }));
             Ok(())
         }
@@ -3886,6 +4299,7 @@ mod tests {
             content: Some("abcd".into()), // 4 chars → 2 tokens (切り上げ)
             tool_calls: vec![],
             usage: None,
+            reasoning: None,
         };
         let u = estimate_usage(&history, &resp);
         assert_eq!(u.prompt_tokens, 3);
@@ -3947,6 +4361,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: vec![tool_call("a"), tool_call("b")],
+                reasoning_content: None,
             },
             Message::Tool {
                 tool_call_id: "a".into(),
@@ -3979,6 +4394,7 @@ mod tests {
             Message::Assistant {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
             },
         ];
         repair_interrupted_history(&mut h);

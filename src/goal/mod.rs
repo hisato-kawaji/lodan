@@ -437,6 +437,7 @@ mod tests {
                 content: Some(v.to_string()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             })
         }
 
@@ -451,6 +452,7 @@ mod tests {
                 content: Some("working on it".to_string()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             }));
             Ok(())
         }

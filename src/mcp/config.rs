@@ -70,6 +70,10 @@ pub enum Transport<'a> {
 impl McpServersConfig {
     /// Read `$CWD/.mcp.json` if it exists. Returns `Ok(None)` when absent.
     pub fn load_from_cwd() -> Result<Option<Self>> {
+        // `.mcp.json` は任意のプロセスを起動する。信頼していないディレクトリのものは読まない (#75)。
+        if !crate::trust::project_trusted() {
+            return Ok(None);
+        }
         let cwd = std::env::current_dir().context("getting cwd")?;
         Self::load_from(&cwd.join(".mcp.json"))
     }

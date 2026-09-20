@@ -78,6 +78,9 @@ fn lodan(home: &Path, port: u16, args: &[&str], stdin: Stdin) -> Output {
         .env_clear()
         .env("HOME", home)
         // 接続先は env で渡す。テスト側が `--provider` などのフラグで上書きできるように。
+        // テストが cwd に置く `.lodan/config.toml` を読ませる。未信頼の挙動を見るテストは
+        // `--trust=false` で打ち消す (フラグは env より優先)。
+        .env("LODAN_TRUST", "1")
         .env("LODAN_PROVIDER", "local")
         .env("LODAN_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -658,4 +661,112 @@ fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
         v["result"], HOSTILE_TEXT,
         "the JSON result carries the model's exact text"
     );
+}
+
+#[test]
+fn an_untrusted_directory_contributes_no_project_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(work.join(".lodan")).unwrap();
+    // 信頼されていれば 2 回で打ち切られ (exit 3)、hook がファイルを作り、MCP サーバが起動する設定。
+    let marker = home.path().join("hook-ran");
+    std::fs::write(
+        work.join(".lodan/config.toml"),
+        format!(
+            "[agent]\nmax_iterations = 2\n\n[permissions]\nmode = \"bypass\"\n\n[[hooks]]\nevent = \"SessionStart\"\ncommand = \"touch {}\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        work.join(".mcp.json"),
+        r#"{"mcpServers":{"x":{"command":"false"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(work.join("CLAUDE.md"), "PROJECT-MEMORY-MARKER").unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let server = start_mock(&demo);
+
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--trust=false",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    // max_iterations = 2 が効いていれば exit 3。効いていないので demo は最後まで進む。
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists(), "a hook from an untrusted directory ran");
+    // `mode = "bypass"` も効いていない: 破壊的ツールは拒否され、ファイルは作られない。
+    assert!(!demo.join("hello.txt").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a trusted directory"), "{stderr}");
+    for ignored in [".lodan/config.toml", ".mcp.json", "CLAUDE.md"] {
+        assert!(
+            stderr.contains(ignored),
+            "the notice should name {ignored}: {stderr}"
+        );
+    }
+    // stdout は契約のまま (通知は stderr だけ)。
+    for line in stdout(&out).lines() {
+        serde_json::from_str::<serde_json::Value>(line).expect("every stdout line is JSON");
+    }
+}
+
+#[test]
+fn trusting_the_directory_makes_the_same_settings_apply() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(work.join(".lodan")).unwrap();
+    let marker = home.path().join("hook-ran");
+    std::fs::write(
+        work.join(".lodan/config.toml"),
+        format!(
+            "[[hooks]]\nevent = \"SessionStart\"\ncommand = \"touch {}\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let server = start_mock(home.path());
+    // 記録による信頼: `lodan trust` を実行してから、フラグなしで走らせる。
+    let trust = lodan(
+        home.path(),
+        server.port,
+        &["--trust=false", "trust"],
+        Stdin::OpenAndSilent,
+    );
+    assert!(
+        trust.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trust.stderr)
+    );
+    let out = lodan(
+        home.path(),
+        server.port,
+        &["--trust=false", "-p", "hi"],
+        Stdin::OpenAndSilent,
+    );
+    assert!(out.status.success());
+    assert!(
+        marker.exists(),
+        "a recorded trust decision should let the hook run"
+    );
+
+    let listed = lodan(
+        home.path(),
+        server.port,
+        &["trust", "--list"],
+        Stdin::OpenAndSilent,
+    );
+    assert!(stdout(&listed).contains("work"), "{}", stdout(&listed));
 }

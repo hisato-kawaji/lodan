@@ -27,6 +27,18 @@ const REMINDER_PERCENT: u64 = 80;
 
 tokio::task_local! {
     static KIND: &'static str;
+    /// いま実行中の呼び出しが載っている台帳。クライアントの内側の再試行が、送り直しを
+    /// 同じ台帳に申告するためのもの。
+    static LEDGER: Arc<Ledger>;
+}
+
+/// 再試行で**もう 1 件送る前**に呼ぶ。送り直しもプロバイダの側では 1 リクエストなので、
+/// 台帳に数え、予算が残っていなければ `false` (= 再試行しない)。計上の外で使われている
+/// クライアントでは常に `true`。
+pub fn admit_retry() -> bool {
+    LEDGER
+        .try_with(|ledger| ledger.admit().is_ok())
+        .unwrap_or(true)
 }
 
 /// `fut` の中から行われる LLM 呼び出しを `kind` として計上する。
@@ -168,8 +180,11 @@ impl Ledger {
             return None;
         }
         let tokens = total(&state.by_kind).total_tokens;
+        // u64 のまま掛けると、巨大な上限 (`--max-requests 18446744073709551615`) であふれる。
         let near = |used: u64, limit: Option<u64>| {
-            limit.is_some_and(|l| l > 0 && used * 100 >= l * REMINDER_PERCENT)
+            limit.is_some_and(|l| {
+                l > 0 && u128::from(used) * 100 >= u128::from(l) * u128::from(REMINDER_PERCENT)
+            })
         };
         let mut parts = Vec::new();
         if near(state.requests, self.budget.max_requests) {
@@ -199,10 +214,17 @@ impl Ledger {
     /// `/cost` 用の表示。
     pub fn describe(&self) -> String {
         let state = self.state();
-        if state.requests == 0 {
-            return "no LLM calls yet".to_string();
-        }
         let all = total(&state.by_kind);
+        let limit = |used: u64, limit: Option<u64>, what: &str| {
+            limit.map(|l| format!("\nbudget: {used} / {l} {what}"))
+        };
+        if state.requests == 0 {
+            // まだ何も送っていなくても、設定した予算は見せる。
+            let mut out = "no LLM calls yet".to_string();
+            out.extend(limit(0, self.budget.max_requests, "requests"));
+            out.extend(limit(0, self.budget.max_total_tokens, "tokens"));
+            return out;
+        }
         let mut out = format!(
             "tokens: {} total (prompt {} + completion {}) across {} LLM request(s)",
             all.total_tokens, all.prompt_tokens, all.completion_tokens, state.requests
@@ -228,9 +250,6 @@ impl Ledger {
                 crate::agent::r#loop::ESTIMATE_CHARS_PER_TOKEN
             ));
         }
-        let limit = |used: u64, limit: Option<u64>, what: &str| {
-            limit.map(|l| format!("\nbudget: {used} / {l} {what}"))
-        };
         out.extend(limit(state.requests, self.budget.max_requests, "requests"));
         out.extend(limit(
             all.total_tokens,
@@ -279,7 +298,12 @@ impl LlmClient for MeteredClient {
         max_tokens: Option<u32>,
     ) -> Result<ChatResponse> {
         self.ledger.admit()?;
-        let resp = self.inner.chat(history, tools, model, max_tokens).await?;
+        let resp = LEDGER
+            .scope(
+                self.ledger.clone(),
+                self.inner.chat(history, tools, model, max_tokens),
+            )
+            .await?;
         self.record(history, &resp);
         Ok(resp)
     }
@@ -303,7 +327,11 @@ impl LlmClient for MeteredClient {
                 let _ = sink.send(event);
             }
         };
-        let (result, ()) = tokio::join!(self.inner.chat_stream(history, tools, model, tx), forward);
+        let inner = LEDGER.scope(
+            self.ledger.clone(),
+            self.inner.chat_stream(history, tools, model, tx),
+        );
+        let (result, ()) = tokio::join!(inner, forward);
         result
     }
 }
@@ -488,5 +516,13 @@ mod tests {
 
         let unlimited = Ledger::new(Budget::default());
         assert_eq!(unlimited.take_reminder(), None);
+
+        // 巨大な上限でも掛け算があふれない。
+        let huge = Ledger::new(Budget {
+            max_requests: Some(u64::MAX),
+            max_total_tokens: Some(u64::MAX),
+        });
+        huge.admit().unwrap();
+        assert_eq!(huge.take_reminder(), None);
     }
 }

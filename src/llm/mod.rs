@@ -100,6 +100,8 @@ pub fn build_metered(cfg: &Config) -> Result<(Arc<dyn LlmClient>, Arc<metered::L
     Ok((client, ledger))
 }
 
+/// 計上なしのクライアント。**本体では使わない** (使用量も予算も効かなくなる) — `build_metered` を使うこと。
+/// 台帳を持たないテスト用に残してある。
 pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
     build_with(cfg, &|inner| inner)
 }

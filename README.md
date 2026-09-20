@@ -147,9 +147,10 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
   `extra_body` のキーはリクエスト body のトップレベルにそのまま足される。lodan 自身が組み立てるキー(`model` / `messages` / `tools` / `tool_choice` / `max_tokens` / `temperature` / `reasoning_effort` / `stream` / `stream_options`)を書くと、そのプロバイダは使えない（有効な provider なら起動時エラー。fallback provider なら警告を出して fallback 無しで続行する — fallback の他の設定不備と同じ扱い）。設定ファイルのレイヤー間では、他のテーブルと同じく**キー単位で重なる**（後段が同じキーを上書きし、書かなかったキーは残る）。`lodan config` は `extra_body` の中身をそのまま表示するので、秘密の値は置かないこと（`api_key` のマスクと合わせて #88 で扱う）。どちらも未設定なら、リクエスト body は 1 バイトも変わらない。`--log-jsonl` の `run_start` に `reasoning_effort` が残る。
 - **思考過程（`reasoning_content`）の扱い**: thinking 系のモデルが本文とは別に返す思考過程（`reasoning_content`。Ollama / OpenRouter は `reasoning`）を受け取り、
-  - **ツール往復の間は送り返す**（同じターンの中で、ツール結果を返すリクエストに、そのツールを呼んだときの思考を付ける。Moonshot / DeepSeek 系はこれが無いと続きの推論の質が落ちる）。**次の利用者の入力が来たら全て落とす** — 過去のターンの思考はコンテキストを食うだけで、どのプロバイダも要求しない（DeepSeek は入力に残っていると 400 を返す）。送り返された思考を受け付けないサーバでは `[llm.<provider>] reasoning_roundtrip = false`。
-  - **画面では畳む**: 端末では本文の前に `(thought for 1234 chars — --show-reasoning to read it)` とだけ出す。`--show-reasoning`（`[agent] show_reasoning = true`、`LODAN_SHOW_REASONING`）で全文を薄い色で流す。`-p` の stdout（最終応答）には思考は入らない。
+  - **ツール往復の間は送り返す**（同じターンの中で、ツール結果を返すリクエストに、そのツールを呼んだときの思考を付ける。Moonshot / DeepSeek 系はこれが無いと続きの推論の質が落ちる）。**次の利用者の入力が来たら全て落とす** — 過去のターンの思考はコンテキストを食うだけで、どのプロバイダも要求しない（DeepSeek は入力に残っていると 400 を返す — [DeepSeek の reasoning model の説明](https://api-docs.deepseek.com/guides/reasoning_model)）。`Task` のサブエージェントも、自分のツール往復で同じように送り返す。送り返された思考を受け付けないサーバでは `[llm.<provider>] reasoning_roundtrip = false`。
+  - **画面では畳む**: 端末では `(thought for 1234 chars — --show-reasoning to read it)` とだけ出す（本文があればその前に、ツールを呼ぶだけで本文の無い応答ならその応答の終わりに）。思考の途中で切れて再試行・fallback した場合は、捨てられた分は数えない。`--show-reasoning`（`[agent] show_reasoning = true`、`LODAN_SHOW_REASONING`）で全文を薄い色で流す。`-p` の stdout（最終応答）には思考は入らない。
   - **プランモードだけ深く考えさせる**: `[llm.<provider>] plan_reasoning_effort = "high"` を書くと、`/plan` の間の呼び出しだけ `reasoning_effort` の代わりにこの値を送る（調査と計画は深く、実行は軽く）。
+  - usage を返さないサーバ向けの文字数概算は思考も数える（thinking モデルの生成はほとんどが思考で、数えないと `max_total_tokens` が効かない）。`--log-jsonl` の `llm_response` に `reasoning_chars`、`run_start` に `plan_reasoning_effort` が残る。
   - 思考過程を返さないサーバでは何も変わらない（リクエスト body も transcript もこれまでと同じ。古い transcript もそのまま `--resume` できる）。
 - **壊れツールコールの再要求**: tool_calls が空なのに応答テキストへ呼び出しの痕跡(`<function=`、`call:Name{…}`、`<|tool_call` 等)が漏れている場合、「正しい tool call として再発行せよ」と自動で注入してターンを継続する(1 ターン 2 回まで)。
 - **重複呼び出しの抑止**: 直前と完全同一(名前 + 引数)の **read-only** 呼び出しは実行せず「結果は不変。別の行動を」と返す(同一ファイルを延々 Read するループ対策)。Bash 再実行など破壊系の正当な繰り返しは対象外。

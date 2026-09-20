@@ -334,6 +334,7 @@ fn init_runlog(path: Option<&std::path::Path>, stream_json: bool, cfg: Option<&C
             "provider": cfg.map(|c| c.llm.provider.as_str()),
             "model": cfg.map(|c| c.llm.active().model.as_str()),
             "reasoning_effort": cfg.and_then(|c| c.llm.active().reasoning_effort.as_deref()),
+            "plan_reasoning_effort": cfg.and_then(|c| c.llm.active().plan_reasoning_effort.as_deref()),
             "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
         }),
     );

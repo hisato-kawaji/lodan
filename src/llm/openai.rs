@@ -505,6 +505,10 @@ impl LlmClient for OpenAiClient {
                             .wait(&format!("stream interrupted: {:#}", f.error), None)
                             .await =>
                 {
+                    // 思考を流していたら、受け手に、やり直しであることを伝える。
+                    if f.emitted_reasoning {
+                        let _ = sink.send(ChatEvent::AttemptRestarted);
+                    }
                     continue;
                 }
                 // 本文を出す前の断は fallback が拾える。出した後は拾わせない (二重表示)。
@@ -565,6 +569,7 @@ impl OpenAiClient {
                     Err(_) => {
                         return Err(StreamFailure {
                             emitted_text: !text_buf.is_empty(),
+                            emitted_reasoning: !reasoning_buf.is_empty(),
                             request_timed_out: false,
                             error: anyhow!("LLM stream idle for {}s", idle.as_secs()),
                         });
@@ -582,6 +587,7 @@ impl OpenAiClient {
                     );
                     return Err(StreamFailure {
                         emitted_text: !text_buf.is_empty(),
+                        emitted_reasoning: !reasoning_buf.is_empty(),
                         request_timed_out,
                         // eventsource の Error は source() を実装していないので、`{:#}` では
                         // 「Transport error: error decoding response body」で止まる。
@@ -661,9 +667,11 @@ struct StreamParts {
     usage: Option<Usage>,
 }
 
-/// ストリーム途中の失敗。`emitted_text` が false なら利用者には何も見えていない。
+/// ストリーム途中の失敗。`emitted_text` が false なら、利用者に**本文**は見えていない。
 struct StreamFailure {
     emitted_text: bool,
+    /// 思考過程は流していた (やり直すなら、受け手に数え直させる)。
+    emitted_reasoning: bool,
     /// リクエスト全体の `timeout_secs` を使い切った (idle timeout とは別物)。
     request_timed_out: bool,
     error: anyhow::Error,
@@ -1056,6 +1064,7 @@ mod tests {
                         thought.push_str(&d);
                     }
                     ChatEvent::TextDelta(d) => text.push_str(&d),
+                    ChatEvent::AttemptRestarted => thought.clear(),
                     ChatEvent::Done(r) => done = Some(r),
                 }
             }
@@ -1072,6 +1081,50 @@ mod tests {
                 "the answer does not contain the thinking"
             );
         }
+    }
+
+    /// 思考の途中で切れたストリームは送り直す (本文はまだ出していない)。受け手には、ここまでの
+    /// 思考が捨てられた応答のものだと伝える。最終応答の思考は、やり直した分だけ。
+    #[tokio::test]
+    async fn a_stream_cut_mid_reasoning_is_retried_and_the_receiver_is_told() {
+        let cut_body =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"0123456789\"}}]}\n\n";
+        // content-length を実際より長く名乗って、本文の前に接続が切れた形にする。
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{cut_body}",
+            cut_body.len() + 100
+        );
+        let good_body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"01234\"}}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        let good = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{good_body}",
+            good_body.len()
+        );
+        let (url, hits) = scripted_server(vec![cut, good]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        client(&url, 3)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap();
+        let mut kinds = Vec::new();
+        let mut done = None;
+        while let Some(ev) = rx.recv().await {
+            kinds.push(match &ev {
+                ChatEvent::ReasoningDelta(_) => "reasoning",
+                ChatEvent::AttemptRestarted => "restarted",
+                ChatEvent::TextDelta(_) => "text",
+                ChatEvent::Done(_) => "done",
+            });
+            if let ChatEvent::Done(r) = ev {
+                done = Some(r);
+            }
+        }
+        assert_eq!(
+            kinds,
+            ["reasoning", "restarted", "reasoning", "text", "done"]
+        );
+        assert_eq!(done.unwrap().reasoning.as_deref(), Some("01234"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1126,7 +1179,7 @@ mod tests {
         while let Some(ev) = rx.recv().await {
             match ev {
                 ChatEvent::TextDelta(d) => text.push_str(&d),
-                ChatEvent::ReasoningDelta(_) => {}
+                ChatEvent::ReasoningDelta(_) | ChatEvent::AttemptRestarted => {}
                 ChatEvent::Done(r) => done = Some(r),
             }
         }

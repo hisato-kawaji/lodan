@@ -278,6 +278,7 @@ impl Session {
                     "turn": self.turn_seq,
                     "iter": iterations,
                     "text_chars": resp.content.as_deref().map(|t| t.chars().count()).unwrap_or(0),
+                    "reasoning_chars": resp.reasoning.as_deref().map(|t| t.chars().count()).unwrap_or(0),
                     "tool_calls": resp.tool_calls.iter().map(|c| c.function.name.as_str()).collect::<Vec<_>>(),
                     "prompt_tokens": u.prompt_tokens,
                     "completion_tokens": u.completion_tokens,
@@ -1150,6 +1151,8 @@ fn resolve_usage(resp: &ChatResponse, prompt_messages: &[Message]) -> (Usage, bo
 pub(crate) fn estimate_usage(prompt_messages: &[Message], resp: &ChatResponse) -> Usage {
     let prompt_chars: u64 = prompt_messages.iter().map(message_chars).sum();
     let mut completion_chars: u64 = resp.content.as_deref().map_or(0, |c| c.chars().count()) as u64;
+    // thinking モデルでは生成のほとんどが思考。数えないと `max_total_tokens` が効かない。
+    completion_chars += resp.reasoning.as_deref().map_or(0, |r| r.chars().count()) as u64;
     for tc in &resp.tool_calls {
         completion_chars +=
             (tc.function.name.chars().count() + tc.function.arguments.chars().count()) as u64;
@@ -1171,9 +1174,11 @@ fn message_chars(m: &Message) -> u64 {
         Message::Assistant {
             content,
             tool_calls,
-            ..
+            reasoning_content,
         } => {
             content.as_deref().map_or(0, |c| c.chars().count())
+                // 往復中の思考は、リクエストのたびに prompt として送り直している。
+                + reasoning_content.as_deref().map_or(0, |r| r.chars().count())
                 + tool_calls
                     .iter()
                     .map(|tc| {
@@ -1639,6 +1644,17 @@ async fn stream_once_to(
             let _ = stdout.write_all(crate::term::sanitize(&s).as_bytes());
             let _ = stdout.flush();
         }
+        // 再試行 / fallback: ここまでの思考は捨てられた応答のもの。数え直す。
+        ChatEvent::AttemptRestarted => {
+            if view.show_reasoning && thought_chars > 0 {
+                let _ = writeln!(
+                    stdout,
+                    "\n{}",
+                    crate::term::dim("(interrupted — starting over)")
+                );
+            }
+            thought_chars = 0;
+        }
         ChatEvent::Done(r) => *last_done = Some(r),
     };
 
@@ -1661,6 +1677,16 @@ async fn stream_once_to(
     // 通常でも応答の末尾が欠ける)。
     while let Ok(ev) = rx.try_recv() {
         on_event(ev, stdout, &mut clear_wait, &mut last_done);
+    }
+    // 本文が 1 文字も来なかった応答 (thinking モデルでは「ツールを呼ぶだけ」の応答がこれで、
+    // 思考はむしろ一番長い) でも、考えていたことは示す。
+    if thought_chars > 0 && !thought_closed {
+        if view.show_reasoning {
+            let _ = stdout.write_all(b"\n");
+        } else if show_wait {
+            let note = format!("(thought for {thought_chars} chars — --show-reasoning to read it)");
+            let _ = writeln!(stdout, "{}", crate::term::dim(&note));
+        }
     }
 
     last_done.ok_or_else(|| anyhow::anyhow!("stream ended without Done event"))
@@ -1958,6 +1984,108 @@ mod tests {
         assert!(full.ends_with("\n42"), "{full:?}");
     }
 
+    /// 決まったイベント列を流すだけの LLM。
+    struct EventsLlm(Vec<ChatEvent>);
+
+    #[async_trait::async_trait]
+    impl LlmClient for EventsLlm {
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            _: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("stream_once only streams")
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            for event in &self.0 {
+                let _ = sink.send(event.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn done(content: Option<&str>, reasoning: &str) -> ChatEvent {
+        ChatEvent::Done(ChatResponse {
+            content: content.map(str::to_string),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning: Some(reasoning.to_string()),
+        })
+    }
+
+    async fn on_a_tty(events: Vec<ChatEvent>) -> String {
+        let mut out = Vec::new();
+        let tty = StreamView {
+            show_wait: true,
+            show_reasoning: false,
+        };
+        stream_once_to(&EventsLlm(events), &[], &[], "m", &mut out, tty)
+            .await
+            .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// thinking モデルの「ツールを呼ぶだけ」の応答は本文が 1 文字も無い。思考は一番長いのに、
+    /// 本文の到着を合図にしていると何も表示されない (実モデルで 257 文字の思考が無表示だった)。
+    #[tokio::test]
+    async fn a_response_with_no_text_still_says_that_the_model_thought() {
+        let shown = on_a_tty(vec![
+            ChatEvent::ReasoningDelta("which file? ".into()),
+            ChatEvent::ReasoningDelta("note.txt".into()),
+            done(None, "which file? note.txt"),
+        ])
+        .await;
+        assert!(shown.contains("(thought for 20 chars"), "{shown:?}");
+    }
+
+    /// 思考の途中で切れてやり直した応答では、捨てられた分を数えない。
+    #[tokio::test]
+    async fn a_restarted_attempt_does_not_inflate_the_thought_count() {
+        let shown = on_a_tty(vec![
+            ChatEvent::ReasoningDelta("0123456789".into()),
+            ChatEvent::AttemptRestarted,
+            ChatEvent::ReasoningDelta("01234".into()),
+            ChatEvent::TextDelta("ok".into()),
+            done(Some("ok"), "01234"),
+        ])
+        .await;
+        assert!(shown.contains("(thought for 5 chars"), "{shown:?}");
+        assert_eq!(shown.matches("thought for").count(), 1, "{shown:?}");
+    }
+
+    /// usage を返さないサーバでは文字数から概算する。thinking モデルの生成はほとんどが思考なので、
+    /// 数えないと `max_total_tokens` が効かない。往復中の思考は prompt の側にも乗る。
+    #[test]
+    fn the_usage_estimate_counts_reasoning_on_both_sides() {
+        let thinking = ChatResponse {
+            content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning: Some("x".repeat(300)),
+        };
+        assert_eq!(estimate_usage(&[], &thinking).completion_tokens, 100);
+
+        let in_flight = [Message::Assistant {
+            content: None,
+            tool_calls: Vec::new(),
+            reasoning_content: Some("y".repeat(30)),
+        }];
+        let plain = ChatResponse {
+            reasoning: None,
+            ..thinking
+        };
+        assert_eq!(estimate_usage(&in_flight, &plain).prompt_tokens, 10);
+    }
+
     /// 思考つきでツールを 1 回呼び、次の応答で答える LLM。送られてきた履歴を記録する。
     struct ThinkThenCallLlm {
         seen: std::sync::Mutex<Vec<Vec<Message>>>,
@@ -2027,6 +2155,10 @@ mod tests {
         let gate = PermissionGate::new(true);
         session.run_turn("first", &llm, &gate).await.unwrap();
         session.run_turn("second", &llm, &gate).await.unwrap();
+
+        // 持ち回るのはツールを呼んだ応答の思考だけ。答えた応答の思考 ("the probe said 1") は、
+        // 次のリクエストが次のターンなので、最初から履歴に入れない。
+        assert_eq!(reasoning_in(session.history()), ["I should probe first"]);
 
         let seen = llm.seen.lock().unwrap();
         assert!(reasoning_in(&seen[0]).is_empty());

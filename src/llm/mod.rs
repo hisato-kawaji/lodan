@@ -67,6 +67,9 @@ pub enum ChatEvent {
     TextDelta(String),
     /// 思考過程の断片。本文より先に流れてくる。
     ReasoningDelta(String),
+    /// 本文を出す前に切れたので、最初からやり直す (再試行、または fallback provider へ)。
+    /// ここまでに流した思考は捨てられた応答のもの — 受け手は数え直すこと。
+    AttemptRestarted,
     /// Final assembled response (sent once at the end).
     Done(ChatResponse),
 }

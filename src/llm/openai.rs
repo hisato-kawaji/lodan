@@ -95,8 +95,11 @@ impl RetryBudget {
         }
         self.used += 1;
         let delay = backoff_delay(self.policy.base, self.used, retry_after, jitter_seed());
+        // `why` にはプロバイダの応答本文が入り得る。メッセージではなくフィールドで渡す
+        // (tracing の fmt はメッセージ中の書式文字を素通しする)。
         tracing::warn!(
-            "LLM request failed ({why}); retry {}/{} in {}ms",
+            why = %crate::term::sanitize(why),
+            "LLM request failed; retry {}/{} in {}ms",
             self.used,
             self.policy.max_retries,
             delay.as_millis()

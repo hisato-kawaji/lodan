@@ -631,7 +631,9 @@ impl Session {
             Err(e) => {
                 crate::say!(
                     "{}",
-                    crate::term::red(&format!("auto-compact failed: {e:#}"))
+                    crate::term::red(&crate::term::sanitize(&format!(
+                        "auto-compact failed: {e:#}"
+                    )))
                 );
                 crate::runlog::record(
                     "compact",

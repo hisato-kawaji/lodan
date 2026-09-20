@@ -43,8 +43,12 @@ impl FallbackClient {
     }
 
     fn announce(&self, primary_error: &anyhow::Error) {
+        // エラーはフィールドで渡す。tracing の fmt は、メッセージ中の ESC はエスケープするが
+        // U+202E のような書式文字は素通しする。フィールドは Debug 経由なのでどちらも落ちる。
+        let error = format!("{primary_error:#}");
         tracing::warn!(
-            "primary LLM provider is unavailable ({primary_error:#}); trying {} ({})",
+            error = %crate::term::sanitize(&error),
+            "primary LLM provider is unavailable; trying {} ({})",
             self.fallback_name,
             self.fallback_model
         );

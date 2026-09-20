@@ -161,8 +161,13 @@ pub fn green(s: &str) -> String {
 }
 
 /// stderr 向けの赤（`eprintln!` に使う。stderr の tty 判定で着色可否を決める）。
+///
+/// エラー行の専用口なので、**ここで無害化する**。エラーには外から来た文字列が入り込む
+/// (プロバイダの応答本文、MCP サーバの文言、解釈できなかった LLM の出力)。呼び出し側で
+/// 1 か所ずつ `sanitize` する方式は、新しいエラー行を足すたびに漏れた (#101 のレビューで 2 周)。
+/// 色を重ねる用途には使わないこと (内側の SGR まで文字になる)。
 pub fn red_err(s: &str) -> String {
-    style("31", s, stderr_color())
+    style("31", &sanitize(s), stderr_color())
 }
 
 #[cfg(test)]
@@ -184,6 +189,16 @@ mod tests {
             "progress 10%\\rprogress 99%"
         );
         assert_eq!(sanitize("a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn error_lines_are_defused_at_the_single_place_they_are_coloured() {
+        let shown = super::red_err("compact failed: LLM HTTP 500: \x1b[2Kok \u{202E}");
+        assert!(
+            !shown.contains("\x1b[2K") && !shown.contains('\u{202E}'),
+            "{shown:?}"
+        );
+        assert!(shown.contains("\\u{1b}[2K") && shown.contains("\\u{202e}"));
     }
 
     #[test]

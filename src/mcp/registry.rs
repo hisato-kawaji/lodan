@@ -84,7 +84,12 @@ pub async fn load_and_register(
                                 }
                             }
                             Err(e) => {
-                                eprintln!("mcp[{server_name}]: prompts/list skipped: {e}");
+                                eprintln!(
+                                    "{}",
+                                    crate::term::sanitize(&format!(
+                                        "mcp[{server_name}]: prompts/list skipped: {e}"
+                                    ))
+                                );
                             }
                         }
 
@@ -101,19 +106,32 @@ pub async fn load_and_register(
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                eprintln!("mcp[{server_name}]: resources/list skipped: {e}");
+                                eprintln!(
+                                    "{}",
+                                    crate::term::sanitize(&format!(
+                                        "mcp[{server_name}]: resources/list skipped: {e}"
+                                    ))
+                                );
                             }
                         }
 
                         outcome.clients.push(client);
                     }
                     Err(e) => {
-                        eprintln!("mcp[{server_name}]: list_tools failed: {e}");
+                        eprintln!(
+                            "{}",
+                            crate::term::sanitize(&format!(
+                                "mcp[{server_name}]: list_tools failed: {e}"
+                            ))
+                        );
                     }
                 }
             }
             Err(e) => {
-                eprintln!("mcp[{server_name}]: connect failed: {e}");
+                eprintln!(
+                    "{}",
+                    crate::term::sanitize(&format!("mcp[{server_name}]: connect failed: {e}"))
+                );
             }
         }
     }

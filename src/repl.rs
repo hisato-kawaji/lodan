@@ -365,7 +365,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                                 persist(&mut recorder, &session);
                             }
                             Ok(_) => eprintln!("mcp prompt /{head} returned no text"),
-                            Err(e) => eprintln!("mcp prompt /{head} failed: {e:#}"),
+                            // MCP サーバの文言が入る。
+                            Err(e) => eprintln!(
+                                "{}",
+                                crate::term::red_err(&format!("mcp prompt /{head} failed: {e:#}"))
+                            ),
                         }
                     } else {
                         eprintln!("unknown command: /{head}");
@@ -679,7 +683,8 @@ fn persist(recorder: &mut Option<Recorder>, session: &agent::Session) {
 /// 端末に出すエラー文。エラーにはプロバイダの応答本文やツールの出力が入り込む
 /// (`LLM HTTP 500: <body>`)。`base_url` は任意に設定できるので、本文は外から来る文字列。
 fn shown_error(label: &str, e: &anyhow::Error) -> String {
-    format!("{label}: {}", crate::term::sanitize(&format!("{e:#}")))
+    // 無害化は `term::red_err` が行う。
+    format!("{label}: {e:#}")
 }
 
 enum SlashResult {
@@ -750,7 +755,8 @@ fn handle_slash(
             if !user_commands.is_empty() {
                 println!("{}", crate::term::bold("user commands:"));
                 for c in user_commands.values() {
-                    let name = crate::term::cyan(&format!("/{}", c.name));
+                    // 名前はプロジェクトのファイル名由来。
+                    let name = crate::term::cyan(&format!("/{}", crate::term::sanitize(&c.name)));
                     if c.description.is_empty() {
                         println!("  {name}");
                     } else {

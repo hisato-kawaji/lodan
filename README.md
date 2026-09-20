@@ -224,7 +224,7 @@ CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` �
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 
-`$CWD/.env` は起動時に自動ロード (dotenvy)。コミット対象外 (`.gitignore` 済)。
+`$CWD/.env` は、そのディレクトリを[信頼している](#workspace-trust--信頼していないディレクトリの設定は読まない)ときだけ自動ロードする (dotenvy)。コミット対象外 (`.gitignore` 済)。
 
 ### v0.1.0 以前からのスキーマ移行
 
@@ -308,8 +308,9 @@ lodan はこれらを**画面に出すときだけ** `\u{1b}` のような見え
 | ファイル | できること |
 |---|---|
 | `.lodan/config.toml` / `.lodan/config.local.toml` | `[[hooks]]` は任意のコマンドを実行する。`[llm.*] base_url` を書き換えれば API キーを外へ送れる。`[permissions] mode = "bypass"` や `allow = ["Bash(*)"]` で承認を素通しにできる |
+| `.env` | 環境変数で渡せる設定は全部ここから渡せる: `LODAN_BASE_URL` (API キーの送り先)、`LODAN_PERMISSION_MODE=bypass`、`LODAN_TRUST=1` (自分で自分を信頼) |
 | `.mcp.json` | 任意のプロセスを起動する |
-| `.lodan/commands` / `.lodan/skills` / `LODAN.md` / `CLAUDE.md` | モデルへの指示を差し込む |
+| `.lodan/commands` / `.lodan/skills` / `LODAN.md` / `CLAUDE.md` | モデルへの指示を差し込む (メモリは cwd の祖先からも読まれるので、祖先の `LODAN.md` / `CLAUDE.md` も対象) |
 
 clone してきたリポジトリで `lodan` を起動するだけでこれらが効くのは危ないので、**信頼済みのディレクトリ (とその配下) でだけ読む**。
 
@@ -318,6 +319,7 @@ clone してきたリポジトリで `lodan` を起動するだけでこれら�
 - `--trust` (`LODAN_TRUST=1`) はその実行に限って信頼する (記録しない)。CI や評価ハーネス向け。`--trust=false` で env を打ち消せる
 - `lodan trust` で今のディレクトリを記録、`lodan trust --list` で一覧、`lodan trust --remove` で取り消し
 - 記録はユーザの設定ディレクトリの `trusted.toml` (Linux: `~/.config/lodan/`、macOS: `~/Library/Application Support/lodan/`)。リポジトリ側からは書き換えられない。比較は symlink を解決したパスで行う
+- 信頼の判断は **`.env` を読む前**の環境変数と引数だけで行う。リポジトリの `.env` に `LODAN_TRUST=1` と書いても、そのリポジトリは信頼されない
 - 未信頼でも読むもの: ユーザ設定 (`~/.config/lodan/config.toml`)、`--config <path>` で明示したファイル、`~/.lodan/LODAN.md`。自分で置いたものだけ
 
 **これは設定の読み込みの話で、実行の隔離ではない**。信頼していないリポジトリの中で Bash を承認すれば、そのコマンドは普通に走る。

@@ -146,10 +146,9 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         return manage_trust(*list, *remove).map(|()| 0);
     }
     // プロジェクトのファイルを読むかどうかは、設定を読む前に決める (設定そのものが対象なので)。
-    // セッション一覧はプロジェクトのファイルを読まないので対象外。
-    if !matches!(args.cmd, Some(Command::Sessions)) {
-        decide_project_trust(&args);
-    }
+    // バイナリでは main が `.env` を読む前に済ませている。ここは、それ以外の呼び出し元のための保険
+    // (2 回目の決定は無視される)。
+    decide_project_trust(&args);
 
     let headless_format = args.print.is_some().then_some(args.output_format);
     let stream_json = headless_format == Some(crate::headless::OutputFormat::StreamJson);
@@ -219,8 +218,13 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
 
 /// このプロセスがプロジェクトのファイルを読んでよいかを決めて固定する (#75)。
 /// 尋ねるのは対話の REPL だけ。`-p` / `config` / パイプ入力では尋ねずに「読まない」側へ倒す。
-fn decide_project_trust(args: &Cli) {
+pub fn decide_project_trust(args: &Cli) {
     use std::io::IsTerminal;
+    // 信頼の管理と、プロジェクトのファイルを使わないサブコマンドでは尋ねない。読みもしない。
+    if matches!(args.cmd, Some(Command::Trust { .. } | Command::Sessions)) {
+        crate::trust::set_project_trusted(false);
+        return;
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let store = crate::trust::store_path();
     let is_repl = args.print.is_none() && matches!(args.cmd, None | Some(Command::Repl));

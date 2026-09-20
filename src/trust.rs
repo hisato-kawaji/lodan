@@ -5,6 +5,8 @@
 //! - `.lodan/config.toml` / `.lodan/config.local.toml` — `[[hooks]]` は任意のコマンドを実行する。
 //!   `[llm.*] base_url` を書き換えれば API キーを外へ送れる。`[permissions] mode = "bypass"` や
 //!   `allow = ["Bash(*)"]` で承認を素通しにできる
+//! - `.env` — `LODAN_BASE_URL` / `LODAN_PERMISSION_MODE=bypass` / `LODAN_TRUST=1` のように、
+//!   環境変数で渡せる設定は全部ここから渡せる (だから信頼の判断より後に読む)
 //! - `.mcp.json` — 任意のプロセスを起動する
 //! - `.lodan/commands` / `.lodan/skills` / `LODAN.md` / `CLAUDE.md` — モデルへの指示を差し込む
 //!
@@ -34,9 +36,12 @@ pub fn set_project_trusted(trusted: bool) {
     let _ = PROJECT_TRUSTED.set(trusted);
 }
 
-/// cwd にある、信頼が要るファイル (表示用の相対名)。
-pub fn project_files(cwd: &Path) -> Vec<&'static str> {
+/// 信頼が要るファイル (表示用の名前)。cwd にあるものに加えて、メモリは cwd の祖先 (ホームまで)
+/// からも読まれるので、祖先の `LODAN.md` / `CLAUDE.md` も含める — そうしないと、何も無い
+/// サブディレクトリから起動したときに、尋ねないまま親のメモリを読んでしまう。
+pub fn project_files(cwd: &Path) -> Vec<String> {
     const CANDIDATES: &[&str] = &[
+        ".env",
         ".lodan/config.toml",
         ".lodan/config.local.toml",
         ".mcp.json",
@@ -45,11 +50,24 @@ pub fn project_files(cwd: &Path) -> Vec<&'static str> {
         "LODAN.md",
         "CLAUDE.md",
     ];
-    CANDIDATES
+    let mut found: Vec<String> = CANDIDATES
         .iter()
-        .copied()
         .filter(|name| cwd.join(name).exists())
-        .collect()
+        .map(|name| name.to_string())
+        .collect();
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    for dir in cwd.ancestors().skip(1) {
+        // メモリの探索と同じく、ホームで止める (ホーム自身の LODAN.md は利用者のもの)。
+        if home.as_deref() == Some(dir) {
+            break;
+        }
+        for name in ["LODAN.md", "CLAUDE.md"] {
+            if dir.join(name).exists() {
+                found.push(dir.join(name).display().to_string());
+            }
+        }
+    }
+    found
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -275,6 +293,22 @@ mod tests {
 
         assert!(forget(&store, dir.path()).unwrap());
         assert!(!is_recorded(&store, dir.path()));
+    }
+
+    #[test]
+    fn a_dotenv_file_and_a_parents_memory_both_need_trust() {
+        let dir = project(&["repo/.env", "CLAUDE.md", "repo/sub/code.rs"]);
+        let store = dir.path().join("store.toml");
+        assert_eq!(
+            project_files(&dir.path().join("repo"))
+                .first()
+                .map(String::as_str),
+            Some(".env")
+        );
+        // 何も無いサブディレクトリから起動しても、親のメモリを尋ねないまま読んだりしない。
+        let (trusted, shown) = ask(&dir.path().join("repo/sub"), &store, false, false, "");
+        assert!(!trusted);
+        assert!(shown.contains("CLAUDE.md"), "{shown}");
     }
 
     #[test]

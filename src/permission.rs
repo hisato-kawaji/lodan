@@ -188,6 +188,9 @@ impl PermissionGate {
         enter_means_yes: bool,
     ) -> bool {
         let summary = summarize(tool_name, args);
+        // MCP ツールの名前はサーバが決める。プロンプトに出すのは無害化した形。
+        let shown_name = visible(tool_name);
+        let tool_label = shown_name.as_str();
         // 保存しても意図どおりに効かない呼び出しには (p) を出さない。
         // ask ルールに当たる呼び出しは、allow を保存しても毎回尋ねられる (ask が優先)。
         // 「保存した」と言って効かないものは出さない。
@@ -200,7 +203,7 @@ impl PermissionGate {
                 stdout,
                 "{} Allow {}: {summary}",
                 crate::term::yellow("[lodan]"),
-                crate::term::bold(tool_name),
+                crate::term::bold(tool_label),
             );
             if let Some(p) = preview(tool_name, args) {
                 let _ = writeln!(stdout, "{p}");
@@ -210,11 +213,11 @@ impl PermissionGate {
                 "{}",
                 crate::term::dim(&match &persistable {
                     Some(rule) => format!(
-                        "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact  \
+                        "  (y) yes once  (n) no  (a) always allow {tool_label}  (e) always allow this exact  \
                          (p) always allow `{rule}` in this project"
                     ),
                     None => format!(
-                        "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
+                        "  (y) yes once  (n) no  (a) always allow {tool_label}  (e) always allow this exact"
                     ),
                 })
             );

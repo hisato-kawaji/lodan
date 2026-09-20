@@ -10,11 +10,14 @@ Supports both stream=false (single JSON) and stream=true (SSE).
 
 Usage: mock_llm.py <port> [<demo_dir>]
 
+Set MOCK_LLM_TEXT to replace the greeting (tests use it to return hostile text).
+
 Pass port 0 to let the OS choose. The port actually bound is printed on the first
 line of stdout ("PORT <n>"), so a test harness never has to guess a free port and
 race other tests for it.
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -50,8 +53,9 @@ def make_handler(demo_dir):
                     f"Demo complete: exercised {len(steps)} tools "
                     f"({', '.join(s[0] for s in steps)}).")
 
-        return ("text",
-                "Hello from mock LLM. Send 'demo' to run the full tool sequence.")
+        return ("text", os.environ.get(
+            "MOCK_LLM_TEXT",
+            "Hello from mock LLM. Send 'demo' to run the full tool sequence."))
 
     def build_message(decision):
         kind, payload = decision

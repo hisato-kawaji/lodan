@@ -134,8 +134,11 @@ pub async fn drive(
                 println!(
                     "{}",
                     crate::term::dim(&format!(
+                        // 評価器 (LLM) の自由記述。
                         "[goal] turn {}/{}: not met — {}",
-                        goal.turns_used, goal.max_turns, v.reason
+                        goal.turns_used,
+                        goal.max_turns,
+                        crate::term::sanitize(&v.reason)
                     ))
                 );
                 input = format!(

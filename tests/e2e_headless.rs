@@ -31,11 +31,17 @@ impl Drop for MockServer {
 /// 終わって mock を kill した時点で後発のテストが落ちる (稀な flake として実際に出た)。
 /// ポート 0 で bind させ、mock 自身に番号を名乗らせれば競合しない。
 fn start_mock(demo_dir: &Path) -> MockServer {
+    start_mock_saying(demo_dir, None)
+}
+
+/// `text` を挨拶の代わりに返す mock。敵対的な文字列を本文として流すテスト用。
+fn start_mock_saying(demo_dir: &Path, text: Option<&str>) -> MockServer {
     let script: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_llm.py");
     let mut child = Command::new("python3")
         .arg(script)
         .arg("0")
         .arg(demo_dir)
+        .envs(text.map(|t| ("MOCK_LLM_TEXT", t)))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -601,5 +607,55 @@ fn a_malformed_permission_rule_fails_at_startup_in_the_requested_format() {
     assert!(
         v["error"].as_str().unwrap().contains("missing closing"),
         "{v}"
+    );
+}
+
+/// カーソルを 2 行上げて行を消し、書き換える。双方向テキストの上書きも混ぜる。
+const HOSTILE_TEXT: &str = "done\x1b[2A\x1b[2Kall tests passed \u{202E}txt.exe";
+
+#[test]
+fn hostile_model_text_is_defused_on_the_repl_screen() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock_saying(home.path(), Some(HOSTILE_TEXT));
+    // REPL にプロンプトをパイプで渡す (承認は要らない)。
+    let out = lodan(home.path(), server.port, &[], Stdin::Piped("hi\n/exit\n"));
+    assert!(out.status.success());
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains('\x1b'), "raw ESC on {name}: {text:?}");
+        assert!(
+            !text.contains('\u{202E}'),
+            "raw bidi override on {name}: {text:?}"
+        );
+    }
+    assert!(stdout(&out).contains("done\\u{1b}[2A\\u{1b}[2Kall tests passed \\u{202e}txt.exe"));
+}
+
+#[test]
+fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock_saying(home.path(), Some(HOSTILE_TEXT));
+    let text = lodan(
+        home.path(),
+        server.port,
+        &["-p", "hi"],
+        Stdin::OpenAndSilent,
+    );
+    assert!(text.status.success());
+    // stdout はパイプ = 呼び出し側との契約。無加工。
+    assert_eq!(stdout(&text), format!("{HOSTILE_TEXT}\n"));
+    // stderr は人が読む進行表示。
+    assert!(!String::from_utf8_lossy(&text.stderr).contains('\x1b'));
+
+    let json = lodan(
+        home.path(),
+        server.port,
+        &["-p", "hi", "--output-format", "json"],
+        Stdin::OpenAndSilent,
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(
+        v["result"], HOSTILE_TEXT,
+        "the JSON result carries the model's exact text"
     );
 }

@@ -432,12 +432,7 @@ impl Session {
                     output.content = format!("{}\n[post-tool hook] {reason}", output.content);
                 }
 
-                let tag = format!("[{name}]");
-                let tag = if output.is_error {
-                    crate::term::red(&tag)
-                } else {
-                    crate::term::cyan(&tag)
-                };
+                let tag = tool_tag(&name, output.is_error);
                 // ツール出力はファイルの中身・Web ページ・コマンド出力を含む。表示だけ無害化する
                 // (モデルへ返す content は無加工のまま)。
                 crate::say!(
@@ -1287,6 +1282,17 @@ async fn stream_once_to(
     last_done.ok_or_else(|| anyhow::anyhow!("stream ended without Done event"))
 }
 
+/// ツール出力の前に出す `[Name]` タグ。名前はモデルが書いた文字列で、登録に無い名前
+/// (`unknown tool`) でもここまで来るので、無害化してから色を付ける。
+fn tool_tag(name: &str, is_error: bool) -> String {
+    let tag = format!("[{}]", crate::term::sanitize(name));
+    if is_error {
+        crate::term::red(&tag)
+    } else {
+        crate::term::cyan(&tag)
+    }
+}
+
 /// 端末表示に使うツール出力の最大行数。
 const DISPLAY_MAX_LINES: usize = 8;
 /// 端末表示に使うツール出力の最大文字数。
@@ -1437,6 +1443,17 @@ mod tests {
             }));
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_tool_name_the_model_made_up_cannot_carry_escapes_into_the_tag() {
+        let tag = tool_tag("Read\x1b[2A\x1b[2K", true);
+        // 色 (lodan 自身の SGR) は付いてよいが、名前由来のエスケープは残らない。
+        assert!(
+            !tag.contains("\x1b[2A") && !tag.contains("\x1b[2K"),
+            "{tag:?}"
+        );
+        assert!(tag.contains("Read\\u{1b}[2A"), "{tag:?}");
     }
 
     #[tokio::test]

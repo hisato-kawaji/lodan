@@ -208,7 +208,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     if let Ok(HookOutcome::Block(reason)) =
         hooks::runner::dispatch(Lifecycle::SessionStart, None, &session_payload, &cfg.hooks).await
     {
-        eprintln!("session-start hook: {reason}");
+        eprintln!("session-start hook: {}", crate::term::sanitize(&reason));
     }
 
     loop {
@@ -272,7 +272,8 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             // /undo は直近ターンのファイル変更を巻き戻す (session を要する)。
             if head == "undo" {
                 match session.undo_last_turn() {
-                    Some(report) => println!("{}", report.describe()),
+                    // パスはモデルが選んだもの。
+                    Some(report) => println!("{}", crate::term::sanitize(&report.describe())),
                     None => println!("nothing to undo (no recorded file changes)"),
                 }
                 continue;
@@ -421,7 +422,7 @@ async fn handle_goal(
     let mut goal = match Goal::new(args) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("{}", crate::term::red_err(&format!("goal: {e:#}")));
+            eprintln!("{}", crate::term::red_err(&shown_error("goal", &e)));
             return;
         }
     };
@@ -475,7 +476,8 @@ async fn handle_goal(
             println!(
                 "{}",
                 crate::term::bold(&crate::term::cyan(&format!(
-                    "[goal] achieved after {turns} turn(s): {reason}"
+                    "[goal] achieved after {turns} turn(s): {}",
+                    crate::term::sanitize(&reason)
                 )))
             );
             // 達成した goal は解除する。
@@ -571,7 +573,7 @@ async fn handle_loop(
     let spec = match LoopSpec::new(interval, &prompt) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{}", crate::term::red_err(&format!("loop: {e:#}")));
+            eprintln!("{}", crate::term::red_err(&shown_error("loop", &e)));
             return;
         }
     };
@@ -621,7 +623,8 @@ async fn handle_loop(
         Some(LoopOutcome::TurnFailed { iterations, error }) => eprintln!(
             "{}",
             crate::term::red_err(&format!(
-                "[loop] stopped: turn failed after {iterations} completed iteration(s): {error:#}"
+                "[loop] stopped: turn failed after {iterations} completed iteration(s): {}",
+                crate::term::sanitize(&format!("{error:#}"))
             ))
         ),
     }
@@ -650,7 +653,7 @@ async fn run_turn_interruptible(
         tokio::select! {
             res = &mut turn => {
                 if let Err(e) = res {
-                    eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
+                    eprintln!("{}", crate::term::red_err(&shown_error("error", &e)));
                 }
                 false
             }
@@ -671,6 +674,12 @@ fn persist(recorder: &mut Option<Recorder>, session: &agent::Session) {
     {
         eprintln!("session: save failed: {e}");
     }
+}
+
+/// 端末に出すエラー文。エラーにはプロバイダの応答本文やツールの出力が入り込む
+/// (`LLM HTTP 500: <body>`)。`base_url` は任意に設定できるので、本文は外から来る文字列。
+fn shown_error(label: &str, e: &anyhow::Error) -> String {
+    format!("{label}: {}", crate::term::sanitize(&format!("{e:#}")))
 }
 
 enum SlashResult {
@@ -745,18 +754,20 @@ fn handle_slash(
                     if c.description.is_empty() {
                         println!("  {name}");
                     } else {
-                        println!("  {name} — {}", c.description);
+                        println!("  {name} — {}", crate::term::sanitize(&c.description));
                     }
                 }
             }
             if !mcp_prompts.is_empty() {
                 println!("{}", crate::term::bold("mcp prompts:"));
                 for p in mcp_prompts.values() {
-                    let name = crate::term::cyan(&format!("/{}", p.full_name()));
+                    // MCP サーバが名乗った名前と説明。
+                    let name =
+                        crate::term::cyan(&format!("/{}", crate::term::sanitize(p.full_name())));
                     if p.description().is_empty() {
                         println!("  {name}");
                     } else {
-                        println!("  {name} — {}", p.description());
+                        println!("  {name} — {}", crate::term::sanitize(p.description()));
                     }
                 }
             }
@@ -768,8 +779,13 @@ fn handle_slash(
         }
         "tools" => {
             for spec in registry.tool_specs() {
+                // MCP ツールの名前と説明はサーバが決める。
                 let desc = first_line(spec.function.description);
-                println!("{} — {desc}", crate::term::cyan(spec.function.name));
+                println!(
+                    "{} — {}",
+                    crate::term::cyan(&crate::term::sanitize(spec.function.name)),
+                    crate::term::sanitize(&desc)
+                );
             }
             SlashResult::Handled
         }

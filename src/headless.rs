@@ -103,7 +103,7 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
     if let Ok(HookOutcome::Block(reason)) =
         hooks::runner::dispatch(Lifecycle::SessionStart, None, &start_payload, &cfg.hooks).await
     {
-        eprintln!("session-start hook: {reason}");
+        eprintln!("session-start hook: {}", crate::term::sanitize(&reason));
     }
 
     // このターンで増えた分だけを最終応答の候補にする (`--resume` では履歴の末尾が
@@ -291,7 +291,12 @@ impl Report {
 
     fn emit(&self, format: OutputFormat) {
         if let Some(e) = &self.error {
-            eprintln!("{}", crate::term::red_err(&format!("error: {e}")));
+            // エラーにはプロバイダの応答本文が入り込む。stderr は人が読む側なので無害化する
+            // (json / stream-json の `error` フィールドは無加工のまま)。
+            eprintln!(
+                "{}",
+                crate::term::red_err(&format!("error: {}", crate::term::sanitize(e)))
+            );
         }
         // 形式によらず runlog には残す (`--log-jsonl` だけを付けた text / json 実行でも
         // ファイルに結果が入る)。

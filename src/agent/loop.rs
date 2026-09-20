@@ -880,14 +880,16 @@ impl Session {
             ),
         };
         let summary_input = [sys, usr];
-        let resp = llm
-            .chat(
+        let resp = crate::llm::metered::with_kind(
+            crate::llm::metered::KIND_COMPACT,
+            llm.chat(
                 &summary_input,
                 &[],
                 &self.cfg.llm.active().model,
                 Some(1024),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         let (u, estimated) = resolve_usage(&resp, &summary_input);
         self.usage.record(u, estimated);
         let summary = resp.content.unwrap_or_default();
@@ -927,7 +929,7 @@ const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
 /// usage 概算フォールバックの 1 トークンあたり文字数。英語 ~4 文字/トークン、
 /// 日本語 ~1-2 文字/トークンの間を取った粗い近似 (桁が合えば十分)。
-const ESTIMATE_CHARS_PER_TOKEN: u64 = 3;
+pub(crate) const ESTIMATE_CHARS_PER_TOKEN: u64 = 3;
 
 /// セッション累積のトークン使用量。`/cost` 表示と自動圧縮 (しきい値) の基盤。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -989,7 +991,7 @@ fn resolve_usage(resp: &ChatResponse, prompt_messages: &[Message]) -> (Usage, bo
 }
 
 /// 文字数ベースの粗いトークン概算。トークナイザ非依存で桁を合わせるのが目的。
-fn estimate_usage(prompt_messages: &[Message], resp: &ChatResponse) -> Usage {
+pub(crate) fn estimate_usage(prompt_messages: &[Message], resp: &ChatResponse) -> Usage {
     let prompt_chars: u64 = prompt_messages.iter().map(message_chars).sum();
     let mut completion_chars: u64 = resp.content.as_deref().map_or(0, |c| c.chars().count()) as u64;
     for tc in &resp.tool_calls {

@@ -239,6 +239,13 @@ impl ToolProfile {
 #[serde(default)]
 pub struct AgentConfig {
     pub max_iterations: usize,
+    /// このプロセスが送る LLM リクエスト数の上限 (サブエージェントや `/goal` の評価器も含む)。
+    /// 使い切ったら次のリクエストを送らずにターンを打ち切る。None (既定) は無制限 (#84)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// 同じく合計トークン数の上限。判定は各リクエストの前なので、超過は最後の 1 回ぶんまで。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
     pub auto_approve: bool,
     /// ターン終了直前に 1 回だけ自己検証を促す (#63)。小型ローカルモデルの
     /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
@@ -375,6 +382,8 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_iterations: 25,
+            max_requests: None,
+            max_total_tokens: None,
             auto_approve: false,
             finish_nudge: false,
             malformed_retry: true,
@@ -550,6 +559,14 @@ impl Config {
             self.agent.parallel_tools = v;
             mark("agent.parallel_tools".into());
         }
+        if let Some(v) = o.max_requests {
+            self.agent.max_requests = Some(v);
+            mark("agent.max_requests".into());
+        }
+        if let Some(v) = o.max_total_tokens {
+            self.agent.max_total_tokens = Some(v);
+            mark("agent.max_total_tokens".into());
+        }
         if let Some(v) = o.tool_profile {
             self.agent.tool_profile = v;
             mark("agent.tool_profile".into());
@@ -588,6 +605,8 @@ pub struct Overrides {
     pub parallel_tools: Option<bool>,
     pub sandbox: Option<crate::sandbox::SandboxMode>,
     pub sandbox_network: Option<bool>,
+    pub max_requests: Option<u64>,
+    pub max_total_tokens: Option<u64>,
     pub permission_mode: Option<PermissionMode>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,

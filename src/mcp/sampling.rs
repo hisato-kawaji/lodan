@@ -31,10 +31,11 @@ impl SamplingProvider {
         let params: CreateMessageParams = serde_json::from_value(params)?;
         let history = Self::to_history(&params);
         // サーバ指定の maxTokens を生成上限として渡し、無制限生成を防ぐ。
-        let resp = self
-            .llm
-            .chat(&history, &[], &self.model, params.max_tokens)
-            .await?;
+        let resp = crate::llm::metered::with_kind(
+            crate::llm::metered::KIND_MCP_SAMPLING,
+            self.llm.chat(&history, &[], &self.model, params.max_tokens),
+        )
+        .await?;
         let text = resp.content.unwrap_or_default();
         let result = CreateMessageResult::assistant_text(text, self.model.clone());
         Ok(serde_json::to_value(result)?)

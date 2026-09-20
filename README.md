@@ -226,6 +226,7 @@ timeout_secs = 30
 - `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
 - `LODAN_TOOL_PROFILE` / `LODAN_TOOLS` (カンマ区切り)
 - `LODAN_PARALLEL_TOOLS` (真偽値。既定 true)
+- `LODAN_MAX_REQUESTS` / `LODAN_MAX_TOKENS` (LLM リクエスト数 / 合計トークン数の上限。既定は無制限)
 - `LODAN_TRUST` (真偽値。この実行に限ってプロジェクトの設定を信頼する)
 - `LODAN_PERMISSION_MODE` (`default` | `accept-edits` | `plan` | `dont-ask` | `bypass`)
 - `LODAN_SANDBOX` (`off` | `workspace-write` | `read-only`) / `LODAN_SANDBOX_NETWORK` (真偽値。既定 true)
@@ -234,7 +235,7 @@ timeout_secs = 30
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--reasoning-effort <LEVEL>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--reasoning-effort <LEVEL>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--max-requests <N>` / `--max-tokens <N>` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 
@@ -301,7 +302,7 @@ lodan -p "続きをやって" --resume last
   - `text`（既定）: 最終応答の本文だけ
   - `json`: `{"type":"result","is_error","exit_code","result","error","session_id","usage":{…}}` を 1 行
   - `stream-json`: `--log-jsonl` と**同じイベント列**（`src/runlog.rs` の表）を stdout に流し、最後に `result` イベント。`--log-jsonl` と併用すればファイルにも同じものが残る
-- **終了コード**: `0` 成功 / `1` エラー（起動時の失敗を含む。`json` / `stream-json` ではこの場合も結果オブジェクトを出す）/ `2` 引数の誤り（clap。stdout は空）/ `3` 最終応答に至らず `max_iterations` を使い切った / `130` SIGINT
+- **終了コード**: `0` 成功 / `1` エラー（起動時の失敗を含む。`json` / `stream-json` ではこの場合も結果オブジェクトを出す）/ `2` 引数の誤り（clap。stdout は空）/ `3` 最終応答に至らず `max_iterations` を使い切った / `4` [予算](#予算)（`max_requests` / `max_total_tokens`）を使い切った / `130` SIGINT
 - **承認**: 尋ねる相手がいないので、`--yes` が無ければ破壊的ツール（Write / Edit / Bash …）は**尋ねずに拒否**され、モデルには「非対話実行なので再試行するな」と返る。ハングしない。`AskUserQuestion` も同様に即エラーを返す
 - **stdin**: プロンプト引数があるときは stdin を**読まない**。CI や親プロセスから継承した stdin は端末でなくても閉じられないことがあり、EOF 待ちで固まるため。引数に stdin を足したいときは `--stdin` を明示する（上限 10 MiB）
 - slash コマンド（`/compact` など）は解釈しない。プロンプトはそのままモデルに渡る
@@ -782,7 +783,8 @@ lodan> /goal cargo test が exit 0 で通る。または 10 ターンで諦め�
 - **評価器の出力がパース不能なときは安全側で停止する**（根拠のない自律継続はしない）。
 - **承認ポリシー**: 破壊的ツール（Write / Edit / Bash …）は goal 中も**既定で通常どおり承認プロンプトを出す**。完全自律にしたい場合のみ `--yes`（または `agent.auto_approve`）を明示する。
 - **Ctrl-C で自律ループを中断できる**。中断した goal は paused として残る（`/goal` で確認、`/goal clear` で破棄）。
-- 制限: 評価器呼び出しは `/cost` の usage 計上外（SubAgentTool と同じ扱い、follow-up 候補）。`-p` 非対話・resume 復元はスコープ外。
+- 評価器の呼び出しも `/cost` と[予算](#予算)に `goal_eval` として計上される。
+- 制限: `-p` 非対話・resume 復元はスコープ外。
 
 ## ファイル変更の巻き戻し（`/undo`）
 
@@ -837,22 +839,43 @@ lodan> /loop 1m /check-ci main
 - **暴走防止（ハード上限）**: 100 反復 / 24 時間。ターンが失敗したときも停止する（壊れたエンドポイントを叩き続けない）。
 - **承認ポリシー**: `/goal` と同じ — 破壊的ツールは既定で通常どおり承認プロンプトを出す。完全自律にしたい場合のみ `--yes`（または `agent.auto_approve`）を明示する。
 
-## トークン会計（`/cost`）
+## トークン会計と予算（`/cost`）
 
-LLM 応答ごとのトークン使用量を収集し、セッション累積を `/cost` で表示する。
+LLM の呼び出しは、どこから行われたものでも 1 つの台帳に載る。エージェントのループだけでなく、`Task` のサブエージェント、`/goal` の評価器、コンテキスト圧縮、MCP sampling も含む（計上はクライアントを包む層で行うので、ループを通らない呼び出しも漏れない）。
 
 ```text
 lodan> /cost
-tokens: 4321 total (prompt 3800 + completion 521) across 5 LLM call(s)
+tokens: 9120 total (prompt 8200 + completion 920) across 9 LLM request(s)
+  compact: 1400 tokens in 1 call(s)
+  main: 5200 tokens in 5 call(s)
+  subagent: 2520 tokens in 3 call(s)
+budget: 9 / 40 requests
 last context: 1200 prompt tokens
 ```
 
-- 非ストリームは応答 body の `usage`、ストリームは `stream_options: {"include_usage": true}` を付けて最終チャンクの `usage` から取得する（OpenAI / vLLM / llama.cpp 対応）。
-- `total_tokens` を返さないサーバは `prompt + completion` で補完する。
+- 内訳の種別は `main` / `subagent` / `goal_eval` / `compact` / `mcp_sampling`。`main` しか無いときは内訳を省く。
+- 非ストリームは応答 body の `usage`、ストリームは `stream_options: {"include_usage": true}` を付けて最終チャンクの `usage` から取得する（OpenAI / vLLM / llama.cpp 対応）。`total_tokens` を返さないサーバは `prompt + completion` で補完する。
 - **usage 非対応サーバへのフォールバック**: usage が取れない呼び出しは文字数ベース（約 3 文字 / トークン）で概算し、`/cost` に概算だった呼び出し数を注記する。桁を合わせるのが目的の粗い近似。
 - `last context` は直近呼び出しの prompt_tokens で、現在のコンテキストサイズの近似。自動圧縮のしきい値判定（前節）に使っている。
 - ローカル / Sakana / さくらのAI / Kimi では単価を持たないため、料金換算はせずトークン数のみ表示する。
 - 累積はメモリ上のみ（transcript には保存しない）。`--resume` 後の `/cost` は 0 から数え直す。
+- `-p` の `json` / `stream-json` の `usage` も同じ台帳から出る（`requests` と `by_kind` が増えた。`llm_calls` などの既存フィールドは、これまで漏れていたサブエージェントなどの分も含む合計になる）。
+
+### 予算
+
+```toml
+[agent]
+max_requests = 40           # このプロセスが送る LLM リクエスト数の上限
+max_total_tokens = 200000   # 同じく合計トークン数の上限
+```
+
+CLI は `--max-requests <N>` / `--max-tokens <N>`、環境変数は `LODAN_MAX_REQUESTS` / `LODAN_MAX_TOKENS`。既定はどちらも無制限。
+
+- 上限に達したら、**次のリクエストを送らずに**ターンを打ち切る。止まるのは必ず LLM 呼び出しの直前なので、履歴は tool_call と結果の対が揃ったまま保存され、`--resume` でそのまま続けられる。`-p` の終了コードは **4**。
+- リクエスト数は**プロバイダへ実際に送った数**（プロバイダの無料枠はリクエスト数で数えられるため）。失敗したものも、再試行（`max_retries`）で送り直したものも、fallback provider へ送り直したものも、それぞれ 1 件。予算が残っていなければ再試行もせず、その失敗は予算切れ（終了コード 4）として報告する。
+- トークンの判定は各リクエストの**前**に行うので、超過は最後の 1 回ぶんまであり得る。
+- サブエージェントや `/goal` の評価器も同じ予算から引かれる。予算はプロセス単位で、`--resume` では引き継がれない。
+- REPL で予算が尽きたあとは、以降のどの入力も同じエラーで失敗する（実行中に予算を増やす手段は無い）。`--max-requests` などを付け直して `--resume` で続けること。
 
 ## ロードマップ
 

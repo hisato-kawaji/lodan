@@ -97,6 +97,10 @@ impl RetryBudget {
         if self.used >= self.policy.max_retries {
             return false;
         }
+        // 送り直しも 1 リクエスト。予算 (`max_requests` など) に数え、残っていなければ再試行しない。
+        if !super::metered::admit_retry() {
+            return false;
+        }
         self.used += 1;
         let delay = backoff_delay(self.policy.base, self.used, retry_after, jitter_seed());
         // `why` にはプロバイダの応答本文が入り得る。tracing の fmt は `%` (Display) のフィールドを
@@ -780,6 +784,39 @@ mod tests {
         .await;
         let resp = client(&url, 3).chat(&[], &[], "m", None).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("hi"));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// 再試行で送り直した分も予算に数える。`--max-requests N` が約束するのは「プロバイダに届く
+    /// リクエストが N 件まで」で、数えないと実際は N × (1 + max_retries) 件になる (レビューで実測)。
+    #[tokio::test]
+    async fn retries_are_counted_against_the_request_budget_and_stop_when_it_runs_out() {
+        use crate::llm::metered::{Budget, Ledger, MeteredClient};
+        let (url, hits) = scripted_server(vec![http("503 Service Unavailable", "", "busy")]).await;
+        let ledger = Arc::new(Ledger::new(Budget {
+            max_requests: Some(2),
+            max_total_tokens: None,
+        }));
+        let metered = MeteredClient::new(Arc::new(client(&url, 5)), ledger.clone());
+        let err = metered.chat(&[], &[], "m", None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("503"), "{err:#}");
+        // 失敗の本当の理由は予算。呼び出し側 (`-p` の終了コード 4) が見分けられる。
+        assert!(
+            err.chain().any(|c| c
+                .downcast_ref::<crate::llm::metered::BudgetExceededError>()
+                .is_some()),
+            "{err:#}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "5 retries were allowed, but the budget had room for one"
+        );
+        assert_eq!(ledger.requests(), 2);
+
+        // 計上の外で使われているクライアントの再試行は、これまでどおり。
+        let (url, hits) = scripted_server(vec![http("503 Service Unavailable", "", "busy")]).await;
+        assert!(client(&url, 2).chat(&[], &[], "m", None).await.is_err());
         assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 

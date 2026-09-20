@@ -183,7 +183,11 @@ pub async fn evaluate(
              last):\n---\n{transcript}\n---\n\nIs the goal condition met?"
         ),
     };
-    let resp = llm.chat(&[sys, usr], &[], model, Some(256)).await?;
+    let resp = crate::llm::metered::with_kind(
+        crate::llm::metered::KIND_GOAL_EVAL,
+        llm.chat(&[sys, usr], &[], model, Some(256)),
+    )
+    .await?;
     let text = resp.content.unwrap_or_default();
     parse_verdict(&text).ok_or_else(|| {
         anyhow!(

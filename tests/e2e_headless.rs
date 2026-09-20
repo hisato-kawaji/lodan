@@ -1097,3 +1097,98 @@ fn a_broken_hook_matcher_stops_startup_instead_of_never_firing() {
     let error = v["error"].as_str().unwrap();
     assert!(error.contains("Bash(") && error.contains("guard.sh"), "{v}");
 }
+
+// ---- #84: 使用量の予算 ----
+
+/// 予算を使い切ったら exit 4。止まるのは「次の LLM リクエストの直前」なので、保存された履歴は
+/// tool_call と結果の対が揃ったまま (= そのまま API に投げ直せる形) で終わる。
+#[test]
+fn running_out_of_budget_is_exit_code_4_and_leaves_a_resumable_history() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let server = start_mock(&demo);
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "json",
+            "--max-requests",
+            "2",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(4), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["exit_code"], 4);
+    assert!(
+        v["error"].as_str().unwrap().contains("2 of 2 requests"),
+        "{v}"
+    );
+    assert_eq!(v["usage"]["requests"], 2);
+    assert_eq!(v["usage"]["by_kind"]["main"]["llm_calls"], 2);
+
+    // 2 回のリクエストで Write と Read まで進んでいる。3 回目は送られていない。
+    assert!(demo.join("hello.txt").exists());
+    let session_id = v["session_id"].as_str().expect("the session is saved");
+    let transcript = find_transcript(home.path(), session_id);
+    let roles: Vec<String> = std::fs::read_to_string(&transcript)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["role"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        roles.last().map(String::as_str),
+        Some("tool"),
+        "every tool call has its result: {roles:?}"
+    );
+    assert_eq!(
+        roles.iter().filter(|r| *r == "assistant").count(),
+        roles.iter().filter(|r| *r == "tool").count(),
+        "{roles:?}"
+    );
+
+    // 予算を付け直して再開すれば、続きから走り切る。
+    let resumed = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "--resume",
+            session_id,
+            "-p",
+            "continue the demo",
+            "--output-format",
+            "json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(resumed.status.code(), Some(0), "{}", stdout(&resumed));
+}
+
+fn find_transcript(home: &Path, session_id: &str) -> PathBuf {
+    fn walk(dir: &Path, session_id: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some(session_id) {
+                    return Some(path.join("transcript.jsonl"));
+                }
+                if let Some(found) = walk(&path, session_id) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(home, session_id).unwrap_or_else(|| panic!("no session dir for {session_id}"))
+}

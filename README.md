@@ -12,6 +12,7 @@
 - **パーミッションゲート**: 破壊的ツール（Write / Edit / Bash / MCP 全般）は実行前にユーザー確認 (`y / n / a / e`)
   - `WebFetch` は read-only な GET なので**非破壊**（ゲートを経ない）。⚠️ ただしフェッチ先 URL はモデルが決めるため、内部ネットワーク到達 (SSRF) やクエリ経由の情報送出があり得る。http/https のみ許可・タイムアウト・サイズ上限を課し、リダイレクトも各ホップを http/https に限定して最大 5 ホップに制限する。**ただしリダイレクト先の内部ホスト到達まではブロックしない**ため、実行環境を信頼する前提（hooks / `.mcp.json` と同じ）で使うこと
   - `WebSearch` も read-only（非破壊）。env `BRAVE_API_KEY` が要り、未設定ならエラーを返す。クエリは外部 (Brave) へ送られるため、上と同じ信頼前提で使うこと。エンドポイントは env `BRAVE_SEARCH_API_URL` で差し替え可能だが（テスト用）、こちらも http/https のみ許可する
+- **Bash のサンドボックス**: `[sandbox] mode = "workspace-write"` で、Bash が起動するプロセスの書き込み先（と任意でネットワーク）を OS の仕組みで制限（macOS seatbelt / Linux bwrap、後述）
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
 - **hooks**: `SessionStart` / `SessionEnd` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` で外部コマンドを発火し、exit code でツール実行やターン停止を制御（後述）
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
@@ -215,12 +216,13 @@ timeout_secs = 30
 - `LODAN_PARALLEL_TOOLS` (真偽値。既定 true)
 - `LODAN_TRUST` (真偽値。この実行に限ってプロジェクトの設定を信頼する)
 - `LODAN_PERMISSION_MODE` (`default` | `accept-edits` | `plan` | `dont-ask` | `bypass`)
+- `LODAN_SANDBOX` (`off` | `workspace-write` | `read-only`) / `LODAN_SANDBOX_NETWORK` (真偽値。既定 true)
 - `LODAN_LOG_JSONL` (実行トレース JSONL の出力先)
 - `SAKANA_API_KEY` (provider=sakana のときに `api_key` が空ならフォールバック)
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 
@@ -394,6 +396,32 @@ deny  = ["Read(**/.env)", "Grep(**/.env)", "Glob(**/.env)", "Read(~/.ssh/**)", "
 - **ルールはツールごと**。`deny = ["Read(**/.env)"]` は Read を止めるだけで、`Grep` が一致行を返すことも、`Bash(cat .env)` も止めない。秘密を守るなら `Read` / `Grep` / `Glob` の 3 つに書き、Bash は尋ねる対象のままにする
 
 - allow した Bash コマンドが内部で何をするか (`cargo test` がテストコードから何を実行するか) までは制御できない。サンドボックスは #75
+
+## Bash のサンドボックス
+
+承認ゲートも権限ルールも、見ているのはコマンドの**文字列**です。承認した `cargo test` や `make` が内側で何を書き換えるかまでは分かりません。`[sandbox]` を有効にすると、Bash ツールが起動するプロセス（とその子孫）を OS の仕組みで閉じ込めます。
+
+```toml
+[sandbox]
+mode = "workspace-write"   # "off"（既定）| "workspace-write" | "read-only"
+network = false            # 既定 true。false でサンドボックス内からの通信を遮断（loopback も）
+```
+
+| mode | 書ける場所 |
+| --- | --- |
+| `off` | 制限なし（既定。これまでと同じ） |
+| `workspace-write` | 作業ディレクトリ以下と一時ディレクトリ（`/tmp`、`$TMPDIR`） |
+| `read-only` | どこにも書けない（`/dev/null` などを除く） |
+
+- **macOS** は `sandbox-exec`（seatbelt）、**Linux** は [`bwrap`（bubblewrap）](https://github.com/containers/bubblewrap)を使います。`mode` が `off` 以外なのに道具が無い・起動できない環境では、**素通しにせずコマンドを実行しません**（サンドボックスを頼んだのに黙って外で走るのが最悪なので）。Windows は未対応です。
+- `workspace-write` でも、作業ディレクトリの中の次の場所は書けません: `.lodan/`、`.env`、`.mcp.json`、`.git/hooks/`、`.git/config`、`.git/modules/`（サブモジュールの git ディレクトリ）。ここに書けると、サンドボックスの中のコマンドが「次にサンドボックスの外で動くもの」（lodan の設定や hooks、MCP サーバ、git の hooks）を仕込めてしまうためです。`.git` という名前そのものも固定します（`.git` ごと rename して hooks 入りの別物に差し替える回り道を塞ぐため）。`git add` / `commit` / `checkout -b` などは通常どおり動きますが、**`git init` とサブモジュール内の git 操作はサンドボックスの外で**行ってください。linked worktree（`git worktree add`）やサブモジュールの中では `.git` が「本体の場所を書いたファイル」で、これも書き換えられません。その場合 git の本体（index や objects）は作業ディレクトリの外にあるので、**`git add` / `commit` もサンドボックスの外で**行うことになります。
+- **Linux（bwrap）の制約**: bwrap が守れるのは起動時に存在するパスだけです。そのため lodan は空の `.lodan/`（と、git リポジトリなら `.git/hooks/`・`.git/modules/`）を先に作ります。まだ存在しない**ファイル**（`.env`・`.mcp.json`・`.git/config`）と、リポジトリでないディレクトリでの `.git` の作成は止められません。代わりに、コマンドの実行中にそれらが現れたら `[sandbox] WARNING` を端末とツール結果の両方に出します（フォアグラウンド実行のみ）。検出はコマンドの終了直後に 1 回行うだけなので、**バックグラウンドに残したプロセスが後から書いたものは拾えません** — Linux では「止められないものを、できる範囲で知らせる」に留まります。macOS は作成そのものを止めます。
+- `$TMPDIR` が `/`・ホーム・作業ディレクトリを含む場所を指している場合は無視します（「一時ディレクトリは書ける」が「どこでも書ける」になってしまうため）。
+- **サンドボックスを切れるのは設定を書ける人**です: 信頼済みディレクトリ（[workspace trust](#workspace-trust--信頼していないディレクトリの設定は読まない)）のプロジェクト設定や `.env` は、ユーザ設定の `[sandbox]` を上書きできます（他の設定と同じ後勝ち）。信頼していないディレクトリのものは読まれません。確実に効かせたい実行では `--sandbox <mode>` を付けてください（フラグが最優先）。
+- 読み取りは制限しません（制限すると普通のビルドが動きません）。秘密のファイルを読ませたくなければ[権限ルール](#権限ルールとモード)の deny と併用してください。`network = true` のままだと、読めたものを外へ送れる点にも注意してください。
+- 対象は **Bash ツールだけ**（フォアグラウンドと `run_in_background` の両方）です。Write / Edit などの組み込みツール、hooks、MCP サーバは lodan 本体と同じ権限で動きます。こちらは承認ゲートと権限ルールの持ち場です。
+- サンドボックスに止められたらしい失敗（`Operation not permitted` など）には、結果に `[sandbox]` の注記が付きます（フォアグラウンド実行のみ。`run_in_background` の出力には付きません）。モデルが同じコマンドを繰り返したり抜け道を探したりせず、ユーザーに伝えるようにするためです。
+- 承認を減らしたいときは `--permission-mode dont-ask` などと組み合わせられますが、サンドボックスは承認を**置き換えません**。モードやルールの判定はこれまでどおり先に行われます。
 
 ## ツール呼び出しの並列実行
 

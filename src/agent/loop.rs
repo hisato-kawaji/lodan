@@ -54,7 +54,8 @@ impl Session {
         let system = prompt::build_system_prompt(&cwd, &cfg.llm.active().model, registry.as_ref());
         let mut history = vec![Message::System { content: system }];
         history.extend(prior);
-        let ctx = ToolCtx::new(cwd);
+        let sandbox = crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd);
+        let ctx = ToolCtx::new(cwd).with_sandbox(sandbox);
         Self {
             cfg,
             registry,

@@ -84,6 +84,8 @@ pub struct ToolCtx {
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
     /// `Bash` の run_in_background が登録し、`Monitor` が読むバックグラウンドプロセス。
     pub bg: Arc<Mutex<background::BgStore>>,
+    /// Bash を包むサンドボックスの方針 (#75)。既定は off。
+    pub sandbox: crate::sandbox::SandboxPolicy,
 }
 
 impl ToolCtx {
@@ -93,7 +95,13 @@ impl ToolCtx {
             read_tracker: Arc::new(Mutex::new(HashSet::new())),
             todos: Arc::new(Mutex::new(Vec::new())),
             bg: Arc::new(Mutex::new(background::BgStore::default())),
+            sandbox: crate::sandbox::SandboxPolicy::off(),
         }
+    }
+
+    pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.sandbox = policy;
+        self
     }
 
     pub fn mark_read(&self, p: &std::path::Path) {

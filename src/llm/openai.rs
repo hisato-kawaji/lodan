@@ -1302,6 +1302,46 @@ mod tests {
         assert_eq!(json["top_k"], 20);
     }
 
+    /// `ChatRequest` にフィールドを足したら、予約キーにも足すこと。忘れると JSON のキーが重複し得る。
+    #[test]
+    fn the_reserved_keys_are_exactly_what_a_full_request_serializes() {
+        let no_extra = serde_json::Map::new();
+        let tool = ToolSpec {
+            kind: "function",
+            function: crate::agent::messages::ToolSpecFunction {
+                name: "T",
+                description: "d",
+                parameters: serde_json::json!({}),
+            },
+        };
+        let tools = [tool];
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &tools,
+            tool_choice: Some("auto"),
+            max_tokens: Some(1),
+            temperature: Some(0.5),
+            reasoning_effort: Some("low"),
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            extra: &no_extra,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let mut sent: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut reserved = RESERVED_BODY_KEYS.to_vec();
+        sent.sort_unstable();
+        reserved.sort_unstable();
+        assert_eq!(sent, reserved);
+    }
+
     #[test]
     fn extra_body_cannot_replace_what_lodan_builds() {
         for key in RESERVED_BODY_KEYS {

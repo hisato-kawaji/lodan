@@ -140,8 +140,9 @@ impl ProviderOverlay {
             context_window: context_window.unwrap_or(base.context_window),
             temperature: temperature.or(base.temperature),
             reasoning_effort: reasoning_effort.or(base.reasoning_effort),
-            // テーブルごと後勝ち (キー単位で混ぜると、下位レイヤーのキーを消す手段が無くなる)。
-            extra_body: extra_body.unwrap_or(base.extra_body),
+            // レイヤー間の重ね合わせは `merge_table` がキー単位で済ませている (他のテーブルと同じ)。
+            // 組み込みの既定値は常に空なので、ここは「書かれていればそれ」で足りる。
+            extra_body: extra_body.unwrap_or_default(),
             max_retries: max_retries.unwrap_or(base.max_retries),
             retry_base_ms: retry_base_ms.unwrap_or(base.retry_base_ms),
             stream_idle_timeout_secs: stream_idle_timeout_secs
@@ -1038,6 +1039,28 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(cfg.llm.active().reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// `extra_body` も他のテーブルと同じく、レイヤー間ではキー単位で重なる。
+    #[test]
+    fn extra_body_merges_per_key_across_layers() {
+        let user = layer(
+            "user.toml",
+            "[llm.local.extra_body]\ntop_k = 20\nmin_p = 0.1\n",
+        );
+        let project = layer(
+            "project.toml",
+            "[llm.local.extra_body]\ntop_k = 40\nchat_template_kwargs = { enable_thinking = false }\n",
+        );
+        let (cfg, origins) = from_layers(vec![user, project]).unwrap();
+        let extra = &cfg.llm.local.extra_body;
+        assert_eq!(extra["top_k"], 40, "the later layer wins per key");
+        assert_eq!(extra["min_p"], 0.1, "keys it does not mention survive");
+        assert_eq!(extra["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(
+            origins["llm.local.extra_body.top_k"],
+            Origin::File(PathBuf::from("project.toml"))
+        );
     }
 
     #[test]

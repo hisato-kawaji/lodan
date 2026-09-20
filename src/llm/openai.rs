@@ -1303,6 +1303,7 @@ mod tests {
     }
 
     /// `ChatRequest` にフィールドを足したら、予約キーにも足すこと。忘れると JSON のキーが重複し得る。
+    /// 下のリテラルは**全フィールドを値つきで**埋めること (`None` のままだと直列化されず、ずれを検出できない)。
     #[test]
     fn the_reserved_keys_are_exactly_what_a_full_request_serializes() {
         let no_extra = serde_json::Map::new();

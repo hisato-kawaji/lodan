@@ -124,6 +124,7 @@ impl Runtime {
                 cfg.agent.max_iterations,
             )
             .with_rules(rules)
+            .with_reasoning_roundtrip(cfg.llm.active().reasoning_roundtrip)
             .with_hooks(
                 crate::hooks::effective(&cfg.hooks, &cfg.disabled_hooks),
                 cfg.hooks_compat,

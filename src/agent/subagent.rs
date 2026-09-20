@@ -42,6 +42,8 @@ pub struct SubAgentTool {
     /// SubagentStart / SubagentStop で発火させる hook (親と同じもの)。
     hooks: Vec<crate::hooks::HookConfig>,
     hooks_compat: crate::hooks::HooksCompat,
+    /// 子のツール往復でも思考過程を送り返すか (`[llm.<provider>] reasoning_roundtrip`)。
+    reasoning_roundtrip: bool,
 }
 
 /// hook の matcher と payload に出す子エージェントの種類。いまは調査用の 1 種類だけ。
@@ -65,7 +67,13 @@ impl SubAgentTool {
             rules: Arc::new(RuleSet::default()),
             hooks: Vec::new(),
             hooks_compat: crate::hooks::HooksCompat::default(),
+            reasoning_roundtrip: true,
         }
+    }
+
+    pub fn with_reasoning_roundtrip(mut self, enabled: bool) -> Self {
+        self.reasoning_roundtrip = enabled;
+        self
     }
 
     /// 親の hook を子の開始・終了でも発火させる。
@@ -164,10 +172,15 @@ impl SubAgentTool {
             .map_err(|e| ToolError::Other(format!("sub-agent llm error: {e}")))?;
 
             let tool_calls = resp.tool_calls.clone();
+            // 親のループと同じ: ツール往復の間だけ、思考過程を送り返す。
+            let reasoning_content = resp
+                .reasoning
+                .clone()
+                .filter(|_| !tool_calls.is_empty() && self.reasoning_roundtrip);
             history.push(Message::Assistant {
                 content: resp.content.clone(),
                 tool_calls: tool_calls.clone(),
-                reasoning_content: None,
+                reasoning_content,
             });
 
             if tool_calls.is_empty() {
@@ -572,6 +585,77 @@ mod tests {
         let sub = subagent(steps, tmp.path().to_path_buf());
         let out = sub.run("find the needle").await.unwrap();
         assert_eq!(out, "found the needle");
+    }
+
+    /// 1 回目は思考つきでツールを呼び、2 回目は「受け取った履歴に思考が付いていたか」を答える LLM。
+    struct ThinkingProbeLlm {
+        call: ToolCall,
+    }
+
+    #[async_trait]
+    impl LlmClient for ThinkingProbeLlm {
+        async fn chat(
+            &self,
+            history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _max_tokens: Option<u32>,
+        ) -> Result<ChatResponse> {
+            let came_back = history.iter().any(|m| {
+                matches!(m, Message::Assistant { reasoning_content: Some(r), .. } if r == "look first")
+            });
+            let asked_already = history.iter().any(|m| matches!(m, Message::Tool { .. }));
+            Ok(if asked_already {
+                ChatResponse {
+                    content: Some(format!("reasoning came back: {came_back}")),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning: None,
+                }
+            } else {
+                ChatResponse {
+                    content: None,
+                    tool_calls: vec![self.call.clone()],
+                    usage: None,
+                    reasoning: Some("look first".into()),
+                }
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            unreachable!("the sub-agent does not stream")
+        }
+    }
+
+    /// 子のツール往復でも、親と同じく思考過程を送り返す (設定で止められる)。
+    #[tokio::test]
+    async fn the_sub_agent_round_trips_reasoning_inside_its_own_tool_loop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = |roundtrip: bool| {
+            let llm = ThinkingProbeLlm {
+                call: tool_call(
+                    "Glob",
+                    &serde_json::json!({ "pattern": "*.none", "path": tmp.path() }).to_string(),
+                ),
+            };
+            let sub = SubAgentTool::new(
+                Arc::new(llm),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                tmp.path().to_path_buf(),
+                8,
+            )
+            .with_reasoning_roundtrip(roundtrip);
+            async move { sub.run("look around").await.unwrap() }
+        };
+        assert_eq!(run(true).await, "reasoning came back: true");
+        assert_eq!(run(false).await, "reasoning came back: false");
     }
 
     #[tokio::test]

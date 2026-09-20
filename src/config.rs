@@ -33,8 +33,50 @@ pub struct Config {
     pub llm: LlmConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
+    pub permissions: PermissionsConfig,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
+}
+
+/// 承認が要る呼び出しをどう扱うか (#74)。deny ルールはどのモードでも効く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionMode {
+    /// 破壊的ツールは尋ねる。
+    #[default]
+    Default,
+    /// ファイル編集 (Write / Edit / MultiEdit / NotebookEdit) は尋ねずに通す。Bash などは尋ねる。
+    AcceptEdits,
+    /// plan モードで開始する (承認の扱いは default と同じ)。
+    Plan,
+    /// 尋ねない。尋ねるはずだった呼び出しは拒否する (無人実行向け。allow ルールで通すものを決める)。
+    DontAsk,
+    /// 尋ねずに全て通す (`--yes` と同じ)。
+    Bypass,
+}
+
+impl PermissionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "accept-edits",
+            PermissionMode::Plan => "plan",
+            PermissionMode::DontAsk => "dont-ask",
+            PermissionMode::Bypass => "bypass",
+        }
+    }
+}
+
+/// `[permissions]`。ルールの構文は `src/permission_rules.rs`。
+/// `allow` / `deny` / `ask` は設定ファイルのレイヤー間で**連結**される (hooks と同じ) —
+/// プロジェクト設定がユーザ設定の deny を消せてはいけない。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    pub mode: PermissionMode,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub ask: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -435,6 +477,19 @@ impl Config {
             self.agent.dup_suppress = v;
             mark("agent.dup_suppress".into());
         }
+        if let Some(v) = o.permission_mode {
+            self.permissions.mode = v;
+            mark("permissions.mode".into());
+        }
+        // 実行時の指定は設定ファイルのルールに足す (置き換えない: deny を消せてはいけない)。
+        if !o.allowed_tools.is_empty() {
+            self.permissions.allow.extend(o.allowed_tools);
+            mark("permissions.allow".into());
+        }
+        if !o.disallowed_tools.is_empty() {
+            self.permissions.deny.extend(o.disallowed_tools);
+            mark("permissions.deny".into());
+        }
         if let Some(v) = o.parallel_tools {
             self.agent.parallel_tools = v;
             mark("agent.parallel_tools".into());
@@ -474,6 +529,9 @@ pub struct Overrides {
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,
     pub parallel_tools: Option<bool>,
+    pub permission_mode: Option<PermissionMode>,
+    pub allowed_tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
     pub tool_profile: Option<ToolProfile>,
     pub tools: Option<Vec<String>>,
 }
@@ -504,7 +562,12 @@ impl std::fmt::Display for Origin {
 
 /// レイヤー間で後勝ちにせず連結する配列キー。hook はユーザ設定とプロジェクト設定の
 /// 両方を効かせたい (プロジェクト側に 1 つ足しただけでユーザの hook が消えるのは事故)。
-const CONCAT_ARRAY_KEYS: &[&str] = &["hooks"];
+const CONCAT_ARRAY_KEYS: &[&str] = &[
+    "hooks",
+    "permissions.allow",
+    "permissions.deny",
+    "permissions.ask",
+];
 
 fn read_toml(path: &Path) -> Result<Option<toml::Table>> {
     if !path.exists() {
@@ -554,7 +617,7 @@ fn merge_table(
         } else {
             format!("{prefix}.{key}")
         };
-        let concat = prefix.is_empty() && CONCAT_ARRAY_KEYS.contains(&key.as_str());
+        let concat = CONCAT_ARRAY_KEYS.contains(&full.as_str());
         match (base.get_mut(&key), value) {
             (Some(Value::Table(b)), Value::Table(o)) => merge_table(b, o, &full, origin, origins),
             (existing, Value::Array(o)) if concat => {
@@ -701,6 +764,43 @@ mod tests {
         });
         assert_eq!(cfg.agent.tools, ["Glob"]);
         assert_eq!(Config::default().agent.tool_profile, ToolProfile::Full);
+    }
+
+    #[test]
+    fn permission_rules_concatenate_across_layers_and_runtime_rules_are_appended() {
+        let user = layer(
+            "user.toml",
+            "[permissions]\nmode = \"accept-edits\"\ndeny = [\"Read(**/.env)\"]\nallow = [\"Bash(git status)\"]\n",
+        );
+        let project = layer(
+            "project.toml",
+            "[permissions]\ndeny = [\"Bash(git push *)\"]\nallow = [\"Bash(cargo *)\"]\n",
+        );
+        let (mut cfg, origins) = from_layers(vec![user, project]).unwrap();
+        assert_eq!(cfg.permissions.mode, PermissionMode::AcceptEdits);
+        // プロジェクト設定はユーザ設定の deny を消せない。
+        assert_eq!(cfg.permissions.deny, ["Read(**/.env)", "Bash(git push *)"]);
+        assert_eq!(cfg.permissions.allow, ["Bash(git status)", "Bash(cargo *)"]);
+        assert_eq!(
+            origins["permissions.deny[0]"],
+            Origin::File(PathBuf::from("user.toml"))
+        );
+        assert_eq!(
+            origins["permissions.deny[1]"],
+            Origin::File(PathBuf::from("project.toml"))
+        );
+
+        cfg.apply_overrides(Overrides {
+            permission_mode: Some(PermissionMode::DontAsk),
+            disallowed_tools: vec!["WebFetch".into()],
+            ..Default::default()
+        });
+        assert_eq!(cfg.permissions.mode, PermissionMode::DontAsk);
+        assert_eq!(
+            cfg.permissions.deny.len(),
+            3,
+            "runtime rules add to the file's, never replace"
+        );
     }
 
     #[test]

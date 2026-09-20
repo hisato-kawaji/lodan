@@ -88,13 +88,21 @@ impl Runtime {
 
         // サブエージェント (Task): 読み取り専用ツールで調査を委譲する。
         // LLM クライアントが要るため default_registry ではなくここで登録する。
-        registry.register(Arc::new(agent::subagent::SubAgentTool::new(
-            Arc::clone(&llm),
-            cfg.llm.active().model.clone(),
-            Arc::new(read_only_registry()),
-            cwd.clone(),
-            cfg.agent.max_iterations,
-        )));
+        // 子は親の承認ゲートを通らないので、同じルールを持たせる (#74)。
+        let p = &cfg.permissions;
+        let rules = Arc::new(crate::permission_rules::RuleSet::parse(
+            &p.allow, &p.deny, &p.ask,
+        )?);
+        registry.register(Arc::new(
+            agent::subagent::SubAgentTool::new(
+                Arc::clone(&llm),
+                cfg.llm.active().model.clone(),
+                Arc::new(read_only_registry()),
+                cwd.clone(),
+                cfg.agent.max_iterations,
+            )
+            .with_rules(rules),
+        ));
 
         // Skill ツール: モデルが名前で手順書を読み込める。skill が無ければ登録しない。
         if !user_skills.is_empty() {

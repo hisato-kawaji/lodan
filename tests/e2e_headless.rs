@@ -496,3 +496,110 @@ fn a_runtime_tool_profile_beats_a_tool_list_in_the_config_file() {
     assert_eq!(tools["visible"].as_array().unwrap().len(), 6, "{tools}");
     assert_eq!(tools["explicit"], false);
 }
+
+/// demo フロー (Write → Read → Edit → Grep → Glob → Bash) の各ツールがどう扱われたか。
+fn demo_reasons(home: &Path, port: u16, extra: &[&str]) -> Vec<(String, String)> {
+    let mut args = vec!["-p", "run the demo", "--output-format", "stream-json"];
+    args.extend_from_slice(extra);
+    let out = lodan(home, port, &args, Stdin::OpenAndSilent);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout(&out)
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["event"] == "tool_result")
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap().to_string(),
+                e["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_deny_rule_holds_even_with_yes() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let server = start_mock(&demo);
+    let reasons = demo_reasons(
+        home.path(),
+        server.port,
+        &["--yes", "--disallowed-tools", "Bash"],
+    );
+    let of = |tool: &str| {
+        reasons
+            .iter()
+            .find(|(n, _)| n == tool)
+            .map(|(_, r)| r.as_str())
+    };
+    assert_eq!(
+        of("Write"),
+        Some("ok"),
+        "--yes still approves what no rule forbids"
+    );
+    assert_eq!(of("Bash"), Some("denied"), "deny wins over --yes");
+    assert!(demo.join("hello.txt").exists());
+}
+
+#[test]
+fn dont_ask_with_allow_rules_runs_exactly_what_was_allowed() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let server = start_mock(&demo);
+    // Write と Edit だけを許可。Bash は尋ねる相手がいないので拒否される。
+    let reasons = demo_reasons(
+        home.path(),
+        server.port,
+        &[
+            "--permission-mode",
+            "dont-ask",
+            "--allowed-tools",
+            "Write",
+            "--allowed-tools",
+            "Edit",
+        ],
+    );
+    let of = |tool: &str| {
+        reasons
+            .iter()
+            .find(|(n, _)| n == tool)
+            .map(|(_, r)| r.as_str())
+    };
+    assert_eq!(of("Write"), Some("ok"));
+    assert_eq!(of("Edit"), Some("ok"));
+    assert_eq!(of("Bash"), Some("denied"));
+    assert_eq!(
+        std::fs::read_to_string(demo.join("hello.txt")).unwrap(),
+        "hello world"
+    );
+}
+
+#[test]
+fn a_malformed_permission_rule_fails_at_startup_in_the_requested_format() {
+    let home = tempfile::tempdir().unwrap();
+    let out = lodan(
+        home.path(),
+        1,
+        &[
+            "-p",
+            "hi",
+            "--output-format",
+            "json",
+            "--disallowed-tools",
+            "Bash(rm *",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("missing closing"),
+        "{v}"
+    );
+}

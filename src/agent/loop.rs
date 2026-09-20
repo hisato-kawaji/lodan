@@ -7,7 +7,7 @@ use crate::agent::messages::Message;
 use crate::config::Config;
 use crate::hooks::{self, HookOutcome, Lifecycle};
 use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
-use crate::permission::PermissionGate;
+use crate::permission::{Decision, PermissionGate};
 use crate::prompt;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{ToolCtx, ToolOutput};
@@ -280,7 +280,7 @@ impl Session {
             // 下の逐次ループが結果を元の順序で消費するので、表示・PostToolUse hook・
             // runlog・history の順序は逐次実行のときと変わらない。
             let mut prefetched = self
-                .prefetch_parallel(&tool_calls, last_call.as_ref())
+                .prefetch_parallel(&tool_calls, last_call.as_ref(), gate)
                 .await?;
             for (call_index, call) in tool_calls.into_iter().enumerate() {
                 let name = call.function.name.clone();
@@ -382,20 +382,22 @@ impl Session {
                                     reason = "hook_blocked";
                                     ToolOutput::error(format!("blocked by hook: {hook_reason}"))
                                 }
+                                // read-only のツールもゲートを通す: deny ルールは Read にも効く (#74)。
                                 HookOutcome::Continue => {
-                                    let approved =
-                                        !tool.is_destructive() || gate.allow(tool.name(), &args);
-                                    if !approved {
-                                        reason = "denied";
-                                        ToolOutput::error(gate.denial_message())
-                                    } else {
-                                        // 実行が確定してから変更前を退避する (/undo 用)。
-                                        self.snapshot_for_undo(&name, &args);
-                                        match tool.execute(args.clone(), &self.ctx).await {
-                                            Ok(o) => o,
-                                            Err(e) => {
-                                                reason = "tool_error";
-                                                ToolOutput::error(format!("tool error: {e}"))
+                                    match gate.decide(tool.name(), &args, tool.is_destructive()) {
+                                        Decision::Deny(why) => {
+                                            reason = "denied";
+                                            ToolOutput::error(why)
+                                        }
+                                        Decision::Allow => {
+                                            // 実行が確定してから変更前を退避する (/undo 用)。
+                                            self.snapshot_for_undo(&name, &args);
+                                            match tool.execute(args.clone(), &self.ctx).await {
+                                                Ok(o) => o,
+                                                Err(e) => {
+                                                    reason = "tool_error";
+                                                    ToolOutput::error(format!("tool error: {e}"))
+                                                }
                                             }
                                         }
                                     }
@@ -471,6 +473,7 @@ impl Session {
         &self,
         calls: &[crate::agent::messages::ToolCall],
         last_call: Option<&(String, String)>,
+        gate: &PermissionGate,
     ) -> Result<std::collections::HashMap<usize, Prefetched>> {
         let mut out = std::collections::HashMap::new();
         if !self.cfg.agent.parallel_tools {
@@ -503,10 +506,18 @@ impl Session {
                 };
                 let duplicate = self.cfg.agent.dup_suppress
                     && previous == Some((call.name.as_str(), call.arguments.as_str()));
+                // 尋ねずに「通す」と決まる呼び出しだけ。deny ルールに当たる Read を先に読んで
+                // しまってはいけないし、ask ルールに当たるものは尋ねる必要がある (#74)。
+                let pre_approved = gate.decide_quietly(
+                    &call.name,
+                    &parse_tool_args(&call.arguments),
+                    tool.is_destructive(),
+                ) == Some(Decision::Allow);
                 self.registry.is_visible(&call.name)
                     && !tool.is_destructive()
                     && tool.parallel_safe()
                     && !duplicate
+                    && pre_approved
             })
             .collect();
 
@@ -920,6 +931,9 @@ impl CompactOutcome {
 
 /// runlog の `tool_result.reason` 既定値 (ループ側の介入なしに実行された)。
 const TOOL_REASON_OK: &str = "ok";
+
+// 下の組分けループは 1 周で少なくとも 2 個進む前提。0 や 1 にすると終わらない。
+const _: () = assert!(MAX_PARALLEL_TOOL_CALLS >= 2);
 
 /// 1 度に同時実行するツール呼び出しの上限。Task は承認ゲートを通らない (非破壊) ので、
 /// モデルが 1 応答に `Task` を 10 個並べると、子エージェントの LLM ループが 10 本同時に走って
@@ -1942,6 +1956,45 @@ mod tests {
                 ("c2".to_string(), "Par 3".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_deny_rule_stops_a_read_only_call_even_inside_a_parallel_span_and_under_yes() {
+        let mut cfg = Config::default();
+        cfg.agent.auto_approve = true;
+        cfg.permissions.deny = vec!["Par".into()];
+        let (mut session, stats) = probe_session(cfg.clone());
+        let gate = PermissionGate::from_config(&cfg, std::path::Path::new("/work"), true).unwrap();
+        let llm = batch(&[("Par", 1), ("Par", 2), ("Ser", 3)]);
+        session.run_turn("go", &llm, &gate).await.unwrap();
+
+        assert_eq!(
+            stats.runs.load(AtomicOrdering::SeqCst),
+            1,
+            "only Ser may run"
+        );
+        let replies = tool_replies(&session);
+        assert!(
+            replies[0].1.contains("denied by permission rule `Par`"),
+            "{}",
+            replies[0].1
+        );
+        assert!(replies[1].1.contains("denied by permission rule"));
+        assert_eq!(replies[2].1, "Ser 3");
+    }
+
+    #[tokio::test]
+    async fn calls_that_need_a_prompt_are_not_run_ahead_in_parallel() {
+        // ask ルールに当たる呼び出しは先行実行しない (尋ねる前に実行してはいけない)。
+        // 尋ねる相手がいないゲートなので、逐次側で拒否される = 1 度も実行されない。
+        let mut cfg = Config::default();
+        cfg.permissions.ask = vec!["Par".into()];
+        let (mut session, stats) = probe_session(cfg.clone());
+        let gate = PermissionGate::from_config(&cfg, std::path::Path::new("/work"), false).unwrap();
+        let llm = batch(&[("Par", 1), ("Par", 2)]);
+        session.run_turn("go", &llm, &gate).await.unwrap();
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), 0);
+        assert!(tool_replies(&session)[0].1.contains("non-interactive"));
     }
 
     #[tokio::test]

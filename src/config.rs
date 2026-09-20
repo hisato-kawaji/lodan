@@ -37,6 +37,10 @@ pub struct Config {
     pub sandbox: crate::sandbox::SandboxConfig,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
+    /// 無効にする hook の `id`。レイヤー間で連結される (プロジェクト側からユーザ設定の hook を
+    /// 名指しで外せる。逆も同じ)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_hooks: Vec<String>,
     /// hook の終了コードの解釈。`"v1"` で「非 0 は全てブロック」の旧挙動に戻す。
     pub hooks_compat: crate::hooks::HooksCompat,
 }
@@ -691,6 +695,7 @@ impl std::fmt::Display for Origin {
 /// 両方を効かせたい (プロジェクト側に 1 つ足しただけでユーザの hook が消えるのは事故)。
 const CONCAT_ARRAY_KEYS: &[&str] = &[
     "hooks",
+    "disabled_hooks",
     "permissions.allow",
     "permissions.deny",
     "permissions.ask",
@@ -1029,6 +1034,43 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.hooks_compat, crate::hooks::HooksCompat::V1);
         assert_eq!(cfg.hooks[0].timeout_secs, Some(5));
+    }
+
+    /// #87 からの持ち越し: 連結される hook を、上のレイヤーから名指しで外せる。
+    #[test]
+    fn a_later_layer_can_disable_or_replace_a_named_hook_from_an_earlier_one() {
+        let user = layer(
+            "user.toml",
+            r#"
+            [[hooks]]
+            id = "notify"
+            event = "Stop"
+            command = "user-notify"
+
+            [[hooks]]
+            id = "lint"
+            event = "PostToolUse"
+            command = "user-lint"
+            "#,
+        );
+        let project = layer(
+            "project.toml",
+            r#"
+            disabled_hooks = ["notify"]
+
+            [[hooks]]
+            id = "lint"
+            event = "PostToolUse"
+            command = "project-lint"
+            "#,
+        );
+        let (cfg, _) = from_layers(vec![user, project]).unwrap();
+        assert_eq!(cfg.hooks.len(), 3, "the file layers still concatenate");
+        let active: Vec<String> = crate::hooks::effective(&cfg.hooks, &cfg.disabled_hooks)
+            .into_iter()
+            .map(|h| h.command)
+            .collect();
+        assert_eq!(active, ["project-lint"]);
     }
 
     #[test]

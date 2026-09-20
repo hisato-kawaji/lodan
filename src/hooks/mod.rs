@@ -14,6 +14,18 @@ pub enum Lifecycle {
     UserPromptSubmit,
     PreToolUse,
     PostToolUse,
+    /// ツールがエラーを返したとき (PostToolUse に加えて発火する)。ブロックはできない。
+    PostToolUseFailure,
+    /// 承認プロンプトを出す直前。JSON の `decision` で allow / deny を返せる。
+    PermissionRequest,
+    /// lodan が利用者の注意を必要としているとき (承認待ちなど)。通知用で、出力は読まない。
+    Notification,
+    /// コンテキスト圧縮の前後。matcher は `manual` (`/compact`) か `auto`。PreCompact はブロックできる。
+    PreCompact,
+    PostCompact,
+    /// `Task` の子エージェントの開始と終了。ブロックはできない。
+    SubagentStart,
+    SubagentStop,
     Stop,
 }
 
@@ -40,6 +52,10 @@ pub enum HooksCompat {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
+    /// 任意の名前。後段のレイヤーが同じ `id` の hook を書けば置き換わり、`disabled_hooks` に
+    /// 書けば無効になる (レイヤー間で hook は連結されるので、名前が無いと外す手段が無い)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub event: Lifecycle,
     #[serde(default)]
     pub matcher: String,
@@ -99,6 +115,34 @@ impl HookConfig {
     }
 }
 
+/// 実際に発火させる hook の並び。`disabled` に挙がった `id` を外し、同じ `id` が複数あれば
+/// **最後のもの**だけを残す (位置は最後のものの位置)。`id` の無い hook はそのまま。
+pub fn effective(hooks: &[HookConfig], disabled: &[String]) -> Vec<HookConfig> {
+    hooks
+        .iter()
+        .enumerate()
+        .filter(|(i, hook)| match &hook.id {
+            None => true,
+            Some(id) => {
+                !disabled.contains(id)
+                    && !hooks[i + 1..]
+                        .iter()
+                        .any(|later| later.id.as_ref() == Some(id))
+            }
+        })
+        .map(|(_, hook)| hook.clone())
+        .collect()
+}
+
+/// `disabled` のうち、どの hook の `id` でもないもの。綴り違いで「外したつもり」になるのを防ぐ。
+pub fn unknown_disabled<'a>(hooks: &[HookConfig], disabled: &'a [String]) -> Vec<&'a str> {
+    disabled
+        .iter()
+        .filter(|id| !hooks.iter().any(|h| h.id.as_ref() == Some(*id)))
+        .map(String::as_str)
+        .collect()
+}
+
 #[async_trait]
 pub trait Hook: Send + Sync {
     fn name(&self) -> &str;
@@ -138,5 +182,50 @@ impl HookOutcome {
     /// `context` を 1 つの文字列に。無ければ None。
     pub fn joined_context(&self) -> Option<String> {
         (!self.context.is_empty()).then(|| self.context.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(id: Option<&str>, command: &str) -> HookConfig {
+        HookConfig {
+            id: id.map(str::to_string),
+            event: Lifecycle::PreToolUse,
+            matcher: String::new(),
+            command: command.to_string(),
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn a_later_hook_with_the_same_id_replaces_the_earlier_one_and_disabled_ids_are_dropped() {
+        // レイヤーの順 (ユーザ設定 → プロジェクト設定) に連結された並び。
+        let hooks = [
+            named(Some("lint"), "user-lint"),
+            named(None, "user-anonymous"),
+            named(Some("notify"), "user-notify"),
+            named(Some("lint"), "project-lint"),
+        ];
+        let commands = |disabled: &[&str]| -> Vec<String> {
+            let disabled: Vec<String> = disabled.iter().map(|s| s.to_string()).collect();
+            effective(&hooks, &disabled)
+                .into_iter()
+                .map(|h| h.command)
+                .collect()
+        };
+        assert_eq!(
+            commands(&[]),
+            ["user-anonymous", "user-notify", "project-lint"]
+        );
+        assert_eq!(commands(&["notify"]), ["user-anonymous", "project-lint"]);
+        assert_eq!(
+            commands(&["lint", "nope"]),
+            ["user-anonymous", "user-notify"]
+        );
+
+        let disabled = vec!["lint".to_string(), "nope".to_string()];
+        assert_eq!(unknown_disabled(&hooks, &disabled), ["nope"]);
     }
 }

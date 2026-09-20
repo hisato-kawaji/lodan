@@ -39,7 +39,13 @@ pub struct SubAgentTool {
     /// 親と同じ permission ルール。子は親の承認ゲートを通らずにツールを実行するので、
     /// ここで見ないと `deny = ["Read(**/.env)"]` を「Task に読ませる」だけですり抜けられる。
     rules: Arc<RuleSet>,
+    /// SubagentStart / SubagentStop で発火させる hook (親と同じもの)。
+    hooks: Vec<crate::hooks::HookConfig>,
+    hooks_compat: crate::hooks::HooksCompat,
 }
+
+/// hook の matcher と payload に出す子エージェントの種類。いまは調査用の 1 種類だけ。
+const AGENT_TYPE: &str = "general-purpose";
 
 impl SubAgentTool {
     pub fn new(
@@ -57,7 +63,59 @@ impl SubAgentTool {
             // 親の上限と子専用上限の小さい方を採る。
             max_iterations: max_iterations.min(SUBAGENT_MAX_ITERATIONS),
             rules: Arc::new(RuleSet::default()),
+            hooks: Vec::new(),
+            hooks_compat: crate::hooks::HooksCompat::default(),
         }
+    }
+
+    /// 親の hook を子の開始・終了でも発火させる。
+    pub fn with_hooks(
+        mut self,
+        hooks: Vec<crate::hooks::HookConfig>,
+        compat: crate::hooks::HooksCompat,
+    ) -> Self {
+        self.hooks = hooks;
+        self.hooks_compat = compat;
+        self
+    }
+
+    /// 通知用。子は既に走る (または走り終えた) ので、hook の結果では止めない。
+    async fn notify(&self, lc: crate::hooks::Lifecycle, extra: serde_json::Value) {
+        let mut payload = serde_json::json!({
+            "hook_event_name": lc,
+            "cwd": self.cwd,
+            "agent_type": AGENT_TYPE,
+        });
+        if let (Some(base), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
+            base.extend(extra);
+        }
+        if let Err(e) = crate::hooks::runner::dispatch(
+            lc,
+            Some(AGENT_TYPE),
+            &payload,
+            &self.hooks,
+            self.hooks_compat,
+        )
+        .await
+        {
+            tracing::warn!("{lc:?} hook failed: {e:#}");
+        }
+    }
+
+    async fn run(&self, task: &str) -> Result<String, ToolError> {
+        use crate::hooks::Lifecycle;
+        self.notify(
+            Lifecycle::SubagentStart,
+            serde_json::json!({ "prompt": task }),
+        )
+        .await;
+        let result = self.run_inner(task).await;
+        let last = match &result {
+            Ok(text) => serde_json::json!({ "last_assistant_message": text }),
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        self.notify(Lifecycle::SubagentStop, last).await;
+        result
     }
 
     /// 親の permission ルールを子にも適用する。
@@ -83,7 +141,7 @@ impl SubAgentTool {
         }
     }
 
-    async fn run(&self, task: &str) -> Result<String, ToolError> {
+    async fn run_inner(&self, task: &str) -> Result<String, ToolError> {
         let system = prompt::build_system_prompt(&self.cwd, &self.model, self.tools.as_ref());
         let user = format!(
             "You are a read-only investigation sub-agent. Use the available tools to \
@@ -419,6 +477,53 @@ mod tests {
         let err = sub.run("again").await.unwrap_err().to_string();
         assert!(err.contains("budget exhausted"), "{err}");
         assert_eq!(ledger.requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn start_and_stop_hooks_see_the_task_and_its_answer() {
+        use crate::hooks::{HookConfig, HooksCompat, Lifecycle};
+        let tmp = tempfile::tempdir().unwrap();
+        let seen = tmp.path().join("payloads.jsonl");
+        let record = |event| HookConfig {
+            id: None,
+            event,
+            // matcher は子エージェントの種類。
+            matcher: "general-purpose".into(),
+            command: format!("cat >> '{0}'; echo >> '{0}'", seen.display()),
+            timeout_secs: None,
+        };
+        let sub = subagent(
+            vec![ChatResponse {
+                content: Some("the answer is 42".into()),
+                tool_calls: vec![],
+                usage: None,
+            }],
+            tmp.path().to_path_buf(),
+        )
+        .with_hooks(
+            vec![
+                record(Lifecycle::SubagentStart),
+                record(Lifecycle::SubagentStop),
+            ],
+            HooksCompat::V2,
+        );
+        assert_eq!(
+            sub.run("find the answer").await.unwrap(),
+            "the answer is 42"
+        );
+
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(payloads.len(), 2, "{payloads:?}");
+        assert_eq!(payloads[0]["hook_event_name"], "SubagentStart");
+        assert_eq!(payloads[0]["prompt"], "find the answer");
+        assert_eq!(payloads[0]["agent_type"], "general-purpose");
+        assert_eq!(payloads[1]["hook_event_name"], "SubagentStop");
+        assert_eq!(payloads[1]["last_assistant_message"], "the answer is 42");
     }
 
     #[tokio::test]

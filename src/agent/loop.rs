@@ -32,6 +32,8 @@ pub struct Session {
     undo: crate::undo::UndoLog,
     /// run_turn ごとに増える通し番号 (undo 台帳のターン識別に使う)。
     turn_seq: u64,
+    /// 実際に発火させる hook (`disabled_hooks` と `id` の置き換えを済ませたもの)。
+    active_hooks: Vec<hooks::HookConfig>,
     /// hook の payload に載せるセッションの素性 (永続化が無効なら空)。
     hook_env: HookEnv,
     /// hook が寄せた追加文脈のうち、まだモデルに渡していないもの。次のユーザ入力に添える。
@@ -67,6 +69,7 @@ impl Session {
         history.extend(prior);
         let sandbox = crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd);
         let ctx = ToolCtx::new(cwd).with_sandbox(sandbox);
+        let active_hooks = hooks::effective(&cfg.hooks, &cfg.disabled_hooks);
         Self {
             cfg,
             registry,
@@ -76,6 +79,7 @@ impl Session {
             mode: Mode::default(),
             undo: crate::undo::UndoLog::default(),
             turn_seq: 0,
+            active_hooks,
             hook_env: HookEnv::default(),
             pending_context: Vec::new(),
         }
@@ -118,7 +122,7 @@ impl Session {
             lc,
             subject,
             &payload,
-            &self.cfg.hooks,
+            &self.active_hooks,
             self.cfg.hooks_compat,
         )
         .await
@@ -484,10 +488,23 @@ impl Session {
                     // `tool_output` は v1 からの名前、`tool_response` は Claude Code の名前。
                     "tool_output": output.content,
                     "tool_response": output.content,
+                    "error": output.is_error.then_some(&output.content),
                 });
-                let post = self
-                    .fire_hook(Lifecycle::PostToolUse, Some(&name), post_payload)
-                    .await?;
+                // Claude Code と同じく、PostToolUse は成功した実行の後、PostToolUseFailure は失敗した
+                // 実行の後。実行に至らなかった呼び出し (hook / ゲートが止めた、未知のツール…) では
+                // どちらも発火しない。`hooks_compat = "v1"` は従来どおり全ての呼び出しで PostToolUse。
+                let executed = reason == TOOL_REASON_OK || reason == "tool_error";
+                let post_event = match (self.cfg.hooks_compat, executed, output.is_error) {
+                    (hooks::HooksCompat::V1, _, _) | (_, true, false) => {
+                        Some(Lifecycle::PostToolUse)
+                    }
+                    (_, true, true) => Some(Lifecycle::PostToolUseFailure),
+                    (_, false, _) => None,
+                };
+                let post = match post_event {
+                    Some(event) => self.fire_hook(event, Some(&name), post_payload).await?,
+                    None => HookOutcome::default(),
+                };
                 if let Some(reason) = &post.block {
                     // 実行後なので取り消せない。理由をツール出力へ追記し、
                     // history 経由でモデルへフィードバックする。
@@ -700,7 +717,7 @@ impl Session {
         // compact() 内の要約呼び出しで last_context_tokens は要約プロンプト分に
         // 上書きされるが、次ターンの stream_once が本来の値で再上書きするため
         // 連続発火にはならない。
-        match self.compact(llm, "").await {
+        match self.compact_triggered_by(COMPACT_AUTO, llm, "").await {
             Ok(outcome) => {
                 crate::say!("{}", crate::term::dim(&outcome.describe()));
                 crate::runlog::record(
@@ -750,8 +767,41 @@ impl Session {
             *args = updated;
         }
         hook_context.extend(pre.context);
+        let mut hint = pre.permission;
+        // 承認が要る呼び出しは、尋ねる前に PermissionRequest hook に諮る。allow の効き方は
+        // PreToolUse の allow と同じ (deny / ask ルールと dont-ask には勝てない)。
+        let assessed = gate.assess(tool.name(), args, tool.is_destructive());
+        if gate.needs_approval(&assessed, hint) {
+            let request = serde_json::json!({ "tool_name": tool.name(), "tool_input": args });
+            match self
+                .fire_hook(Lifecycle::PermissionRequest, Some(tool.name()), request)
+                .await
+            {
+                Ok(asked) => {
+                    if let Some(why) = asked.block {
+                        *reason = "hook_blocked";
+                        return ToolOutput::error(format!("denied by hook: {why}"));
+                    }
+                    // hook の ask を PermissionRequest の allow で打ち消させない。
+                    if hint != Some(hooks::PermissionHint::Ask) {
+                        hint = asked.permission.or(hint);
+                    }
+                }
+                Err(e) => tracing::warn!("PermissionRequest hook failed: {e:#}"),
+            }
+            // それでも人に尋ねることになるなら、通知用の hook を鳴らす (結果は見ない)。
+            if gate.can_prompt() && gate.needs_approval(&assessed, hint) {
+                let note = serde_json::json!({
+                    "notification_type": "permission_prompt",
+                    "message": format!("lodan needs your permission to use {}", tool.name()),
+                });
+                let _ = self
+                    .fire_hook(Lifecycle::Notification, Some("permission_prompt"), note)
+                    .await;
+            }
+        }
         // read-only のツールもゲートを通す: deny ルールは Read にも効く (#74)。
-        match gate.decide_hinted(tool.name(), args, tool.is_destructive(), pre.permission) {
+        match gate.decide_assessed(assessed, tool.name(), args, hint) {
             Decision::Deny(why) => {
                 *reason = "denied";
                 ToolOutput::error(why)
@@ -844,6 +894,50 @@ impl Session {
         llm: &dyn LlmClient,
         instruction: &str,
     ) -> Result<CompactOutcome> {
+        self.compact_triggered_by(COMPACT_MANUAL, llm, instruction)
+            .await
+    }
+
+    /// `trigger` は hook に伝える圧縮のきっかけ (`manual` = `/compact`、`auto` = しきい値)。
+    async fn compact_triggered_by(
+        &mut self,
+        trigger: &'static str,
+        llm: &dyn LlmClient,
+        instruction: &str,
+    ) -> Result<CompactOutcome> {
+        // 畳むものが無いときは hook も鳴らさない (「圧縮の前」ではないので)。
+        if self.compact_boundary().is_none() {
+            return Ok(CompactOutcome::Skipped);
+        }
+        let pre = self
+            .fire_hook(
+                Lifecycle::PreCompact,
+                Some(trigger),
+                serde_json::json!({ "trigger": trigger, "custom_instructions": instruction }),
+            )
+            .await?;
+        if let Some(reason) = pre.block {
+            crate::say!(
+                "compact blocked by hook: {}",
+                crate::term::sanitize(&reason)
+            );
+            return Ok(CompactOutcome::Skipped);
+        }
+        let outcome = self.compact_now(llm, instruction).await?;
+        if let CompactOutcome::Compacted { .. } = &outcome {
+            let _ = self
+                .fire_hook(
+                    Lifecycle::PostCompact,
+                    Some(trigger),
+                    serde_json::json!({ "trigger": trigger }),
+                )
+                .await;
+        }
+        Ok(outcome)
+    }
+
+    /// 要約で畳む範囲の終わり (`history[1..boundary]` が対象)。畳むものが無ければ None。
+    fn compact_boundary(&self) -> Option<usize> {
         let user_idxs: Vec<usize> = self
             .history
             .iter()
@@ -852,13 +946,21 @@ impl Session {
             .map(|(i, _)| i)
             .collect();
         if user_idxs.len() <= KEEP_RECENT_USER_TURNS {
-            return Ok(CompactOutcome::Skipped);
+            return None;
         }
         let boundary = user_idxs[user_idxs.len() - KEEP_RECENT_USER_TURNS];
         // system(index 0) の直後から boundary 手前までが要約対象。
-        if boundary <= 1 {
+        (boundary > 1).then_some(boundary)
+    }
+
+    async fn compact_now(
+        &mut self,
+        llm: &dyn LlmClient,
+        instruction: &str,
+    ) -> Result<CompactOutcome> {
+        let Some(boundary) = self.compact_boundary() else {
             return Ok(CompactOutcome::Skipped);
-        }
+        };
 
         let before = self.history.len();
         let rendered = render_for_summary(&self.history[1..boundary]);
@@ -923,6 +1025,9 @@ impl Session {
 
 /// System を除き、直近何ユーザターンを生のまま残すか。
 const KEEP_RECENT_USER_TURNS: usize = 2;
+/// hook に伝える圧縮のきっかけ (PreCompact / PostCompact の matcher と payload の `trigger`)。
+const COMPACT_MANUAL: &str = "manual";
+const COMPACT_AUTO: &str = "auto";
 
 /// 自動圧縮を発火するコンテキスト使用率 (context_window に対する %)。
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
@@ -1703,6 +1808,7 @@ mod tests {
         let mut cfg = Config::default();
         if let Some(command) = cmd {
             cfg.hooks = vec![HookConfig {
+                id: None,
                 event: Lifecycle::Stop,
                 matcher: String::new(),
                 command,
@@ -2121,6 +2227,10 @@ mod tests {
             self.stats.runs.fetch_add(1, AtomicOrdering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             self.stats.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            // n = 13 は「実行したが失敗した」呼び出し (PostToolUseFailure のテスト用)。
+            if args["n"] == 13 {
+                return Ok(ToolOutput::error("unlucky"));
+            }
             Ok(ToolOutput::ok(format!("{} {}", self.name, args["n"])))
         }
     }
@@ -2353,6 +2463,7 @@ mod tests {
         // n = 2 の呼び出しだけをブロックする hook (payload は stdin に JSON で来る)。
         let cfg = Config {
             hooks: vec![HookConfig {
+                id: None,
                 event: Lifecycle::PreToolUse,
                 matcher: "Par".into(),
                 command: r#"grep -q '"n":2' && { echo "no twos" >&2; exit 2; } || exit 0"#.into(),
@@ -2386,6 +2497,7 @@ mod tests {
 
     fn pre_tool_hook(matcher: &str, json: &str) -> HookConfig {
         HookConfig {
+            id: None,
             event: Lifecycle::PreToolUse,
             matcher: matcher.into(),
             command: format!("cat > /dev/null; printf '%s' '{json}'"),
@@ -2535,6 +2647,7 @@ mod tests {
         let cfg = Config {
             hooks: vec![
                 HookConfig {
+                    id: None,
                     event: Lifecycle::UserPromptSubmit,
                     matcher: String::new(),
                     command: "cat > /dev/null; echo 'branch: main'".into(),
@@ -2545,6 +2658,7 @@ mod tests {
                     r#"{"hookSpecificOutput":{"additionalContext":"Par is rate limited"}}"#,
                 ),
                 HookConfig {
+                    id: None,
                     event: Lifecycle::PostToolUse,
                     matcher: "Ser".into(),
                     command: r#"cat > /dev/null; printf '%s' '{"hookSpecificOutput":{"additionalContext":"lint: 2 warnings"}}'"#.into(),
@@ -2592,6 +2706,256 @@ mod tests {
         );
     }
 
+    /// 発火したイベント名を 1 行ずつ `log` に追記するだけの hook。
+    fn recorder(event: Lifecycle, log: &std::path::Path) -> HookConfig {
+        HookConfig {
+            id: None,
+            event,
+            matcher: String::new(),
+            command: format!("cat > /dev/null; echo {event:?} >> '{}'", log.display()),
+            timeout_secs: None,
+        }
+    }
+
+    fn recorded(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn post_tool_events_follow_what_actually_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events");
+        let run = |compat: hooks::HooksCompat, deny: &[&str]| {
+            let mut cfg = Config {
+                hooks: vec![
+                    recorder(Lifecycle::PostToolUse, &log),
+                    recorder(Lifecycle::PostToolUseFailure, &log),
+                ],
+                hooks_compat: compat,
+                ..Default::default()
+            };
+            cfg.permissions.deny = deny.iter().map(|s| s.to_string()).collect();
+            let log = log.clone();
+            async move {
+                let _ = std::fs::remove_file(&log);
+                let gate = headless_gate(&cfg);
+                let (mut session, _stats) = probe_session(cfg);
+                // 成功 / 実行して失敗 / ゲートが止めて実行されない、の 3 通り。
+                session
+                    .run_turn("go", &batch(&[("Ser", 1), ("Ser", 13), ("Mut", 2)]), &gate)
+                    .await
+                    .unwrap();
+                recorded(&log)
+            }
+        };
+        assert_eq!(
+            run(hooks::HooksCompat::V2, &[]).await,
+            ["PostToolUse", "PostToolUseFailure"],
+            "nothing fires for the call that never ran"
+        );
+        assert_eq!(
+            run(hooks::HooksCompat::V1, &[]).await,
+            ["PostToolUse", "PostToolUse", "PostToolUse"],
+            "v1 keeps firing PostToolUse for every call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permission_request_hook_can_approve_or_refuse_what_would_have_been_asked() {
+        let answer = |json: &str| HookConfig {
+            id: None,
+            event: Lifecycle::PermissionRequest,
+            matcher: "Mut".into(),
+            command: format!("cat > /dev/null; printf '%s' '{json}'"),
+            timeout_secs: None,
+        };
+        let run = |hook: HookConfig, deny: &[&str]| {
+            let mut cfg = Config {
+                hooks: vec![hook],
+                ..Default::default()
+            };
+            // "ask:X" は ask ルール、それ以外は deny ルール。
+            for rule in deny {
+                match rule.strip_prefix("ask:") {
+                    Some(ask) => cfg.permissions.ask.push(ask.to_string()),
+                    None => cfg.permissions.deny.push(rule.to_string()),
+                }
+            }
+            async move {
+                let gate = headless_gate(&cfg);
+                let (mut session, stats) = probe_session(cfg);
+                session
+                    .run_turn("go", &batch(&[("Mut", 1), ("Ser", 2)]), &gate)
+                    .await
+                    .unwrap();
+                (
+                    stats.runs.load(AtomicOrdering::SeqCst),
+                    tool_replies(&session)[0].1.clone(),
+                )
+            }
+        };
+        let allow = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+        let deny =
+            r#"{"hookSpecificOutput":{"decision":{"behavior":"deny","message":"not on fridays"}}}"#;
+        // Ser は承認が要らないので、hook に諮られることもなく常に走る (= 1 回ぶん)。
+        assert_eq!(run(answer(allow), &[]).await.0, 2, "Mut ran too");
+        let (runs, reply) = run(answer(deny), &[]).await;
+        assert_eq!(runs, 1);
+        assert!(reply.contains("not on fridays"), "{reply}");
+        // 文字列の形も受ける。deny ルールには allow でも勝てない。
+        let plain = r#"{"hookSpecificOutput":{"decision":"allow"}}"#;
+        assert_eq!(run(answer(plain), &[]).await.0, 2);
+        assert_eq!(run(answer(plain), &["Mut"]).await.0, 1);
+        // ask ルールにも勝てない (利用者が「必ず尋ねる」と書いたもの)。
+        assert_eq!(run(answer(plain), &["ask:Mut"]).await.0, 1);
+    }
+
+    /// PreToolUse hook が「必ず尋ねろ」と言った呼び出しを、PermissionRequest hook の allow で
+    /// 通してしまわない。
+    #[tokio::test]
+    async fn a_permission_request_allow_cannot_cancel_a_pre_tool_ask() {
+        let mut cfg = Config {
+            hooks: vec![
+                pre_tool_hook("Mut", HOOK_ASKS),
+                HookConfig {
+                    id: None,
+                    event: Lifecycle::PermissionRequest,
+                    matcher: String::new(),
+                    command: r#"cat > /dev/null; printf '%s' '{"hookSpecificOutput":{"decision":"allow"}}'"#.into(),
+                    timeout_secs: None,
+                },
+            ],
+            ..Default::default()
+        };
+        cfg.agent.auto_approve = true;
+        let gate = headless_gate(&cfg);
+        let (mut session, stats) = probe_session(cfg);
+        session
+            .run_turn("go", &batch(&[("Mut", 1)]), &gate)
+            .await
+            .unwrap();
+        assert_eq!(stats.runs.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// 失敗した呼び出しの後でも、hook が述べた理由は捨てずにモデルへ返す (v1 でも v2 でも)。
+    #[tokio::test]
+    async fn a_post_tool_block_on_a_failed_call_still_reaches_the_model() {
+        for (compat, event) in [
+            (hooks::HooksCompat::V1, Lifecycle::PostToolUse),
+            (hooks::HooksCompat::V2, Lifecycle::PostToolUseFailure),
+        ] {
+            let cfg = Config {
+                hooks: vec![HookConfig {
+                    id: None,
+                    event,
+                    matcher: String::new(),
+                    command: "cat > /dev/null; echo 'check the lockfile' >&2; exit 2".into(),
+                    timeout_secs: None,
+                }],
+                hooks_compat: compat,
+                ..Default::default()
+            };
+            let (mut session, _stats) = probe_session(cfg);
+            session
+                .run_turn("go", &batch(&[("Ser", 13)]), &PermissionGate::new(true))
+                .await
+                .unwrap();
+            let reply = &tool_replies(&session)[0].1;
+            assert!(
+                reply.contains("unlucky") && reply.contains("[post-tool hook] check the lockfile"),
+                "{compat:?}: {reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_notification_hook_stays_quiet_when_nobody_can_be_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events");
+        let cfg = Config {
+            hooks: vec![
+                recorder(Lifecycle::PermissionRequest, &log),
+                recorder(Lifecycle::Notification, &log),
+            ],
+            ..Default::default()
+        };
+        let gate = headless_gate(&cfg);
+        let (mut session, _stats) = probe_session(cfg);
+        session
+            .run_turn("go", &batch(&[("Mut", 1)]), &gate)
+            .await
+            .unwrap();
+        assert_eq!(recorded(&log), ["PermissionRequest"]);
+    }
+
+    #[tokio::test]
+    async fn compact_hooks_fire_around_a_real_compaction_and_can_stop_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events");
+        let session_with = |hooks: Vec<HookConfig>| {
+            let cfg = Config {
+                hooks,
+                ..Default::default()
+            };
+            Session::new(cfg, Arc::new(default_registry()))
+        };
+        let llm = FinalTextLlm {
+            text: "SUMMARY".into(),
+            usage: None,
+        };
+        let gate = PermissionGate::new(true);
+
+        let mut session = session_with(vec![
+            recorder(Lifecycle::PreCompact, &log),
+            recorder(Lifecycle::PostCompact, &log),
+        ]);
+        session.run_turn("t1", &llm, &gate).await.unwrap();
+        // 畳むものがまだ無い: hook も鳴らない。
+        assert_eq!(
+            session.compact(&llm, "").await.unwrap(),
+            CompactOutcome::Skipped
+        );
+        assert!(recorded(&log).is_empty());
+        for p in ["t2", "t3"] {
+            session.run_turn(p, &llm, &gate).await.unwrap();
+        }
+        assert!(matches!(
+            session.compact(&llm, "").await.unwrap(),
+            CompactOutcome::Compacted { .. }
+        ));
+        assert_eq!(recorded(&log), ["PreCompact", "PostCompact"]);
+
+        // matcher は圧縮のきっかけ。`/compact` は manual なので、auto だけを見る hook は当たらない。
+        let mut blocker = recorder(Lifecycle::PreCompact, &log);
+        blocker.command = "echo 'keep the full history' >&2; exit 2".into();
+        for (matcher, expect_compacted) in [("auto", true), ("manual", false)] {
+            let mut hook = blocker.clone();
+            hook.matcher = matcher.into();
+            let mut session = session_with(vec![hook]);
+            for p in ["t1", "t2", "t3"] {
+                session.run_turn(p, &llm, &gate).await.unwrap();
+            }
+            let before = session.history().len();
+            let outcome = session.compact(&llm, "").await.unwrap();
+            assert_eq!(
+                matches!(outcome, CompactOutcome::Compacted { .. }),
+                expect_compacted,
+                "{matcher}"
+            );
+            if !expect_compacted {
+                assert_eq!(
+                    session.history().len(),
+                    before,
+                    "a blocked compaction changes nothing"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hook_context_cannot_close_its_own_frame() {
         let block =
@@ -2611,6 +2975,7 @@ mod tests {
         let seen = dir.path().join("payload.json");
         let cfg = Config {
             hooks: vec![HookConfig {
+                id: None,
                 event: Lifecycle::PreToolUse,
                 matcher: String::new(),
                 command: format!("cat > '{}'", seen.display()),

@@ -14,7 +14,7 @@
   - `WebSearch` も read-only（非破壊）。env `BRAVE_API_KEY` が要り、未設定ならエラーを返す。クエリは外部 (Brave) へ送られるため、上と同じ信頼前提で使うこと。エンドポイントは env `BRAVE_SEARCH_API_URL` で差し替え可能だが（テスト用）、こちらも http/https のみ許可する
 - **Bash のサンドボックス**: `[sandbox] mode = "workspace-write"` で、Bash が起動するプロセスの書き込み先（と任意でネットワーク）を OS の仕組みで制限（macOS seatbelt / Linux bwrap、後述）
 - **gitignore-aware 検索**: ripgrep の内部クレート (`ignore` + `grep-searcher` + `grep-regex`) を直接利用
-- **hooks**: `SessionStart` / `SessionEnd` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` で外部コマンドを発火し、終了コードと stdout の JSON（Claude Code 互換）でツール実行の可否・入力の書き換え・モデルへの追加文脈・ターン停止を制御（後述）
+- **hooks**: `SessionStart` / `SessionEnd` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `PostToolUseFailure` / `PreCompact` / `PostCompact` / `SubagentStart` / `SubagentStop` / `Notification` / `Stop` で外部コマンドを発火し、終了コードと stdout の JSON（Claude Code 互換）でツール実行の可否・入力の書き換え・モデルへの追加文脈・ターン停止を制御（後述）
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
 - **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
 - **skills**: `.lodan/skills/<name>/SKILL.md` を読み込み、`Skill` ツールとしてモデルへ公開（後述）
@@ -569,7 +569,8 @@ src/
 
 ```toml
 [[hooks]]
-event = "PreToolUse"     # SessionStart | SessionEnd | UserPromptSubmit | PreToolUse | PostToolUse | Stop
+id = "guard"             # 省略可。後段のレイヤーから置き換え・無効化するための名前
+event = "PreToolUse"     # 下の「ペイロード」にあるイベント名
 matcher = "Edit|Write"   # 省略可。下の「matcher」を参照
 command = "./scripts/guard.sh"
 timeout_secs = 30        # 省略可（既定 30）
@@ -619,6 +620,30 @@ timeout_secs = 30        # 省略可（既定 30）
 - 複数の hook が違う希望を出したら `deny` > `ask` > `allow`。ブロックした時点で残りの hook は実行しません。
 - UserPromptSubmit と SessionStart では、JSON でない素の stdout もそのまま追加の文脈になります。
 
+### hook の置き換えと無効化
+
+`[[hooks]]` は設定ファイルのレイヤー間で**連結**されます（ユーザ設定の hook とプロジェクトの hook が両方効く）。そのままだと下のレイヤーの hook を外す手段が無いので、`id` を付けた hook は名指しで扱えます。
+
+```toml
+# ~/.config/lodan/config.toml
+[[hooks]]
+id = "notify"
+event = "Stop"
+command = "terminal-notifier -message done"
+
+# <project>/.lodan/config.toml
+disabled_hooks = ["notify"]      # このプロジェクトでは鳴らさない
+
+[[hooks]]
+id = "lint"                      # 同じ id があれば、後段のものに置き換わる
+event = "PostToolUse"
+command = "./scripts/lint-changed.sh"
+```
+
+`disabled_hooks` もレイヤー間で連結されます。`id` の無い hook は外せません。どの hook の `id` でもない名前が書かれていたら、起動時に警告します（綴り違いで「外したつもり」にならないように。別のマシンの設定には無い hook を名指しすることもあるので、エラーにはしません）。置き換えた hook は**後段の hook の位置**で発火します（hook は並び順に実行され、ブロックした時点で残りは実行されないので、順序が効く場面では注意）。`lodan config` の `[[hooks]]` は連結したままの一覧で、実際に発火するのは「`disabled_hooks` を除き、同じ `id` は最後の 1 つ」です。
+
+> ⚠️ これは便利のための仕組みで、**守りにはなりません**。信頼したプロジェクトの設定は、ユーザ設定の guard hook を `disabled_hooks` で外せます（プロジェクトの設定は hook を足せる時点で任意のコマンドを実行できるので、信頼の範囲は変わりません）。
+
 ### matcher
 
 | matcher | 解釈 |
@@ -627,7 +652,7 @@ timeout_secs = 30        # 省略可（既定 30）
 | 英数と `_` `-` 空白 `,` `\|` だけ | 完全一致。`Edit\|Write` のような並びはどれかに完全一致 |
 | それ以外の文字を含む | 正規表現（**部分一致**）。`Edit.*` は `NotebookEdit` にも当たる。全体一致は `^Edit$` |
 
-MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memory` だけだと完全一致扱いで何にも当たりません）。正規表現として壊れている matcher は**起動時にエラー**にします（一度も発火しない guard を黙って受け入れないため）。matcher が照合するのは Pre/PostToolUse ではツール名、SessionStart では `startup` / `resume` です。
+MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memory` だけだと完全一致扱いで何にも当たりません）。正規表現として壊れている matcher は**起動時にエラー**にします（一度も発火しない guard を黙って受け入れないため）。matcher が照合する相手: PreToolUse / PostToolUse / PostToolUseFailure / PermissionRequest はツール名、SessionStart は `startup` / `resume`、PreCompact / PostCompact は `manual`（`/compact`）/ `auto`、SubagentStart / SubagentStop は子エージェントの種類（いまは `general-purpose` のみ）、Notification は通知の種類（`permission_prompt`）。UserPromptSubmit / Stop / SessionEnd は matcher を見ません。
 
 ### ペイロード
 
@@ -637,7 +662,12 @@ MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memo
 - **SessionEnd**: 終了時（ベストエフォート、ブロック不可）。
 - **UserPromptSubmit**: `prompt`。ブロック時はそのターンを実行せず破棄。
 - **PreToolUse**: `tool_name` / `tool_input`。ブロック時はツールを実行せず、理由をモデルへ返す。
-- **PostToolUse**: `tool_name` / `tool_input` / `tool_response`（旧名 `tool_output` も同じ値）。実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。
+- **PermissionRequest**: `tool_name` / `tool_input`。**承認プロンプトを出す直前**（= ルールでもモードでも決まらず、誰かの承認が要る呼び出し）に発火。`{"hookSpecificOutput": {"decision": {"behavior": "allow"}}}` で承認、`{"behavior": "deny", "message": "…"}` で拒否（`"decision": "allow"` の文字列形も可）。`allow` の効き方は PreToolUse の `allow` と同じで、deny / ask ルールと `dont-ask` には勝てない。尋ねる相手のいない `-p` でも発火するので、ヘッドレス実行の承認役にできる。
+- **Notification**: `notification_type`（`permission_prompt`）/ `message`。REPL が承認プロンプトを出して**人の入力を待つ直前**に発火（デスクトップ通知などに）。出力は読まない。hook の終了を待ってからプロンプトを出すので、時間のかかる通知はコマンドの中でバックグラウンドに回すこと（`notify-send … &`）。
+- **PostToolUse**: `tool_name` / `tool_input` / `tool_response`（旧名 `tool_output` も同じ値）。**成功した実行の後**に発火。実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。
+- **PostToolUseFailure**: PostToolUse の項目に加えて `error`。ツールを**実行して失敗した**ときに発火。PostToolUse と同じく実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。hook やゲートが止めて実行に至らなかった呼び出しでは、PostToolUse も PostToolUseFailure も発火しない（`hooks_compat = "v1"` では従来どおり、全ての呼び出しで PostToolUse）。
+- **PreCompact** / **PostCompact**: `trigger`（`manual` | `auto`）、PreCompact には `custom_instructions`（`/compact <指示>` の指示）。PreCompact をブロックすると圧縮しない。畳むものが無くて圧縮が見送られるときは発火しない。
+- **SubagentStart** / **SubagentStop**: `agent_type` / `cwd`、Start には `prompt`（依頼文）、Stop には `last_assistant_message`（失敗時は `error`）。`Task` の子エージェントの開始と終了。通知用で、ブロックはできない。`session_id` などの共通フィールドは付かない。
 - **Stop**: `last_assistant_message`（旧名 `last_message` も同じ値）。ターン終端で発火。**ブロックすると停止せず、その理由をユーザー入力として注入し次ターンへ継続する**（暴走は `max_iterations` で停止）。「条件を満たすまで作業を続ける」系の自律ループの土台。
 
 > ⚠️ **信頼前提**: hook コマンドは `sh -c` で実行され、パーミッションゲートを経ません。プロジェクトの `config.toml` の hook が動くのは、そのディレクトリを[信頼した](#workspace-trust--信頼していないディレクトリの設定は読まない)ときだけです。信頼するのは中身を確認したリポジトリに限ってください（任意コード実行になります）。

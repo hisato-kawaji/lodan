@@ -220,6 +220,11 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
 /// 尋ねるのは対話の REPL だけ。`-p` / `config` / パイプ入力では尋ねずに「読まない」側へ倒す。
 pub fn decide_project_trust(args: &Cli) {
     use std::io::IsTerminal;
+    // main が既に決めている。尋ね直すと、2 回目の答えはこのプロセスには効かないのに
+    // `(y)` の記録だけが残る (1 回目に断った信頼が次回から効いてしまう)。
+    if crate::trust::is_decided() {
+        return;
+    }
     // 信頼の管理と、プロジェクトのファイルを使わないサブコマンドでは尋ねない。読みもしない。
     if matches!(args.cmd, Some(Command::Trust { .. } | Command::Sessions)) {
         crate::trust::set_project_trusted(false);
@@ -249,20 +254,23 @@ fn manage_trust(list: bool, remove: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     if list {
         for dir in crate::trust::list(&store)? {
-            println!("{}", dir.display());
+            println!("{}", crate::trust::shown(&dir));
         }
     } else if remove {
         if crate::trust::forget(&store, &cwd)? {
-            println!("no longer trusting {}", cwd.display());
+            println!("no longer trusting {}", crate::trust::shown(&cwd));
         } else {
             println!(
                 "{} was not trusted on its own (a parent directory may be; see `lodan trust --list`)",
-                cwd.display()
+                crate::trust::shown(&cwd)
             );
         }
     } else {
         crate::trust::record(&store, &cwd)?;
-        println!("trusting {} (and everything under it)", cwd.display());
+        println!(
+            "trusting {} (and everything under it)",
+            crate::trust::shown(&cwd)
+        );
     }
     Ok(())
 }

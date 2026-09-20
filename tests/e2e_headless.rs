@@ -61,6 +61,9 @@ fn start_mock_saying(demo_dir: &Path, text: Option<&str>) -> MockServer {
     server
 }
 
+/// ハーネスへの合図 (lodan には渡さない): cwd を `<home>/REL` にする。
+const CWD_PREFIX: &str = "<harness:cwd=";
+
 /// ハーネスへの合図 (lodan には渡さない): 既定の `LODAN_TRUST=1` を設定しない。
 /// 「信頼を与える環境変数が本当に無い」状態を作るためのもの。
 const NO_TRUST_ENV: &str = "<harness:no-trust-env>";
@@ -74,10 +77,17 @@ enum Stdin {
 
 /// 隔離した HOME / cwd で lodan を走らせ、終了まで待つ。`RUN_LIMIT` を超えたら kill して panic。
 fn lodan(home: &Path, port: u16, args: &[&str], stdin: Stdin) -> Output {
-    let cwd = home.join("work");
+    // 既定の cwd は `<home>/work`。`<harness:cwd=REL>` で `<home>/REL` に変えられる。
+    let cwd = args
+        .iter()
+        .find_map(|a| a.strip_prefix(CWD_PREFIX))
+        .map_or_else(|| home.join("work"), |rel| home.join(rel));
     std::fs::create_dir_all(&cwd).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_lodan"))
-        .args(args.iter().filter(|a| **a != NO_TRUST_ENV))
+        .args(
+            args.iter()
+                .filter(|a| **a != NO_TRUST_ENV && !a.starts_with(CWD_PREFIX)),
+        )
         .current_dir(&cwd)
         .env_clear()
         .env("HOME", home)
@@ -851,5 +861,69 @@ fn a_trusted_directorys_dotenv_is_still_loaded() {
     assert!(
         demo.join("hello.txt").exists(),
         ".env from a trusted directory should apply"
+    );
+}
+
+#[test]
+fn a_parent_directorys_dotenv_is_not_picked_up_from_a_subdirectory() {
+    // pr-review #102 F1: dotenvy::dotenv() は親ディレクトリを遡って `.env` を探す。判定は cwd しか
+    // 見ていなかったので、リポジトリのサブディレクトリから起動すると親の `.env` が無警告で読まれ、
+    // 接続先と承認を書き換えられた。
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("work/repo");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(
+        repo.join(".env"),
+        "LODAN_BASE_URL=http://127.0.0.1:1/v1\nLODAN_AUTO_APPROVE=true\nLODAN_TRUST=1\n",
+    )
+    .unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let server = start_mock(&demo);
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            NO_TRUST_ENV,
+            "<harness:cwd=work/repo/sub",
+            "-p",
+            "run the demo",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the parent's .env redirected the request: {stderr}"
+    );
+    assert!(
+        !demo.join("hello.txt").exists(),
+        "LODAN_AUTO_APPROVE from the parent's .env took effect"
+    );
+}
+
+#[test]
+fn the_trust_notice_is_printed_once() {
+    // pr-review #102 F2: 判断が 2 回走っていた (main と dispatch)。
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(work.join(".lodan")).unwrap();
+    std::fs::write(
+        work.join(".lodan/config.toml"),
+        "[agent]\nmax_iterations = 40\n",
+    )
+    .unwrap();
+    let server = start_mock(home.path());
+    let out = lodan(
+        home.path(),
+        server.port,
+        &["--trust=false", "-p", "hi"],
+        Stdin::OpenAndSilent,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("not a trusted directory").count(),
+        1,
+        "{stderr}"
     );
 }

@@ -36,6 +36,26 @@ pub fn set_project_trusted(trusted: bool) {
     let _ = PROJECT_TRUSTED.set(trusted);
 }
 
+/// もう決まっているか。決まっていたら尋ね直してはいけない — 2 回目の問い合わせの答えは
+/// このプロセスには効かないのに、`(y)` なら記録だけは残ってしまう。
+pub fn is_decided() -> bool {
+    PROJECT_TRUSTED.get().is_some()
+}
+
+/// パスを端末に出す形にする。ディレクトリ名は利用者が付けたとは限らない (clone したリポジトリ、
+/// 展開したアーカイブ)。制御文字や双方向テキストの上書きで警告文を書き換えさせない。
+pub fn shown(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .map(|c| {
+            let hidden = c.is_control()
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}');
+            if hidden { c.escape_default().to_string() } else { c.to_string() }
+        })
+        .collect()
+}
+
 /// 信頼が要るファイル (表示用の名前)。cwd にあるものに加えて、メモリは cwd の祖先 (ホームまで)
 /// からも読まれるので、祖先の `LODAN.md` / `CLAUDE.md` も含める — そうしないと、何も無い
 /// サブディレクトリから起動したときに、尋ねないまま親のメモリを読んでしまう。
@@ -63,7 +83,7 @@ pub fn project_files(cwd: &Path) -> Vec<String> {
         }
         for name in ["LODAN.md", "CLAUDE.md"] {
             if dir.join(name).exists() {
-                found.push(dir.join(name).display().to_string());
+                found.push(shown(&dir.join(name)));
             }
         }
     }
@@ -167,7 +187,7 @@ pub fn decide(req: &Request<'_>, input: &mut dyn BufRead, out: &mut dyn Write) -
         let _ = writeln!(
             out,
             "lodan: {} is not a trusted directory; ignoring {}. Run `lodan trust` here, or pass --trust.",
-            req.cwd.display(),
+            shown(req.cwd),
             files.join(", ")
         );
         return false;
@@ -309,6 +329,20 @@ mod tests {
         let (trusted, shown) = ask(&dir.path().join("repo/sub"), &store, false, false, "");
         assert!(!trusted);
         assert!(shown.contains("CLAUDE.md"), "{shown}");
+    }
+
+    #[test]
+    fn a_hostile_directory_name_cannot_rewrite_the_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let evil = dir.path().join("repo\x1b[2K\x1b[1Gtrusted \u{202E}");
+        std::fs::create_dir_all(evil.join(".lodan")).unwrap();
+        std::fs::write(evil.join(".lodan/config.toml"), "x").unwrap();
+        let (trusted, shown) = ask(&evil, &dir.path().join("store.toml"), false, false, "");
+        assert!(!trusted);
+        assert!(
+            !shown.contains('\x1b') && !shown.contains('\u{202E}'),
+            "{shown:?}"
+        );
     }
 
     #[test]

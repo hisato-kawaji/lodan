@@ -42,10 +42,13 @@ fn load_memory_with(cwd: &Path, home: Option<&Path>, include_project: bool) -> S
 
     // cwd → 上方向。home がパス上にあればそこで打ち切る（その上の system 領域は読まない）。
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for anc in cwd
-        .ancestors()
-        .take(if include_project { usize::MAX } else { 0 })
-    {
+    // 未信頼なら、プロジェクト階層は 1 つも辿らない。
+    let ancestors: Vec<&Path> = if include_project {
+        cwd.ancestors().collect()
+    } else {
+        Vec::new()
+    };
+    for anc in ancestors {
         dirs.push(anc.to_path_buf());
         if Some(anc) == home {
             break;

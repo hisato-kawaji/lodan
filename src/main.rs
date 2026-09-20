@@ -17,7 +17,13 @@ async fn main() -> Result<()> {
     // 引数を解釈し直す (clap が env から拾う値を反映するため)。
     let args = lodan::cli::Cli::parse();
     lodan::cli::decide_project_trust(&args);
-    let args = if lodan::trust::project_trusted() && dotenvy::dotenv().is_ok() {
+    // 読むのは **cwd の** `.env` だけ。`dotenvy::dotenv()` は親ディレクトリを `/` まで遡って探すので、
+    // 信頼の判定 (cwd の `.env` を見る) と食い違い、サブディレクトリから起動すると親の `.env` が
+    // 尋ねられないまま読まれる。
+    let dotenv = std::env::current_dir().map(|d| d.join(".env"));
+    let loaded =
+        lodan::trust::project_trusted() && dotenv.is_ok_and(|p| dotenvy::from_path(p).is_ok());
+    let args = if loaded {
         lodan::cli::Cli::parse()
     } else {
         args

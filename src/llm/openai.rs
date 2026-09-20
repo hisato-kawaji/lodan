@@ -19,6 +19,10 @@ pub struct OpenAiClient {
     api_key: String,
     /// None はリクエストに含めない (サーバ既定)。#61: 小型モデルの整形安定用。
     temperature: Option<f32>,
+    /// None は送らない (サーバ既定)。値はそのまま渡す (#78)。
+    reasoning_effort: Option<String>,
+    /// body にそのまま足すサーバ固有のパラメータ。`new` で予約キーとの衝突を弾いてある。
+    extra_body: serde_json::Map<String, serde_json::Value>,
     retry: RetryPolicy,
     /// ストリームの無通信許容時間。None は無効。
     stream_idle_timeout: Option<Duration>,
@@ -169,6 +173,16 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
 
 impl OpenAiClient {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
+        if let Some(key) = cfg
+            .extra_body
+            .keys()
+            .find(|k| RESERVED_BODY_KEYS.contains(&k.as_str()))
+        {
+            anyhow::bail!(
+                "extra_body must not set `{key}`: lodan builds that part of the request itself \
+                 (use the dedicated setting instead)"
+            );
+        }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()
@@ -177,6 +191,11 @@ impl OpenAiClient {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
             temperature: cfg.temperature,
+            reasoning_effort: cfg
+                .reasoning_effort
+                .clone()
+                .filter(|e| !e.trim().is_empty()),
+            extra_body: cfg.extra_body.clone(),
             retry: RetryPolicy {
                 max_retries: cfg.max_retries,
                 base: Duration::from_millis(cfg.retry_base_ms),
@@ -257,12 +276,31 @@ struct ChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     stream: bool,
     /// ストリーミング時に最終チャンクへ usage を含めるよう要求する
     /// (OpenAI / vLLM / llama.cpp が対応。非対応サーバは無視する)。
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// `extra_body`。空なら body は 1 バイトも変わらない。
+    #[serde(flatten)]
+    extra: &'a serde_json::Map<String, serde_json::Value>,
 }
+
+/// lodan 自身が組み立てる body のキー。`extra_body` に書かれると JSON のキーが重複し、どちらが
+/// 効くかがサーバ次第になる (`stream` や `messages` を差し替えられると動作も壊れる)。
+const RESERVED_BODY_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "max_tokens",
+    "temperature",
+    "reasoning_effort",
+    "stream",
+    "stream_options",
+];
 
 #[derive(Serialize)]
 struct StreamOptions {
@@ -324,8 +362,10 @@ impl LlmClient for OpenAiClient {
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens,
             temperature: self.temperature,
+            reasoning_effort: self.reasoning_effort.as_deref(),
             stream: false,
             stream_options: None,
+            extra: &self.extra_body,
         };
 
         let mut budget = RetryBudget::new(self.retry);
@@ -402,10 +442,12 @@ impl LlmClient for OpenAiClient {
             tool_choice: if tools.is_empty() { None } else { Some("auto") },
             max_tokens: None,
             temperature: self.temperature,
+            reasoning_effort: self.reasoning_effort.as_deref(),
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            extra: &self.extra_body,
         };
 
         let mut budget = RetryBudget::new(self.retry);
@@ -1155,6 +1197,7 @@ mod tests {
 
     #[test]
     fn stream_request_includes_stream_options() {
+        let no_extra = serde_json::Map::new();
         let req = ChatRequest {
             model: "m",
             messages: &[],
@@ -1162,10 +1205,12 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            extra: &no_extra,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["stream_options"]["include_usage"], true);
@@ -1182,6 +1227,7 @@ mod tests {
     /// temperature は None なら省略・Some なら数値で入る (#61)。
     #[test]
     fn request_temperature_omitted_unless_set() {
+        let no_extra = serde_json::Map::new();
         let req = ChatRequest {
             model: "m",
             messages: &[],
@@ -1189,8 +1235,10 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             stream: false,
             stream_options: None,
+            extra: &no_extra,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(
@@ -1204,5 +1252,69 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!((json["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+    }
+
+    /// #78 の受け入れ条件: 何も設定しなければ、body は reasoning 対応を入れる前と 1 バイトも違わない。
+    #[test]
+    fn an_unconfigured_request_body_is_byte_identical_to_before() {
+        let no_extra = serde_json::Map::new();
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &[],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            extra: &no_extra,
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_and_extra_body_are_sent_as_given() {
+        let extra: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{"chat_template_kwargs":{"enable_thinking":false},"top_k":20}"#,
+        )
+        .unwrap();
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &[],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: Some("none"),
+            stream: false,
+            stream_options: None,
+            extra: &extra,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["reasoning_effort"], "none");
+        assert_eq!(json["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(json["top_k"], 20);
+    }
+
+    #[test]
+    fn extra_body_cannot_replace_what_lodan_builds() {
+        for key in RESERVED_BODY_KEYS {
+            let mut cfg = ProviderConfig::default_local();
+            cfg.extra_body
+                .insert(key.to_string(), serde_json::json!(true));
+            let err = OpenAiClient::new(&cfg).err().expect(key).to_string();
+            assert!(err.contains(key), "{err}");
+        }
+        let mut cfg = ProviderConfig::default_local();
+        cfg.extra_body.insert("top_k".into(), serde_json::json!(20));
+        cfg.reasoning_effort = Some("  ".into());
+        let client = OpenAiClient::new(&cfg).unwrap();
+        assert_eq!(client.reasoning_effort, None, "a blank effort is not sent");
     }
 }

@@ -108,6 +108,8 @@ struct ProviderOverlay {
     timeout_secs: Option<u64>,
     context_window: Option<u64>,
     temperature: Option<f32>,
+    reasoning_effort: Option<String>,
+    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     max_retries: Option<u32>,
     retry_base_ms: Option<u64>,
     stream_idle_timeout_secs: Option<u64>,
@@ -124,6 +126,8 @@ impl ProviderOverlay {
             timeout_secs,
             context_window,
             temperature,
+            reasoning_effort,
+            extra_body,
             max_retries,
             retry_base_ms,
             stream_idle_timeout_secs,
@@ -135,6 +139,9 @@ impl ProviderOverlay {
             timeout_secs: timeout_secs.unwrap_or(base.timeout_secs),
             context_window: context_window.unwrap_or(base.context_window),
             temperature: temperature.or(base.temperature),
+            reasoning_effort: reasoning_effort.or(base.reasoning_effort),
+            // テーブルごと後勝ち (キー単位で混ぜると、下位レイヤーのキーを消す手段が無くなる)。
+            extra_body: extra_body.unwrap_or(base.extra_body),
             max_retries: max_retries.unwrap_or(base.max_retries),
             retry_base_ms: retry_base_ms.unwrap_or(base.retry_base_ms),
             stream_idle_timeout_secs: stream_idle_timeout_secs
@@ -182,6 +189,16 @@ pub struct ProviderConfig {
     /// サンプリング温度。None (既定) はリクエストに含めずサーバ既定に従う。
     /// 小型ローカルモデルはツールコール整形が崩れやすいため 0.1-0.2 を推奨 (#61)。
     pub temperature: Option<f32>,
+    /// 推論の深さ。リクエストの `reasoning_effort` にそのまま入れる (`low` / `medium` / `high`、
+    /// サーバによっては `none` / `max` / `minimal`)。None (既定) は送らずサーバ既定に従う。
+    /// 値は検査しない — 受け付ける語彙はサーバとモデルごとに違う (#78)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// リクエスト body にそのまま足すサーバ固有のパラメータ
+    /// (例: vLLM / llama.cpp の `chat_template_kwargs = { enable_thinking = false }`)。
+    /// lodan 自身が組み立てるキー (`model` / `messages` / `tools` …) は書けない。
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
     /// 一時的な失敗 (接続エラー / 408 / 429 / 5xx / 出力前のストリーム断) を再試行する
     /// 最大回数。`0` で無効。400 や 401 のような恒久的な失敗は再試行しない (#70)。
     pub max_retries: u32,
@@ -292,6 +309,8 @@ impl ProviderConfig {
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            reasoning_effort: None,
+            extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
             stream_idle_timeout_secs: 0,
@@ -306,6 +325,8 @@ impl ProviderConfig {
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            reasoning_effort: None,
+            extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
             stream_idle_timeout_secs: 0,
@@ -322,6 +343,8 @@ impl ProviderConfig {
             timeout_secs: 120,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            reasoning_effort: None,
+            extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
             stream_idle_timeout_secs: 0,
@@ -338,6 +361,8 @@ impl ProviderConfig {
             timeout_secs: KIMI_TIMEOUT_SECS,
             context_window: DEFAULT_CONTEXT_WINDOW,
             temperature: None,
+            reasoning_effort: None,
+            extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
             stream_idle_timeout_secs: 0,
@@ -479,6 +504,10 @@ impl Config {
             active.temperature = Some(v);
             mark(format!("llm.{provider}.temperature"));
         }
+        if let Some(v) = o.reasoning_effort {
+            active.reasoning_effort = Some(v);
+            mark(format!("llm.{provider}.reasoning_effort"));
+        }
         if o.auto_approve {
             self.agent.auto_approve = true;
             mark("agent.auto_approve".into());
@@ -549,6 +578,7 @@ pub struct Overrides {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub temperature: Option<f32>,
+    pub reasoning_effort: Option<String>,
     /// `true` のときだけ有効化する (既存 `--yes` の意味を保つ)。
     pub auto_approve: bool,
     pub finish_nudge: Option<bool>,
@@ -979,6 +1009,35 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.hooks_compat, crate::hooks::HooksCompat::V1);
         assert_eq!(cfg.hooks[0].timeout_secs, Some(5));
+    }
+
+    #[test]
+    fn reasoning_settings_parse_layer_and_stay_out_of_the_dump_when_unset() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [llm.local]
+            reasoning_effort = "low"
+            [llm.local.extra_body]
+            top_k = 20
+            chat_template_kwargs = { enable_thinking = false }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            cfg.llm.local.extra_body["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        // 未設定のプロバイダは、`lodan config` の出力にもキーを出さない。
+        let dumped = toml::to_string(&Config::default()).unwrap();
+        assert!(!dumped.contains("reasoning_effort") && !dumped.contains("extra_body"));
+
+        let mut cfg = Config::default();
+        cfg.apply_overrides(Overrides {
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        });
+        assert_eq!(cfg.llm.active().reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

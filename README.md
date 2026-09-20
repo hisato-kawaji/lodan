@@ -135,6 +135,17 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 小型モデルはツール呼び出しの XML/JSON を崩しがち(サーバ側でパース不能 → ただのテキストとして届く)なため、lodan は次の 3 つの対策を内蔵している:
 
 - **温度制御**: provider 設定の `temperature`(既定は未送信 = サーバ既定)。整形の破綻・綴りブレ・実行ごとの分散を抑えるには `0.1`〜`0.2` を推奨。
+- **推論の深さ**(provider 設定の `reasoning_effort`、`--reasoning-effort`、`LODAN_REASONING_EFFORT`。既定は未送信 = サーバ既定): thinking 系のモデルは、推論の深さで 1 応答の所要時間が大きく変わる(kimi-k3 のサーバ既定は `max`)。値は**検査せずそのまま** `reasoning_effort` として送る — 受け付ける語彙はサーバとモデルごとに違うため(`low` / `medium` / `high` が共通、Ollama は `none` で thinking を切れる、`max` / `minimal` を持つサーバもある)。未対応の値はサーバが 400 で返す。`reasoning_effort` を読まないサーバ固有の切り方は `extra_body` で渡す:
+
+  ```toml
+  [llm.local]
+  reasoning_effort = "low"
+  # vLLM / llama.cpp の Qwen3 系: テンプレート側の thinking を切る
+  [llm.local.extra_body]
+  chat_template_kwargs = { enable_thinking = false }
+  ```
+
+  `extra_body` のキーはリクエスト body のトップレベルにそのまま足される。lodan 自身が組み立てるキー(`model` / `messages` / `tools` / `tool_choice` / `max_tokens` / `temperature` / `reasoning_effort` / `stream` / `stream_options`)を書くと起動時エラー。設定ファイルのレイヤー間ではテーブルごと後勝ち。どちらも未設定なら、リクエスト body は 1 バイトも変わらない。`--log-jsonl` の `run_start` に `reasoning_effort` が残る。
 - **壊れツールコールの再要求**: tool_calls が空なのに応答テキストへ呼び出しの痕跡(`<function=`、`call:Name{…}`、`<|tool_call` 等)が漏れている場合、「正しい tool call として再発行せよ」と自動で注入してターンを継続する(1 ターン 2 回まで)。
 - **重複呼び出しの抑止**: 直前と完全同一(名前 + 引数)の **read-only** 呼び出しは実行せず「結果は不変。別の行動を」と返す(同一ファイルを延々 Read するループ対策)。Bash 再実行など破壊系の正当な繰り返しは対象外。
 - **ツールプロファイル**(`[agent] tool_profile`、`--tool-profile`、`LODAN_TOOL_PROFILE`): ツール定義は**毎リクエスト全量が送られる**ので、小型モデルでは固定費がそのまま所要時間になる(ラダーのベースラインで 1.8k〜2.4k tok/呼び出し)。`core` は Read / Write / Edit / Bash / Grep / Glob の 6 個だけを見せ、定義の JSON は 6,643 → 2,437 バイト(-63%)。`readonly` は破壊的でないツールだけ。`tools = [...]`(`--tools Read,Grep,...`)で明示リストも指定できる。隠したツールは登録に残るので、モデルが名前を覚えていて呼んできても実行はされず「このプロファイルでは無効。使えるのは …」と返る(`--yes` でも通らない)。Task / Skill / MCP のツールも `core` では隠れる点に注意。`agent.tools` は設定ファイルのレイヤー間で連結されず後勝ち。実行時の `--tool-profile` は設定ファイルの `tools = [...]` より優先される(リストを残すとプロファイル指定が黙って無視されるため)。リストがどのツールにも一致しなければ、LLM を呼ぶ前にエラーで止まる。`Task` の内側の調査エージェントは常に Read / Grep / Glob の 3 個を使い、プロファイルの影響を受けない。`readonly` は WebFetch / WebSearch を含むので、権限の境界としては使わないこと(それは承認ゲートの役割)。起動時の `tools` イベント(`--log-jsonl` / `stream-json`)に、見せているツールと定義のバイト数が残る
@@ -211,6 +222,7 @@ timeout_secs = 30
 - `LODAN_PROVIDER` (`local` | `sakana` | `sakura` | `kimi`)
 - `LODAN_FALLBACK_PROVIDER` (同上。未設定なら fallback しない)
 - `LODAN_BASE_URL` / `LODAN_MODEL` / `LODAN_API_KEY` / `LODAN_AUTO_APPROVE`
+- `LODAN_REASONING_EFFORT` (推論の深さ。値はそのままサーバへ渡す)
 - `LODAN_TEMPERATURE` / `LODAN_FINISH_NUDGE` / `LODAN_MALFORMED_RETRY` / `LODAN_DUP_SUPPRESS` (真偽値は `true`/`false`/`1`/`0`/`yes`/`no`)
 - `LODAN_TOOL_PROFILE` / `LODAN_TOOLS` (カンマ区切り)
 - `LODAN_PARALLEL_TOOLS` (真偽値。既定 true)
@@ -222,7 +234,7 @@ timeout_secs = 30
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--reasoning-effort <LEVEL>` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 

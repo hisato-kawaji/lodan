@@ -612,6 +612,33 @@ fn scan_command(command: &str) -> (Vec<String>, bool) {
     (parts, opaque)
 }
 
+/// 承認プロンプトの「このプロジェクトで常に許可」が保存するルール。保存しても意図どおりに
+/// 効かない呼び出しには `None` (選択肢を出さない)。
+///
+/// - Bash: そのコマンドの完全一致。複合コマンドや追い切れない構文は、allow として決して一致
+///   しないので対象外。`*` を含むコマンドは、保存するとワイルドカードとして解釈されて意図より
+///   広く一致するので対象外。`:*` で終わるコマンドも同じ理由で対象外
+/// - それ以外: ツール名 (そのツールの全呼び出し)。セッション中の「(a) always」と同じ広さ
+pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value) -> Option<String> {
+    // 計画の承認は毎回目を通すもの。保存して自動承認にはさせない。
+    if tool == "ExitPlanMode" {
+        return None;
+    }
+    if tool != "Bash" {
+        return Some(tool.to_string());
+    }
+    let command = bash_command(args)?.trim();
+    let simple = matches!(split_command(command), Some(parts) if parts.len() == 1);
+    if !simple || command.contains('*') || command.ends_with(':') || command.contains(['(', ')']) {
+        return None;
+    }
+    let rule = format!("Bash({command})");
+    // 保存したものが読めて、同じ呼び出しに一致することを確かめてから返す。
+    let parsed = Rule::parse(&rule).ok()?;
+    parsed.check_usable_as_allow().ok()?;
+    parsed.permits(tool, args, Path::new("/")).then_some(rule)
+}
+
 /// ルールだけで決まる判定。どのルールにも当たらなければ `None` (既定の扱いに任せる)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -1170,6 +1197,50 @@ mod tests {
             all.evaluate("Grep", &json!({ "pattern": "x", "path": ".." }), &cwd),
             None
         );
+    }
+
+    #[test]
+    fn only_calls_whose_saved_rule_would_mean_the_same_thing_can_be_persisted() {
+        let rule = |cmd: &str| persistable_allow_rule("Bash", &json!({ "command": cmd }));
+        assert_eq!(
+            rule("cargo test --lib").as_deref(),
+            Some("Bash(cargo test --lib)")
+        );
+        assert_eq!(rule("  git status  ").as_deref(), Some("Bash(git status)"));
+        assert_eq!(
+            rule("git commit -m 'a; b'").as_deref(),
+            Some("Bash(git commit -m 'a; b')")
+        );
+        // 保存すると意味が変わるもの、決して一致しないものは出さない。
+        for cmd in [
+            "ls && rm -rf build", // 複合: allow として一致しない
+            "echo $(date)",       // 追い切れない
+            "echo hi > out.txt",  // リダイレクト
+            "ls *.rs",            // `*` がワイルドカードになり、意図より広く一致する
+            "npm run test:",      // `:*` と紛らわしい
+            "(cd x; ls)",         // 括弧はルールの構文と衝突する
+            "",
+        ] {
+            assert_eq!(rule(cmd), None, "{cmd:?}");
+        }
+        assert_eq!(
+            persistable_allow_rule("Edit", &json!({ "path": "a" })).as_deref(),
+            Some("Edit")
+        );
+        assert_eq!(
+            persistable_allow_rule("mcp__github__create_issue", &json!({})).as_deref(),
+            Some("mcp__github__create_issue")
+        );
+        assert_eq!(
+            persistable_allow_rule("ExitPlanMode", &json!({ "plan": "x" })),
+            None
+        );
+
+        // 保存したルールは、読み直すと同じ呼び出しを allow する。
+        let saved = rule("cargo test --lib").unwrap();
+        let set = rules(&[&saved], &[], &[]);
+        assert_eq!(bash(&set, "cargo test --lib"), Some(Verdict::Allow));
+        assert_eq!(bash(&set, "cargo test --lib && rm -rf /"), None);
     }
 
     #[test]

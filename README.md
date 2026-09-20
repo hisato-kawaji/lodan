@@ -141,7 +141,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 ## 設定
 
-階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `--config <path>` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
+階層: 既定値 ← `~/.config/lodan/config.toml` ← `$CWD/.lodan/config.toml` ← `$CWD/.lodan/config.local.toml` (個人用・コミットしない) ← `--config <path>` ← `$CWD/.env` ← 環境変数 ← CLI フラグ
 
 ユーザ設定の場所は OS の流儀に従う (`directories` crate): Linux は `~/.config/lodan/config.toml`、**macOS は `~/Library/Application Support/lodan/config.toml`**。以下 `~/.config/lodan/` と書いている箇所は macOS では後者に読み替えること。
 
@@ -307,6 +307,12 @@ deny  = ["Read(**/.env)", "Grep(**/.env)", "Glob(**/.env)", "Read(~/.ssh/**)", "
 - **ask** は必ず尋ねる (allow より優先、read-only にも効く)。**allow** は尋ねずに通す。ただし `--yes` / `bypass` は ask も尋ねずに通す (尋ねないのが bypass の意味なので。止めたいものは deny に書く)
 - ルールはユーザ設定 → プロジェクト設定 → `--config` の間で**連結**される。プロジェクト設定はユーザ設定の deny を消せない。**ただし広げることはできる**: プロジェクトの `.lodan/config.toml` は `allow = ["Bash(*)"]` を足すことも `mode = "bypass"` にすることもできる (信頼していないリポジトリで lodan を起動しない、という既存の前提のまま。未信頼ディレクトリの設定を読む前に確認する workspace trust は #75)。`--allowed-tools <RULE>` / `--disallowed-tools <RULE>` (繰り返し可) も足すだけで、置き換えない
 - 解釈できないルールが 1 つでもあれば**起動時にエラー**。権限の設定を黙って読み飛ばさない
+
+**承認プロンプトから保存する**: プロンプトの `(p) always allow … in this project` を選ぶと、その呼び出しの allow ルールが `$CWD/.lodan/config.local.toml` に追記され、次のセッションからは尋ねられない (選んだセッションでも以後は尋ねない)。
+
+- Bash は**そのコマンドの完全一致** (`Bash(cargo test --lib)`)、それ以外はツール名 (`Edit` = そのツールの全呼び出し。セッション中の `(a) always` と同じ広さ)
+- 保存しても意図どおりに効かない呼び出しには `(p)` を出さない: 複合コマンド・`$(…)`・リダイレクト (allow として決して一致しない)、`*` や括弧を含むコマンド (保存するとワイルドカードや構文として解釈され、意味が変わる)、計画の承認 (`ExitPlanMode` — 毎回目を通すもの)
+- `config.local.toml` は**個人用**で、共有の `.lodan/config.toml` とは別のレイヤー (プロジェクト設定の後、`--config` の前)。`.gitignore` に入れること。lodan が書き戻すのでコメントは残らない。広げすぎたら、このファイルから行を消せばよい
 
 **ルールの構文** (Claude Code の `permissions` と同じ `Tool` / `Tool(pattern)`):
 

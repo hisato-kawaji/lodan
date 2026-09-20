@@ -182,6 +182,8 @@ impl PermissionGate {
         enter_means_yes: bool,
     ) -> bool {
         let summary = summarize(tool_name, args);
+        // 保存しても意図どおりに効かない呼び出しには (p) を出さない。
+        let persistable = crate::permission_rules::persistable_allow_rule(tool_name, args);
         loop {
             let _ = writeln!(
                 stdout,
@@ -195,9 +197,15 @@ impl PermissionGate {
             let _ = writeln!(
                 stdout,
                 "{}",
-                crate::term::dim(&format!(
-                    "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
-                ))
+                crate::term::dim(&match &persistable {
+                    Some(rule) => format!(
+                        "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact  \
+                         (p) always allow `{rule}` in this project"
+                    ),
+                    None => format!(
+                        "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
+                    ),
+                })
             );
             let _ = write!(stdout, "{} ", crate::term::yellow(">"));
             let _ = stdout.flush();
@@ -214,6 +222,37 @@ impl PermissionGate {
                 "a" | "A" => {
                     if let Ok(mut p) = self.policy.lock() {
                         p.always_tools.insert(tool_name.to_string());
+                    }
+                    return true;
+                }
+                "p" | "P" if persistable.is_some() => {
+                    let rule = persistable.as_deref().unwrap_or_default();
+                    match crate::config::append_local_allow_rule(&self.cwd, rule) {
+                        Ok(path) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                crate::term::dim(&format!(
+                                    "  saved `{rule}` to {} (keep this file out of version control)",
+                                    path.display()
+                                ))
+                            );
+                        }
+                        // 保存できなくても今回の承認は有効。次回また尋ねることになるだけ。
+                        Err(e) => {
+                            let _ = writeln!(stdout, "  could not save the rule: {e:#}");
+                        }
+                    }
+                    // このセッションでも以後は尋ねない。
+                    if let Ok(mut p) = self.policy.lock() {
+                        match args.get("command").and_then(|v| v.as_str()) {
+                            Some(cmd) if tool_name == "Bash" => {
+                                p.always_commands.insert(cmd.to_string());
+                            }
+                            _ => {
+                                p.always_tools.insert(tool_name.to_string());
+                            }
+                        }
                     }
                     return true;
                 }
@@ -372,6 +411,61 @@ mod tests {
 
     fn bash(cmd: &str) -> serde_json::Value {
         serde_json::json!({ "command": cmd })
+    }
+
+    fn gate_in(cwd: &Path) -> PermissionGate {
+        PermissionGate::from_config(&crate::config::Config::default(), cwd, true).unwrap()
+    }
+
+    #[test]
+    fn p_saves_a_project_rule_and_stops_asking_for_the_rest_of_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let args = bash("cargo test --lib");
+        let mut out = Vec::new();
+        assert!(gate.prompt_with("Bash", &args, &mut "p\n".as_bytes(), &mut out, true));
+        let shown = String::from_utf8(out).unwrap();
+        assert!(
+            shown.contains("(p) always allow `Bash(cargo test --lib)` in this project"),
+            "{shown}"
+        );
+
+        let saved = std::fs::read_to_string(dir.path().join(".lodan/config.local.toml")).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.permissions.allow, ["Bash(cargo test --lib)"]);
+        // このセッションではもう尋ねない。
+        assert_eq!(
+            gate.decide_quietly("Bash", &args, true),
+            Some(Decision::Allow)
+        );
+        // 次のセッション (設定から組み直したゲート) でも尋ねない。
+        let next = PermissionGate::from_config(&cfg, dir.path(), true).unwrap();
+        assert_eq!(
+            next.decide_quietly("Bash", &args, true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            next.decide_quietly("Bash", &bash("cargo publish"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn p_is_not_offered_when_the_saved_rule_would_not_mean_the_same_thing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let mut out = Vec::new();
+        // (p) は無視されて再プロンプト、次の n で拒否。
+        let allowed = gate.prompt_with(
+            "Bash",
+            &bash("ls && rm -rf build"),
+            &mut "p\nn\n".as_bytes(),
+            &mut out,
+            true,
+        );
+        assert!(!allowed);
+        assert!(!String::from_utf8(out).unwrap().contains("(p)"));
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
     }
 
     #[test]

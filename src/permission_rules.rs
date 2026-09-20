@@ -174,7 +174,7 @@ impl Rule {
 
     /// allow ルールとしてこの呼び出しに一致するか (ゲートがセッション中に保存したルール用)。
     pub fn allows(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> bool {
-        self.permits(tool, args, cwd)
+        self.permits(tool, args, &real_cwd(cwd))
     }
 
     /// allow / ask として一致するか。追い切れない Bash コマンドには一致しない。
@@ -449,12 +449,42 @@ fn path_candidates(tool: &str, args: &serde_json::Value, cwd: &Path) -> Vec<Path
     };
     let lexical = normalize(&cwd.join(raw));
     let mut out = vec![lexical.clone()];
-    if let Ok(real) = std::fs::canonicalize(&lexical)
-        && real != lexical
-    {
+    let real = resolve_through_symlinks(&lexical);
+    if real != lexical {
         out.push(real);
     }
     out
+}
+
+/// cwd 自身を symlink 解決した形。パスの候補は symlink を解決して比べるので、基準の cwd も
+/// 揃えておかないと、cwd が symlink 越し (macOS の `/var` → `/private/var` など) のときに
+/// 「cwd 以下」の判定が食い違い、相対パターンの allow が一切効かなくなる。
+/// (モデルが symlink 越しの綴りで絶対パスを渡した場合、字句上の候補は cwd の外に見えるので
+/// allow は一致せず尋ねる側に倒れる。deny は解決後の候補で効く。)
+fn real_cwd(cwd: &Path) -> PathBuf {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// symlink を解決したパス。**まだ存在しないファイルでも**、実在する最も深い祖先までを解決して
+/// 残りを付け直す。`canonicalize` はパス全体が実在しないと失敗するので、それだけに頼ると
+/// 「`src/link -> /outside` の下に**新しい**ファイルを Write する」が字句上のパスだけで
+/// `Write(src/**)` に一致し、cwd の外へ書けてしまう。
+fn resolve_through_symlinks(lexical: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut probe = lexical;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(probe) {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (probe.parent(), probe.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                probe = parent;
+            }
+            // ルートまで何も実在しない (あり得ないが) なら字句上のパスのまま。
+            _ => return lexical.to_path_buf(),
+        }
+    }
 }
 
 /// `.` と `..` を字句的に畳む (ファイルシステムには触らない)。
@@ -627,6 +657,7 @@ fn scan_command(command: &str) -> (Vec<String>, bool) {
 ///   広く一致するので対象外。`:*` で終わるコマンドも同じ理由で対象外
 /// - それ以外: ツール名 (そのツールの全呼び出し)。セッション中の「(a) always」と同じ広さ
 pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value, cwd: &Path) -> Option<String> {
+    let cwd = &real_cwd(cwd);
     // 計画の承認は毎回目を通すもの。保存して自動承認にはさせない。
     if tool == "ExitPlanMode" {
         return None;
@@ -641,7 +672,12 @@ pub fn persistable_allow_rule(tool: &str, args: &serde_json::Value, cwd: &Path) 
     } else if PATH_TOOLS.contains(&tool) {
         // ツール全体ではなく、そのファイルのあるディレクトリ以下に絞る。1 回の承認が
         // 「どのパスへの Edit も永久に許可」になるのは広すぎる。cwd の外は保存しない。
-        let path = normalize(&cwd.join(args.get("path").and_then(|v| v.as_str())?));
+        let raw = args.get("path").and_then(|v| v.as_str())?;
+        // プロンプトに表示されるのはこのパス。不可視文字が混ざっていたら保存させない。
+        if raw.chars().any(is_invisible) {
+            return None;
+        }
+        let path = normalize(&cwd.join(raw));
         let dir = path.parent()?.strip_prefix(cwd).ok()?.to_str()?.to_string();
         if dir.contains(['*', '?', '[', ']', '{', '}', '(', ')']) || dir.chars().any(is_invisible) {
             return None;
@@ -681,12 +717,17 @@ pub fn is_invisible(c: char) -> bool {
             c,
             '\u{00AD}'
                 | '\u{061C}'
+                | '\u{115F}'..='\u{1160}'
                 | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{2029}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
+                | '\u{2800}'
+                | '\u{3164}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
                 | '\u{FFF9}'..='\u{FFFB}'
                 | '\u{E0000}'..='\u{E007F}'
         )
@@ -750,6 +791,7 @@ impl RuleSet {
         cwd: &Path,
         deadline: std::time::Instant,
     ) -> Option<Verdict> {
+        let cwd = &real_cwd(cwd);
         let mut unverifiable = None;
         for rule in &self.deny {
             match rule.forbids(tool, args, cwd, deadline) {
@@ -1294,6 +1336,42 @@ mod tests {
         let set = rules(&[&saved], &[], &[]);
         assert_eq!(bash(&set, "cargo test --lib"), Some(Verdict::Allow));
         assert_eq!(bash(&set, "cargo test --lib && rm -rf /"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_under_a_symlinked_directory_is_judged_by_where_it_would_really_land() {
+        // pr-review #99: まだ存在しないファイルは canonicalize できないので、字句上のパスだけで
+        // allow に一致して cwd の外へ書けていた。
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (cwd, outside) = (root.join("work"), root.join("outside"));
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("src/link")).unwrap();
+
+        let new_file = json!({ "path": "src/link/new.txt" });
+        let deep_new = json!({ "path": "src/link/a/b/new.txt" });
+        let allow = rules(&["Write(src/**)"], &[], &[]);
+        assert_eq!(
+            allow.evaluate("Write", &new_file, &cwd),
+            None,
+            "it would land outside src/"
+        );
+        assert_eq!(allow.evaluate("Write", &deep_new, &cwd), None);
+        assert_eq!(
+            allow.evaluate("Write", &json!({ "path": "src/real/new.txt" }), &cwd),
+            Some(Verdict::Allow),
+            "a not-yet-existing file in a real directory is still allowed"
+        );
+        // deny は着地点でも効く。
+        let deny = rules(&[], &[&format!("Write({}/**)", outside.display())], &[]);
+        assert!(matches!(
+            deny.evaluate("Write", &new_file, &cwd),
+            Some(Verdict::Deny(_))
+        ));
+        // そして (p) は出さない (保存したルールが同じ呼び出しを allow しないので)。
+        assert_eq!(persistable_allow_rule("Write", &new_file, &cwd), None);
     }
 
     #[test]

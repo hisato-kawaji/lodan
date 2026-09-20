@@ -340,7 +340,7 @@ deny  = ["Read(**/.env)", "Grep(**/.env)", "Glob(**/.env)", "Read(~/.ssh/**)", "
 
 **検索ツール (Grep / Glob)** は `path` 以下を丸ごと読む (`path` 省略時は cwd)。deny / ask は、**その検索が実際に触れるファイルの中に一致するものがあれば**効く: `deny = ["Grep(secrets/**)"]` は `path` 無しの Grep も止める。判定は Grep / Glob と同じ走査 (`.gitignore` を尊重、隠しファイルは含む) で行うので、`Grep(**/.env)` は `.env` のあるディレクトリの検索だけを止め、gitignore された `.env` は上の階層からの検索では読まれないので止めない (ignore されたディレクトリ自体を起点に指定した検索は中を読むので、止める)。確認は 5 万エントリ / 1 回の判定あたり合計 0.3 秒 (ルールが何個あっても) で打ち切り、確かめきれなかった範囲は通さない (モデルには「`path` を狭めてやり直せ」と返る。`$HOME` 全体のような検索がこれに当たる)。
 
-**パス**: `src/../.env` のような `..` は畳んでから照合する。deny / ask は大文字小文字を無視する (macOS / Windows では `.GITHUB/x` への書き込みが `.github/x` に着地するため)。allow は綴りどおり。Unicode の正規化 (NFC と NFD) は揃えない: macOS の APFS では `café.key` の合成形と分解形が同じファイルを指すが、ルールは書かれた形としか一致しない。非 ASCII のファイル名を deny で守るなら、ディレクトリ単位 (`Write(keys/**)`) で書くこと。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。
+**パス**: `src/../.env` のような `..` は畳んでから照合する。deny / ask は大文字小文字を無視する (macOS / Windows では `.GITHUB/x` への書き込みが `.github/x` に着地するため)。allow は綴りどおり。Unicode の正規化 (NFC と NFD) は揃えない: macOS の APFS では `café.key` の合成形と分解形が同じファイルを指すが、ルールは書かれた形としか一致しない。非 ASCII のファイル名を deny で守るなら、ディレクトリ単位 (`Write(keys/**)`) で書くこと。symlink は解決後のパスも見る — allow は「どちらの見え方でも一致」、deny は「どちらかが一致」を条件にするので、cwd の外を指す symlink で `Edit(src/**)` を満たすことはできない。まだ存在しないファイルも、実在する最も深い祖先までを解決して判定する (`src/link -> /outside` の下に**新しい**ファイルを Write しても `Write(src/**)` は満たせない)。
 
 **モード** (`[permissions] mode` / `--permission-mode` / `LODAN_PERMISSION_MODE`):
 

@@ -300,7 +300,7 @@ fn summarize(tool: &str, args: &serde_json::Value) -> String {
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => args
             .get("path")
             .and_then(|v| v.as_str())
-            .map(rel_path)
+            .map(|p| visible(&rel_path(p)))
             .unwrap_or_else(|| args.to_string()),
         // 計画本文は直前に表示済みなので、プロンプトには要旨だけ出す。
         "ExitPlanMode" => "approve the plan above and exit plan mode".to_string(),
@@ -321,6 +321,11 @@ fn visible(text: &str) -> String {
             }
         })
         .collect()
+}
+
+/// プレビュー用。コードにはタブが普通にあるので、タブだけはそのまま出す。
+fn visible_line(line: &str) -> String {
+    line.split('\t').map(visible).collect::<Vec<_>>().join("\t")
 }
 
 /// cwd 配下のパスは相対表示にする (#42 P5)。cwd 外・取得失敗時はそのまま。
@@ -374,7 +379,7 @@ fn preview(tool: &str, args: &serde_json::Value) -> Option<String> {
                 if i > 0 {
                     out.push('\n');
                 }
-                out.push_str(&crate::term::green(&format!("  + {line}")));
+                out.push_str(&crate::term::green(&format!("  + {}", visible_line(line))));
             }
             let total = content.lines().count();
             if total > PREVIEW_MAX_LINES {
@@ -399,7 +404,7 @@ fn diff_block(old: &str, new: &str) -> String {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(&color(&format!("  {sign} {line}")));
+            out.push_str(&color(&format!("  {sign} {}", visible_line(line))));
         }
         if total > PREVIEW_MAX_LINES {
             out.push_str(&crate::term::dim(&format!(
@@ -536,6 +541,36 @@ mod tests {
         assert!(!allowed);
         assert!(!String::from_utf8(out).unwrap().contains("(p)"));
         assert!(!dir.path().join(".lodan/config.local.toml").exists());
+    }
+
+    #[test]
+    fn paths_and_previews_are_escaped_too() {
+        let esc = "\x1b[2K\x1b[1G";
+        let edit = serde_json::json!({
+            "path": format!("src/{esc}harmless.rs"),
+            "old_string": format!("a{esc}b"),
+            "new_string": "fn x() {\n\tlet y = 1;\n}",
+        });
+        let write =
+            serde_json::json!({ "path": "x", "content": format!("\x1b[2A{esc}looks fine") });
+        for shown in [
+            summarize("Edit", &edit),
+            preview("Edit", &edit).unwrap(),
+            preview("Write", &write).unwrap(),
+        ] {
+            // 着色のための SGR (`\x1b[..m`) 以外のエスケープが端末へ出てはいけない。
+            let stripped = shown.replace("\x1b[0m", "");
+            let raw_escapes = stripped.matches('\x1b').filter(|_| true).count();
+            let sgr = stripped.matches("\x1b[3").count() + stripped.matches("\x1b[2m").count();
+            assert_eq!(raw_escapes, sgr, "unescaped control sequence in {shown:?}");
+        }
+        // タブはコードに普通にあるので、プレビューではそのまま。
+        assert!(preview("Edit", &edit).unwrap().contains("\tlet y = 1;"));
+        // 不可視文字入りのパスには (p) を出さない。
+        assert_eq!(
+            crate::permission_rules::persistable_allow_rule("Edit", &edit, Path::new("/work")),
+            None
+        );
     }
 
     #[test]

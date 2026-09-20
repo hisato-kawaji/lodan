@@ -800,6 +800,13 @@ mod tests {
         let metered = MeteredClient::new(Arc::new(client(&url, 5)), ledger.clone());
         let err = metered.chat(&[], &[], "m", None).await.unwrap_err();
         assert!(format!("{err:#}").contains("503"), "{err:#}");
+        // 失敗の本当の理由は予算。呼び出し側 (`-p` の終了コード 4) が見分けられる。
+        assert!(
+            err.chain().any(|c| c
+                .downcast_ref::<crate::llm::metered::BudgetExceededError>()
+                .is_some()),
+            "{err:#}"
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,

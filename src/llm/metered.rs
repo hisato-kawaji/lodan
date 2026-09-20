@@ -37,7 +37,15 @@ tokio::task_local! {
 /// クライアントでは常に `true`。
 pub fn admit_retry() -> bool {
     LEDGER
-        .try_with(|ledger| ledger.admit().is_ok())
+        .try_with(|ledger| match ledger.admit() {
+            Ok(()) => true,
+            Err(refused) => {
+                // 呼び出しは「一時的な失敗」として返ってくる。本当の理由が予算だったことを、
+                // `MeteredClient` がエラーに付け直せるように控えておく。
+                ledger.state().retry_refused = Some(refused);
+                false
+            }
+        })
         .unwrap_or(true)
 }
 
@@ -101,6 +109,8 @@ struct LedgerState {
     requests: u64,
     by_kind: BTreeMap<&'static str, KindUsage>,
     reminded: bool,
+    /// 予算が無くて見送った再試行 (あれば)。
+    retry_refused: Option<BudgetExceededError>,
 }
 
 /// プロセス全体の LLM 使用量の台帳。
@@ -277,6 +287,17 @@ impl MeteredClient {
         Self { inner, ledger }
     }
 
+    /// 再試行を予算で見送った末の失敗なら、予算切れとして返す (`-p` の終了コードが 4 になる)。
+    /// 元の失敗の内容は文脈として残す。
+    fn explain(&self, error: anyhow::Error) -> anyhow::Error {
+        match self.ledger.state().retry_refused.take() {
+            Some(refused) => anyhow::Error::new(refused).context(format!(
+                "the request failed and the budget left no room to retry it: {error:#}"
+            )),
+            None => error,
+        }
+    }
+
     fn record(&self, history: &[Message], resp: &ChatResponse) {
         let (usage, estimated) = match resp.usage {
             Some(u) if u.prompt_tokens + u.completion_tokens + u.total_tokens > 0 => {
@@ -303,7 +324,8 @@ impl LlmClient for MeteredClient {
                 self.ledger.clone(),
                 self.inner.chat(history, tools, model, max_tokens),
             )
-            .await?;
+            .await
+            .map_err(|e| self.explain(e))?;
         self.record(history, &resp);
         Ok(resp)
     }
@@ -332,7 +354,7 @@ impl LlmClient for MeteredClient {
             self.inner.chat_stream(history, tools, model, tx),
         );
         let (result, ()) = tokio::join!(inner, forward);
-        result
+        result.map_err(|e| self.explain(e))
     }
 }
 

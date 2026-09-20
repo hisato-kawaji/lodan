@@ -95,8 +95,11 @@ impl RetryBudget {
         }
         self.used += 1;
         let delay = backoff_delay(self.policy.base, self.used, retry_after, jitter_seed());
+        // `why` にはプロバイダの応答本文が入り得る。tracing の fmt は `%` (Display) のフィールドを
+        // 無加工で出すので、無害化は `sanitize` が担っている (外さないこと。fallback.rs も同じ)。
         tracing::warn!(
-            "LLM request failed ({why}); retry {}/{} in {}ms",
+            why = %crate::term::sanitize(why),
+            "LLM request failed; retry {}/{} in {}ms",
             self.used,
             self.policy.max_retries,
             delay.as_millis()

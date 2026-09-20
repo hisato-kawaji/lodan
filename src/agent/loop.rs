@@ -118,7 +118,7 @@ impl Session {
         )
         .await?
         {
-            crate::say!("prompt blocked by hook: {reason}");
+            crate::say!("prompt blocked by hook: {}", crate::term::sanitize(&reason));
             return Ok(());
         }
         self.turn_seq += 1;
@@ -257,7 +257,13 @@ impl Session {
                         return Ok(());
                     }
                     HookOutcome::Block(reason) => {
-                        crate::say!("{}", crate::term::dim(&format!("[stop hook] {reason}")));
+                        crate::say!(
+                            "{}",
+                            crate::term::dim(&format!(
+                                "[stop hook] {}",
+                                crate::term::sanitize(&reason)
+                            ))
+                        );
                         crate::runlog::record(
                             "stop_hook_block",
                             serde_json::json!({ "turn": self.turn_seq, "iter": iterations }),
@@ -422,17 +428,17 @@ impl Session {
                 {
                     // 実行後なので取り消せない。理由をツール出力へ追記し、
                     // history 経由でモデルへフィードバックする。
-                    crate::say!("post-tool hook: {reason}");
+                    crate::say!("post-tool hook: {}", crate::term::sanitize(&reason));
                     output.content = format!("{}\n[post-tool hook] {reason}", output.content);
                 }
 
-                let tag = format!("[{name}]");
-                let tag = if output.is_error {
-                    crate::term::red(&tag)
-                } else {
-                    crate::term::cyan(&tag)
-                };
-                crate::say!("{tag} {}", display_tool_output(&name, &output));
+                let tag = tool_tag(&name, output.is_error);
+                // ツール出力はファイルの中身・Web ページ・コマンド出力を含む。表示だけ無害化する
+                // (モデルへ返す content は無加工のまま)。
+                crate::say!(
+                    "{tag} {}",
+                    crate::term::sanitize(&display_tool_output(&name, &output))
+                );
                 // ツール自身がエラー出力を返した場合はループ側の分類が付かないので補う。
                 if reason == TOOL_REASON_OK && output.is_error {
                     reason = "tool_reported_error";
@@ -625,7 +631,9 @@ impl Session {
             Err(e) => {
                 crate::say!(
                     "{}",
-                    crate::term::red(&format!("auto-compact failed: {e:#}"))
+                    crate::term::red(&crate::term::sanitize(&format!(
+                        "auto-compact failed: {e:#}"
+                    )))
                 );
                 crate::runlog::record(
                     "compact",
@@ -687,7 +695,8 @@ impl Session {
         }
 
         crate::say!("{}", crate::term::bold("--- proposed plan ---"));
-        crate::say!("{plan}");
+        // 計画はモデルが書いた文字列。この直後に承認を求めるので、画面を書き換えさせない。
+        crate::say!("{}", crate::term::sanitize(plan));
         crate::say!("{}", crate::term::bold("---------------------"));
 
         if gate.allow(EXIT_PLAN_MODE, args) {
@@ -1248,7 +1257,7 @@ async fn stream_once_to(
                 match ev {
                     Some(ChatEvent::TextDelta(s)) => {
                         clear_wait(stdout);
-                        let _ = stdout.write_all(s.as_bytes());
+                        let _ = stdout.write_all(crate::term::sanitize(&s).as_bytes());
                         let _ = stdout.flush();
                     }
                     Some(ChatEvent::Done(r)) => last_done = Some(r),
@@ -1265,7 +1274,7 @@ async fn stream_once_to(
     while let Ok(ev) = rx.try_recv() {
         match ev {
             ChatEvent::TextDelta(s) => {
-                let _ = stdout.write_all(s.as_bytes());
+                let _ = stdout.write_all(crate::term::sanitize(&s).as_bytes());
                 let _ = stdout.flush();
             }
             ChatEvent::Done(r) => last_done = Some(r),
@@ -1273,6 +1282,17 @@ async fn stream_once_to(
     }
 
     last_done.ok_or_else(|| anyhow::anyhow!("stream ended without Done event"))
+}
+
+/// ツール出力の前に出す `[Name]` タグ。名前はモデルが書いた文字列で、登録に無い名前
+/// (`unknown tool`) でもここまで来るので、無害化してから色を付ける。
+fn tool_tag(name: &str, is_error: bool) -> String {
+    let tag = format!("[{}]", crate::term::sanitize(name));
+    if is_error {
+        crate::term::red(&tag)
+    } else {
+        crate::term::cyan(&tag)
+    }
 }
 
 /// 端末表示に使うツール出力の最大行数。
@@ -1388,6 +1408,73 @@ mod tests {
             }));
             Ok(())
         }
+    }
+
+    /// 本文にエスケープ列を混ぜて返す LLM。断片の境目でエスケープ列を割る。
+    struct EscapeLlm;
+
+    const ESCAPE_ATTACK: &str = "done\x1b[2A\x1b[2Kall tests passed \u{202E}txt.exe";
+
+    #[async_trait::async_trait]
+    impl LlmClient for EscapeLlm {
+        async fn chat(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            _: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("stream_once only streams")
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[crate::agent::messages::ToolSpec<'_>],
+            _: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let (head, tail) = ESCAPE_ATTACK.split_at("done\x1b".len());
+            for part in [head, tail] {
+                let _ = sink.send(ChatEvent::TextDelta(part.to_string()));
+            }
+            let _ = sink.send(ChatEvent::Done(ChatResponse {
+                content: Some(ESCAPE_ATTACK.into()),
+                tool_calls: Vec::new(),
+                usage: None,
+            }));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_tool_name_the_model_made_up_cannot_carry_escapes_into_the_tag() {
+        let tag = tool_tag("Read\x1b[2A\x1b[2K", true);
+        // 色 (lodan 自身の SGR) は付いてよいが、名前由来のエスケープは残らない。
+        assert!(
+            !tag.contains("\x1b[2A") && !tag.contains("\x1b[2K"),
+            "{tag:?}"
+        );
+        assert!(tag.contains("Read\\u{1b}[2A"), "{tag:?}");
+    }
+
+    #[tokio::test]
+    async fn streamed_text_is_defused_on_screen_but_kept_verbatim_for_the_model() {
+        let mut out = Vec::new();
+        let resp = stream_once_to(&EscapeLlm, &[], &[], "m", &mut out, false)
+            .await
+            .unwrap();
+        let shown = String::from_utf8(out).unwrap();
+        assert!(
+            !shown.contains('\x1b') && !shown.contains('\u{202E}'),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains("\\u{1b}[2A") && shown.contains("\\u{202e}"),
+            "{shown}"
+        );
+        // 履歴 (= モデルへ返るもの、`-p` の結果) は無加工。
+        assert_eq!(resp.content.as_deref(), Some(ESCAPE_ATTACK));
     }
 
     #[tokio::test]

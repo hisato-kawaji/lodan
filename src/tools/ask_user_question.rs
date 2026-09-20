@@ -95,9 +95,10 @@ impl Tool for AskUserQuestion {
 
 /// 質問＋番号付き選択肢を表示する文字列。
 fn render(question: &str, options: &[String]) -> String {
-    let mut out = format!("{question}\n");
+    // 質問も選択肢もモデルが書いた文字列。利用者が答える直前の画面を書き換えさせない。
+    let mut out = format!("{}\n", crate::term::sanitize(question));
     for (i, opt) in options.iter().enumerate() {
-        out.push_str(&format!("  {}) {}\n", i + 1, opt));
+        out.push_str(&format!("  {}) {}\n", i + 1, crate::term::sanitize(opt)));
     }
     out
 }

@@ -103,7 +103,7 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
     if let Ok(HookOutcome::Block(reason)) =
         hooks::runner::dispatch(Lifecycle::SessionStart, None, &start_payload, &cfg.hooks).await
     {
-        eprintln!("session-start hook: {reason}");
+        eprintln!("session-start hook: {}", crate::term::sanitize(&reason));
     }
 
     // このターンで増えた分だけを最終応答の候補にする (`--resume` では履歴の末尾が
@@ -211,6 +211,16 @@ fn usage_json(usage: &crate::agent::r#loop::SessionUsage) -> serde_json::Value {
     })
 }
 
+/// text モードの最終応答。stdout がパイプなら**無加工** (呼び出し側との契約)。端末に直接出るなら
+/// 人が読む画面なので、モデルの書いたエスケープ列で画面を書き換えさせない (#100)。
+fn text_for_stdout(text: &str, stdout_is_terminal: bool) -> std::borrow::Cow<'_, str> {
+    if stdout_is_terminal {
+        crate::term::sanitize(text)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 struct Report {
     exit_code: i32,
     result: Option<String>,
@@ -281,7 +291,12 @@ impl Report {
 
     fn emit(&self, format: OutputFormat) {
         if let Some(e) = &self.error {
-            eprintln!("{}", crate::term::red_err(&format!("error: {e}")));
+            // エラーにはプロバイダの応答本文が入り込む。stderr は人が読む側なので無害化する
+            // (json / stream-json の `error` フィールドは無加工のまま)。
+            eprintln!(
+                "{}",
+                crate::term::red_err(&format!("error: {}", crate::term::sanitize(e)))
+            );
         }
         // 形式によらず runlog には残す (`--log-jsonl` だけを付けた text / json 実行でも
         // ファイルに結果が入る)。
@@ -289,7 +304,7 @@ impl Report {
         match format {
             OutputFormat::Text => {
                 if let Some(text) = &self.result {
-                    println!("{text}");
+                    println!("{}", text_for_stdout(text, crate::term::is_terminal()));
                 }
             }
             OutputFormat::Json => {
@@ -316,6 +331,13 @@ mod tests {
         assert!(wants_stdin("do it", true));
         assert!(wants_stdin("", false));
         assert!(wants_stdin("  ", false));
+    }
+
+    #[test]
+    fn the_text_result_is_verbatim_for_pipes_and_defused_for_a_terminal() {
+        let result = "ok\x1b[2Kforged";
+        assert_eq!(text_for_stdout(result, false), result);
+        assert_eq!(text_for_stdout(result, true), "ok\\u{1b}[2Kforged");
     }
 
     #[test]

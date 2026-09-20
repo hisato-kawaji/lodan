@@ -68,7 +68,7 @@ impl Runtime {
         let mcp_outcome = mcp::registry::load_and_register(&mut registry, Some(sampling_ctx))
             .await
             .unwrap_or_else(|e| {
-                eprintln!("mcp: {e}");
+                eprintln!("{}", crate::term::sanitize(&format!("mcp: {e}")));
                 mcp::registry::LoadOutcome::default()
             });
         if mcp_outcome.servers > 0 {

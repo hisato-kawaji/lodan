@@ -488,7 +488,13 @@ fn resolve_through_symlinks(path: &Path) -> PathBuf {
     resolve_components(path, &mut hops).unwrap_or_else(|| PathBuf::from(UNRESOLVABLE))
 }
 
+/// `path` は絶対パスであること。相対だと最初の `read_link` がプロセスの cwd 基準になり、
+/// ゲートの cwd と食い違う (呼び出し元は必ず `cwd.join(raw)` を渡す)。
 fn resolve_components(path: &Path, hops_left: &mut u32) -> Option<PathBuf> {
+    debug_assert!(
+        path.is_absolute(),
+        "resolve_components needs an absolute path: {path:?}"
+    );
     let mut real = PathBuf::new();
     for component in path.components() {
         match component {

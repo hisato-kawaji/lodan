@@ -510,6 +510,21 @@ fn redact_url(url: &str) -> String {
     let authority_end = rest[authority_start..]
         .find('/')
         .map_or(rest.len(), |at| authority_start + at);
+    // パスワードに生の `/` が入っていると、authority を最初の `/` で切った時点で `@` を見失う。
+    // そういう値は URL として無効なので、無効な値に限って「最後の `@` まで」を userinfo とみなす
+    // (有効な URL では、パスの中の `@` に触らない性質を保つ)。
+    let authority_end = match rest[authority_end..].rfind('@') {
+        Some(at)
+            if !rest[authority_start..authority_end].contains('@')
+                && reqwest::Url::parse(url).is_err() =>
+        {
+            let after = authority_end + at + 1;
+            rest[after..]
+                .find('/')
+                .map_or(rest.len(), |slash| after + slash)
+        }
+        _ => authority_end,
+    };
     let authority = &rest[authority_start..authority_end];
     // userinfo は最後の `@` まで (パスワードに `@` が入っていても取りこぼさない)。
     let host = authority.rfind('@').map(|at| &authority[at + 1..]);
@@ -1439,6 +1454,13 @@ mod tests {
                 "https://gw.example/v1/users/me@example.com",
                 "https://gw.example/v1/users/me@example.com",
             ),
+            // パスワードに生の `/` (base64 など)、スキーム無しの `//`。どちらも URL としては無効。
+            (
+                "https://user:aB3/xY9+Qw==@gw.example/v1",
+                "https://***@gw.example/v1",
+            ),
+            // (スキームが無いので先頭の `//` ごと userinfo 扱いになる。無効な値なので形は問わない)
+            ("//user:hunter2@gw.example/v1", "***@gw.example/v1"),
             ("not a url", "not a url"),
             ("", ""),
         ] {

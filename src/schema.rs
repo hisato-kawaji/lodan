@@ -421,7 +421,9 @@ pub fn extract_json(text: &str) -> Option<Value> {
     if let Ok(value) = serde_json::from_str(trimmed) {
         return Some(value);
     }
-    let fences: Vec<&str> = trimmed.split("```").collect();
+    // `~~~` のフェンスも同じに扱う。
+    let unified = trimmed.replace("~~~", "```");
+    let fences: Vec<&str> = unified.split("```").collect();
     // フェンスが 1 つなら、区切りで 3 つに分かれる (前・中・後)。
     if fences.len() == 3 {
         // フェンスの 1 行目は言語名 (`json`)。
@@ -433,14 +435,11 @@ pub fn extract_json(text: &str) -> Option<Value> {
     if fences.len() > 1 {
         return None;
     }
-    for open in ['{', '['] {
-        if let Some(start) = trimmed.find(open)
-            && let Ok(value) = serde_json::from_str(&trimmed[start..])
-        {
-            return Some(value);
-        }
-    }
-    None
+    // 末尾まで続く JSON を探す。前置きの中に別の `{` があっても (`Note {x}: {...}`)、そこから
+    // 末尾までは JSON として読めないので、次の候補へ進む。「後ろに何も続かない」は保たれる。
+    trimmed
+        .match_indices(['{', '['])
+        .find_map(|(start, _)| serde_json::from_str(&trimmed[start..]).ok())
 }
 
 #[cfg(test)]
@@ -618,6 +617,8 @@ mod tests {
             "Here you go:\n```json\n{\"ok\": true}\n```\nLet me know!",
             "```\n{\"ok\": true}\n```",
             "The answer is:\n{\"ok\": true}",
+            "Note {x} applies: {\"ok\": true}",
+            "~~~json\n{\"ok\": true}\n~~~",
         ] {
             assert_eq!(extract_json(reply), Some(want.clone()), "{reply}");
         }

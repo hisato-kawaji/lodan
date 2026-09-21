@@ -1475,6 +1475,22 @@ fn an_answer_that_never_matches_is_exit_code_5_and_says_what_was_wrong() {
     assert_eq!(events(&log, "schema_retry"), 2, "asked twice, then gave up");
 }
 
+/// 断りの文に混ざった例示の JSON を、答えとして拾わない。拾うと、呼び出し側には成功 (exit 0) に見える。
+#[test]
+fn an_example_inside_a_refusal_is_not_taken_as_the_answer() {
+    let (out, _log) = run_with_schema(
+        r#"{"type":"object","properties":{"verdict":{"enum":["approve","request_changes"]}}}"#,
+        &[
+            "For example a verdict looks like {\"verdict\":\"approve\"}. But I cannot decide, so I decline.",
+        ],
+        &["--output-format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["structured_output"], serde_json::Value::Null);
+    assert!(v["error"].as_str().unwrap().contains("was not JSON"), "{v}");
+}
+
 /// 読めないスキーマでは LLM を呼ばない (検証できない結果が返るだけなので)。
 #[test]
 fn a_schema_lodan_cannot_enforce_fails_before_any_request() {

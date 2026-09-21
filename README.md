@@ -320,9 +320,9 @@ lodan -p "この PR をレビューして" --output-schema review.schema.json --
 - **承認**: 尋ねる相手がいないので、`--yes` が無ければ破壊的ツール（Write / Edit / Bash …）は**尋ねずに拒否**され、モデルには「非対話実行なので再試行するな」と返る。ハングしない。`AskUserQuestion` も同様に即エラーを返す
 - **stdin**: プロンプト引数があるときは stdin を**読まない**。CI や親プロセスから継承した stdin は端末でなくても閉じられないことがあり、EOF 待ちで固まるため。引数に stdin を足したいときは `--stdin` を明示する（上限 10 MiB）
 - **`--output-schema <FILE>`**: 最終応答を、指定した JSON Schema に合う JSON にさせる。結果を機械で読むスクリプト向け
-  - スキーマはプロンプトの後ろに添えてモデルに渡す。最終応答から JSON を取り出し（前置きやコードフェンスが付いていても拾う）、検証して、合わなければ**どこが違うかを伝えて最大 2 回出し直させる**（`$.score: expected integer, got string` のような 1 行ずつ）。出し直しも普通のターンなので、予算（`max_requests` など）から引かれる
+  - スキーマはプロンプトの後ろに添えてモデルに渡す。最終応答から JSON を取り出し（応答全体が JSON / コードフェンスがちょうど 1 つ / 前置きの後ろに JSON があって**その後ろに何も続かない**、のどれか。断りの文に混ざった例示を答えとして拾わないため、それ以外は JSON 無しとして扱う）、検証して、合わなければ**どこが違うかを伝えて最大 2 回出し直させる**（`$.score: expected integer, got string` のような 1 行ずつ）。出し直しも普通のターンなので、予算（`max_requests` など）から引かれる
   - 合格したら `result` はその JSON だけ（`text` でも同じ）、`json` / `stream-json` では `structured_output` に値そのものも入る。最後まで合わなければ終了コード `5` で、`error` に最後の検証結果が入る
-  - 検証は lodan に内蔵の最小実装。対応しているキーワード: `type`（配列も可）/ `properties` / `required` / `additionalProperties` / `items` / `enum` / `const` / `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` / `minLength` / `maxLength` / `minItems` / `maxItems`。`title` や `description` などの注釈は読み飛ばす
+  - 検証は lodan に内蔵の最小実装。対応しているキーワード: `type`（配列も可）/ `properties` / `required` / `additionalProperties` / `items` / `enum` / `const` / `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` / `minLength` / `maxLength` / `minItems` / `maxItems`。`title` / `description` / `default` / `examples` / `readOnly` / `deprecated` などの、検証に関わらない注釈は読み飛ばす。`enum` / `const` と数値の範囲は値で比べる（`1` と `1.0` は同じ。大きな整数も丸めない）
   - **それ以外のキーワード（`$ref` / `oneOf` / `anyOf` / `pattern` / `format` …）を含むスキーマは、LLM を呼ぶ前にエラーにする**。黙って無視すると、検証した気になって素通しになるため。小型モデルが従えるのは平たいスキーマまでなので、対応範囲もそこに合わせている
 - slash コマンド（`/compact` など）は解釈しない。プロンプトはそのままモデルに渡る
 - hooks（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / SessionEnd）、MCP、skills、プロジェクトメモリ、セッション保存は REPL と同じ

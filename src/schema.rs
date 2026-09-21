@@ -20,6 +20,13 @@ const ANNOTATIONS: &[&str] = &[
     "description",
     "default",
     "examples",
+    // 検証に関わらない注釈。Pydantic や OpenAPI から書き出したスキーマに普通に入っている。
+    "$anchor",
+    "readOnly",
+    "writeOnly",
+    "deprecated",
+    "contentMediaType",
+    "contentEncoding",
 ];
 
 /// モデルに返す検証エラーの最大件数。全部並べても直せないので、先頭だけ。
@@ -107,10 +114,10 @@ pub struct Schema {
     additional: Additional,
     items: Option<Box<Schema>>,
     allowed: Option<Vec<Value>>,
-    minimum: Option<f64>,
-    maximum: Option<f64>,
-    exclusive_minimum: Option<f64>,
-    exclusive_maximum: Option<f64>,
+    minimum: Option<serde_json::Number>,
+    maximum: Option<serde_json::Number>,
+    exclusive_minimum: Option<serde_json::Number>,
+    exclusive_maximum: Option<serde_json::Number>,
     min_length: Option<u64>,
     max_length: Option<u64>,
     min_items: Option<u64>,
@@ -185,10 +192,9 @@ impl Schema {
             }
         }
         // 綴り違いで「必須のつもりが、誰も定義していない名前」になっていないか。
-        if !schema.properties.is_empty() {
+        if matches!(schema.additional, Additional::Forbidden) {
             for name in &schema.required {
-                let defined = schema.properties.iter().any(|(n, _)| n == name);
-                if !defined && matches!(schema.additional, Additional::Forbidden) {
+                if !schema.properties.iter().any(|(n, _)| n == name) {
                     return Err(format!(
                         "{at}.required: `{name}` is required but is not in `properties`, and \
                          additionalProperties is false — nothing could ever satisfy this"
@@ -306,24 +312,16 @@ impl Schema {
                 }
             }
             Value::Number(number) => {
-                let Some(n) = number.as_f64() else { return };
+                use std::cmp::Ordering::{Equal, Greater, Less};
                 let bounds = [
-                    (self.minimum, n >= self.minimum.unwrap_or(n), ">="),
-                    (self.maximum, n <= self.maximum.unwrap_or(n), "<="),
-                    (
-                        self.exclusive_minimum,
-                        n > self.exclusive_minimum.unwrap_or(f64::NEG_INFINITY),
-                        ">",
-                    ),
-                    (
-                        self.exclusive_maximum,
-                        n < self.exclusive_maximum.unwrap_or(f64::INFINITY),
-                        "<",
-                    ),
+                    (&self.minimum, ">=", [Greater, Equal].as_slice()),
+                    (&self.maximum, "<=", [Less, Equal].as_slice()),
+                    (&self.exclusive_minimum, ">", [Greater].as_slice()),
+                    (&self.exclusive_maximum, "<", [Less].as_slice()),
                 ];
-                for (bound, ok, op) in bounds {
+                for (bound, op, accepted) in bounds {
                     if let Some(bound) = bound
-                        && !ok
+                        && !compare(number, bound).is_some_and(|o| accepted.contains(&o))
                     {
                         errors.push(format!("{at}: must be {op} {bound}, got {number}"));
                     }
@@ -387,10 +385,21 @@ fn strings(value: &Value, at: &str) -> Result<Vec<String>, String> {
         .ok_or_else(|| format!("{at}: expected a list of property names"))
 }
 
-fn number(value: &Value, at: &str) -> Result<f64, String> {
-    value
-        .as_f64()
-        .ok_or_else(|| format!("{at}: expected a number"))
+fn number(value: &Value, at: &str) -> Result<serde_json::Number, String> {
+    match value {
+        Value::Number(n) => Ok(n.clone()),
+        _ => Err(format!("{at}: expected a number")),
+    }
+}
+
+/// 数の大小。どちらも整数なら整数のまま比べる — f64 に落とすと 2^53 より上で隣の整数と区別が
+/// つかなくなり、`minimum: 9007199254740993` が `9007199254740992` を通してしまう。
+fn compare(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    let int = |n: &serde_json::Number| n.as_i64().map(i128::from).or(n.as_u64().map(i128::from));
+    match (int(a), int(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
+    }
 }
 
 fn count(value: &Value, at: &str) -> Result<u64, String> {
@@ -399,28 +408,36 @@ fn count(value: &Value, at: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{at}: expected a non-negative integer"))
 }
 
-/// モデルの応答から JSON を取り出す。応答全体、```` ```json ```` のコードフェンスの中、最初の
-/// `{` / `[` から対応する最後の閉じ括弧まで、の順に試す。小型モデルは「JSON だけを返せ」と
-/// 言っても前置きやフェンスを付けがちで、そこで落とすのは惜しい。
+/// モデルの応答から JSON を取り出す。小型モデルは「JSON だけを返せ」と言っても前置きやコードフェンスを
+/// 付けがちで、そこで落とすのは惜しい。ただし**答えでない JSON を答えとして拾わない**ことを優先する:
+/// 「例えば `{"verdict":"approve"}` のようになりますが、私には判断できません」という断りの文から
+/// 例示を拾うと、呼び出し側には成功に見えてしまう (レビューで実際に通った)。
+///
+/// 1. 応答全体が JSON
+/// 2. コードフェンスが**ちょうど 1 つ**で、その中身が JSON
+/// 3. 前置きの後ろに JSON があり、**JSON の後ろには何も続かない**
+///
+/// どれにも当たらなければ None (= 出し直しを求める。その仕組みは既にある)。
 pub fn extract_json(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str(trimmed) {
         return Some(value);
     }
-    if let Some(start) = trimmed.find("```") {
-        let after = &trimmed[start + 3..];
+    let fences: Vec<&str> = trimmed.split("```").collect();
+    // フェンスが 1 つなら、区切りで 3 つに分かれる (前・中・後)。
+    if fences.len() == 3 {
         // フェンスの 1 行目は言語名 (`json`)。
-        let body = after.split_once('\n').map_or(after, |(_, rest)| rest);
-        if let Some(end) = body.find("```")
-            && let Ok(value) = serde_json::from_str(body[..end].trim())
-        {
-            return Some(value);
-        }
+        let body = fences[1]
+            .split_once('\n')
+            .map_or(fences[1], |(_, rest)| rest);
+        return serde_json::from_str(body.trim()).ok();
     }
-    for (open, close) in [('{', '}'), ('[', ']')] {
-        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close))
-            && start < end
-            && let Ok(value) = serde_json::from_str(&trimmed[start..=end])
+    if fences.len() > 1 {
+        return None;
+    }
+    for open in ['{', '['] {
+        if let Some(start) = trimmed.find(open)
+            && let Ok(value) = serde_json::from_str(&trimmed[start..])
         {
             return Some(value);
         }
@@ -522,6 +539,20 @@ mod tests {
     }
 
     #[test]
+    fn large_integer_bounds_are_compared_exactly_and_shown_as_written() {
+        let schema = Schema::parse(&json!({ "minimum": 9007199254740993u64 })).unwrap();
+        assert_eq!(
+            schema.validate(&json!(9007199254740992u64)),
+            ["$: must be >= 9007199254740993, got 9007199254740992"]
+        );
+        assert!(schema.validate(&json!(9007199254740993u64)).is_empty());
+        let fractional = Schema::parse(&json!({ "exclusiveMinimum": 0, "maximum": 1.5 })).unwrap();
+        assert!(fractional.validate(&json!(1.5)).is_empty());
+        assert_eq!(fractional.validate(&json!(0)).len(), 1);
+        assert_eq!(fractional.validate(&json!(2)).len(), 1);
+    }
+
+    #[test]
     fn the_error_list_is_capped() {
         let schema =
             Schema::parse(&json!({ "type": "array", "items": { "type": "string" } })).unwrap();
@@ -567,6 +598,14 @@ mod tests {
             "properties": { "name": { "type": "string" } }
         });
         assert!(Schema::parse(&impossible).unwrap_err().contains("nmae"));
+        // `properties` が無くても同じ (必須なのに、どのプロパティも許されていない)。
+        let impossible =
+            json!({ "type": "object", "required": ["verdict"], "additionalProperties": false });
+        assert!(Schema::parse(&impossible).unwrap_err().contains("verdict"));
+        // 検証に関わらない注釈は読み飛ばす。
+        let annotated =
+            json!({ "type": "string", "readOnly": true, "deprecated": false, "$anchor": "x" });
+        assert!(Schema::parse(&annotated).is_ok());
     }
 
     #[test]
@@ -577,12 +616,22 @@ mod tests {
             "  \n{\"ok\": true}\n",
             "Here you go:\n```json\n{\"ok\": true}\n```\nLet me know!",
             "```\n{\"ok\": true}\n```",
-            "The answer is {\"ok\": true} as requested.",
+            "The answer is:\n{\"ok\": true}",
         ] {
             assert_eq!(extract_json(reply), Some(want.clone()), "{reply}");
         }
         assert_eq!(extract_json("[1, 2]"), Some(json!([1, 2])));
         assert_eq!(extract_json("I could not do it."), None);
+        // 答えでない JSON を拾わない: 例示の後ろに断りが続く文、複数のフェンス、本文中の `{}`。
+        for not_an_answer in [
+            "For example a verdict looks like {\"verdict\":\"approve\"}. But I cannot decide, so I decline.",
+            "I am not able to review this; I will use {} placeholders later.",
+            "The answer is {\"ok\": true} as requested.",
+            "Before:\n```json\n{\"ok\": false}\n```\nAfter:\n```json\n{\"ok\": true}\n```",
+            "```json\nnot json\n```\n{\"ok\": true}",
+        ] {
+            assert_eq!(extract_json(not_an_answer), None, "{not_an_answer}");
+        }
         assert_eq!(extract_json("{not json}"), None);
     }
 }

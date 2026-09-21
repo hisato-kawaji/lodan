@@ -241,7 +241,7 @@ impl Schema {
             return;
         }
         if let Some(allowed) = &self.allowed
-            && !allowed.contains(value)
+            && !allowed.iter().any(|candidate| same_json(candidate, value))
         {
             let list: Vec<String> = allowed.iter().map(Value::to_string).collect();
             errors.push(format!(
@@ -331,6 +331,26 @@ impl Schema {
             }
             Value::Bool(_) | Value::Null => {}
         }
+    }
+}
+
+/// `enum` / `const` の比較。JSON Schema では `1` と `1.0` は同じ値だが、`serde_json::Value` の
+/// `==` は整数と浮動小数を別物として扱うので、数は値で比べる。
+fn same_json(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => x == y,
+            _ => x == y,
+        },
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_json(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|other| same_json(v, other)))
+        }
+        _ => a == b,
     }
 }
 
@@ -483,6 +503,22 @@ mod tests {
         let errors = review_schema()
             .validate(&json!({ "verdict": "approve", "score": 7.5, "findings": [] }));
         assert_eq!(errors, ["$.score: expected integer, got number"]);
+    }
+
+    #[test]
+    fn enum_and_const_compare_numbers_by_value() {
+        let schema = Schema::parse(&json!({
+            "type": "object",
+            "properties": {
+                "level": { "enum": [1, 2, 3] },
+                "point": { "const": [1.0, { "x": 2 }] }
+            }
+        }))
+        .unwrap();
+        let ok = json!({ "level": 2.0, "point": [1, { "x": 2.0 }] });
+        assert_eq!(schema.validate(&ok), Vec::<String>::new());
+        assert_eq!(schema.validate(&json!({ "level": 2.5 })).len(), 1);
+        assert_eq!(schema.validate(&json!({ "level": "2" })).len(), 1);
     }
 
     #[test]

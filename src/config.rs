@@ -460,6 +460,100 @@ impl Default for BashConfig {
     }
 }
 
+/// `lodan config` が秘密の値の代わりに出す文字列。
+pub const REDACTED: &str = "***";
+
+impl Config {
+    /// 画面に出してよい形の写し (#88)。`lodan config` の出力は画面共有や issue にそのまま貼られる。
+    ///
+    /// - `api_key`: 空でなければ伏せる
+    /// - `extra_body`: キーは残し、値を全て伏せる (何が秘密かはキー名からは分からない)
+    /// - `base_url`: `https://user:pass@host/…` の資格情報とクエリ文字列を伏せる
+    pub fn redacted(&self) -> Config {
+        let mut shown = self.clone();
+        let llm = &mut shown.llm;
+        for provider in [
+            &mut llm.local,
+            &mut llm.sakana,
+            &mut llm.sakura,
+            &mut llm.kimi,
+        ] {
+            if !provider.api_key.is_empty() {
+                provider.api_key = REDACTED.to_string();
+            }
+            for value in provider.extra_body.values_mut() {
+                *value = serde_json::Value::String(REDACTED.to_string());
+            }
+            provider.base_url = redact_url(&provider.base_url);
+        }
+        shown
+    }
+}
+
+/// URL に埋め込まれた資格情報 (userinfo)・クエリ文字列・フラグメントを伏せる。
+///
+/// URL パーサには頼らず文字列として処理する。`lodan config` を見るのは設定が壊れているときで、
+/// ポート番号の打ち間違いのような「URL として読めない値」こそ貼り付けられる。パーサが読めなかったら
+/// そのまま出す、という作りでは、一番漏れやすい場面で漏れる。秘密を含まない値は一字も変えない。
+fn redact_url(url: &str) -> String {
+    // 後ろから順に切り分ける: `#fragment`、`?query`、残りが scheme://authority/path。
+    let (rest, fragment) = match url.split_once('#') {
+        Some((rest, _)) => (rest, true),
+        None => (url, false),
+    };
+    let (rest, query) = match rest.split_once('?') {
+        Some((rest, _)) => (rest, true),
+        None => (rest, false),
+    };
+    // authority は `://` の後ろから最初の `/` まで。`://` が無ければ先頭から。
+    let authority_start = rest.find("://").map_or(0, |at| at + 3);
+    let authority_end = rest[authority_start..]
+        .find('/')
+        .map_or(rest.len(), |at| authority_start + at);
+    // パスワードに生の `/` が入っていると、authority を最初の `/` で切った時点で `@` を見失う。
+    // そういう値は URL として無効なので、無効な値に限って「最後の `@` まで」を userinfo とみなす
+    // (有効な URL では、パスの中の `@` に触らない性質を保つ)。
+    let authority_end = match rest[authority_end..].rfind('@') {
+        Some(at)
+            if !rest[authority_start..authority_end].contains('@')
+                && reqwest::Url::parse(url).is_err() =>
+        {
+            let after = authority_end + at + 1;
+            rest[after..]
+                .find('/')
+                .map_or(rest.len(), |slash| after + slash)
+        }
+        _ => authority_end,
+    };
+    let authority = &rest[authority_start..authority_end];
+    // userinfo は最後の `@` まで (パスワードに `@` が入っていても取りこぼさない)。
+    let host = authority.rfind('@').map(|at| &authority[at + 1..]);
+
+    if host.is_none() && !query && !fragment {
+        return url.to_string();
+    }
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&rest[..authority_start]);
+    match host {
+        Some(host) => {
+            out.push_str(REDACTED);
+            out.push('@');
+            out.push_str(host);
+        }
+        None => out.push_str(authority),
+    }
+    out.push_str(&rest[authority_end..]);
+    if query {
+        out.push('?');
+        out.push_str(REDACTED);
+    }
+    if fragment {
+        out.push('#');
+        out.push_str(REDACTED);
+    }
+    out
+}
+
 impl LlmConfig {
     pub fn active(&self) -> &ProviderConfig {
         self.get(self.provider)
@@ -1308,6 +1402,78 @@ mod tests {
         );
         assert_eq!(cfg.llm.fallback, Some(Provider::Sakana));
         assert_eq!(origins["llm.fallback"], Origin::Override);
+    }
+
+    /// `lodan config` の既定の出力には、秘密の値が 1 つも入らない (#88)。
+    #[test]
+    fn the_redacted_config_shows_no_secret_values_but_keeps_the_shape() {
+        let mut cfg = Config::default();
+        cfg.llm.sakura.api_key = "sk-SAKURA-SECRET".into();
+        cfg.llm.kimi.base_url = "https://alice:hunter2@gateway.example/v1?token=URLSECRET".into();
+        cfg.llm.local.extra_body.insert(
+            "auth".into(),
+            serde_json::json!({ "bearer": "BODYSECRET", "n": 1 }),
+        );
+        let shown = toml::to_string_pretty(&cfg.redacted()).unwrap();
+        for secret in [
+            "sk-SAKURA-SECRET",
+            "hunter2",
+            "alice",
+            "URLSECRET",
+            "BODYSECRET",
+        ] {
+            assert!(!shown.contains(secret), "{secret} leaked:\n{shown}");
+        }
+        // どこに何が設定されているかは分かる。
+        assert!(shown.contains("api_key = \"***\""), "{shown}");
+        assert!(shown.contains("auth = \"***\""), "{shown}");
+        assert!(shown.contains("gateway.example/v1"), "{shown}");
+
+        // URL として読めない値でも、`file:` のような資格情報を持てないはずのスキームでも、伏せる
+        // (レビューで、ポート番号を打ち間違えた URL のパスワードがそのまま出た)。
+        for (given, shown) in [
+            (
+                "https://u:FLAGPASS@gw.example:99999/v1",
+                "https://***@gw.example:99999/v1",
+            ),
+            ("https://alice:hunter2@", "https://***@"),
+            ("file://alice:hunter2@host/v1", "file://***@host/v1"),
+            ("https://a:p@ss@gw.example/v1", "https://***@gw.example/v1"),
+            ("alice:hunter2@gw.example/v1", "***@gw.example/v1"),
+            (
+                "https://a:b@gw.example/v1?t=Q#sk-FRAG-SECRET",
+                "https://***@gw.example/v1?***#***",
+            ),
+            (
+                "http://localhost:11434/v1#tok",
+                "http://localhost:11434/v1#***",
+            ),
+            // 秘密を含まない値は一字も変えない (パスの中の `@` は userinfo ではない)。
+            ("http://localhost:11434/v1/", "http://localhost:11434/v1/"),
+            (
+                "https://gw.example/v1/users/me@example.com",
+                "https://gw.example/v1/users/me@example.com",
+            ),
+            // パスワードに生の `/` (base64 など)、スキーム無しの `//`。どちらも URL としては無効。
+            (
+                "https://user:aB3/xY9+Qw==@gw.example/v1",
+                "https://***@gw.example/v1",
+            ),
+            // (スキームが無いので先頭の `//` ごと userinfo 扱いになる。無効な値なので形は問わない)
+            ("//user:hunter2@gw.example/v1", "***@gw.example/v1"),
+            ("not a url", "not a url"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_url(given), shown, "{given}");
+        }
+
+        // 設定していないキーは空のまま (「設定してある」と見せかけない)。秘密の無い URL は一字も変えない。
+        let plain = Config::default();
+        let plain_shown = plain.redacted();
+        assert_eq!(plain_shown.llm.local.api_key, "");
+        assert_eq!(plain_shown.llm.local.base_url, plain.llm.local.base_url);
+        // 伏せるのは写しだけ。
+        assert_eq!(cfg.llm.sakura.api_key, "sk-SAKURA-SECRET");
     }
 
     #[test]

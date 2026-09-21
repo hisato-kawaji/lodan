@@ -490,23 +490,53 @@ impl Config {
     }
 }
 
-/// URL に埋め込まれた資格情報 (userinfo) とクエリ文字列を伏せる。URL として読めないものはそのまま。
+/// URL に埋め込まれた資格情報 (userinfo)・クエリ文字列・フラグメントを伏せる。
+///
+/// URL パーサには頼らず文字列として処理する。`lodan config` を見るのは設定が壊れているときで、
+/// ポート番号の打ち間違いのような「URL として読めない値」こそ貼り付けられる。パーサが読めなかったら
+/// そのまま出す、という作りでは、一番漏れやすい場面で漏れる。秘密を含まない値は一字も変えない。
 fn redact_url(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return url.to_string();
+    // 後ろから順に切り分ける: `#fragment`、`?query`、残りが scheme://authority/path。
+    let (rest, fragment) = match url.split_once('#') {
+        Some((rest, _)) => (rest, true),
+        None => (url, false),
     };
-    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
-    if !has_userinfo && parsed.query().is_none() {
+    let (rest, query) = match rest.split_once('?') {
+        Some((rest, _)) => (rest, true),
+        None => (rest, false),
+    };
+    // authority は `://` の後ろから最初の `/` まで。`://` が無ければ先頭から。
+    let authority_start = rest.find("://").map_or(0, |at| at + 3);
+    let authority_end = rest[authority_start..]
+        .find('/')
+        .map_or(rest.len(), |at| authority_start + at);
+    let authority = &rest[authority_start..authority_end];
+    // userinfo は最後の `@` まで (パスワードに `@` が入っていても取りこぼさない)。
+    let host = authority.rfind('@').map(|at| &authority[at + 1..]);
+
+    if host.is_none() && !query && !fragment {
         return url.to_string();
     }
-    if has_userinfo {
-        let _ = parsed.set_username(REDACTED);
-        let _ = parsed.set_password(None);
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&rest[..authority_start]);
+    match host {
+        Some(host) => {
+            out.push_str(REDACTED);
+            out.push('@');
+            out.push_str(host);
+        }
+        None => out.push_str(authority),
     }
-    if parsed.query().is_some() {
-        parsed.set_query(Some(REDACTED));
+    out.push_str(&rest[authority_end..]);
+    if query {
+        out.push('?');
+        out.push_str(REDACTED);
     }
-    parsed.to_string()
+    if fragment {
+        out.push('#');
+        out.push_str(REDACTED);
+    }
+    out
 }
 
 impl LlmConfig {
@@ -1383,6 +1413,37 @@ mod tests {
         assert!(shown.contains("api_key = \"***\""), "{shown}");
         assert!(shown.contains("auth = \"***\""), "{shown}");
         assert!(shown.contains("gateway.example/v1"), "{shown}");
+
+        // URL として読めない値でも、`file:` のような資格情報を持てないはずのスキームでも、伏せる
+        // (レビューで、ポート番号を打ち間違えた URL のパスワードがそのまま出た)。
+        for (given, shown) in [
+            (
+                "https://u:FLAGPASS@gw.example:99999/v1",
+                "https://***@gw.example:99999/v1",
+            ),
+            ("https://alice:hunter2@", "https://***@"),
+            ("file://alice:hunter2@host/v1", "file://***@host/v1"),
+            ("https://a:p@ss@gw.example/v1", "https://***@gw.example/v1"),
+            ("alice:hunter2@gw.example/v1", "***@gw.example/v1"),
+            (
+                "https://a:b@gw.example/v1?t=Q#sk-FRAG-SECRET",
+                "https://***@gw.example/v1?***#***",
+            ),
+            (
+                "http://localhost:11434/v1#tok",
+                "http://localhost:11434/v1#***",
+            ),
+            // 秘密を含まない値は一字も変えない (パスの中の `@` は userinfo ではない)。
+            ("http://localhost:11434/v1/", "http://localhost:11434/v1/"),
+            (
+                "https://gw.example/v1/users/me@example.com",
+                "https://gw.example/v1/users/me@example.com",
+            ),
+            ("not a url", "not a url"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_url(given), shown, "{given}");
+        }
 
         // 設定していないキーは空のまま (「設定してある」と見せかけない)。秘密の無い URL は一字も変えない。
         let plain = Config::default();

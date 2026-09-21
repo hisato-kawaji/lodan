@@ -254,7 +254,7 @@ CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` �
 
 ### 設定の確認（`lodan config`）
 
-`lodan config` の出力は画面共有や issue にそのまま貼られがちなので、**既定では秘密を `***` に伏せます**: `api_key`（空なら空のまま）、`[llm.<provider>.extra_body]` の値（何が秘密かはキー名からは分からないので全て。キーは残る）、`base_url` に埋め込まれた資格情報（`https://user:pass@host/…`）とクエリ文字列。環境変数から拾う API キー（`KIMI_API_KEY` など）は、もともと設定には入らないので出ません。
+`lodan config` の出力は画面共有や issue にそのまま貼られがちなので、**既定では秘密を `***` に伏せます**: `api_key`（空なら空のまま）、`[llm.<provider>.extra_body]` の値（何が秘密かはキー名からは分からないので全て。キーは残る）、`base_url` に埋め込まれた資格情報（`https://user:pass@host/…`）・クエリ文字列・フラグメント（URL として正しく読めない値でも伏せる）。**伏せないもの**: `base_url` のパスに埋めたトークン（`https://host/v1/sk-…/`）、`[[hooks]]` の `command`、`[permissions]` のルール文字列 — 秘密はここに直接書かず、環境変数で渡すこと。環境変数から拾う API キー（`KIMI_API_KEY` など）は、もともと設定には入らないので出ません。
 
 `lodan config --show-secrets` で伏せずに出します。この出力はそのまま `config.toml` に貼れます。
 

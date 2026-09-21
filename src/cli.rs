@@ -137,6 +137,10 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t, requires = "print")]
     pub output_format: crate::headless::OutputFormat,
 
+    /// With -p: the final answer must be JSON matching this JSON Schema file (the model is asked to fix it if not)
+    #[arg(long, value_name = "FILE", requires = "print")]
+    pub output_schema: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }
@@ -230,6 +234,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
             prompt,
             read_stdin: args.stdin,
             format,
+            output_schema: args.output_schema,
             resume: args.resume,
         };
         return Ok(crate::headless::run(cfg, opts).await);

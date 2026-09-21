@@ -41,6 +41,10 @@ def build_steps(demo_dir):
 
 def make_handler(demo_dir):
     steps = build_steps(demo_dir)
+    # MOCK_LLM_TEXTS: JSON 配列。本文の返事を呼ばれるたびに順に返す (尽きたら最後を繰り返す)。
+    # 「1 回目は駄目な答え、直せと言われたら正しい答え」を再現するためのもの。
+    scripted = json.loads(os.environ.get("MOCK_LLM_TEXTS", "[]"))
+    served = {"n": 0}
 
     def decide(messages, model=None):
         # MOCK_LLM_JUDGE_MODEL / MOCK_LLM_JUDGE_TEXT: このモデル名で来たリクエストにだけ別の返事をする
@@ -62,6 +66,10 @@ def make_handler(demo_dir):
                     f"Demo complete: exercised {len(steps)} tools "
                     f"({', '.join(s[0] for s in steps)}).")
 
+        if scripted:
+            reply = scripted[min(served["n"], len(scripted) - 1)]
+            served["n"] += 1
+            return ("text", reply)
         return ("text", os.environ.get(
             "MOCK_LLM_TEXT",
             "Hello from mock LLM. Send 'demo' to run the full tool sequence."))

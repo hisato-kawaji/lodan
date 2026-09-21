@@ -336,10 +336,8 @@ impl Schema {
 /// `==` は整数と浮動小数を別物として扱うので、数は値で比べる。
 fn same_json(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
-            (Some(x), Some(y)) => x == y,
-            _ => x == y,
-        },
+        // 整数どうしは整数のまま (f64 に落とすと、2^53 より上の隣り合う整数が同じになる)。
+        (Value::Number(x), Value::Number(y)) => compare(x, y) == Some(std::cmp::Ordering::Equal),
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_json(x, y))
         }
@@ -535,6 +533,9 @@ mod tests {
         let ok = json!({ "level": 2.0, "point": [1, { "x": 2.0 }] });
         assert_eq!(schema.validate(&ok), Vec::<String>::new());
         assert_eq!(schema.validate(&json!({ "level": 2.5 })).len(), 1);
+        let big = Schema::parse(&json!({ "const": 9007199254740993u64 })).unwrap();
+        assert_eq!(big.validate(&json!(9007199254740992u64)).len(), 1);
+        assert!(big.validate(&json!(9007199254740993u64)).is_empty());
         assert_eq!(schema.validate(&json!({ "level": "2" })).len(), 1);
     }
 

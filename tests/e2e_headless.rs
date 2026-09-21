@@ -1373,3 +1373,135 @@ fn lodan_config_hides_secrets_unless_asked_and_the_full_output_still_round_trips
     ]);
     assert_eq!(again, full);
 }
+
+// ---- #71: `--output-schema` ----
+
+const REVIEW_SCHEMA: &str = r#"{
+  "type": "object",
+  "required": ["verdict", "score"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": { "enum": ["approve", "request_changes"] },
+    "score": { "type": "integer", "minimum": 0, "maximum": 10 }
+  }
+}"#;
+
+/// スキーマを置き、mock に `replies` を順に返させて `-p --output-schema` を走らせる。
+fn run_with_schema(schema: &str, replies: &[&str], extra: &[&str]) -> (Output, RunLog) {
+    let home = tempfile::tempdir().unwrap();
+    let schema_path = home.path().join("schema.json");
+    std::fs::write(&schema_path, schema).unwrap();
+    let scripted = serde_json::to_string(replies).unwrap();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_TEXTS", &scripted)]);
+    let log = home.path().join("run.jsonl");
+    let mut args = vec![
+        "-p",
+        "review the change",
+        "--output-schema",
+        schema_path.to_str().unwrap(),
+        "--log-jsonl",
+        log.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    let out = lodan(home.path(), server.port, &args, Stdin::OpenAndSilent);
+    (out, RunLog { home })
+}
+
+/// 実行の `--log-jsonl`。tempdir を握っているので、読み終わるまで消えない。
+struct RunLog {
+    home: tempfile::TempDir,
+}
+
+fn events(log: &RunLog, name: &str) -> usize {
+    std::fs::read_to_string(log.home.path().join("run.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["event"] == name)
+        .count()
+}
+
+/// 受け入れ条件: スキーマ不一致 → 再要求 → 成功。
+#[test]
+fn an_answer_that_misses_the_schema_is_sent_back_and_the_corrected_one_is_returned() {
+    let (out, log) = run_with_schema(
+        REVIEW_SCHEMA,
+        &[
+            "Looks good to me! I'd give it an 11.",
+            "```json\n{\"verdict\": \"lgtm\", \"score\": 11}\n```",
+            "Sure:\n```json\n{\"verdict\": \"approve\", \"score\": 9}\n```",
+        ],
+        &["--output-format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        v["structured_output"],
+        serde_json::json!({ "verdict": "approve", "score": 9 })
+    );
+    // `result` は前置きもコードフェンスも除いた JSON そのもの。
+    assert_eq!(v["result"], r#"{"score":9,"verdict":"approve"}"#);
+    assert_eq!(events(&log, "schema_retry"), 2);
+    assert_eq!(
+        v["usage"]["requests"], 3,
+        "two corrections = two more requests"
+    );
+}
+
+#[test]
+fn a_matching_first_answer_needs_no_correction_and_text_mode_prints_the_json() {
+    let (out, log) = run_with_schema(REVIEW_SCHEMA, &[r#"{"verdict":"approve","score":7}"#], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(stdout(&out).trim(), r#"{"score":7,"verdict":"approve"}"#);
+    assert_eq!(events(&log, "schema_retry"), 0);
+}
+
+#[test]
+fn an_answer_that_never_matches_is_exit_code_5_and_says_what_was_wrong() {
+    let (out, log) = run_with_schema(
+        REVIEW_SCHEMA,
+        &[r#"{"verdict":"approve","score":"high"}"#],
+        &["--output-format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(5), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["result"], serde_json::Value::Null);
+    assert_eq!(v["structured_output"], serde_json::Value::Null);
+    let error = v["error"].as_str().unwrap();
+    assert!(
+        error.contains("$.score: expected integer, got string"),
+        "{error}"
+    );
+    assert_eq!(events(&log, "schema_retry"), 2, "asked twice, then gave up");
+}
+
+/// 読めないスキーマでは LLM を呼ばない (検証できない結果が返るだけなので)。
+#[test]
+fn a_schema_lodan_cannot_enforce_fails_before_any_request() {
+    let (out, log) = run_with_schema(
+        r#"{"type":"object","properties":{"email":{"type":"string","format":"email"}}}"#,
+        &["{}"],
+        &["--output-format", "json"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let error = v["error"].as_str().unwrap();
+    assert!(
+        error.contains("format") && error.contains("not supported"),
+        "{error}"
+    );
+    assert_eq!(v["usage"]["llm_calls"], 0);
+    assert_eq!(events(&log, "llm_response"), 0);
+}
+
+#[test]
+fn output_schema_needs_print_mode() {
+    let home = tempfile::tempdir().unwrap();
+    let out = lodan(
+        home.path(),
+        1,
+        &["--output-schema", "schema.json"],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(2), "a usage error, caught by clap");
+}

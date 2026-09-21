@@ -18,6 +18,7 @@ pub mod repl;
 pub mod runlog;
 pub mod runtime;
 pub mod sandbox;
+pub mod schema;
 pub mod session;
 pub mod skills;
 pub mod slash;

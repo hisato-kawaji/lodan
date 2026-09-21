@@ -35,6 +35,8 @@ pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_MAX_ITERATIONS: i32 = 3;
 /// `max_requests` / `max_total_tokens` を使い切り、次の LLM リクエストを送らずに打ち切った。
 pub const EXIT_BUDGET: i32 = 4;
+/// `--output-schema`: 再要求しても、最終応答がスキーマに合わなかった。
+pub const EXIT_SCHEMA: i32 = 5;
 /// SIGINT (128 + 2)。
 pub const EXIT_INTERRUPTED: i32 = 130;
 
@@ -49,6 +51,62 @@ pub struct Options {
     pub read_stdin: bool,
     pub format: OutputFormat,
     pub resume: Option<String>,
+    /// `--output-schema`: 最終応答はこの JSON Schema に合う JSON でなければならない。
+    pub output_schema: Option<std::path::PathBuf>,
+}
+
+/// スキーマに合わない応答を、直させるために再要求する回数。
+const SCHEMA_RETRIES: u32 = 2;
+
+/// 読み込んだ `--output-schema`。
+struct OutputSchema {
+    schema: crate::schema::Schema,
+    /// モデルに見せる原文 (整形済み)。
+    text: String,
+}
+
+impl OutputSchema {
+    fn load(path: &std::path::Path) -> Result<Self> {
+        use anyhow::Context;
+        let shown = path.display();
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --output-schema {shown}"))?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .with_context(|| format!("--output-schema {shown} is not valid JSON"))?;
+        let schema = crate::schema::Schema::parse(&value)
+            .map_err(|e| anyhow::anyhow!("--output-schema {shown}: {e}"))?;
+        let text = serde_json::to_string_pretty(&value)?;
+        Ok(Self { schema, text })
+    }
+
+    /// 利用者のプロンプトの後ろに添える指示。
+    fn instruction(&self) -> String {
+        format!(
+            "When you are done, your final message must be a single JSON value that matches this \
+             JSON Schema — JSON only, no prose and no code fence:\n{}",
+            self.text
+        )
+    }
+
+    /// 最終応答を検証する。合えばその値、合わなければモデルへ返す再要求文。
+    fn check(&self, reply: Option<&str>) -> std::result::Result<serde_json::Value, String> {
+        let Some(value) = reply.and_then(crate::schema::extract_json) else {
+            return Err(format!(
+                "Your final message was not JSON. Reply again with a single JSON value that \
+                 matches the schema — JSON only, nothing else:\n{}",
+                self.text
+            ));
+        };
+        let problems = self.schema.validate(&value);
+        if problems.is_empty() {
+            return Ok(value);
+        }
+        Err(format!(
+            "Your final JSON does not match the required schema:\n- {}\nReply again with the \
+             corrected JSON only (the complete value, not a diff).",
+            problems.join("\n- ")
+        ))
+    }
 }
 
 /// 1 ターン実行し、終了コードを返す。ターンに入る前の失敗 (stdin の読み取り・API キー無し・
@@ -79,7 +137,13 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         read_stdin,
         format: _,
         resume,
+        output_schema,
     } = opts;
+    // ターンに入る前に読む。読めないスキーマで LLM を呼んでも、検証できない結果が返るだけ。
+    let output_schema = output_schema
+        .as_deref()
+        .map(OutputSchema::load)
+        .transpose()?;
 
     let piped = if wants_stdin(&prompt_arg, read_stdin) {
         read_stdin_to_end()?
@@ -90,6 +154,10 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
     if prompt.is_empty() {
         anyhow::bail!("-p needs a prompt: pass it as the argument, or pipe it on stdin");
     }
+    let prompt = match &output_schema {
+        Some(schema) => format!("{prompt}\n\n{}", schema.instruction()),
+        None => prompt,
+    };
 
     let runtime = Runtime::build(&cfg, Notices::Stderr).await?;
     let gate = PermissionGate::from_config(&cfg, &runtime.cwd, false)?;
@@ -130,18 +198,36 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
 
     // このターンで増えた分だけを最終応答の候補にする (`--resume` では履歴の末尾が
     // 前回の応答なので、何も足されなかったターンがそれを拾ってしまう)。
-    let history_before = session.history().len();
-    let outcome = {
-        let turn = session.run_turn(&prompt, runtime.llm.as_ref(), &gate);
-        tokio::pin!(turn);
-        tokio::select! {
-            res = &mut turn => match res {
-                Ok(()) => Outcome::Done,
-                Err(e) => Outcome::Failed(e),
-            },
-            _ = tokio::signal::ctrl_c() => Outcome::Interrupted,
+    let mut history_before = session.history().len();
+    let mut outcome = drive(&mut session, &prompt, &runtime, &gate).await;
+
+    // `--output-schema`: 合わなければ、どこが違うかを伝えて出し直させる。再要求も普通のターンなので、
+    // ツールも使えるし、`max_requests` などの予算からも引かれる。
+    let mut structured = None;
+    let mut schema_failure = None;
+    if let Some(schema) = &output_schema {
+        for attempt in 0..=SCHEMA_RETRIES {
+            if !matches!(outcome, Outcome::Done) {
+                break;
+            }
+            let reply = final_text(added_this_turn(session.history(), history_before));
+            match schema.check(reply.as_deref()) {
+                Ok(value) => {
+                    structured = Some(value);
+                    break;
+                }
+                Err(feedback) if attempt < SCHEMA_RETRIES => {
+                    crate::runlog::record(
+                        "schema_retry",
+                        serde_json::json!({ "attempt": attempt + 1, "max": SCHEMA_RETRIES }),
+                    );
+                    history_before = session.history().len();
+                    outcome = drive(&mut session, &feedback, &runtime, &gate).await;
+                }
+                Err(feedback) => schema_failure = Some(feedback),
+            }
         }
-    };
+    }
     if matches!(outcome, Outcome::Interrupted) {
         session.interrupt_repair();
     }
@@ -161,7 +247,26 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         recorder.as_ref().map(|r| r.id().to_string()),
         session.usage(),
     )
+    .with_schema_result(structured, schema_failure)
     .with_ledger(&runtime.ledger))
+}
+
+/// 1 ターン走らせる。Ctrl-C で中断できる。
+async fn drive(
+    session: &mut crate::agent::Session,
+    prompt: &str,
+    runtime: &Runtime,
+    gate: &PermissionGate,
+) -> Outcome {
+    let turn = session.run_turn(prompt, runtime.llm.as_ref(), gate);
+    tokio::pin!(turn);
+    tokio::select! {
+        res = &mut turn => match res {
+            Ok(()) => Outcome::Done,
+            Err(e) => Outcome::Failed(e),
+        },
+        _ = tokio::signal::ctrl_c() => Outcome::Interrupted,
+    }
 }
 
 /// ターン開始時点より後ろの履歴。自動圧縮で履歴が開始時点より短くなっていたら、圧縮は
@@ -252,6 +357,8 @@ struct Report {
     error: Option<String>,
     session_id: Option<String>,
     usage: serde_json::Value,
+    /// `--output-schema` に合格した値。
+    structured_output: Option<serde_json::Value>,
 }
 
 impl Report {
@@ -294,7 +401,31 @@ impl Report {
             error,
             session_id,
             usage: usage_json(usage),
+            structured_output: None,
         }
+    }
+
+    /// `--output-schema` の結果を載せる。合格なら `result` をその JSON (余計な前置きやコードフェンスを
+    /// 除いた形) に揃える。最後まで合わなければ、成功していたターンでも失敗として返す。
+    fn with_schema_result(
+        mut self,
+        structured: Option<serde_json::Value>,
+        failure: Option<String>,
+    ) -> Self {
+        if let Some(value) = structured {
+            self.result = Some(value.to_string());
+            self.structured_output = Some(value);
+        } else if let Some(feedback) = failure
+            && self.exit_code == EXIT_OK
+        {
+            self.exit_code = EXIT_SCHEMA;
+            self.error = Some(format!(
+                "the final answer did not match --output-schema after {SCHEMA_RETRIES} correction \
+                 request(s). Last check: {feedback}"
+            ));
+            self.result = None;
+        }
+        self
     }
 
     /// usage をプロセス全体の台帳で置き換える。エージェントループの外の呼び出し (サブエージェント、
@@ -334,6 +465,7 @@ impl Report {
             session_id: None,
             // 形は成功時と揃える (呼び出し側が `usage.llm_calls` を無条件に読めるように)。
             usage: usage_json(&crate::agent::r#loop::SessionUsage::default()),
+            structured_output: None,
         }
     }
 
@@ -345,6 +477,7 @@ impl Report {
             "error": self.error,
             "session_id": self.session_id,
             "usage": self.usage,
+            "structured_output": self.structured_output,
         })
     }
 

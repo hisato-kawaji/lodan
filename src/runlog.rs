@@ -20,7 +20,8 @@
 //! | `stop_hook_block` | `turn`, `iter` |
 //! | `tool_result` | `turn`, `iter`, `name`, `outcome` (`ok` / `error`), `reason`, `ms`, `parallel` (同じ応答の他の呼び出しと同時に実行したか。このとき `ms` の合計は経過時間より大きくなる), `args_bytes`, `output_bytes` |
 //! | `compact` | `turn`, `outcome` |
-//! | `result` | ヘッドレス実行 (`-p`) の最後に 1 回。`is_error`, `exit_code`, `result`, `error`, `session_id`, `usage` |
+//! | `schema_retry` | `--output-schema` に合わない最終応答を出し直させた。`attempt`, `max` |
+//! | `result` | ヘッドレス実行 (`-p`) の最後に 1 回。`is_error`, `exit_code`, `result`, `error`, `session_id`, `usage`, `structured_output` |
 //! | `turn_end` | `turn`, `iterations`, `tool_calls`, `reason` (`final` / `max_iterations` / `error` / `aborted`), `ms` |
 //!
 //! `turn_end` は `turn_start` と必ず対になる (エラー終了は `error`、Ctrl-C 中断は `aborted`)。

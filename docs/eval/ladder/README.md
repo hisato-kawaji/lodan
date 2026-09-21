@@ -30,7 +30,7 @@
 | `temp` | `--temperature 0.2` | 温度固定だけ |
 | `mitig` | `+ --malformed-retry --dup-suppress` | v2 (#61) |
 | `nudge` | `+ --finish-nudge` | v4 (#63) |
-| `think-none` / `think-low` | `temp` + `--reasoning-effort none` / `low` | 推論の深さ (#78)。**`temp` (サーバ既定の effort) と比べる**。語彙はサーバ次第 (Ollama は `none` で thinking off、kimi / gpt-oss は `low`)。既定の `CONFIGS` には含めない。実測: [kimi-k3 の `low` vs 既定](kimi-k3-effort-2026-09.md) |
+| `think-none` / `think-low` | `temp` + `--reasoning-effort none` / `low` | 推論の深さ (#78)。**`temp` (サーバ既定の effort) と比べる**。語彙はサーバ次第 (Ollama は `none` で thinking off、kimi / gpt-oss は `low`)。既定の `CONFIGS` には含めない。実測: [kimi-k3 の `low` vs 既定](kimi-k3-effort-2026-09.md)、[qwen3.5:9b の thinking off と `core`](qwen3.5-thinking-core-2026-09.md) |
 | `core` | `temp` + `--tool-profile core` | ツール定義を 6 個に絞る (#72)。**`temp` と比べる** (既定の `CONFIGS` には含めない) |
 
 ## 使い方

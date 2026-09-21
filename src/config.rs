@@ -460,6 +460,55 @@ impl Default for BashConfig {
     }
 }
 
+/// `lodan config` が秘密の値の代わりに出す文字列。
+pub const REDACTED: &str = "***";
+
+impl Config {
+    /// 画面に出してよい形の写し (#88)。`lodan config` の出力は画面共有や issue にそのまま貼られる。
+    ///
+    /// - `api_key`: 空でなければ伏せる
+    /// - `extra_body`: キーは残し、値を全て伏せる (何が秘密かはキー名からは分からない)
+    /// - `base_url`: `https://user:pass@host/…` の資格情報とクエリ文字列を伏せる
+    pub fn redacted(&self) -> Config {
+        let mut shown = self.clone();
+        let llm = &mut shown.llm;
+        for provider in [
+            &mut llm.local,
+            &mut llm.sakana,
+            &mut llm.sakura,
+            &mut llm.kimi,
+        ] {
+            if !provider.api_key.is_empty() {
+                provider.api_key = REDACTED.to_string();
+            }
+            for value in provider.extra_body.values_mut() {
+                *value = serde_json::Value::String(REDACTED.to_string());
+            }
+            provider.base_url = redact_url(&provider.base_url);
+        }
+        shown
+    }
+}
+
+/// URL に埋め込まれた資格情報 (userinfo) とクエリ文字列を伏せる。URL として読めないものはそのまま。
+fn redact_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    if !has_userinfo && parsed.query().is_none() {
+        return url.to_string();
+    }
+    if has_userinfo {
+        let _ = parsed.set_username(REDACTED);
+        let _ = parsed.set_password(None);
+    }
+    if parsed.query().is_some() {
+        parsed.set_query(Some(REDACTED));
+    }
+    parsed.to_string()
+}
+
 impl LlmConfig {
     pub fn active(&self) -> &ProviderConfig {
         self.get(self.provider)
@@ -1308,6 +1357,40 @@ mod tests {
         );
         assert_eq!(cfg.llm.fallback, Some(Provider::Sakana));
         assert_eq!(origins["llm.fallback"], Origin::Override);
+    }
+
+    /// `lodan config` の既定の出力には、秘密の値が 1 つも入らない (#88)。
+    #[test]
+    fn the_redacted_config_shows_no_secret_values_but_keeps_the_shape() {
+        let mut cfg = Config::default();
+        cfg.llm.sakura.api_key = "sk-SAKURA-SECRET".into();
+        cfg.llm.kimi.base_url = "https://alice:hunter2@gateway.example/v1?token=URLSECRET".into();
+        cfg.llm.local.extra_body.insert(
+            "auth".into(),
+            serde_json::json!({ "bearer": "BODYSECRET", "n": 1 }),
+        );
+        let shown = toml::to_string_pretty(&cfg.redacted()).unwrap();
+        for secret in [
+            "sk-SAKURA-SECRET",
+            "hunter2",
+            "alice",
+            "URLSECRET",
+            "BODYSECRET",
+        ] {
+            assert!(!shown.contains(secret), "{secret} leaked:\n{shown}");
+        }
+        // どこに何が設定されているかは分かる。
+        assert!(shown.contains("api_key = \"***\""), "{shown}");
+        assert!(shown.contains("auth = \"***\""), "{shown}");
+        assert!(shown.contains("gateway.example/v1"), "{shown}");
+
+        // 設定していないキーは空のまま (「設定してある」と見せかけない)。秘密の無い URL は一字も変えない。
+        let plain = Config::default();
+        let plain_shown = plain.redacted();
+        assert_eq!(plain_shown.llm.local.api_key, "");
+        assert_eq!(plain_shown.llm.local.base_url, plain.llm.local.base_url);
+        // 伏せるのは写しだけ。
+        assert_eq!(cfg.llm.sakura.api_key, "sk-SAKURA-SECRET");
     }
 
     #[test]

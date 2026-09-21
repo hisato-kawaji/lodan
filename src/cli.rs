@@ -148,6 +148,9 @@ pub enum Command {
         /// Also list which config file each explicitly-set key came from
         #[arg(long)]
         show_origin: bool,
+        /// Print API keys, extra_body values and URL credentials as they are (hidden by default)
+        #[arg(long)]
+        show_secrets: bool,
     },
     /// Start the interactive REPL (default if omitted)
     Repl,
@@ -234,8 +237,13 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
 
     match args.cmd.unwrap_or(Command::Repl) {
         Command::Repl => repl::run(cfg, args.resume).await.map(|()| 0),
-        Command::Config { show_origin } => {
-            println!("{}", toml::to_string_pretty(&cfg)?);
+        Command::Config {
+            show_origin,
+            show_secrets,
+        } => {
+            // 既定では秘密を伏せる。そのまま config.toml に貼れる形が要るときは `--show-secrets`。
+            let shown = if show_secrets { cfg } else { cfg.redacted() };
+            println!("{}", toml::to_string_pretty(&shown)?);
             if show_origin {
                 print!("{}", describe_origins(&origins));
             }

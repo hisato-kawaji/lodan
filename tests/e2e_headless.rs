@@ -1340,3 +1340,36 @@ fn the_configured_evaluator_model_is_the_one_that_is_asked() {
     let unjudged = run("");
     assert!(unjudged.contains("evaluator failed"), "{unjudged}");
 }
+
+// ---- #88: `lodan config` は秘密を伏せる ----
+
+#[test]
+fn lodan_config_hides_secrets_unless_asked_and_the_full_output_still_round_trips() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = lodan(home.path(), 1, args, Stdin::OpenAndSilent);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout(&out)
+    };
+    // 鍵は CLI フラグで渡す (設定ファイル由来でも同じ経路を通る)。
+    let hidden = run(&["--api-key", "sk-CLI-SECRET", "config", "--show-origin"]);
+    assert!(!hidden.contains("sk-CLI-SECRET"), "{hidden}");
+    assert!(hidden.contains("api_key = \"***\""), "{hidden}");
+
+    let full = run(&["--api-key", "sk-CLI-SECRET", "config", "--show-secrets"]);
+    assert!(full.contains("api_key = \"sk-CLI-SECRET\""), "{full}");
+    // `--show-secrets` の出力は、そのまま設定ファイルとして読み直せる。
+    let pasted = home.path().join("pasted.toml");
+    std::fs::write(&pasted, &full).unwrap();
+    let again = run(&[
+        "--config",
+        pasted.to_str().unwrap(),
+        "config",
+        "--show-secrets",
+    ]);
+    assert_eq!(again, full);
+}

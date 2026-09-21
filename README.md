@@ -169,7 +169,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 
 設定ファイルは**フィールド単位で重なる**。後段のファイルは自分が書いたキーだけを上書きし、書かなかったキーは前段の値が残る (プロジェクト側に `[agent] max_iterations = 40` だけ書いても、ユーザ設定の provider は消えない)。`[[hooks]]` だけは上書きではなく**連結**で、ユーザ設定 → プロジェクト設定 → `--config` の順に全て発火する。
 
-`lodan config` は合成後の設定を表示する。`lodan config --show-origin` を付けると、各キーを最後に決めたもの (設定ファイルのパス、または `env or CLI flag`) も出る。載らないキーは既定値。
+`lodan config` は合成後の設定を表示する。`lodan config --show-origin` を付けると、各キーを最後に決めたもの (設定ファイルのパス、または `env or CLI flag`) も出る。載らないキーは既定値。API キーなどの秘密は既定で `***` に伏せる（[後述](#設定の確認lodan-config)）。
 
 ```toml
 # ~/.config/lodan/config.toml
@@ -251,6 +251,12 @@ CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--stdin` �
 ### v0.1.0 以前からのスキーマ移行
 
 `[llm]` 直下にあった `base_url` / `model` / `api_key` / `timeout_secs` は `[llm.local]` 配下に移った。Sakana 側 (`[llm.sakana]`) は新規追加。既存の `~/.config/lodan/config.toml` は上記の新フォーマットに書き換えが必要。
+
+### 設定の確認（`lodan config`）
+
+`lodan config` の出力は画面共有や issue にそのまま貼られがちなので、**既定では秘密を `***` に伏せます**: `api_key`（空なら空のまま）、`[llm.<provider>.extra_body]` の値（何が秘密かはキー名からは分からないので全て。キーは残る）、`base_url` に埋め込まれた資格情報（`https://user:pass@host/…`）とクエリ文字列。環境変数から拾う API キー（`KIMI_API_KEY` など）は、もともと設定には入らないので出ません。
+
+`lodan config --show-secrets` で伏せずに出します。この出力はそのまま `config.toml` に貼れます。
 
 ## REPL の使い方
 

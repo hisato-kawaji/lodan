@@ -1,7 +1,7 @@
 # PR レビュー ポリシー（v0.1）
 
-- 最終更新: 2026-06-24
-- ステータス: Draft v0.1
+- 最終更新: 2026-09-22
+- ステータス: Draft v0.2
 - 関連:
   - レビュー Agent: [`.claude/agents/pr-reviewer.md`](../../.claude/agents/pr-reviewer.md)
   - 手動起動コマンド: [`.claude/commands/pr-review.md`](../../.claude/commands/pr-review.md)
@@ -45,7 +45,8 @@ lodan の特徴 (個人開発・Rust CLI・ローカル LLM ↔ Sakana provider)
 集計の判定ルール:
 
 - **APPROVE**: 6 観点すべて PASS、または PR body で明示的に waiver された WARN のみ
-- **REQUEST_CHANGES**: いずれかが FAIL、または重大な WARN が複数（reviewer 裁量）
+- **APPROVE（条件つき）**: FAIL が無く、waiver されていない WARN が **1 件だけ**。verdict は APPROVE とし、その WARN を「マージ前に対応するか、PR body で waiver するか」の 2 択で作者に返す。作者がどちらかを済ませた head で再レビューはしない（対応の確認は `loop-pr-discussion` の往復で行う）
+- **REQUEST_CHANGES**: いずれかが FAIL、または重大な WARN が複数（reviewer 裁量）。WARN が 1 件でも、放置するとマージ後に壊れると reviewer が判断するものは WARN ではなく FAIL にする
 - **NEEDS_DISCUSSION**: 設計判断・スコープ判断・トレードオフ判断が必要で、レビュー観点では結論を出せない
 
 自動レビューは **コメントのみ**（GitHub の Approve / Request changes は **人間 (最終的に `loop-pr-discussion` の自動 approve も含む) の専有**）。

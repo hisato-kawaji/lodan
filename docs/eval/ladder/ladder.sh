@@ -72,6 +72,8 @@ flags_for_config() {
     nudge) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=true" ;;
     # temp と同条件でツール定義だけを 6 個に絞る (#72)。temp との差がプロファイルの寄与。
     core)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --tool-profile core" ;;
+    # core と同条件で、隠した 8 個を ToolSearch で読み込めるようにする (#72)。core との差が遅延ロードの寄与。
+    core-search) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --tool-profile core --tool-search" ;;
     # temp と同条件で推論の深さだけを変える (#78)。temp (サーバ既定) との差が effort の寄与。
     # 受け付ける語彙はサーバ次第: Ollama は none で thinking を切れる。kimi / gpt-oss は low。
     think-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --reasoning-effort none" ;;

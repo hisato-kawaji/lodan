@@ -310,6 +310,10 @@ pub struct AgentConfig {
     pub tool_profile: ToolProfile,
     /// モデルに見せるツールの明示リスト。空でなければ `tool_profile` より優先する。
     pub tools: Vec<String>,
+    /// system prompt の末尾に足す指示 (`--append-system-prompt`)。メモリより後ろに置かれる。
+    /// サブエージェントには渡さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append_system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -450,6 +454,7 @@ impl Default for AgentConfig {
             parallel_tools: true,
             tool_profile: ToolProfile::Full,
             tools: Vec::new(),
+            append_system_prompt: None,
         }
     }
 }
@@ -724,6 +729,14 @@ impl Config {
             self.agent.max_total_tokens = Some(v);
             mark("agent.max_total_tokens".into());
         }
+        if let Some(v) = o.max_iterations {
+            self.agent.max_iterations = v;
+            mark("agent.max_iterations".into());
+        }
+        if let Some(v) = o.append_system_prompt {
+            self.agent.append_system_prompt = Some(v);
+            mark("agent.append_system_prompt".into());
+        }
         if let Some(v) = o.tool_profile {
             self.agent.tool_profile = v;
             mark("agent.tool_profile".into());
@@ -765,6 +778,9 @@ pub struct Overrides {
     pub sandbox_network: Option<bool>,
     pub max_requests: Option<u64>,
     pub max_total_tokens: Option<u64>,
+    /// `--max-turns`: `agent.max_iterations` を上書きする。
+    pub max_iterations: Option<usize>,
+    pub append_system_prompt: Option<String>,
     pub permission_mode: Option<PermissionMode>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,

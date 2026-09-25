@@ -52,6 +52,13 @@ def make_handler(demo_dir):
         judge = os.environ.get("MOCK_LLM_JUDGE_MODEL")
         if judge and model == judge:
             return ("text", os.environ.get("MOCK_LLM_JUDGE_TEXT", ""))
+        # MOCK_LLM_ECHO_SYSTEM: 受け取った system prompt をそのまま本文にして返す
+        # (`--append-system-prompt` が本当に届いているか、どこに置かれたかを見る)。
+        if os.environ.get("MOCK_LLM_ECHO_SYSTEM"):
+            system = next(
+                (m for m in messages if m.get("role") == "system"), None
+            )
+            return ("text", (system or {}).get("content", "") or "")
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )

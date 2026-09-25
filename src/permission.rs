@@ -585,6 +585,29 @@ mod tests {
     }
 
     #[test]
+    fn a_non_interactive_gate_denies_instead_of_asking() {
+        let gate = PermissionGate::non_interactive(false);
+        assert!(!gate.can_prompt());
+        // 尋ねる相手がいないので拒否。理由はモデルに「再試行するな」と伝える固定文。
+        assert_eq!(
+            gate.decide("Bash", &bash("rm -rf build"), true),
+            Decision::Deny(DENIED_NON_INTERACTIVE.to_string())
+        );
+        // read-only は尋ねる必要がないので、そのまま通る。
+        assert_eq!(
+            gate.decide("Read", &serde_json::json!({ "path": "/work/a" }), false),
+            Decision::Allow
+        );
+        // `--yes` 相当なら破壊的な呼び出しも通る (ハングもしない)。
+        let yes = PermissionGate::non_interactive(true);
+        assert!(!yes.can_prompt());
+        assert_eq!(
+            yes.decide("Bash", &bash("rm -rf build"), true),
+            Decision::Allow
+        );
+    }
+
+    #[test]
     fn p_saves_a_project_rule_and_stops_asking_for_the_rest_of_the_session() {
         let dir = tempfile::tempdir().unwrap();
         let gate = gate_in(dir.path());

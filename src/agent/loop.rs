@@ -68,7 +68,16 @@ impl Session {
 
     fn with_prior(cfg: Config, registry: Arc<ToolRegistry>, prior: Vec<Message>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let system = prompt::build_system_prompt(&cwd, &cfg.llm.active().model, registry.as_ref());
+        let mut system =
+            prompt::build_system_prompt(&cwd, &cfg.llm.active().model, registry.as_ref());
+        // 利用者の追加指示はメモリのさらに後ろ。メモリと同じく、承認を回避させる指示ではない。
+        if let Some(extra) = cfg.agent.append_system_prompt.as_deref()
+            && !extra.trim().is_empty()
+        {
+            system.push_str("\nAdditional instructions from the user:\n");
+            system.push_str(extra.trim());
+            system.push('\n');
+        }
         let mut history = vec![Message::System { content: system }];
         history.extend(prior);
         let sandbox = crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd);

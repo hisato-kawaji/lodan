@@ -138,7 +138,8 @@ for task_file in $TASK_FILES; do
         work="$RUNS_DIR/$LABEL/$config/$task/$run"
         rm -rf "$work"; mkdir -p "$work"
         runlog="$work/run.jsonl"
-        stdout_log="$work/stdout.log"
+        stdout_log="$work/stdout.log"   # 進行の表示 (stderr)
+        result_json="$work/result.json" # `-p --output-format json` の結果オブジェクト
         CHECK_LOG="$work/checks.log"
         : >"$CHECK_LOG"
 
@@ -153,12 +154,14 @@ for task_file in $TASK_FILES; do
 
         limit="$(timeout_for_level "$LEVEL")"
         t0=$(date +%s)
+        # ヘッドレス実行 (`-p`)。stdout には結果オブジェクトが 1 行だけ出て、進行の表示は stderr。
+        # 終了コードは 0 成功 / 1 エラー / 3 max_iterations / 4 予算切れ / 5 schema 不一致 / 124 timeout。
         # shellcheck disable=SC2046  # フラグ列は意図的に単語分割する
-        printf '%s\n/exit\n' "$PROMPT" \
-          | timeout "$limit" "$LODAN" \
-              --provider "$PROVIDER" --model "$MODEL" --yes --trust \
-              --log-jsonl "$runlog" $(flags_for_config "$config") \
-          > "$stdout_log" 2>&1
+        timeout "$limit" "$LODAN" \
+            --provider "$PROVIDER" --model "$MODEL" --yes --trust \
+            --log-jsonl "$runlog" $(flags_for_config "$config") \
+            -p "$PROMPT" --output-format json \
+          > "$result_json" 2> "$stdout_log"
         rc=$?
         secs=$(( $(date +%s) - t0 ))
 

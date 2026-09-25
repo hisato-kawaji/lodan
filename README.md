@@ -217,6 +217,7 @@ dup_suppress    = true    # 直前と同一の read-only 呼び出しの抑止 (
 parallel_tools  = true    # 連続する並列可能なツール呼び出し (Read / Grep / Glob / WebFetch / WebSearch / Task) を同時に実行
 tool_profile    = "full"  # モデルに見せるツール: full / core (6 個) / readonly
 tools           = []      # 明示リスト。空でなければ tool_profile より優先 (例: ["Read", "Grep", "TodoWrite"])
+# append_system_prompt = "..."  # system prompt の末尾 (メモリより後ろ) に足す指示。--append-system-prompt と同じ
 
 [tools.bash]
 timeout_secs = 30
@@ -242,7 +243,7 @@ timeout_secs = 30
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--output-schema` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--reasoning-effort <LEVEL>` / `--show-reasoning[=<bool>]` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--max-requests <N>` / `--max-tokens <N>` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--output-schema` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--reasoning-effort <LEVEL>` / `--show-reasoning[=<bool>]` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--max-requests <N>` / `--max-tokens <N>` / `--max-turns <N>` / `--append-system-prompt <TEXT>` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 
@@ -309,6 +310,7 @@ lodan -p "テストを直して" --yes --output-format json       # 結果を JS
 lodan -p "..." --output-format stream-json | jq -c .       # 進行をイベント列で
 lodan -p "続きをやって" --resume last
 lodan -p "この PR をレビューして" --output-schema review.schema.json --output-format json
+lodan -p "..." --max-turns 5 --append-system-prompt "Reply in Japanese."
 ```
 
 - **stdout は契約**。人間向けの表示（ストリーム本文・ツール出力の要約・`session:` などの通知・エラー）は全て **stderr** に出る
@@ -319,6 +321,8 @@ lodan -p "この PR をレビューして" --output-schema review.schema.json --
 - **終了コード**: `0` 成功 / `1` エラー（起動時の失敗を含む。`json` / `stream-json` ではこの場合も結果オブジェクトを出す）/ `2` 引数の誤り（clap。stdout は空）/ `3` 最終応答に至らず `max_iterations` を使い切った / `4` [予算](#予算)（`max_requests` / `max_total_tokens`）を使い切った / `5` 再要求しても最終応答が `--output-schema` に合わなかった / `130` SIGINT
 - **承認**: 尋ねる相手がいないので、`--yes` が無ければ破壊的ツール（Write / Edit / Bash …）は**尋ねずに拒否**され、モデルには「非対話実行なので再試行するな」と返る。ハングしない。`AskUserQuestion` も同様に即エラーを返す
 - **stdin**: プロンプト引数があるときは stdin を**読まない**。CI や親プロセスから継承した stdin は端末でなくても閉じられないことがあり、EOF 待ちで固まるため。引数に stdin を足したいときは `--stdin` を明示する（上限 10 MiB）
+- **`--max-turns <N>`**（`LODAN_MAX_TURNS`）: 最終応答に至らないまま N 回 LLM と往復したら打ち切る（終了コード `3`）。`[agent] max_iterations` の上書きで、REPL でも効く。`--output-schema` の出し直しは別のターンなので、それぞれに N 回ある
+- **`--append-system-prompt <TEXT>`**（`LODAN_APPEND_SYSTEM_PROMPT`、設定は `[agent] append_system_prompt`）: system prompt の**末尾**（プロジェクトメモリより後ろ）に足す。メモリと同じく「利用者の文脈」であって、承認ゲートを回避させる指示にはならない。`Task` の内側のサブエージェントには渡らない
 - **`--output-schema <FILE>`**: 最終応答を、指定した JSON Schema に合う JSON にさせる。結果を機械で読むスクリプト向け
   - スキーマはプロンプトの後ろに添えてモデルに渡す。最終応答から JSON を取り出し（応答全体が JSON / コードフェンスがちょうど 1 つ / 前置きの後ろに JSON があって**その後ろに何も続かない**、のどれか。それ以外は JSON 無しとして扱う。本文の途中に出てくる例示を答えと取り違えないための制限だが、完全ではない: 断りの文が例示の JSON で**終わっている**場合や、フェンスつきの例示の後ろに断りが続く場合は、正しい答えと形が同じなので拾ってしまう）、検証して、合わなければ**どこが違うかを伝えて最大 2 回出し直させる**（`$.score: expected integer, got string` のような 1 行ずつ）。出し直しも普通のターンなので、予算（`max_requests` など）から引かれる
   - 合格したら `result` はその JSON だけ（`text` でも同じ）、`json` / `stream-json` では `structured_output` に値そのものも入る。最後まで合わなければ終了コード `5` で、`error` に最後の検証結果が入る

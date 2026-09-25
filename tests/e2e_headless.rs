@@ -606,6 +606,76 @@ fn tool_profile_core_is_reported_and_shrinks_the_tool_specs() {
 }
 
 #[test]
+fn tool_search_loads_a_hidden_tool_on_demand() {
+    let home = tempfile::tempdir().unwrap();
+    let todo = serde_json::json!({ "todos": [{ "id": "1", "content": "x", "status": "pending" }] });
+    let steps = serde_json::json!([
+        ["TodoWrite", todo],
+        ["ToolSearch", { "query": "select:TodoWrite" }],
+        ["TodoWrite", todo],
+    ])
+    .to_string();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_STEPS", &steps)]);
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "--tool-profile",
+            "core",
+            "--tool-search",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<serde_json::Value> = stdout(&out)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every stdout line is JSON"))
+        .collect();
+    let tools = events.iter().find(|e| e["event"] == "tools").unwrap();
+    assert_eq!(
+        tools["visible"],
+        serde_json::json!(["Bash", "Edit", "Glob", "Grep", "Read", "Write"])
+    );
+    assert!(
+        tools["deferred"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("TodoWrite")),
+        "{tools}"
+    );
+    let results: Vec<(&str, &str, &str)> = events
+        .iter()
+        .filter(|e| e["event"] == "tool_result")
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap(),
+                e["outcome"].as_str().unwrap(),
+                e["reason"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            ("TodoWrite", "error", "deferred_unloaded"),
+            ("ToolSearch", "ok", "ok"),
+            ("TodoWrite", "ok", "ok"),
+        ]
+    );
+    let search = events.iter().find(|e| e["event"] == "tool_search").unwrap();
+    assert_eq!(search["loaded"], serde_json::json!(["TodoWrite"]));
+}
+
+#[test]
 fn a_tool_list_that_matches_nothing_fails_before_calling_the_model() {
     let home = tempfile::tempdir().unwrap();
     let out = lodan(

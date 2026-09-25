@@ -10,7 +10,8 @@
 //! | event | 主なフィールド |
 //! |---|---|
 //! | `run_start` | `version`, `provider`, `model`, `cwd`。設定が読めずに起動に失敗したときも出るが、その場合 `provider` / `model` は `null` |
-//! | `tools` | 起動時に 1 回。`profile`, `explicit`, `visible` (モデルに見せるツール名), `registered`, `spec_bytes` (毎リクエスト送るツール定義の JSON バイト数) |
+//! | `tools` | 起動時に 1 回。`profile`, `explicit`, `visible` (モデルに見せるツール名), `deferred` (`ToolSearch` で読み込めるツール名), `registered`, `spec_bytes` (毎リクエスト送るツール定義の JSON バイト数。`ToolSearch` 自身と読み込み後の分は含まない) |
+//! | `tool_search` | `turn`, `query`, `loaded` (読み込んだツール名) |
 //! | `turn_start` | `turn`, `mode`, `input_chars` |
 //! | `llm_response` | `turn`, `iter`, `text_chars`, `tool_calls`, `prompt_tokens`, `completion_tokens`, `estimated` |
 //! | `api_retry` | `attempt`, `max_retries`, `why` (`HTTP 503` / `connect error` / `stream interrupted`), `delay_ms` |

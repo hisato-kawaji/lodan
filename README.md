@@ -155,6 +155,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 - **壊れツールコールの再要求**: tool_calls が空なのに応答テキストへ呼び出しの痕跡(`<function=`、`call:Name{…}`、`<|tool_call` 等)が漏れている場合、「正しい tool call として再発行せよ」と自動で注入してターンを継続する(1 ターン 2 回まで)。
 - **重複呼び出しの抑止**: 直前と完全同一(名前 + 引数)の **read-only** 呼び出しは実行せず「結果は不変。別の行動を」と返す(同一ファイルを延々 Read するループ対策)。Bash 再実行など破壊系の正当な繰り返しは対象外。
 - **ツールプロファイル**(`[agent] tool_profile`、`--tool-profile`、`LODAN_TOOL_PROFILE`): ツール定義は**毎リクエスト全量が送られる**ので、小型モデルでは固定費がそのまま所要時間になる(ラダーのベースラインで 1.8k〜2.4k tok/呼び出し)。`core` は Read / Write / Edit / Bash / Grep / Glob の 6 個だけを見せ、定義の JSON は 6,643 → 2,437 バイト(-63%)。`readonly` は破壊的でないツールだけ。`tools = [...]`(`--tools Read,Grep,...`)で明示リストも指定できる。隠したツールは登録に残るので、モデルが名前を覚えていて呼んできても実行はされず「このプロファイルでは無効。使えるのは …」と返る(`--yes` でも通らない)。Task / Skill / MCP のツールも `core` では隠れる点に注意。`agent.tools` は設定ファイルのレイヤー間で連結されず後勝ち。実行時の `--tool-profile` は設定ファイルの `tools = [...]` より優先される(リストを残すとプロファイル指定が黙って無視されるため)。リストがどのツールにも一致しなければ、LLM を呼ぶ前にエラーで止まる。`Task` の内側の調査エージェントは常に Read / Grep / Glob の 3 個を使い、プロファイルの影響を受けない。`readonly` は WebFetch / WebSearch を含むので、権限の境界としては使わないこと(それは承認ゲートの役割)。起動時の `tools` イベント(`--log-jsonl` / `stream-json`)に、見せているツールと定義のバイト数が残る
+- **遅延ロード**(`[agent] tool_search = true`、`--tool-search[=<bool>]`、`LODAN_TOOL_SEARCH`): プロファイルで隠したツールと **MCP のツール**(`full` でも)の定義を送らず、`ToolSearch` という擬似ツールの説明に**名前と 1 行説明だけ**を載せる。モデルが `ToolSearch` に `{"query": "select:TodoWrite"}`(名前の完全一致、カンマ区切り可)か `{"query": "notebook"}`(名前と説明の部分一致)で尋ねると、合ったツール(最大 5 個)の説明と引数スキーマが返り、**次のリクエストからそのツールの定義が tools に加わる**(同じ応答の後続の呼び出しでも使える)。読み込む前に直接呼ぶと、実行せずに「先に `ToolSearch` で読み込め」と返る(`tool_result` の `reason` は `deferred_unloaded`)。Claude Code の deferred tools / Codex の `tool_search` に相当し、大量の MCP ツールを system prompt に常駐させないための仕組み。既定 off — `core` は 6 個だけ、`full` は全部を送る従来どおり。読み込んだツールはセッションの間だけ有効で、`--resume` では引き継がない。`--log-jsonl` の `tools` イベントに `deferred`、読み込みのたびに `tool_search` イベントが残る
 - **終了前自己検証ナッジ**(`[agent] finish_nudge = true`、既定 false): ターンが終わろうとする最初の応答で 1 回だけ、ツール未使用なら「計画を述べ直さず今実行せよ」、使用済みなら「元の依頼を読み直し全要件の実装・検証を確認せよ」と促して継続させる。「計画だけ述べて終了」「長い自己編集中の要件脱落」対策(#63)。良行儀なモデルには余計なラウンドトリップになるため opt-in。
 
 ## 設定
@@ -217,6 +218,7 @@ dup_suppress    = true    # 直前と同一の read-only 呼び出しの抑止 (
 parallel_tools  = true    # 連続する並列可能なツール呼び出し (Read / Grep / Glob / WebFetch / WebSearch / Task) を同時に実行
 tool_profile    = "full"  # モデルに見せるツール: full / core (6 個) / readonly
 tools           = []      # 明示リスト。空でなければ tool_profile より優先 (例: ["Read", "Grep", "TodoWrite"])
+tool_search     = false   # 隠したツールと MCP ツールを ToolSearch で遅延ロードする (#72)
 # append_system_prompt = "..."  # system prompt の末尾 (メモリより後ろ) に足す指示。--append-system-prompt と同じ
 
 [tools.bash]
@@ -244,7 +246,7 @@ timeout_secs = 30
 - `SAKURA_API_KEY` (provider=sakura のときに `api_key` が空ならフォールバック)
 - `KIMI_API_KEY` (provider=kimi のときに `api_key` が空ならフォールバック)
 
-CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--output-schema` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--reasoning-effort <LEVEL>` / `--show-reasoning[=<bool>]` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--max-requests <N>` / `--max-tokens <N>` / `--max-turns <N>` / `--append-system-prompt <TEXT>` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
+CLI フラグ（ヘッドレス実行の `-p` / `--output-format` / `--output-schema` / `--stdin` は[後述](#ヘッドレス実行-p)）: `--provider` / `--fallback-provider <provider>` / `--base-url` / `--model` / `--api-key` / `--config <path>` / `--yes` / `--trust[=<bool>]` / `--temperature <f32>` / `--reasoning-effort <LEVEL>` / `--show-reasoning[=<bool>]` / `--log-jsonl <path>` / `--finish-nudge[=<bool>]` / `--malformed-retry[=<bool>]` / `--dup-suppress[=<bool>]` / `--parallel-tools[=<bool>]` / `--max-requests <N>` / `--max-tokens <N>` / `--max-turns <N>` / `--append-system-prompt <TEXT>` / `--permission-mode <mode>` / `--allowed-tools <RULE>` / `--disallowed-tools <RULE>` / `--tool-profile <full|core|readonly>` / `--tools <NAME,...>` / `--tool-search[=<bool>]` / `--sandbox <off|workspace-write|read-only>` / `--sandbox-network[=<bool>]`
 
 真偽値フラグは値なしで `true`。明示するときは **`=` でつなぐ** (`--dup-suppress=false`)。空白区切りの次の語は値として食わないので、`lodan --finish-nudge repl` はサブコマンドとして解釈される。設定ファイルで有効にした緩和策を評価実行から切る (ablation) ための形。
 

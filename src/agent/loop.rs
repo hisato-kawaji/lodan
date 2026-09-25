@@ -9,7 +9,7 @@ use crate::hooks::{self, HookOutcome, Lifecycle, PermissionHint};
 use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
 use crate::permission::{Decision, PermissionGate};
 use crate::prompt;
-use crate::tools::registry::ToolRegistry;
+use crate::tools::registry::{TOOL_SEARCH, ToolRegistry};
 use crate::tools::{ToolCtx, ToolOutput};
 
 /// セッションの動作モード。Plan 中は破壊的ツールを LLM から不可視にし、
@@ -40,6 +40,8 @@ pub struct Session {
     pending_context: Vec<String>,
     /// プロセス全体の使用量の台帳。予算が残り少なくなったら、モデルに一度だけ知らせる (#84)。
     ledger: Option<Arc<crate::llm::metered::Ledger>>,
+    /// `ToolSearch` で読み込んだ遅延ツール。次のリクエストから定義を送る (#72)。
+    loaded_tools: std::collections::BTreeSet<String>,
 }
 
 /// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
@@ -99,6 +101,7 @@ impl Session {
             hook_env: HookEnv::default(),
             pending_context: Vec::new(),
             ledger: None,
+            loaded_tools: std::collections::BTreeSet::new(),
         }
     }
 
@@ -245,14 +248,16 @@ impl Session {
             // Plan 中は read-only specs に ExitPlanMode (承認要求の擬似ツール) を
             // 加える。Normal では不可視。モードはターン途中でも切り替わり得る
             // (ExitPlanMode 承認直後) ため、毎イテレーション組み直す。
-            let specs = match self.mode {
+            let mut specs = match self.mode {
                 Mode::Plan => {
-                    let mut s = self.registry.read_only_tool_specs();
+                    let mut s = self.registry.read_only_tool_specs_with(&self.loaded_tools);
                     s.push(exit_plan_mode_spec());
                     s
                 }
-                Mode::Normal => self.registry.tool_specs(),
+                Mode::Normal => self.registry.tool_specs_with(&self.loaded_tools),
             };
+            // 遅延ツールがあるときだけ、それを読み込む ToolSearch を見せる (#72)。
+            specs.extend(self.registry.tool_search_spec());
             // 予算の 8 割を使ったら、打ち切られる前に畳めるよう一度だけ知らせる。ここは必ず
             // User か Tool の直後なので、履歴は API に投げられる形のまま。
             if let Some(reminder) = self.ledger.as_ref().and_then(|l| l.take_reminder()) {
@@ -445,6 +450,14 @@ impl Session {
                         plan_just_approved = true;
                     }
                     out
+                } else if name == TOOL_SEARCH {
+                    // registry 外の擬似ツール。遅延ツールの定義を返し、以後のリクエストに載せる (#72)。
+                    // 読み込むだけで何も実行しないので、承認ゲートも hook も通さない。
+                    let out = self.handle_tool_search(&args);
+                    if out.is_error {
+                        reason = "tool_search_miss";
+                    }
+                    out
                 } else {
                     // #61: 直前と同一の read-only 呼び出しは結果が変わらないため
                     // 実行せず、別の行動を促す (gemma 系の同一 Read 反復対策)。
@@ -458,9 +471,22 @@ impl Session {
                             reason = "unknown_tool";
                             ToolOutput::error(format!("unknown tool: {name}"))
                         }
+                        // 遅延ツールを読み込まずに呼んだ。定義を見ていないので引数も当てずっぽう
+                        // になりがち。実行はせず、読み込んでから呼び直させる (#72)。
+                        Some(_)
+                            if self.registry.is_deferred(&name)
+                                && !self.loaded_tools.contains(&name) =>
+                        {
+                            reason = "deferred_unloaded";
+                            ToolOutput::error(format!(
+                                "tool '{name}' exists but is not loaded. Call {TOOL_SEARCH} with \
+                                 {{\"query\": \"select:{name}\"}} first, then call '{name}' again \
+                                 with the parameters it describes."
+                            ))
+                        }
                         // プロファイルで隠したツール。名前だけ覚えているモデルが呼んでくる
                         // ことがあるので、使えるものを示して誘導する (#72)。
-                        Some(_) if !self.registry.is_visible(&name) => {
+                        Some(_) if !self.registry.is_usable(&name, &self.loaded_tools) => {
                             reason = "profile_hidden";
                             ToolOutput::error(format!(
                                 "tool '{name}' is disabled by the active tool profile. \
@@ -672,7 +698,7 @@ impl Session {
                     &parse_tool_args(&call.arguments),
                     tool.is_destructive(),
                 ) == Some(Decision::Allow);
-                self.registry.is_visible(&call.name)
+                self.registry.is_usable(&call.name, &self.loaded_tools)
                     && !tool.is_destructive()
                     && tool.parallel_safe()
                     && !duplicate
@@ -1455,6 +1481,41 @@ pub(crate) fn looks_like_malformed_tool_call(text: &str) -> bool {
 }
 
 /// ExitPlanMode の spec (Plan モード中のみ LLM へ提示)。
+impl Session {
+    /// `ToolSearch`: 問い合わせに合う遅延ツールを読み込み、その定義を返す。
+    fn handle_tool_search(&mut self, args: &serde_json::Value) -> ToolOutput {
+        let query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
+        let hits = self.registry.search_deferred(query);
+        if hits.is_empty() {
+            return ToolOutput::error(format!(
+                "no loadable tool matches '{query}'. Tools you can load: {}",
+                self.registry.deferred_names().join(", ")
+            ));
+        }
+        let names: Vec<&str> = hits.iter().map(|t| t.name()).collect();
+        crate::runlog::record(
+            "tool_search",
+            serde_json::json!({ "turn": self.turn_seq, "query": query, "loaded": names }),
+        );
+        let mut text = format!(
+            "Loaded {}: {}. They are in your tool list from your next response; call them \
+             directly with the parameters below.\n",
+            if names.len() == 1 { "1 tool" } else { "tools" },
+            names.join(", ")
+        );
+        for tool in &hits {
+            text.push_str(&format!(
+                "\n## {}\n{}\nParameters (JSON Schema): {}\n",
+                tool.name(),
+                tool.description(),
+                tool.schema()
+            ));
+            self.loaded_tools.insert(tool.name().to_string());
+        }
+        ToolOutput::ok(text)
+    }
+}
+
 fn exit_plan_mode_spec() -> crate::agent::messages::ToolSpec<'static> {
     crate::agent::messages::ToolSpec {
         kind: "function",
@@ -2860,6 +2921,53 @@ mod tests {
         let seen = llm.seen.lock().unwrap();
         assert!(seen[0].contains(&EXIT_PLAN_MODE.to_string()));
         assert!(!seen[1].contains(&EXIT_PLAN_MODE.to_string()));
+    }
+
+    /// ToolSearch で読み込んだ遅延ツールは、その応答の中でも次のリクエストでも使える (#72)。
+    #[tokio::test]
+    async fn tool_search_loads_a_deferred_tool_for_the_rest_of_the_session() {
+        let mut cfg = Config::default();
+        cfg.agent.tool_profile = crate::config::ToolProfile::Core;
+        cfg.agent.tool_search = true;
+        let mut registry = default_registry();
+        registry.apply_profile_with_search(cfg.agent.tool_profile, &[], true);
+        let mut session = Session::new(cfg, Arc::new(registry));
+        let todo = r#"{"todos": [{"id": "1", "content": "x", "status": "pending"}]}"#;
+        let llm = CallThenDoneLlm {
+            calls: vec![
+                // 読み込む前の直接呼び出しは実行されず、読み込みに誘導される。
+                tool_call_with_args("t0", "TodoWrite", todo),
+                tool_call_with_args("s1", TOOL_SEARCH, r#"{"query": "select:TodoWrite"}"#),
+                // 同じ応答の後続は、読み込み済みなので実行される。
+                tool_call_with_args("t1", "TodoWrite", todo),
+            ],
+            called: false.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("track it", &llm, &gate).await.unwrap();
+
+        let tool_replies: Vec<&str> = session
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_replies.len(), 3);
+        assert!(
+            tool_replies[0].contains("not loaded"),
+            "{}",
+            tool_replies[0]
+        );
+        assert!(tool_replies[1].contains("Loaded 1 tool: TodoWrite"));
+        assert!(tool_replies[1].contains("Parameters (JSON Schema)"));
+        assert!(
+            !tool_replies[2].contains("not loaded"),
+            "{}",
+            tool_replies[2]
+        );
+        assert!(session.loaded_tools.contains("TodoWrite"));
     }
 
     /// 承認 (auto_approve) されると Normal へ遷移し、実行続行の指示が返る。

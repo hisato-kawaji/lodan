@@ -18,6 +18,7 @@
 //! | `provider_fallback` | primary が一時的に使えず fallback provider を試した。`to`, `model`, `switched` (fallback が成功して以後そちらに固定したか), `why` |
 //! | `malformed_retry` | `turn`, `iter`, `n` |
 //! | `finish_nudge` | `turn`, `iter`, `kind` (`act` / `verify`) |
+//! | `empty_reply_nudge` | 本文もツール呼び出しも無い応答に「答えを書け」と促した (#111)。`turn`, `iter`, `reasoning_chars` |
 //! | `stop_hook_block` | `turn`, `iter` |
 //! | `tool_result` | `turn`, `iter`, `name`, `outcome` (`ok` / `error`), `reason`, `ms`, `parallel` (同じ応答の他の呼び出しと同時に実行したか。このとき `ms` の合計は経過時間より大きくなる), `args_bytes`, `output_bytes` |
 //! | `compact` | `turn`, `outcome` |

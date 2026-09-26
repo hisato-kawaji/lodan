@@ -287,19 +287,21 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
             continue;
         }
 
-        // `!<cmd>`: シェルで直接実行して、出力を次のユーザ発話の文脈に添える (#81)。承認ゲートは
-        // 通さない — 打ったのは利用者自身で、モデルではない。
-        if let Some(cmd) = line.strip_prefix('!').map(str::trim)
-            && !cmd.is_empty()
-        {
+        // `!<cmd>`: シェルで直接実行して、出力を次のユーザ発話の文脈に添える (#81)。承認ゲートも
+        // サンドボックスも deny ルールも通さない — 打ったのは利用者自身で、モデルではない。
+        if let Some(cmd) = shell_escape(line) {
             let output = run_shell_for_user(cmd, &runtime.cwd, cfg.tools.bash.timeout_secs).await;
             println!("{}", crate::term::sanitize(&output));
             session.add_context(format!(
-                "The user ran this shell command themselves (not via a tool); its output is context \
-                 for their next message:\n$ {cmd}\n{output}"
+                "The user ran this shell command themselves at the prompt (not a hook, not a tool \
+                 call); its output is context for their next message:\n$ {cmd}\n{output}"
             ));
             continue;
         }
+        // `\!…` は `!` で始まる普通の発話。
+        let line = line
+            .strip_prefix("\\!")
+            .map_or(line, |rest| &line[line.len() - rest.len() - 1..]);
 
         if let Some(rest) = line
             .strip_prefix('/')
@@ -989,6 +991,26 @@ fn first_line(desc: &str) -> String {
     }
 }
 
+/// `!<cmd>` として実行するコマンド。`!` の直後が空白や `!` なら発話 (`!!! 急ぎで`)、
+/// `!important` のような単語も発話と区別できないので、コマンドとして扱うのは先頭の語が
+/// シェルの組み込みか PATH 上の実行ファイルのときだけ。それ以外は `\!…` と同じくモデルへ渡る。
+fn shell_escape(line: &str) -> Option<&str> {
+    let cmd = line.strip_prefix('!')?;
+    let first = cmd.chars().next()?;
+    if first.is_whitespace() || first == '!' {
+        return None;
+    }
+    let word = cmd.split_whitespace().next()?;
+    const BUILTINS: &[&str] = &[
+        "cd", "export", "echo", "pwd", "set", "unset", "type", "test", "[",
+    ];
+    let word_is_command = BUILTINS.contains(&word)
+        || word.contains('/') && std::path::Path::new(word).exists()
+        || std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(word).is_file()));
+    word_is_command.then_some(cmd.trim())
+}
+
 /// プロンプト文字列。`[ui] prompt_status = true` で tty のときだけ、モデル名とコンテキスト使用率を
 /// 添える (#81)。パイプには装飾を出さない。
 fn prompt_line(cfg: &Config, session: &agent::Session) -> String {
@@ -1000,25 +1022,33 @@ fn prompt_line(cfg: &Config, session: &agent::Session) -> String {
         return format!("{base}> ");
     }
     let active = cfg.llm.active();
-    let used = session.usage().last_context_tokens;
-    let ctx = (used * 100)
-        .checked_div(active.context_window)
-        .map_or_else(|| format!("{used} tok"), |pct| format!("ctx {pct}%"));
-    format!(
-        "{base} [{} · {ctx}]> ",
-        crate::term::sanitize(&active.model)
+    decorated_prompt(
+        base,
+        &active.model,
+        session.usage().last_context_tokens,
+        active.context_window,
     )
+}
+
+/// 装飾つきのプロンプト (tty 判定を除いた純粋な整形。テスト用に分けてある)。
+fn decorated_prompt(base: &str, model: &str, used: u64, window: u64) -> String {
+    let ctx = (used * 100)
+        .checked_div(window)
+        .map_or_else(|| format!("{used} tok"), |pct| format!("ctx {pct}%"));
+    format!("{base} [{} · {ctx}]> ", crate::term::sanitize(model))
 }
 
 /// `!<cmd>` の実行。`sh -c` で cwd から、Bash ツールと同じ timeout。出力は stdout + stderr を
 /// 順に並べ、長すぎる分は切る (文脈として添えるものなので)。
 async fn run_shell_for_user(cmd: &str, cwd: &std::path::Path, timeout_secs: u64) -> String {
     const MAX_BYTES: usize = 16 * 1024;
+    // Bash ツールと同じく、timeout で諦めたら子を殺す (放置すると `!sleep 300` が生き残る)。
     let run = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output();
     let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await {
         Ok(Ok(out)) => out,
@@ -1033,12 +1063,7 @@ async fn run_shell_for_user(cmd: &str, cwd: &std::path::Path, timeout_secs: u64)
         }
         text.push_str(&err);
     }
-    if !out.status.success() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&format!("(exit {})", out.status.code().unwrap_or(-1)));
-    }
+    // 切り詰めてから exit を足す (長い出力で失敗の印が消えないように)。
     if text.len() > MAX_BYTES {
         let cut = text
             .char_indices()
@@ -1048,6 +1073,12 @@ async fn run_shell_for_user(cmd: &str, cwd: &std::path::Path, timeout_secs: u64)
             .unwrap_or(0);
         text.truncate(cut);
         text.push_str("\n… (truncated)");
+    }
+    if !out.status.success() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("(exit {})", out.status.code().unwrap_or(-1)));
     }
     text
 }
@@ -1201,6 +1232,29 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
 mod tests {
     use super::parse_model_arg;
     use super::prompt_line;
+
+    #[test]
+    fn decorated_prompt_shows_percent_or_tokens() {
+        assert_eq!(
+            super::decorated_prompt("lodan", "qwen3.5:9b", 420, 1000),
+            "lodan [qwen3.5:9b · ctx 42%]> "
+        );
+        assert_eq!(
+            super::decorated_prompt("lodan (plan)", "m", 1234, 0),
+            "lodan (plan) [m · 1234 tok]> "
+        );
+    }
+
+    #[test]
+    fn bang_is_a_command_only_when_the_first_word_is_one() {
+        assert_eq!(super::shell_escape("!echo hi"), Some("echo hi"));
+        assert_eq!(super::shell_escape("!ls -la"), Some("ls -la"));
+        assert_eq!(super::shell_escape("!important: fix it"), None);
+        assert_eq!(super::shell_escape("!!! 急ぎで"), None);
+        assert_eq!(super::shell_escape("! not a command"), None);
+        assert_eq!(super::shell_escape("!"), None);
+        assert_eq!(super::shell_escape("plain"), None);
+    }
 
     /// テストの stdout は tty ではないので、`prompt_status = true` でも装飾は付かない。
     #[test]

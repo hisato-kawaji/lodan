@@ -28,12 +28,12 @@
 |---|---|---|
 | `base` | 緩和策すべて off | v1 (温度未指定・対策なし) |
 | `temp` | `--temperature 0.2` | 温度固定だけ |
-| `mitig` | `+ --malformed-retry --dup-suppress` | v2 (#61) |
+| `mitig` | `+ --malformed-retry --dup-suppress --empty-reply-nudge` | v2 (#61)。2026-09-26 以降は空応答の促し (#111) も含むので、[baseline-2026-07](baseline-2026-07.md) の `mitig` とは条件が違う |
 | `nudge` | `+ --finish-nudge` | v4 (#63) |
 | `think-none` / `think-low` | `temp` + `--reasoning-effort none` / `low` | 推論の深さ (#78)。**`temp` (サーバ既定の effort) と比べる**。語彙はサーバ次第 (Ollama は `none` で thinking off、kimi / gpt-oss は `low`)。既定の `CONFIGS` には含めない。実測: [kimi-k3 の `low` vs 既定](kimi-k3-effort-2026-09.md)、[qwen3.5:9b の thinking off と `core`](qwen3.5-thinking-core-2026-09.md) |
 | `core` | `temp` + `--tool-profile core` | ツール定義を 6 個に絞る (#72)。**`temp` と比べる** (既定の `CONFIGS` には含めない) |
 | `core-search` | `core` + `--tool-search` | 隠したツールを `ToolSearch` で読み込めるようにする (#72)。**`core` と比べる** |
-| `empty-nudge` | `temp` + `--empty-reply-nudge` | 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)。**`temp` と比べる**。`base` / `temp` / `core` / `think-*` はこれを off にしている (lodan の既定は on) |
+| `empty-nudge` | `temp` + `--empty-reply-nudge` | 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)。**`temp` と比べる**。`base` / `temp` / `core` / `core-search` / `think-*` はこれを off にしている (lodan の既定は on) |
 
 ## 使い方
 

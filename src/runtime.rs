@@ -318,8 +318,11 @@ fn resume_session(
     registry: &Arc<ToolRegistry>,
     notices: Notices,
 ) -> (agent::Session, Option<Recorder>) {
+    // `last` は cli が cwd スコープで id に解決してから渡す。ここに残るのは保険で、同じ cwd スコープ。
     let resolved = if arg == "last" {
-        crate::session::latest_session_id().ok().flatten()
+        crate::session::latest_session_id_in(Some(cwd))
+            .ok()
+            .flatten()
     } else {
         Some(arg.to_string())
     };

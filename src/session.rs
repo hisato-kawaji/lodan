@@ -30,6 +30,26 @@ pub struct SessionMeta {
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    /// `/rename` で付けた名前 (#80)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `--fork` / `/fork` で複製した元のセッション (#80)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+}
+
+impl SessionMeta {
+    /// この cwd で作られたセッションか。保存した文字列と、実体 (symlink 解決) の両方で比べる。
+    pub fn is_in(&self, cwd: &Path) -> bool {
+        let saved = Path::new(&self.cwd);
+        if saved == cwd {
+            return true;
+        }
+        match (std::fs::canonicalize(saved), std::fs::canonicalize(cwd)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// 進行中セッションを transcript.jsonl へ追記するレコーダ。
@@ -58,6 +78,8 @@ impl Recorder {
             cwd: cwd.display().to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
+            name: None,
+            forked_from: None,
         };
         let meta_path = dir.join("meta.json");
         let transcript_path = dir.join("transcript.jsonl");
@@ -70,14 +92,17 @@ impl Recorder {
         Ok(Self { dir, persisted: 0 })
     }
 
+    /// `/rename`: このセッションに名前を付ける。
+    pub fn rename(&self, name: &str) -> Result<()> {
+        rename_session(self.id(), name)
+    }
+
     /// 既存セッションを継続する。`history`（復元済みの会話）のうち、API 上有効な
     /// 接頭辞ぶんを保存済みとして扱い、以降の `sync` は新規ぶんだけ追記する。
     /// （transcript の行数ではなく history を基準にするため、復元時の system 差し替え
     ///   や将来の履歴整形に依存しない。）
     pub fn open_resumed(id: &str, history: &[Message]) -> Result<Self> {
-        let dir = sessions_root()
-            .context("could not resolve sessions directory")?
-            .join(id);
+        let dir = session_dir(id)?;
         if !dir.join("transcript.jsonl").is_file() {
             anyhow::bail!("no such session: {id} (looked in {dir:?})");
         }
@@ -158,8 +183,11 @@ impl Recorder {
     }
 }
 
-/// `<data_dir>/lodan/sessions`。
+/// `<data_dir>/lodan/sessions`。`LODAN_SESSIONS_DIR` で差し替えられる (テストや持ち運び用)。
 fn sessions_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("LODAN_SESSIONS_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     directories::ProjectDirs::from("", "", "lodan").map(|d| d.data_dir().join("sessions"))
 }
 
@@ -213,9 +241,7 @@ fn valid_prefix_len(messages: &[Message]) -> usize {
 
 /// 保存済みセッションの transcript を読み戻す。
 pub fn load_transcript(id: &str) -> Result<Vec<Message>> {
-    let dir = sessions_root()
-        .context("could not resolve sessions directory")?
-        .join(id);
+    let dir = session_dir(id)?;
     let path = dir.join("transcript.jsonl");
     let file =
         File::open(&path).with_context(|| format!("no such session: {id} (looked in {dir:?})"))?;
@@ -232,6 +258,147 @@ pub fn load_transcript(id: &str) -> Result<Vec<Message>> {
     // 末尾が宙ぶらりんの tool_call で終わっていても再投入できるよう整える。
     messages.truncate(valid_prefix_len(&messages));
     Ok(messages)
+}
+
+fn session_dir(id: &str) -> Result<PathBuf> {
+    // id はディレクトリ名。`..` や区切りを含む文字列でセッション置き場の外を指させない。
+    if id.is_empty() || id.contains(['/', '\\']) || id == "." || id == ".." {
+        anyhow::bail!("invalid session id: {id:?}");
+    }
+    Ok(sessions_root()
+        .context("could not resolve sessions directory")?
+        .join(id))
+}
+
+pub fn read_meta(id: &str) -> Result<SessionMeta> {
+    let path = session_dir(id)?.join("meta.json");
+    let text = fs::read_to_string(&path).with_context(|| format!("no such session: {id}"))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {path:?}"))
+}
+
+fn write_meta(meta: &SessionMeta) -> Result<()> {
+    let path = session_dir(&meta.id)?.join("meta.json");
+    fs::write(&path, serde_json::to_string_pretty(meta)?)
+        .with_context(|| format!("write {path:?}"))?;
+    restrict(&path, 0o600);
+    Ok(())
+}
+
+/// セッションに名前を付ける (`meta.json` の `name`)。
+pub fn rename_session(id: &str, name: &str) -> Result<()> {
+    let mut meta = read_meta(id)?;
+    let name = name.trim();
+    meta.name = (!name.is_empty()).then(|| name.to_string());
+    write_meta(&meta)
+}
+
+/// transcript を新しい id に複製する (#80)。元は変わらない。`goal.json` は写さない
+/// (未達の goal を 2 か所で走らせない)。
+pub fn fork_session(id: &str) -> Result<SessionMeta> {
+    let src = read_meta(id)?;
+    let src_dir = session_dir(id)?;
+    let created_at_ms = now_ms();
+    let new_id = format!("{created_at_ms}-{}", std::process::id());
+    let dir = session_dir(&new_id)?;
+    fs::create_dir_all(&dir).with_context(|| format!("create session dir {dir:?}"))?;
+    restrict(&dir, 0o700);
+    let transcript = dir.join("transcript.jsonl");
+    fs::copy(src_dir.join("transcript.jsonl"), &transcript)
+        .with_context(|| format!("copy transcript of {id}"))?;
+    restrict(&transcript, 0o600);
+    let meta = SessionMeta {
+        id: new_id,
+        created_at_ms,
+        forked_from: Some(src.id.clone()),
+        name: None,
+        ..src
+    };
+    write_meta(&meta)?;
+    Ok(meta)
+}
+
+/// 一覧のプレビュー: 最初のユーザ発話の 1 行目 (長ければ切る)。
+pub fn first_user_line(id: &str) -> Option<String> {
+    let path = session_dir(id).ok()?.join("transcript.jsonl");
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(Message::User { content }) = serde_json::from_str::<Message>(&line) {
+            return Some(preview(&content));
+        }
+    }
+    None
+}
+
+/// 1 行目を 60 文字までに詰める。
+pub fn preview(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    let mut out: String = first.chars().take(60).collect();
+    if first.chars().count() > 60 {
+        out.push('…');
+    }
+    out
+}
+
+/// `/export`: 会話を Markdown にする。system prompt は含めない (長く、ツール一覧やメモリが入る)。
+pub fn transcript_markdown(id: &str, history: &[Message]) -> String {
+    let mut out = format!("# lodan session {id}\n");
+    for m in history {
+        match m {
+            Message::System { .. } => {}
+            Message::User { content } => {
+                out.push_str("\n## user\n\n");
+                out.push_str(content.trim_end());
+                out.push('\n');
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                out.push_str("\n## assistant\n\n");
+                if let Some(text) = content.as_deref().filter(|t| !t.trim().is_empty()) {
+                    out.push_str(text.trim_end());
+                    out.push('\n');
+                }
+                for call in tool_calls {
+                    out.push_str(&format!(
+                        "\n```json\n// tool call {} ({})\n{}\n```\n",
+                        call.function.name, call.id, call.function.arguments
+                    ));
+                }
+            }
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                out.push_str(&format!("\n## tool result ({tool_call_id})\n\n```\n"));
+                out.push_str(content.trim_end());
+                out.push_str("\n```\n");
+            }
+        }
+    }
+    out
+}
+
+/// 本人だけが読めるファイルとして書く (`/export` 用。transcript と同じ 0600)。既存ファイルは上書きする。
+pub fn write_private(path: &Path, text: &str) -> Result<()> {
+    fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+    restrict(path, 0o600);
+    Ok(())
+}
+
+/// この cwd のセッションだけ (`None` なら全部)。作成時刻の昇順。
+pub fn list_sessions_in(cwd: Option<&Path>) -> Result<Vec<SessionMeta>> {
+    let mut all = list_sessions()?;
+    if let Some(cwd) = cwd {
+        all.retain(|m| m.is_in(cwd));
+    }
+    Ok(all)
+}
+
+/// この cwd の最新セッションの id (`--continue` / cwd スコープの `--resume last`)。
+pub fn latest_session_id_in(cwd: Option<&Path>) -> Result<Option<String>> {
+    Ok(list_sessions_in(cwd)?.into_iter().next_back().map(|m| m.id))
 }
 
 /// 全セッションのメタを作成時刻の昇順で返す。
@@ -279,6 +446,66 @@ mod tests {
                 name: name.into(),
                 arguments: "{}".into(),
             },
+        }
+    }
+
+    #[test]
+    fn preview_takes_the_first_line_and_caps_it() {
+        assert_eq!(preview("fix the bug\nmore"), "fix the bug");
+        let long = "x".repeat(80);
+        assert_eq!(preview(&long).chars().count(), 61);
+    }
+
+    #[test]
+    fn markdown_export_skips_the_system_prompt_and_fences_tool_traffic() {
+        let history = vec![
+            Message::System {
+                content: "SYSTEM".into(),
+            },
+            Message::User {
+                content: "hi".into(),
+            },
+            Message::Assistant {
+                content: Some("calling".into()),
+                tool_calls: vec![tool_call("c1", "Read")],
+                reasoning_content: None,
+            },
+            Message::Tool {
+                tool_call_id: "c1".into(),
+                content: "file body".into(),
+            },
+            Message::Assistant {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+        ];
+        let md = transcript_markdown("s1", &history);
+        assert!(md.starts_with("# lodan session s1\n"));
+        assert!(!md.contains("SYSTEM"));
+        assert!(md.contains("## user\n\nhi") && md.contains("// tool call Read (c1)"));
+        assert!(md.contains("## tool result (c1)\n\n```\nfile body\n```"));
+        assert!(md.ends_with("done\n"));
+    }
+
+    #[test]
+    fn session_ids_cannot_point_outside_the_sessions_dir() {
+        assert!(session_dir("../etc").is_err());
+        assert!(session_dir("a/b").is_err());
+        assert!(session_dir("").is_err());
+        // 実際に読み書きする経路もガードを通る (#129 のレビュー: --resume ../evil が通っていた)。
+        // 「無いから失敗」ではなく「id が不正だから失敗」であることを確かめる (ガードを外しても
+        // ENOENT で is_err にはなるので)。
+        for err in [
+            load_transcript("../evil").unwrap_err().to_string(),
+            Recorder::open_resumed("../evil", &[])
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            read_meta("../evil").unwrap_err().to_string(),
+            fork_session("..//evil").unwrap_err().to_string(),
+        ] {
+            assert!(err.contains("invalid session id"), "{err}");
         }
     }
 

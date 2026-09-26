@@ -15,6 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod rules;
+
 /// メモリ全体のサイズ上限（バイト）。超過分は char 境界で打ち切る。
 pub const MEMORY_CAP: usize = 32 * 1024;
 

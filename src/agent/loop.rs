@@ -45,6 +45,9 @@ pub struct Session {
     /// 直近のターンが「思考だけで本文の無い応答」で終わったなら、その思考の文字数 (#111)。
     /// ヘッドレスの結果で「hook に止められた」と言い分けるためのもの。
     last_reply_thought_chars: Option<usize>,
+    /// path-scoped ルール (`.lodan/rules/*.md`, #79) と、このセッションで注入済みの添字。
+    rules: Vec<crate::memory::rules::Rule>,
+    rules_injected: std::collections::BTreeSet<usize>,
 }
 
 /// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
@@ -139,6 +142,7 @@ impl Session {
             }
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let rules = crate::memory::rules::load_rules(&cwd);
         let system = Self::system_prompt(&cfg, &cwd, registry.as_ref());
         let mut history = vec![Message::System { content: system }];
         history.extend(prior);
@@ -160,7 +164,44 @@ impl Session {
             ledger: None,
             loaded_tools: std::collections::BTreeSet::new(),
             last_reply_thought_chars: None,
+            rules,
+            rules_injected: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// テスト用: ルールを差し替える。
+    #[cfg(test)]
+    fn set_rules(&mut self, rules: Vec<crate::memory::rules::Rule>) {
+        self.rules = rules;
+        self.rules_injected.clear();
+    }
+
+    /// ファイルを相手にするツールの呼び出しに、まだ出していない一致ルールがあれば、
+    /// tool_result に足す文を返す (#79)。1 ルール 1 セッション 1 回。
+    fn rules_for_call(&mut self, tool_name: &str, args: &serde_json::Value) -> Option<String> {
+        if !crate::memory::rules::FILE_TOOLS.contains(&tool_name) {
+            return None;
+        }
+        let file = std::path::Path::new(args.get("path")?.as_str()?);
+        let cwd = self.ctx.cwd.clone();
+        let mut extra = String::new();
+        for (i, rule) in self.rules.iter().enumerate() {
+            if self.rules_injected.contains(&i) || !rule.matches(file, &cwd) {
+                continue;
+            }
+            self.rules_injected.insert(i);
+            crate::runlog::record(
+                "rule_injected",
+                serde_json::json!({
+                    "turn": self.turn_seq,
+                    "rule": rule.name,
+                    "tool": tool_name,
+                    "path": file.display().to_string(),
+                }),
+            );
+            extra.push_str(&rule.injection());
+        }
+        (!extra.is_empty()).then_some(extra)
     }
 
     pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
@@ -755,6 +796,13 @@ impl Session {
                     }),
                 );
                 last_call = Some((name.clone(), call.function.arguments.clone()));
+                // path-scoped ルール: 該当ファイルに初めて触れた tool_result の後ろに 1 回だけ (#79)。
+                // 失敗した呼び出し (存在しないパスなど) には足さない。
+                if !output.is_error
+                    && let Some(extra) = self.rules_for_call(&name, &args)
+                {
+                    output.content.push_str(&extra);
+                }
                 self.history.push(Message::Tool {
                     tool_call_id: call.id,
                     content: output.content,
@@ -4569,6 +4617,58 @@ mod tests {
         );
         assert_eq!(b.messages, 3);
         assert!(b.describe().contains("window         1000 tokens"));
+    /// path-scoped ルールは、一致するファイルに初めて触れた tool_result に 1 回だけ付く (#79)。
+    #[tokio::test]
+    async fn a_path_rule_is_injected_once_after_the_first_matching_read() {
+        // ルールは cwd 配下のファイルにしか当たらない。Session の cwd はプロセスの cwd なので、
+        // その下 (target/) に一時ディレクトリを作る。
+        let target = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let dir = tempfile::tempdir_in(&target).unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        let mut session = session_with_stop_hook(None);
+        let rule = crate::memory::rules::parse_rule(
+            &dir.path().join(".lodan/rules/rust.md"),
+            "---\npaths: [\"target/**/*.rs\"]\n---\nUSE THISERROR\n",
+        )
+        .unwrap();
+        session.set_rules(vec![rule]);
+        let read = |id: &str, p: &std::path::Path| {
+            tool_call_with_args(id, "Read", &format!(r#"{{"path": "{}"}}"#, p.display()))
+        };
+        let llm = CallThenDoneLlm {
+            calls: vec![
+                read("r0", &dir.path().join("b.txt")),
+                read("r1", &dir.path().join("a.rs")),
+                read("r2", &dir.path().join("a.rs")),
+            ],
+            called: false.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("read them", &llm, &gate).await.unwrap();
+        let tool_replies: Vec<&str> = session
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_replies.len(), 3);
+        assert!(
+            !tool_replies[0].contains("USE THISERROR"),
+            "b.txt does not match"
+        );
+        assert!(
+            tool_replies[1].contains("[lodan] Rules for this path"),
+            "{}",
+            tool_replies[1]
+        );
+        assert!(
+            !tool_replies[2].contains("USE THISERROR"),
+            "only once per session"
+        );
     }
 
     /// 既定 (finish_nudge=false) ではナッジは注入されない。

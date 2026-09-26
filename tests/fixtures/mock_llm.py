@@ -24,6 +24,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 def build_steps(demo_dir):
+    # MOCK_LLM_STEPS: demo をこの手順に差し替える。JSON 配列 [[name, args], ...]。
+    # 1 手順 = 1 応答で、順にツールを呼んでから最後に本文を返す。
+    scripted = os.environ.get("MOCK_LLM_STEPS")
+    if scripted:
+        return [(name, args) for name, args in json.loads(scripted)]
     # MOCK_LLM_BASH: demo を「この Bash コマンド 1 回」に差し替える (サンドボックスの e2e 用)。
     bash_only = os.environ.get("MOCK_LLM_BASH")
     if bash_only:

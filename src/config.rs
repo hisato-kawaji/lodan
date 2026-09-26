@@ -314,6 +314,9 @@ pub struct AgentConfig {
     /// サブエージェントには渡さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_system_prompt: Option<String>,
+    /// プロファイルで隠したツールと MCP ツールを、定義を送らずに `ToolSearch` で読み込ませる (#72)。
+    /// 既定 false (`core` はこれまでどおり 6 個だけ、`full` は全部をそのまま送る)。
+    pub tool_search: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -455,6 +458,7 @@ impl Default for AgentConfig {
             tool_profile: ToolProfile::Full,
             tools: Vec::new(),
             append_system_prompt: None,
+            tool_search: false,
         }
     }
 }
@@ -752,6 +756,10 @@ impl Config {
             self.agent.tools = v;
             mark("agent.tools".into());
         }
+        if let Some(v) = o.tool_search {
+            self.agent.tool_search = v;
+            mark("agent.tool_search".into());
+        }
     }
 }
 
@@ -786,6 +794,7 @@ pub struct Overrides {
     pub disallowed_tools: Vec<String>,
     pub tool_profile: Option<ToolProfile>,
     pub tools: Option<Vec<String>>,
+    pub tool_search: Option<bool>,
 }
 
 fn user_config_path() -> Option<PathBuf> {

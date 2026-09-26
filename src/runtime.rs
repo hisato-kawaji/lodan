@@ -137,7 +137,11 @@ impl Runtime {
         }
 
         // 全ツールの登録が済んだところで、モデルに見せる範囲を絞る (#72)。
-        for name in registry.apply_profile(cfg.agent.tool_profile, &cfg.agent.tools) {
+        for name in registry.apply_profile_with_search(
+            cfg.agent.tool_profile,
+            &cfg.agent.tools,
+            cfg.agent.tool_search,
+        ) {
             eprintln!("tools: '{name}' is listed in agent.tools but no such tool is registered");
         }
         // 綴り間違いで全ツールが消えた実行は、ツールなしのまま LLM を呼んで終わるだけで何も
@@ -148,22 +152,37 @@ impl Runtime {
                 registry.all_names().join(", ")
             );
         }
-        let spec_bytes = serde_json::to_string(&registry.tool_specs()).map_or(0, |s| s.len());
+        // 毎リクエスト送る定義の大きさ。ToolSearch を見せるならその分も入る (遅延ロードの固定費)。
+        let mut specs = registry.tool_specs();
+        specs.extend(registry.tool_search_spec());
+        let spec_bytes = serde_json::to_string(&specs).map_or(0, |s| s.len());
+        let tool_search_bytes = registry
+            .tool_search_spec()
+            .and_then(|s| serde_json::to_string(&s).ok())
+            .map_or(0, |s| s.len());
         crate::runlog::record(
             "tools",
             serde_json::json!({
                 "profile": cfg.agent.tool_profile.as_str(),
                 "explicit": !cfg.agent.tools.is_empty(),
                 "visible": registry.names(),
+                "deferred": registry.deferred_names(),
                 "registered": registry.registered_len(),
                 "spec_bytes": spec_bytes,
+                "tool_search_bytes": tool_search_bytes,
             }),
         );
         if registry.len() < registry.registered_len() {
+            let deferred = registry.deferred_names().len();
             notices.say(&format!(
-                "tools: {} of {} visible to the model ({spec_bytes} bytes of tool specs)",
+                "tools: {} of {} visible to the model ({spec_bytes} bytes of tool specs{})",
                 registry.len(),
-                registry.registered_len()
+                registry.registered_len(),
+                if deferred > 0 {
+                    format!(", {deferred} loadable with ToolSearch")
+                } else {
+                    String::new()
+                }
             ));
         }
 

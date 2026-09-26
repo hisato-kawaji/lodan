@@ -133,6 +133,10 @@ pub struct Cli {
     )]
     pub tools: Option<Vec<String>>,
 
+    /// Defer hidden and MCP tools: send only their names, let the model load them with ToolSearch (#72)
+    #[arg(long, env = "LODAN_TOOL_SEARCH", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub tool_search: Option<bool>,
+
     /// Run one turn non-interactively and exit. Without PROMPT, the prompt is read from stdin
     #[arg(short = 'p', long = "print", value_name = "PROMPT", num_args = 0..=1, default_missing_value = "")]
     pub print: Option<String>,
@@ -229,6 +233,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         disallowed_tools: args.disallowed_tools,
         tool_profile: args.tool_profile,
         tools: args.tools,
+        tool_search: args.tool_search,
     };
     cfg.apply_overrides_tracked(overrides, &mut origins);
 

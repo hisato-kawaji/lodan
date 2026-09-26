@@ -1014,6 +1014,26 @@ fn bang_runs_a_shell_command_and_the_prompt_stays_plain_off_a_tty() {
     let work = home.path().join("work/.lodan");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("config.toml"), "[ui]\nprompt_status = true\n").unwrap();
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("!echo hi-from-shell; echo oops >&2; exit 3\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("hi-from-shell"), "{text}");
+    assert!(text.contains("oops") && text.contains("(exit 3)"), "{text}");
+    assert!(
+        !text.contains("· ctx") && !text.contains(" tok]"),
+        "no prompt decoration off a tty: {text}"
+    );
+}
+
 /// stdout の `session: <id>` 行から id を拾う。
 fn started_session_id(out: &Output) -> String {
     stdout(out)
@@ -1111,7 +1131,6 @@ fn fork_copies_the_transcript_and_export_writes_markdown() {
         home.path(),
         server.port,
         &[],
-        Stdin::Piped("!echo hi-from-shell; echo oops >&2; exit 3\n/exit\n"),
         Stdin::Piped("first question\n/fork\n/export notes.md\n/exit\n"),
     );
     assert!(
@@ -1120,12 +1139,6 @@ fn fork_copies_the_transcript_and_export_writes_markdown() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = stdout(&out);
-    assert!(text.contains("hi-from-shell"), "{text}");
-    assert!(text.contains("oops") && text.contains("(exit 3)"), "{text}");
-    assert!(
-        !text.contains("· ctx") && !text.contains(" tok]"),
-        "no prompt decoration off a tty: {text}"
-    );
     let original = started_session_id(&out);
     let fork_line = text
         .lines()

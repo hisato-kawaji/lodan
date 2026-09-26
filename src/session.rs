@@ -498,7 +498,10 @@ mod tests {
         // ENOENT で is_err にはなるので)。
         for err in [
             load_transcript("../evil").unwrap_err().to_string(),
-            Recorder::open_resumed("../evil", &[]).unwrap_err().to_string(),
+            Recorder::open_resumed("../evil", &[])
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
             read_meta("../evil").unwrap_err().to_string(),
             fork_session("..//evil").unwrap_err().to_string(),
         ] {

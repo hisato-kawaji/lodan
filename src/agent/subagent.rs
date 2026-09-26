@@ -302,9 +302,18 @@ impl SubAgentTool {
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
                 let refusal = self.refusal(&call.function.name, &args);
-                let output = match p.tools.get(&call.function.name) {
-                    // 読み取り専用 registry にしか無いので未知名はまず出ないが、保険。
-                    None => ToolOutput::error(format!("unknown tool: {}", call.function.name)),
+                // 定義の `tools:` で隠したものは実行もしない (spec に無いだけでは、名前を覚えている
+                // モデルが呼べてしまう)。書き込み可の子を足すときの土台でもある。
+                let usable = p
+                    .tools
+                    .get(&call.function.name)
+                    .filter(|_| p.tools.is_visible(&call.function.name));
+                let output = match usable {
+                    None => ToolOutput::error(format!(
+                        "tool '{}' is not available to this sub-agent (available: {})",
+                        call.function.name,
+                        p.tools.names().join(", ")
+                    )),
                     Some(_) if refusal.is_some() => ToolOutput::error(refusal.unwrap_or_default()),
                     Some(tool) => match tool.execute(args, &ctx).await {
                         Ok(o) => o,
@@ -336,7 +345,7 @@ impl Tool for SubAgentTool {
     }
 
     fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "description": {
@@ -348,14 +357,18 @@ impl Tool for SubAgentTool {
                     "description": "The investigation task. Be specific and self-contained; \
                                     the sub-agent does not see this conversation."
                 },
-                "subagent_type": {
-                    "type": "string",
-                    "description": "Which sub-agent to run (see the tool description); omit for the default",
-                    "enum": self.profiles.keys().collect::<Vec<_>>()
-                }
             },
             "required": ["description", "prompt"]
-        })
+        });
+        // 定義が無ければ従来と同じ schema (小型モデルに余計な項目を見せない)。
+        if !self.custom_names().is_empty() {
+            schema["properties"]["subagent_type"] = serde_json::json!({
+                "type": "string",
+                "description": "Which sub-agent to run (see the tool description); omit for the default",
+                "enum": self.profiles.keys().collect::<Vec<_>>()
+            });
+        }
+        schema
     }
 
     fn is_destructive(&self) -> bool {
@@ -529,6 +542,7 @@ mod tests {
             echoed.contains("- Read") && !echoed.contains("- Grep"),
             "tools narrowed: {echoed}"
         );
+        assert!(tool.schema()["properties"]["subagent_type"]["enum"].is_array());
         let err = run(Some("nope")).await.unwrap_err().to_string();
         assert!(
             err.contains("unknown subagent_type") && err.contains("echo"),
@@ -536,6 +550,65 @@ mod tests {
         );
         assert!(tool.description().contains("echo — echoes its prompt"));
         assert_eq!(tool.custom_names(), ["echo"]);
+    }
+
+    /// `tools:` で隠したツールは、名前を覚えているモデルが呼んでも実行されない (#128 のレビュー)。
+    #[tokio::test]
+    async fn a_hidden_tool_is_refused_at_execution_time_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "secret").unwrap();
+        let mut only_read = read_only_registry();
+        only_read.apply_profile(crate::config::ToolProfile::Full, &["Read".to_string()]);
+        let glob = tool_call(
+            "Glob",
+            &format!(
+                r#"{{"pattern": "*.txt", "path": "{}"}}"#,
+                dir.path().display()
+            ),
+        );
+        let tool = SubAgentTool::new(
+            Arc::new(ScriptedLlm::new(vec![])),
+            "mock".into(),
+            Arc::new(read_only_registry()),
+            dir.path().to_path_buf(),
+            8,
+        )
+        .with_profile(
+            "narrow".into(),
+            AgentProfile::new(
+                Arc::new(EchoToolOutputLlm { call: glob }),
+                "mock".into(),
+                Arc::new(only_read),
+                3,
+            ),
+        );
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let out = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "narrow" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("not available to this sub-agent"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("a.txt"),
+            "the hidden Glob must not have run: {}",
+            out.content
+        );
+    }
+
+    /// 定義が無ければ Task の schema は従来と同じ (subagent_type を見せない)。
+    #[test]
+    fn without_definitions_the_schema_has_no_subagent_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = subagent(vec![], dir.path().to_path_buf());
+        assert!(tool.schema()["properties"].get("subagent_type").is_none());
+        assert!(tool.custom_names().is_empty());
     }
 
     /// 子の system prompt は素の `build_system_prompt` のまま。親の `--append-system-prompt`

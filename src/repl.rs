@@ -1123,6 +1123,8 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_model_arg;
+
     #[test]
     fn model_arg_keeps_colons_inside_model_names() {
         use crate::config::Provider;

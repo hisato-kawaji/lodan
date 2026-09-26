@@ -4514,6 +4514,8 @@ mod tests {
         session.run_turn("which port?", &llm, &gate).await.unwrap();
         assert_eq!(empty_reply_notes(&session), 0);
         assert!(session.last_reply_thought_chars().is_some());
+    }
+
     /// `/model`: system prompt の model 行が差し替わり、履歴はそのまま残る (#81)。
     #[test]
     fn switch_llm_rewrites_the_system_prompt_and_keeps_the_history() {

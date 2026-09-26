@@ -22,7 +22,7 @@ use crate::slash::{self, SlashCommand};
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
     "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop", "plan", "accept",
-    "undo", "memory", "model", "status", "context",
+    "undo", "memory", "model", "status", "context", "fork", "rename", "export",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
@@ -488,6 +488,64 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
             // /context: コンテキストの内訳 (#81)。
             if head == "context" {
                 println!("{}", session.context_breakdown().describe());
+                continue;
+            }
+
+            // /fork: いまの会話を新しいセッションに複製し、以後はそちらへ保存する (#80)。
+            if head == "fork" {
+                persist(&mut recorder, &session);
+                match recorder
+                    .as_ref()
+                    .map(|r| crate::session::fork_session(r.id()))
+                {
+                    None => println!("session: persistence is disabled; nothing to fork"),
+                    Some(Err(e)) => println!("session: fork failed: {e:#}"),
+                    Some(Ok(meta)) => match Recorder::open_resumed(&meta.id, session.history()) {
+                        Ok(rec) => {
+                            println!(
+                                "session: forked {} -> {} (now saving to the fork)",
+                                meta.forked_from.as_deref().unwrap_or("?"),
+                                meta.id
+                            );
+                            recorder = Some(rec);
+                        }
+                        Err(e) => println!("session: fork created but cannot switch: {e:#}"),
+                    },
+                }
+                continue;
+            }
+
+            // /rename: セッションに名前を付ける (#80)。
+            if head == "rename" {
+                match recorder.as_ref() {
+                    None => println!("session: persistence is disabled; nothing to rename"),
+                    Some(rec) => match rec.rename(args) {
+                        Ok(()) if args.trim().is_empty() => println!("session: name cleared"),
+                        Ok(()) => {
+                            println!("session: named \"{}\"", crate::term::sanitize(args.trim()))
+                        }
+                        Err(e) => println!("session: rename failed: {e:#}"),
+                    },
+                }
+                continue;
+            }
+
+            // /export [path]: 会話を Markdown に書き出す (#80)。
+            if head == "export" {
+                let id = recorder
+                    .as_ref()
+                    .map_or("ephemeral", |r| r.id())
+                    .to_string();
+                let path = if args.is_empty() {
+                    runtime.cwd.join(format!("lodan-session-{id}.md"))
+                } else {
+                    runtime.cwd.join(args)
+                };
+                let markdown = crate::session::transcript_markdown(&id, session.history());
+                match std::fs::write(&path, markdown) {
+                    Ok(()) => println!("session: exported to {}", path.display()),
+                    Err(e) => println!("session: export failed ({}): {e}", path.display()),
+                }
                 continue;
             }
 
@@ -1152,6 +1210,15 @@ fn handle_slash(
                 ),
                 ("/memory", "読み込まれているメモリファイルの一覧とサイズ"),
                 ("!<cmd>", "シェルで実行して、出力を次の発話の文脈に添える"),
+                (
+                    "/fork",
+                    "いまの会話を新しいセッションに複製して、以後そちらへ保存",
+                ),
+                (
+                    "/rename <名前>",
+                    "セッションに名前を付ける (lodan sessions に出る)",
+                ),
+                ("/export [path]", "会話を Markdown に書き出す"),
                 (
                     "/goal <条件> | /goal | /goal clear",
                     "条件達成までターンを自律継続 / 状態表示 / 解除",

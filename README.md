@@ -744,8 +744,12 @@ REPL セッションは自動的に保存され、後から再開できます。
   - `meta.json`: id / 作成時刻 / cwd / provider / model
   - `transcript.jsonl`: 各メッセージを 1 行 1 件でターンごとに追記
   - `goal.json`: 未達の `/goal` があるときだけ（条件・通算ターン数・走っていた時間。[後述](#ゴール駆動の自律継続goal)）
-- `lodan sessions` — 保存済みセッションを一覧表示
-- `lodan --resume <id>` — 指定 id を再開（`--resume last` で直近を再開）
+- `lodan sessions` — **この cwd で始めた**セッションを一覧表示（`--all` で全ディレクトリ、`--json` で 1 行 1 オブジェクト）。id / model / provider / cwd に加え、`/rename` で付けた名前・最初のユーザ発話のプレビュー・fork 元
+- `lodan --continue` — この cwd の直近セッションを再開（無ければエラー。黙って新規にはしない）
+- `lodan --resume <id>` — 指定 id を再開（`--resume last` は**この cwd の直近**。`--all` を付けると全ディレクトリの直近）
+- `lodan --fork <id|last>` — transcript を新しいセッションに複製してその複製を再開（元は変わらない。`meta.json` に `forked_from`。未達の `goal.json` は写さない）
+- REPL 内: `/fork`（いまの会話を複製して以後は複製へ保存）/ `/rename <名前>` / `/export [path]`（Markdown。system prompt は含めない。既定は cwd の `lodan-session-<id>.md`）
+- 保存先は `LODAN_SESSIONS_DIR` で差し替えられる
 
 ```console
 $ lodan
@@ -758,7 +762,8 @@ session: resumed 1782332785130-31477 (12 messages)
 再開時は保存済みの会話を読み戻したうえで、**system prompt は現在の環境（ツール一覧）で作り直します**。
 永続化に失敗してもセッションは継続します（その場合は保存なしの ephemeral 動作）。
 
-- `--resume last` は **cwd を問わず全セッションの最新**を選びます（現状はプロジェクト単位の索引なし）。別ディレクトリのセッションを拾い得る点に注意。
+- `--resume last` / `--continue` は **この cwd で始めたセッション**の最新を選びます（`meta.json` の `cwd` で照合。symlink は実体で比べる）。別ディレクトリのものを拾いたいときは `--all`。
+- 再開で戻るのは会話だけです。トークンの累計・プランモード・`/model` の切り替えは復元しません（`/goal` は `goal.json` から戻ります）。
 - transcript には Read したファイル内容や貼り付けた値が**平文**で残ります。セッションディレクトリは本人のみアクセス可（unix で dir `0700` / file `0600`）に制限しますが、秘密情報の扱いには留意してください。
 - 中断などで tool 呼び出しの結果が揃わなかったターンは、再投入の整合性のため保存されません（解決済みの履歴のみ追記）。
 

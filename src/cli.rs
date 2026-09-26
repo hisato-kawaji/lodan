@@ -35,9 +35,21 @@ pub struct Cli {
     #[arg(long, env = "LODAN_AUTO_APPROVE")]
     pub yes: bool,
 
-    /// Resume a saved session by id (or `last` for the most recent)
-    #[arg(long, value_name = "ID")]
+    /// Resume a saved session by id (or `last` for the most recent one started in this directory)
+    #[arg(long, value_name = "ID", conflicts_with_all = ["continue_", "fork"])]
     pub resume: Option<String>,
+
+    /// Resume the most recent session started in this directory (#80)
+    #[arg(long = "continue", conflicts_with = "fork")]
+    pub continue_: bool,
+
+    /// Copy a saved session (its transcript) into a new one and resume the copy
+    #[arg(long, value_name = "ID")]
+    pub fork: Option<String>,
+
+    /// With `--resume last` / `lodan sessions`: look across every directory, not just this one
+    #[arg(long, global = true)]
+    pub all: bool,
 
     /// Append a machine-readable JSONL run log (turns, tool calls, timings) to PATH
     #[arg(long, env = "LODAN_LOG_JSONL", value_name = "PATH")]
@@ -174,8 +186,12 @@ pub enum Command {
     },
     /// Start the interactive REPL (default if omitted)
     Repl,
-    /// List saved sessions
-    Sessions,
+    /// List saved sessions (this directory's by default; --all for every directory)
+    Sessions {
+        /// One JSON object per line instead of the table
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage MCP servers in ~/.config/lodan/mcp.json (user) or ./.mcp.json (project)
     Mcp {
         #[command(subcommand)]
@@ -372,6 +388,17 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         }
         (Err(e), None) => return Err(e),
     };
+    // `--continue` / `--fork` / cwd スコープの `--resume last` を具体的な id にする (#80)。
+    let resume = match resolve_resume(&args) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(match args.print.is_some().then_some(args.output_format) {
+                Some(format) => crate::headless::report_startup_failure(format, &e),
+                None => return Err(e),
+            });
+        }
+    };
+
     let overrides = crate::config::Overrides {
         provider: args.provider,
         fallback: args.fallback_provider,
@@ -415,13 +442,13 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
             read_stdin: args.stdin,
             format,
             output_schema: args.output_schema,
-            resume: args.resume,
+            resume,
         };
         return Ok(crate::headless::run(cfg, opts).await);
     }
 
     match args.cmd.unwrap_or(Command::Repl) {
-        Command::Repl => repl::run(cfg, args.resume).await.map(|()| 0),
+        Command::Repl => repl::run(cfg, resume).await.map(|()| 0),
         Command::Config {
             show_origin,
             show_secrets,
@@ -434,7 +461,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Command::Sessions => list_sessions().map(|()| 0),
+        Command::Sessions { json } => list_sessions(args.all, json).map(|()| 0),
         Command::Trust { .. } | Command::Mcp { .. } => {
             unreachable!("handled before the config is loaded")
         }
@@ -453,7 +480,7 @@ pub fn decide_project_trust(args: &Cli) {
     // 信頼の管理と、プロジェクトのファイルを使わないサブコマンドでは尋ねない。読みもしない。
     if matches!(
         args.cmd,
-        Some(Command::Trust { .. } | Command::Sessions | Command::Mcp { .. })
+        Some(Command::Trust { .. } | Command::Sessions { .. } | Command::Mcp { .. })
     ) {
         crate::trust::set_project_trusted(false);
         return;
@@ -551,15 +578,79 @@ fn describe_origins(origins: &crate::config::Origins) -> String {
     out
 }
 
-fn list_sessions() -> Result<()> {
-    let sessions = crate::session::list_sessions()?;
-    if sessions.is_empty() {
-        println!("no saved sessions");
+/// `--continue` / `--fork <id>` / `--resume last` を、再開する id に解決する。無ければエラー
+/// (黙って新規セッションにしない — 「続き」のつもりで新しい会話が始まると気づきにくい)。
+fn resolve_resume(args: &Cli) -> Result<Option<String>> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Some(id) = &args.fork {
+        let id = if id == "last" {
+            latest_or_bail(&cwd, args.all)?
+        } else {
+            id.clone()
+        };
+        let meta = crate::session::fork_session(&id)?;
+        eprintln!("session: forked {id} -> {}", meta.id);
+        return Ok(Some(meta.id));
+    }
+    if args.continue_ {
+        return latest_or_bail(&cwd, false).map(Some);
+    }
+    match args.resume.as_deref() {
+        Some("last") => latest_or_bail(&cwd, args.all).map(Some),
+        other => Ok(other.map(str::to_string)),
+    }
+}
+
+fn latest_or_bail(cwd: &std::path::Path, all: bool) -> Result<String> {
+    let scope = (!all).then_some(cwd);
+    crate::session::latest_session_id_in(scope)?.ok_or_else(|| {
+        if all {
+            anyhow::anyhow!("no saved sessions")
+        } else {
+            anyhow::anyhow!(
+                "no saved session for {} (try --all, or `lodan sessions --all`)",
+                cwd.display()
+            )
+        }
+    })
+}
+
+fn list_sessions(all: bool, json: bool) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let scope = (!all).then_some(cwd.as_path());
+    let sessions = crate::session::list_sessions_in(scope)?;
+    if sessions.is_empty() && !json {
+        println!(
+            "no saved sessions{}",
+            if all {
+                ""
+            } else {
+                " for this directory (--all for every directory)"
+            }
+        );
         return Ok(());
     }
     for meta in sessions {
+        let preview = crate::session::first_user_line(&meta.id);
+        if json {
+            let mut v = serde_json::to_value(&meta)?;
+            v["preview"] = serde_json::Value::from(preview);
+            println!("{v}");
+            continue;
+        }
+        // 名前とプレビューは利用者の入力由来。端末に出す前に無害化する。
+        let name = meta.name.as_deref().map_or(String::new(), |n| {
+            format!("  [{}]", crate::term::sanitize(n))
+        });
+        let preview = preview.map_or(String::new(), |p| {
+            format!("  \"{}\"", crate::term::sanitize(&p))
+        });
+        let fork = meta
+            .forked_from
+            .as_deref()
+            .map_or(String::new(), |f| format!("  (fork of {f})"));
         println!(
-            "{}  {} ({})  {}",
+            "{}  {} ({})  {}{name}{preview}{fork}",
             meta.id, meta.model, meta.provider, meta.cwd
         );
     }

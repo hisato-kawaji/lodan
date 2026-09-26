@@ -1014,11 +1014,105 @@ fn bang_runs_a_shell_command_and_the_prompt_stays_plain_off_a_tty() {
     let work = home.path().join("work/.lodan");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("config.toml"), "[ui]\nprompt_status = true\n").unwrap();
+/// stdout の `session: <id>` 行から id を拾う。
+fn started_session_id(out: &Output) -> String {
+    stdout(out)
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("session: ")
+                .filter(|r| !r.starts_with("resumed"))
+        })
+        .expect("a session id line")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// `--continue` はこの cwd の直近を再開し、別の cwd からは見えない。`sessions` も cwd で絞る (#80)。
+#[test]
+fn continue_and_sessions_are_scoped_to_the_working_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock(home.path());
+    let first = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("hi there\n/rename my chat\n/exit\n"),
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let id = started_session_id(&first);
+
+    let again = lodan(
+        home.path(),
+        server.port,
+        &["--continue"],
+        Stdin::Piped("/exit\n"),
+    );
+    assert!(
+        stdout(&again).contains(&format!("session: resumed {id}")),
+        "{}",
+        stdout(&again)
+    );
+
+    let elsewhere = lodan(
+        home.path(),
+        server.port,
+        &["--continue", "<harness:cwd=other>"],
+        Stdin::Piped("/exit\n"),
+    );
+    assert!(!elsewhere.status.success(), "no session in that directory");
+    assert!(String::from_utf8_lossy(&elsewhere.stderr).contains("no saved session for"));
+
+    let listed = lodan(
+        home.path(),
+        server.port,
+        &["sessions"],
+        Stdin::OpenAndSilent,
+    );
+    let text = stdout(&listed);
+    assert!(
+        text.contains(&id) && text.contains("[my chat]") && text.contains("\"hi there\""),
+        "{text}"
+    );
+    let none = lodan(
+        home.path(),
+        server.port,
+        &["sessions", "<harness:cwd=other>"],
+        Stdin::OpenAndSilent,
+    );
+    assert!(
+        stdout(&none).contains("no saved sessions for this directory"),
+        "{}",
+        stdout(&none)
+    );
+    let all = lodan(
+        home.path(),
+        server.port,
+        &["sessions", "--all", "--json", "<harness:cwd=other>"],
+        Stdin::OpenAndSilent,
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout(&all).lines().next().unwrap()).unwrap();
+    assert_eq!(v["id"], id);
+    assert_eq!(v["name"], "my chat");
+    assert_eq!(v["preview"], "hi there");
+}
+
+/// `/fork` と `--fork` は transcript を複製し、元を変えない。`/export` は Markdown を書く。
+#[test]
+fn fork_copies_the_transcript_and_export_writes_markdown() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock(home.path());
     let out = lodan(
         home.path(),
         server.port,
         &[],
         Stdin::Piped("!echo hi-from-shell; echo oops >&2; exit 3\n/exit\n"),
+        Stdin::Piped("first question\n/fork\n/export notes.md\n/exit\n"),
     );
     assert!(
         out.status.success(),
@@ -1032,6 +1126,60 @@ fn bang_runs_a_shell_command_and_the_prompt_stays_plain_off_a_tty() {
         !text.contains("· ctx") && !text.contains(" tok]"),
         "no prompt decoration off a tty: {text}"
     );
+    let original = started_session_id(&out);
+    let fork_line = text
+        .lines()
+        .find(|l| l.contains("session: forked"))
+        .expect("fork line");
+    let forked = fork_line
+        .split(" -> ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert_ne!(forked, original);
+    let notes = std::fs::read_to_string(home.path().join("work/notes.md")).unwrap();
+    assert!(
+        notes.contains("## user\n\nfirst question") && notes.contains(GREETING),
+        "{notes}"
+    );
+
+    let listed = lodan(
+        home.path(),
+        server.port,
+        &["sessions", "--json"],
+        Stdin::OpenAndSilent,
+    );
+    let rows: Vec<serde_json::Value> = stdout(&listed)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    let fork_row = rows.iter().find(|r| r["id"] == forked).unwrap();
+    assert_eq!(fork_row["forked_from"], original);
+    assert_eq!(
+        fork_row["preview"], "first question",
+        "the copy has the same transcript"
+    );
+
+    let cli_fork = lodan(
+        home.path(),
+        server.port,
+        &["--fork", &original],
+        Stdin::Piped("/exit\n"),
+    );
+    assert!(
+        String::from_utf8_lossy(&cli_fork.stderr)
+            .contains(&format!("session: forked {original} -> "))
+    );
+    let listed = lodan(
+        home.path(),
+        server.port,
+        &["sessions"],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(stdout(&listed).lines().count(), 3, "{}", stdout(&listed));
 }
 
 /// `lodan mcp add / list / remove` は設定ファイルを読み書きするだけで、サーバには繋がない (#83)。

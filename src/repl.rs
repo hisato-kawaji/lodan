@@ -1123,6 +1123,29 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_arg_keeps_colons_inside_model_names() {
+        use crate::config::Provider;
+        let p = |s: &str| parse_model_arg(s, Provider::Local);
+        assert_eq!(
+            p("qwen2.5-coder:7b"),
+            Some((Provider::Local, Some("qwen2.5-coder:7b".into())))
+        );
+        assert_eq!(p("kimi"), Some((Provider::Kimi, None)));
+        assert_eq!(p("LOCAL"), Some((Provider::Local, None)));
+        assert_eq!(
+            p("local:qwen3.5:9b"),
+            Some((Provider::Local, Some("qwen3.5:9b".into())))
+        );
+        assert_eq!(p("sakana:"), Some((Provider::Sakana, None)));
+        assert_eq!(p(":"), None);
+        assert_eq!(p(""), None);
+        assert_eq!(
+            parse_model_arg("gpt-oss:20b", Provider::Kimi),
+            Some((Provider::Kimi, Some("gpt-oss:20b".into())))
+        );
+    }
+
     use super::looks_like_slash_command;
     use super::slash_candidates;
 
@@ -1216,33 +1239,5 @@ mod tests {
         assert!(looks_like_slash_command("help"));
         assert!(looks_like_slash_command("tools "));
         assert!(looks_like_slash_command("tools list"));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_arg_keeps_colons_inside_model_names() {
-        use crate::config::Provider;
-        let p = |s: &str| parse_model_arg(s, Provider::Local);
-        assert_eq!(
-            p("qwen2.5-coder:7b"),
-            Some((Provider::Local, Some("qwen2.5-coder:7b".into())))
-        );
-        assert_eq!(p("kimi"), Some((Provider::Kimi, None)));
-        assert_eq!(p("LOCAL"), Some((Provider::Local, None)));
-        assert_eq!(
-            p("local:qwen3.5:9b"),
-            Some((Provider::Local, Some("qwen3.5:9b".into())))
-        );
-        assert_eq!(p("sakana:"), Some((Provider::Sakana, None)));
-        assert_eq!(p(":"), None);
-        assert_eq!(p(""), None);
-        assert_eq!(
-            parse_model_arg("gpt-oss:20b", Provider::Kimi),
-            Some((Provider::Kimi, Some("gpt-oss:20b".into())))
-        );
     }
 }

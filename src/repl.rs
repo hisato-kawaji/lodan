@@ -262,11 +262,8 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
     }
 
     loop {
-        let prompt = match session.mode() {
-            agent::Mode::Plan => "lodan (plan)> ",
-            agent::Mode::Normal => "lodan> ",
-        };
-        let line = match rl.readline(prompt) {
+        let prompt = prompt_line(&cfg, &session);
+        let line = match rl.readline(&prompt) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
                 println!("(Ctrl-C, type /exit to quit)");
@@ -287,6 +284,20 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
         let line = normalize_input(raw);
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+
+        // `!<cmd>`: シェルで直接実行して、出力を次のユーザ発話の文脈に添える (#81)。承認ゲートは
+        // 通さない — 打ったのは利用者自身で、モデルではない。
+        if let Some(cmd) = line.strip_prefix('!').map(str::trim)
+            && !cmd.is_empty()
+        {
+            let output = run_shell_for_user(cmd, &runtime.cwd, cfg.tools.bash.timeout_secs).await;
+            println!("{}", crate::term::sanitize(&output));
+            session.add_context(format!(
+                "The user ran this shell command themselves (not via a tool); its output is context \
+                 for their next message:\n$ {cmd}\n{output}"
+            ));
             continue;
         }
 
@@ -978,6 +989,69 @@ fn first_line(desc: &str) -> String {
     }
 }
 
+/// プロンプト文字列。`[ui] prompt_status = true` で tty のときだけ、モデル名とコンテキスト使用率を
+/// 添える (#81)。パイプには装飾を出さない。
+fn prompt_line(cfg: &Config, session: &agent::Session) -> String {
+    let base = match session.mode() {
+        agent::Mode::Plan => "lodan (plan)",
+        agent::Mode::Normal => "lodan",
+    };
+    if !cfg.ui.prompt_status || !crate::term::is_terminal() {
+        return format!("{base}> ");
+    }
+    let active = cfg.llm.active();
+    let used = session.usage().last_context_tokens;
+    let ctx = (used * 100)
+        .checked_div(active.context_window)
+        .map_or_else(|| format!("{used} tok"), |pct| format!("ctx {pct}%"));
+    format!(
+        "{base} [{} · {ctx}]> ",
+        crate::term::sanitize(&active.model)
+    )
+}
+
+/// `!<cmd>` の実行。`sh -c` で cwd から、Bash ツールと同じ timeout。出力は stdout + stderr を
+/// 順に並べ、長すぎる分は切る (文脈として添えるものなので)。
+async fn run_shell_for_user(cmd: &str, cwd: &std::path::Path, timeout_secs: u64) -> String {
+    const MAX_BYTES: usize = 16 * 1024;
+    let run = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return format!("(failed to start: {e})"),
+        Err(_) => return format!("(timed out after {timeout_secs}s)"),
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    if !out.status.success() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("(exit {})", out.status.code().unwrap_or(-1)));
+    }
+    if text.len() > MAX_BYTES {
+        let cut = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= MAX_BYTES)
+            .last()
+            .unwrap_or(0);
+        text.truncate(cut);
+        text.push_str("\n… (truncated)");
+    }
+    text
+}
+
 /// `/model` の引数。provider 名そのもの / `provider:model` / モデル名 (コロンを含んでよい —
 /// ollama の `qwen2.5-coder:7b` が local の標準)。`:` の前が provider として読めるときだけ
 /// provider:model と解釈し、それ以外は全体をいまの provider のモデル名にする。
@@ -1033,6 +1107,7 @@ fn handle_slash(
                     "コンテキストの内訳 (system / tools / user / assistant / tool)",
                 ),
                 ("/memory", "読み込まれているメモリファイルの一覧とサイズ"),
+                ("!<cmd>", "シェルで実行して、出力を次の発話の文脈に添える"),
                 (
                     "/goal <条件> | /goal | /goal clear",
                     "条件達成までターンを自律継続 / 状態表示 / 解除",
@@ -1125,6 +1200,19 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
 #[cfg(test)]
 mod tests {
     use super::parse_model_arg;
+    use super::prompt_line;
+
+    /// テストの stdout は tty ではないので、`prompt_status = true` でも装飾は付かない。
+    #[test]
+    fn prompt_has_no_decoration_off_a_tty() {
+        let mut cfg = crate::config::Config::default();
+        cfg.ui.prompt_status = true;
+        let session = crate::agent::Session::new(
+            cfg.clone(),
+            std::sync::Arc::new(crate::tools::registry::default_registry()),
+        );
+        assert_eq!(prompt_line(&cfg, &session), "lodan> ");
+    }
 
     #[test]
     fn model_arg_keeps_colons_inside_model_names() {

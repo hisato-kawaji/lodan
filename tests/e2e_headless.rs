@@ -1005,6 +1005,35 @@ fn a_model_switch_that_cannot_build_a_client_is_refused() {
     );
 }
 
+/// `!<cmd>` はシェルで実行して出力を見せ、次の発話の文脈になる (#81)。パイプ (非 tty) では
+/// `prompt_status` が on でもプロンプトに装飾を出さない。
+#[test]
+fn bang_runs_a_shell_command_and_the_prompt_stays_plain_off_a_tty() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_ECHO_SYSTEM", "1")]);
+    let work = home.path().join("work/.lodan");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("config.toml"), "[ui]\nprompt_status = true\n").unwrap();
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("!echo hi-from-shell; echo oops >&2; exit 3\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("hi-from-shell"), "{text}");
+    assert!(text.contains("oops") && text.contains("(exit 3)"), "{text}");
+    assert!(
+        !text.contains("· ctx") && !text.contains(" tok]"),
+        "no prompt decoration off a tty: {text}"
+    );
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

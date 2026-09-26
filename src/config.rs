@@ -48,6 +48,24 @@ pub struct Config {
     pub pricing: std::collections::BTreeMap<String, crate::llm::metered::ModelPrice>,
     /// hook の終了コードの解釈。`"v1"` で「非 0 は全てブロック」の旧挙動に戻す。
     pub hooks_compat: crate::hooks::HooksCompat,
+    /// REPL の見た目 (`[ui]`)。
+    #[serde(skip_serializing_if = "UiConfig::is_default")]
+    pub ui: UiConfig,
+}
+
+/// `[ui]` (#81)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// プロンプトにモデル名とコンテキスト使用率を出す (`lodan [qwen3.5:9b · ctx 42%]> `)。
+    /// tty のときだけ。既定 false。
+    pub prompt_status: bool,
+}
+
+impl UiConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[goal]`。

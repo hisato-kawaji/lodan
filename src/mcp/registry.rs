@@ -31,6 +31,17 @@ pub fn wrap_tools(
     tools: Vec<crate::mcp::protocol::McpToolMeta>,
     client: &Arc<McpClient>,
 ) -> Vec<McpTool> {
+    // `enabledTools` の綴り違いは黙って 0 個になるので、知らせる。
+    for wanted in &spec.enabled_tools {
+        if !tools.iter().any(|t| &t.name == wanted) {
+            eprintln!(
+                "{}",
+                crate::term::sanitize(&format!(
+                    "mcp[{server_name}]: enabledTools names `{wanted}`, but the server has no such tool"
+                ))
+            );
+        }
+    }
     tools
         .into_iter()
         .filter(|meta| spec.tool_enabled(&meta.name))

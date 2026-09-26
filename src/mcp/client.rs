@@ -154,8 +154,21 @@ impl McpClient {
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {
+        self.call_tool_with_timeout(name, arguments, transport::REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// `toolTimeoutSecs` つき。transport の上限もこの値になる (既定の 30 秒に頭を抑えられない)。
+    pub async fn call_tool_with_timeout(
+        &self,
+        name: &str,
+        arguments: Value,
+        timeout: std::time::Duration,
+    ) -> Result<ToolOutput> {
         let params = ToolsCallParams { name, arguments };
-        let result: ToolsCallResult = self.request("tools/call", Some(&params)).await?;
+        let result: ToolsCallResult = self
+            .request_with("tools/call", Some(&params), timeout)
+            .await?;
         let text = result.flatten_text();
         let content = if text.is_empty() && !result.is_error {
             "(no content)".to_string()
@@ -174,6 +187,16 @@ impl McpClient {
         method: &str,
         params: Option<&P>,
     ) -> Result<R> {
+        self.request_with(method, params, transport::REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<&P>,
+        timeout: std::time::Duration,
+    ) -> Result<R> {
         let id = transport::next_id(&self.next_id);
         let payload = JsonRpcRequest {
             jsonrpc: "2.0",
@@ -182,7 +205,7 @@ impl McpClient {
             params,
         };
         let line = serde_json::to_string(&payload).context("serializing JSON-RPC request")?;
-        let inc = self.transport.send_request(id, line).await?;
+        let inc = self.transport.send_request(id, line, timeout).await?;
 
         if let Some(err) = inc.error {
             return Err(anyhow!(

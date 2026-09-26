@@ -88,16 +88,12 @@ impl Tool for McpTool {
     }
 
     async fn execute(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let call = self.client.call_tool(&self.upstream_name, args);
-        let mut out = match tokio::time::timeout(self.timeout, call).await {
-            Ok(result) => result.map_err(|e| ToolError::Other(format!("mcp call failed: {e}")))?,
-            Err(_) => {
-                return Err(ToolError::Other(format!(
-                    "mcp call timed out after {}s (toolTimeoutSecs)",
-                    self.timeout.as_secs()
-                )));
-            }
-        };
+        // timeout は transport に渡す (transport の既定 30 秒に頭を抑えられないように)。
+        let mut out = self
+            .client
+            .call_tool_with_timeout(&self.upstream_name, args, self.timeout)
+            .await
+            .map_err(|e| ToolError::Other(format!("mcp call failed: {e}")))?;
         if out.content.len() > self.max_output_bytes {
             let total = out.content.len();
             let cut = (0..=self.max_output_bytes)

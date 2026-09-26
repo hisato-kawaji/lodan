@@ -52,8 +52,14 @@ pub type ServerRequestHandler = Arc<
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    /// `line` (JSON-RPC リクエスト) を送り、`id` で相関した応答を返す。
-    async fn send_request(&self, id: u64, line: String) -> Result<JsonRpcIncoming>;
+    /// `line` (JSON-RPC リクエスト) を送り、`id` で相関した応答を返す。`timeout` を超えたら諦める
+    /// (ツール呼び出しは `toolTimeoutSecs`、それ以外は `REQUEST_TIMEOUT`)。
+    async fn send_request(
+        &self,
+        id: u64,
+        line: String,
+        timeout: Duration,
+    ) -> Result<JsonRpcIncoming>;
     /// 通知 (応答なし) を送る。
     async fn send_notification(&self, line: String) -> Result<()>;
 }
@@ -200,13 +206,18 @@ impl StdioTransport {
 
 #[async_trait]
 impl Transport for StdioTransport {
-    async fn send_request(&self, id: u64, line: String) -> Result<JsonRpcIncoming> {
+    async fn send_request(
+        &self,
+        id: u64,
+        line: String,
+        limit: Duration,
+    ) -> Result<JsonRpcIncoming> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
         self.outbound
             .send(line)
             .map_err(|_| anyhow!("mcp[{}]: writer channel closed", self.label))?;
-        match timeout(REQUEST_TIMEOUT, rx).await {
+        match timeout(limit, rx).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(_)) => Err(anyhow!(
                 "mcp[{}]: response channel dropped (server died?)",
@@ -215,9 +226,9 @@ impl Transport for StdioTransport {
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 Err(anyhow!(
-                    "mcp[{}]: request timed out after {:?}",
+                    "mcp[{}]: request timed out after {}s",
                     self.label,
-                    REQUEST_TIMEOUT
+                    limit.as_secs()
                 ))
             }
         }
@@ -279,10 +290,11 @@ impl HttpTransport {
         })
     }
 
-    async fn post(&self, line: String) -> Result<reqwest::Response> {
+    async fn post(&self, line: String, limit: Duration) -> Result<reqwest::Response> {
         let mut req = self
             .client
             .post(&self.url)
+            .timeout(limit)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(line);
@@ -300,8 +312,13 @@ impl HttpTransport {
 
 #[async_trait]
 impl Transport for HttpTransport {
-    async fn send_request(&self, id: u64, line: String) -> Result<JsonRpcIncoming> {
-        let resp = self.post(line).await?;
+    async fn send_request(
+        &self,
+        id: u64,
+        line: String,
+        limit: Duration,
+    ) -> Result<JsonRpcIncoming> {
+        let resp = self.post(line, limit).await?;
         let status = resp.status();
         // サーバが割り当てたセッション ID を引き継ぐ。
         if let Some(sid) = resp.headers().get(SESSION_HEADER)
@@ -339,7 +356,7 @@ impl Transport for HttpTransport {
     }
 
     async fn send_notification(&self, line: String) -> Result<()> {
-        let resp = self.post(line).await?;
+        let resp = self.post(line, REQUEST_TIMEOUT).await?;
         if let Some(sid) = resp.headers().get(SESSION_HEADER)
             && let Ok(s) = sid.to_str()
         {

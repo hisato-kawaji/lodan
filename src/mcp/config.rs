@@ -174,18 +174,37 @@ impl McpServersConfig {
     }
 }
 
-/// `lodan mcp add` / `remove` が書く 1 件ぶんの設定 (JSON のまま扱い、他のキーは保つ)。
+/// `lodan mcp add` が書く 1 件ぶんの設定。JSON のまま扱い、ファイルの他のキーも、**同名サーバの
+/// 既存のキー** (`headers` / `env` / `allowSampling` / `enabledTools` …) も保つ。`spec` にあるキー
+/// だけを上書きし、transport を変えるとき (`command` ↔ `url`) は古い側の transport キーを外す。
 pub fn upsert_server(path: &Path, name: &str, spec: serde_json::Value) -> Result<()> {
     let mut root = read_json_or_empty(path)?;
     let servers = root
         .as_object_mut()
         .context("mcp.json is not a JSON object")?
         .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}));
-    servers
+        .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .context("`mcpServers` is not a JSON object")?
-        .insert(name.to_string(), spec);
+        .context("`mcpServers` is not a JSON object")?;
+    let entry = servers
+        .entry(name.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(existing) = entry.as_object_mut() else {
+        anyhow::bail!("`mcpServers.{name}` is not a JSON object");
+    };
+    let Some(new) = spec.as_object() else {
+        anyhow::bail!("server spec must be a JSON object");
+    };
+    if new.contains_key("command") {
+        existing.remove("url");
+    }
+    if new.contains_key("url") {
+        existing.remove("command");
+        existing.remove("args");
+    }
+    for (k, v) in new {
+        existing.insert(k.clone(), v.clone());
+    }
     write_json(path, &root)
 }
 
@@ -216,8 +235,20 @@ fn write_json(path: &Path, root: &serde_json::Value) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(root)?;
-    std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))
+    std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+    // `headers` / `env` に秘密が入る。transcript と同じく本人だけが読める形に (unix のみ)。
+    restrict_private(path);
+    Ok(())
 }
+
+#[cfg(unix)]
+fn restrict_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_private(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -266,6 +297,41 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["note"], "keep me");
+        // 同名を add し直しても、他のキー (headers / allowSampling) は残る。transport を変えたら古い側は外す。
+        std::fs::write(
+            &path,
+            r#"{ "mcpServers": { "web": { "url": "http://h/mcp", "headers": { "Authorization": "Bearer t" }, "allowSampling": true } } }"#,
+        )
+        .unwrap();
+        upsert_server(&path, "web", serde_json::json!({ "url": "http://h/mcp2" })).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["mcpServers"]["web"]["url"], "http://h/mcp2");
+        assert_eq!(
+            raw["mcpServers"]["web"]["headers"]["Authorization"],
+            "Bearer t"
+        );
+        assert_eq!(raw["mcpServers"]["web"]["allowSampling"], true);
+        upsert_server(&path, "web", serde_json::json!({ "command": "local-mcp" })).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            raw["mcpServers"]["web"].get("url").is_none(),
+            "switching transport drops url"
+        );
+        assert_eq!(
+            raw["mcpServers"]["web"]["headers"]["Authorization"],
+            "Bearer t"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        upsert_server(&path, "fs", serde_json::json!({ "command": "npx" })).unwrap();
         assert!(remove_server(&path, "fs").unwrap());
         assert!(!remove_server(&path, "fs").unwrap());
         let cfg = McpServersConfig::load_from(&path).unwrap().unwrap();

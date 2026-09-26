@@ -495,7 +495,8 @@ network = false            # 既定 true。false でサンドボックス内か�
 - **サーバ別の設定**（`.mcp.json` の各サーバに書く）:
   - `"trustAnnotations": true` — ツールの `annotations.readOnlyHint: true` を信じて、そのツールを**非破壊**（承認ゲートを通さず、plan モードでも使える）にする。ヒントはサーバの自己申告なので既定 false。信頼するサーバだけ
   - `"enabledTools": ["read_file"]` / `"disabledTools": ["delete"]` — 取り込むツールを絞る（`disabledTools` が優先）。使わないツールの定義でコンテキストを食わない
-  - `"toolTimeoutSecs": 60` / `"maxOutputBytes": 65536` — 1 回の呼び出しの上限と、結果をモデルに渡す上限（超えた分は切って注記）。既定はこの値
+  - `"toolTimeoutSecs": 60` / `"maxOutputBytes": 65536` — 1 回の呼び出しの上限（transport の待ち時間もこの値になる。handshake や `tools/list` は従来どおり 30 秒）と、結果をモデルに渡す上限（超えた分は切って注記）。既定はこの値。`read_resource` には掛からない
+- `lodan mcp add` は同名サーバの既存のキー（`headers` / `env` / `allowSampling` …）を保ち、渡したキーだけ上書きする（`--command` ↔ `--url` で transport を変えると古い側は外す）。user スコープの `mcp.json` は `0600` で書く。`enabledTools` にサーバに無い名前があれば起動時に警告
 
 
 ```json

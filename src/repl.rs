@@ -334,11 +334,12 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                         "no memory files (LODAN.md / CLAUDE.md / AGENTS.md in the cwd hierarchy, ~/.lodan/LODAN.md)"
                     );
                 }
+                // パスは clone したリポジトリの中の名前かもしれない。端末に出す前に無害化する。
                 for s in &loaded.sources {
                     let via = s.imported_from.as_ref().map_or(String::new(), |f| {
-                        format!("  (imported from {})", f.display())
+                        format!("  (imported from {})", crate::trust::shown(f))
                     });
-                    println!("{} — {} bytes{via}", s.path.display(), s.bytes);
+                    println!("{} — {} bytes{via}", crate::trust::shown(&s.path), s.bytes);
                 }
                 if !loaded.sources.is_empty() {
                     println!(

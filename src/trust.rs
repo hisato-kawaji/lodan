@@ -8,7 +8,7 @@
 //! - `.env` — `LODAN_BASE_URL` / `LODAN_PERMISSION_MODE=bypass` / `LODAN_TRUST=1` のように、
 //!   環境変数で渡せる設定は全部ここから渡せる (だから信頼の判断より後に読む)
 //! - `.mcp.json` — 任意のプロセスを起動する
-//! - `.lodan/commands` / `.lodan/skills` / `LODAN.md` / `CLAUDE.md` — モデルへの指示を差し込む
+//! - `.lodan/commands` / `.lodan/skills` / `LODAN.md` / `CLAUDE.md` / `AGENTS.md` — モデルへの指示を差し込む
 //!
 //! clone してきたリポジトリで `lodan` を起動するだけでこれらが効くのは危ない。信頼済みの
 //! ディレクトリ (とその配下) でだけ読む。信頼の記録はユーザの設定ディレクトリに置くので、
@@ -48,9 +48,13 @@ pub fn shown(path: &Path) -> String {
     crate::term::sanitize(&path.display().to_string()).into_owned()
 }
 
+/// メモリとして読まれるファイル名。`crate::memory` の探索と必ず揃えること — ここに無い名前は
+/// 信頼の確認をすり抜けて system prompt に入る (#125 のレビューで `AGENTS.md` が抜けていた)。
+pub const MEMORY_FILES: &[&str] = &["LODAN.md", "CLAUDE.md", "AGENTS.md"];
+
 /// 信頼が要るファイル (表示用の名前)。cwd にあるものに加えて、メモリは cwd の祖先 (ホームまで)
-/// からも読まれるので、祖先の `LODAN.md` / `CLAUDE.md` も含める — そうしないと、何も無い
-/// サブディレクトリから起動したときに、尋ねないまま親のメモリを読んでしまう。
+/// からも読まれるので、祖先の `LODAN.md` / `CLAUDE.md` / `AGENTS.md` も含める — そうしないと、
+/// 何も無いサブディレクトリから起動したときに、尋ねないまま親のメモリを読んでしまう。
 pub fn project_files(cwd: &Path) -> Vec<String> {
     const CANDIDATES: &[&str] = &[
         ".env",
@@ -61,6 +65,7 @@ pub fn project_files(cwd: &Path) -> Vec<String> {
         ".lodan/skills",
         "LODAN.md",
         "CLAUDE.md",
+        "AGENTS.md",
     ];
     let mut found: Vec<String> = CANDIDATES
         .iter()
@@ -73,7 +78,7 @@ pub fn project_files(cwd: &Path) -> Vec<String> {
         if home.as_deref() == Some(dir) {
             break;
         }
-        for name in ["LODAN.md", "CLAUDE.md"] {
+        for name in MEMORY_FILES {
             if dir.join(name).exists() {
                 found.push(shown(&dir.join(name)));
             }
@@ -287,6 +292,20 @@ mod tests {
         let (trusted, shown) = ask(dir.path(), &store, true, false, "");
         assert!(trusted);
         assert!(shown.is_empty());
+    }
+
+    /// メモリの探索と trust の候補が揃っていること。片方に名前を足して片方を忘れると、
+    /// その名前のファイルだけのリポジトリが尋ねられずに信頼される。
+    #[test]
+    fn every_memory_file_name_needs_trust() {
+        for name in crate::memory::PROJECT_FILES {
+            assert!(
+                MEMORY_FILES.contains(name),
+                "{name} is read as memory but not trust-gated"
+            );
+        }
+        let dir = project(&["AGENTS.md"]);
+        assert_eq!(project_files(dir.path()), ["AGENTS.md"]);
     }
 
     #[test]

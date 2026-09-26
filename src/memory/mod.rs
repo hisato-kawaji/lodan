@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 pub const MEMORY_CAP: usize = 32 * 1024;
 
 /// 各ディレクトリで優先的に探すファイル名（先にヒットしたものを採用）。`AGENTS.md` は Codex の
-/// 標準で、Claude Code も `CLAUDE.md` が無ければ読む。
-const PROJECT_FILES: &[&str] = &["LODAN.md", "CLAUDE.md", "AGENTS.md"];
+/// 標準で、Claude Code も `CLAUDE.md` が無ければ読む。`crate::trust::MEMORY_FILES` と揃える
+/// (テストで固定)。
+pub const PROJECT_FILES: &[&str] = &["LODAN.md", "CLAUDE.md", "AGENTS.md"];
 
 /// `@path` の最大ホップ数 (Claude Code と同じ)。
 pub const MAX_IMPORT_DEPTH: usize = 4;
@@ -473,6 +474,26 @@ mod tests {
         assert!(!m.text.contains("TOP SECRET"), "{}", m.text);
         assert_eq!(m.warnings.len(), 2, "{:?}", m.warnings);
         assert!(m.warnings[0].contains("outside"));
+    }
+
+    /// 未信頼の cwd では、ユーザー自身の `~/.lodan/LODAN.md` からでも cwd 配下は取り込めない。
+    #[test]
+    fn an_untrusted_cwd_cannot_be_imported_even_from_the_users_own_memory() {
+        let home = tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".lodan")).unwrap();
+        let cwd = home.path().join("work/repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(cwd.join("notes.md"), "REPO NOTES").unwrap();
+        fs::write(
+            home.path().join(".lodan/LODAN.md"),
+            format!("mine\n@{}\n", cwd.join("notes.md").display()),
+        )
+        .unwrap();
+        let untrusted = load_memory_with(&cwd, Some(home.path()), false);
+        assert!(!untrusted.text.contains("REPO NOTES"), "{}", untrusted.text);
+        assert!(untrusted.warnings.iter().any(|w| w.contains("outside")));
+        let trusted = load_memory_with(&cwd, Some(home.path()), true);
+        assert!(trusted.text.contains("REPO NOTES"));
     }
 
     #[test]

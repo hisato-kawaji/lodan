@@ -121,7 +121,8 @@ pub fn parse_rule(path: &Path, content: &str) -> Result<Rule, String> {
     if body.trim().is_empty() {
         return Err("empty rule body".into());
     }
-    let has_paths_key = front.is_some_and(|f| f.lines().any(|l| l.starts_with("paths:")));
+    let has_paths_key =
+        front.is_some_and(|f| f.lines().any(|l| l.trim_start().starts_with("paths:")));
     let patterns = front.map(parse_paths).unwrap_or_default();
     // `paths:` を書いたのに空なら、書き損じ。全ファイルに当てるより止めるほうが安全。
     if has_paths_key && patterns.is_empty() {
@@ -245,6 +246,7 @@ mod tests {
         let p = Path::new("/w/.lodan/rules/x.md");
         assert!(parse_rule(p, "---\npaths: []\n---\nbody").is_err());
         assert!(parse_rule(p, "---\npaths:\n---\nbody").is_err());
+        assert!(parse_rule(p, "---\n  paths: []\n---\nbody").is_err(), "indented key");
         assert!(
             parse_rule(p, "---\nname: x\n---\nbody").is_ok(),
             "no key = every file"

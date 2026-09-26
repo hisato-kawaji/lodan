@@ -812,7 +812,7 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 - 中身が空（空白のみ）のファイルは無視する。
 - cwd が `$HOME` 配下なら遡上は `$HOME` で打ち切る。cwd が home 外（例 `/opt/proj`）の場合は filesystem root まで遡る（Claude Code と同じ挙動）。
 
-- **path-scoped ルール**（`.lodan/rules/*.md`）: frontmatter の `paths:` に一致するファイルを Read / Write / Edit / MultiEdit / NotebookEdit したとき、**その tool_result の後ろに 1 回だけ**本文を足す（system prompt には常駐させない — 小型モデルのコンテキストを圧迫しないため）。`paths: ["src/**/*.rs", "*.toml"]` / `paths: src/**, docs/*.md` / YAML のリスト、の 3 通り。`/` の無いパターンはどの階層のファイル名にも一致（権限ルールと同じ）。`paths:` が無ければ全てのファイル。cwd の外のファイルには一致しない。1 ルールはセッション中 1 回だけ注入され、失敗した呼び出し（存在しないパスなど）には足さない。読むのは**信頼済みディレクトリ**の cwd 直下 `.lodan/rules/` だけ（trust の候補にも入る）。ルールはセッション開始時に読まれ、セッション中にファイルを変えても次の起動まで反映されない（`/memory` はディスクの現在値を表示する）。注入は `<path-rules source="…">` … `</path-rules>` で囲み、本文中の閉じタグは潰す。`--log-jsonl` に `rule_injected` が残り、`tool_result` の `output_bytes` はルールを含んだ大きさ
+- **path-scoped ルール**（`.lodan/rules/*.md`）: frontmatter の `paths:` に一致するファイルを Read / Write / Edit / MultiEdit / NotebookEdit したとき、**その tool_result の後ろに 1 回だけ**本文を足す（system prompt には常駐させない — 小型モデルのコンテキストを圧迫しないため）。`paths: ["src/**/*.rs", "*.toml"]` / `paths: src/**, docs/*.md` / YAML のリスト、の 3 通り。`/` の無いパターンはどの階層のファイル名にも一致（権限ルールと同じ）。`paths:` が無ければ全てのファイル。cwd の外のファイルには一致しない。1 ルールはセッション中 1 回だけ注入され、失敗した呼び出し（存在しないパスなど）には足さない。読むのは**信頼済みディレクトリ**の cwd 直下 `.lodan/rules/` だけ（trust の候補にも入る）。`Task` のサブエージェントの Read / Edit には乗らない（子は親の履歴を持たないため）。ルールはセッション開始時に読まれ、セッション中にファイルを変えても次の起動まで反映されない（`/memory` はディスクの現在値を表示する）。注入は `<path-rules source="…">` … `</path-rules>` で囲み、本文中の閉じタグは潰す。`--log-jsonl` に `rule_injected` が残り、`tool_result` の `output_bytes` はルールを含んだ大きさ
 
 ```markdown
 <!-- .lodan/rules/rust.md -->

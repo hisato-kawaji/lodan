@@ -366,6 +366,19 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
                 for w in &loaded.warnings {
                     println!("warning: {}", crate::term::sanitize(w));
                 }
+                let rules = crate::memory::rules::load_rules(&runtime.cwd);
+                for r in &rules {
+                    println!(
+                        "rule {} — paths: {}  ({} bytes, injected when a matching file is read or edited)",
+                        r.path.display(),
+                        if r.patterns.is_empty() {
+                            "(all)".to_string()
+                        } else {
+                            crate::term::sanitize(&r.patterns.join(", ")).into_owned()
+                        },
+                        r.body.len()
+                    );
+                }
                 continue;
             }
 

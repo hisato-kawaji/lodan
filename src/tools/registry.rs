@@ -66,11 +66,17 @@ impl ToolRegistry {
         let unknown = self.restrict(profile, explicit);
         self.deferred.clear();
         if tool_search {
+            // `readonly` が隠すのは破壊的だからで、読み込ませてよいものではない。遅延にもしない
+            // (「readonly では破壊的ツールは実行されない」を tool_search が覆さない)。
+            let readonly = profile == crate::config::ToolProfile::Readonly && explicit.is_empty();
             let hidden_or_mcp: Vec<String> = self
                 .tools
-                .keys()
-                .filter(|n| !self.is_visible(n) || n.starts_with(MCP_PREFIX))
-                .cloned()
+                .iter()
+                .filter(|(n, t)| {
+                    (!self.is_visible(n) || n.starts_with(MCP_PREFIX))
+                        && !(readonly && t.is_destructive())
+                })
+                .map(|(n, _)| n.clone())
                 .collect();
             if let Some(visible) = &mut self.visible {
                 visible.retain(|n| !n.starts_with(MCP_PREFIX));
@@ -185,11 +191,16 @@ impl ToolRegistry {
     pub fn search_deferred(&self, query: &str) -> Vec<Arc<dyn Tool>> {
         let query = query.trim();
         let mut hits: Vec<Arc<dyn Tool>> = if let Some(names) = query.strip_prefix("select:") {
+            // 名前は大文字小文字を区別しない (小型モデルは `todowrite` と書きがち)。
             names
                 .split(',')
                 .map(str::trim)
-                .filter(|n| self.deferred.contains(*n))
-                .filter_map(|n| self.tools.get(n).cloned())
+                .filter_map(|want| {
+                    self.deferred
+                        .iter()
+                        .find(|n| n.eq_ignore_ascii_case(want))
+                        .and_then(|n| self.tools.get(n).cloned())
+                })
                 .collect()
         } else {
             let needles: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
@@ -498,6 +509,34 @@ mod tests {
         r.apply_profile(crate::config::ToolProfile::Core, &[]);
         assert!(r.deferred_names().is_empty());
         assert!(r.tool_search_spec().is_none());
+    }
+
+    /// `readonly` が隠した破壊的ツールは、`tool_search` でも読み込めない (#120 のレビュー)。
+    #[test]
+    fn readonly_profile_never_defers_destructive_tools() {
+        let mut r = default_registry();
+        r.register(dyn_tool("mcp__fs__write", "Write a file over MCP"));
+        r.apply_profile_with_search(crate::config::ToolProfile::Readonly, &[], true);
+        assert!(!r.is_visible("Write") && !r.is_deferred("Write"));
+        assert!(
+            !r.is_deferred("mcp__fs__write"),
+            "MCP tools are destructive"
+        );
+        assert!(r.search_deferred("select:Write").is_empty());
+        assert!(
+            r.tool_search_spec().is_none(),
+            "nothing to load, so no ToolSearch: {:?}",
+            r.deferred_names()
+        );
+    }
+
+    #[test]
+    fn select_ignores_case() {
+        let mut r = default_registry();
+        r.apply_profile_with_search(crate::config::ToolProfile::Core, &[], true);
+        let hits = r.search_deferred("select:todowrite");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name(), "TodoWrite");
     }
 
     #[test]

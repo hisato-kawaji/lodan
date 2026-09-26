@@ -450,9 +450,10 @@ impl Session {
                         plan_just_approved = true;
                     }
                     out
-                } else if name == TOOL_SEARCH {
+                } else if name == TOOL_SEARCH && self.registry.tool_search_spec().is_some() {
                     // registry 外の擬似ツール。遅延ツールの定義を返し、以後のリクエストに載せる (#72)。
                     // 読み込むだけで何も実行しないので、承認ゲートも hook も通さない。
+                    // 見せていないのに呼ばれた (名前を覚えていた) ときは、普通の unknown_tool。
                     let out = self.handle_tool_search(&args);
                     if out.is_error {
                         reason = "tool_search_miss";
@@ -1480,7 +1481,6 @@ pub(crate) fn looks_like_malformed_tool_call(text: &str) -> bool {
     false
 }
 
-/// ExitPlanMode の spec (Plan モード中のみ LLM へ提示)。
 impl Session {
     /// `ToolSearch`: 問い合わせに合う遅延ツールを読み込み、その定義を返す。
     fn handle_tool_search(&mut self, args: &serde_json::Value) -> ToolOutput {
@@ -1516,6 +1516,7 @@ impl Session {
     }
 }
 
+/// ExitPlanMode の spec (Plan モード中のみ LLM へ提示)。
 fn exit_plan_mode_spec() -> crate::agent::messages::ToolSpec<'static> {
     crate::agent::messages::ToolSpec {
         kind: "function",

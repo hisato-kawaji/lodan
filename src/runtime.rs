@@ -152,7 +152,14 @@ impl Runtime {
                 registry.all_names().join(", ")
             );
         }
-        let spec_bytes = serde_json::to_string(&registry.tool_specs()).map_or(0, |s| s.len());
+        // 毎リクエスト送る定義の大きさ。ToolSearch を見せるならその分も入る (遅延ロードの固定費)。
+        let mut specs = registry.tool_specs();
+        specs.extend(registry.tool_search_spec());
+        let spec_bytes = serde_json::to_string(&specs).map_or(0, |s| s.len());
+        let tool_search_bytes = registry
+            .tool_search_spec()
+            .and_then(|s| serde_json::to_string(&s).ok())
+            .map_or(0, |s| s.len());
         crate::runlog::record(
             "tools",
             serde_json::json!({
@@ -162,6 +169,7 @@ impl Runtime {
                 "deferred": registry.deferred_names(),
                 "registered": registry.registered_len(),
                 "spec_bytes": spec_bytes,
+                "tool_search_bytes": tool_search_bytes,
             }),
         );
         if registry.len() < registry.registered_len() {

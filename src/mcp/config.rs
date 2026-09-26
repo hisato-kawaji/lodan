@@ -45,6 +45,45 @@ pub struct McpServerSpec {
     /// 既定は false。信頼するサーバのみ明示的に opt-in する。
     #[serde(default, rename = "allowSampling")]
     pub allow_sampling: bool,
+    /// ツールの `annotations.readOnlyHint` を信じて、承認ゲートを通さずに実行するか (#83)。
+    /// ヒントはサーバの自己申告なので既定 false。信頼するサーバだけ opt-in する。
+    #[serde(default, rename = "trustAnnotations")]
+    pub trust_annotations: bool,
+    /// 取り込むツール名 (upstream の名前)。空なら全部。
+    #[serde(default, rename = "enabledTools")]
+    pub enabled_tools: Vec<String>,
+    /// 取り込まないツール名。`enabledTools` より優先。
+    #[serde(default, rename = "disabledTools")]
+    pub disabled_tools: Vec<String>,
+    /// ツール 1 回の呼び出しの上限秒。既定 `DEFAULT_TOOL_TIMEOUT_SECS`。
+    #[serde(default, rename = "toolTimeoutSecs")]
+    pub tool_timeout_secs: Option<u64>,
+    /// ツール結果をモデルに渡す上限バイト。既定 `DEFAULT_MAX_OUTPUT_BYTES`。超えた分は切る。
+    #[serde(default, rename = "maxOutputBytes")]
+    pub max_output_bytes: Option<usize>,
+}
+
+/// MCP ツール 1 回の呼び出しの既定上限。
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 60;
+/// MCP ツール結果の既定上限 (バイト)。ツール出力はそのままコンテキストを食うので、無制限にしない。
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+impl McpServerSpec {
+    /// このサーバのツール `name` を取り込むか。
+    pub fn tool_enabled(&self, name: &str) -> bool {
+        if self.disabled_tools.iter().any(|d| d == name) {
+            return false;
+        }
+        self.enabled_tools.is_empty() || self.enabled_tools.iter().any(|e| e == name)
+    }
+
+    pub fn tool_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.tool_timeout_secs.unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS))
+    }
+
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+    }
 }
 
 impl McpServerSpec {
@@ -67,6 +106,29 @@ pub enum Transport<'a> {
     Http { url: &'a str },
 }
 
+/// どのスコープの設定ファイルか (#83)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// `<config_dir>/mcp.json` (ユーザー全体。`config.toml` と同じ場所)。
+    User,
+    /// `<cwd>/.mcp.json` (プロジェクト。信頼済みのときだけ読む)。
+    Project,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::User => "user",
+            Scope::Project => "project",
+        }
+    }
+}
+
+/// ユーザー全体の `mcp.json` の場所。
+pub fn user_mcp_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "lodan").map(|d| d.config_dir().join("mcp.json"))
+}
+
 impl McpServersConfig {
     /// Read `$CWD/.mcp.json` if it exists. Returns `Ok(None)` when absent.
     pub fn load_from_cwd() -> Result<Option<Self>> {
@@ -76,6 +138,28 @@ impl McpServersConfig {
         }
         let cwd = std::env::current_dir().context("getting cwd")?;
         Self::load_from(&cwd.join(".mcp.json"))
+    }
+
+    /// ユーザー全体 + プロジェクト (信頼済みのときだけ) を合成する。同名はプロジェクトが勝つ。
+    /// 戻り値の第 2 要素は、各サーバがどのスコープから来たか。
+    pub fn load_effective() -> Result<(Self, BTreeMap<String, Scope>)> {
+        let mut merged = McpServersConfig::default();
+        let mut scopes = BTreeMap::new();
+        if let Some(path) = user_mcp_path()
+            && let Some(user) = Self::load_from(&path)?
+        {
+            for (name, spec) in user.mcp_servers {
+                scopes.insert(name.clone(), Scope::User);
+                merged.mcp_servers.insert(name, spec);
+            }
+        }
+        if let Some(project) = Self::load_from_cwd()? {
+            for (name, spec) in project.mcp_servers {
+                scopes.insert(name.clone(), Scope::Project);
+                merged.mcp_servers.insert(name, spec);
+            }
+        }
+        Ok((merged, scopes))
     }
 
     pub fn load_from(path: &Path) -> Result<Option<Self>> {
@@ -90,9 +174,216 @@ impl McpServersConfig {
     }
 }
 
+/// `lodan mcp add` が書く 1 件ぶんの設定。JSON のまま扱い、ファイルの他のキーも、**同名サーバの
+/// 既存のキー** (`headers` / `env` / `allowSampling` / `enabledTools` …) も保つ。`spec` にあるキー
+/// だけを上書きし、transport を変えるとき (`command` ↔ `url`) は古い側の transport キーを外す。
+/// `upsert_server` が既存エントリに対してしたこと (`add` の出力用)。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Upsert {
+    /// 渡さなかったのに残したキー。
+    pub kept: Vec<String>,
+    /// 外したキー (transport の切り替え、ホストの変更)。
+    pub dropped: Vec<String>,
+}
+
+/// URL のホスト部分 (scheme + host + port)。`headers` を持ち回ってよいかの判定に使う。
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split('/').next()?;
+    Some(format!("{scheme}://{host}"))
+}
+
+pub fn upsert_server(path: &Path, name: &str, spec: serde_json::Value) -> Result<Upsert> {
+    let mut root = read_json_or_empty(path)?;
+    let servers = root
+        .as_object_mut()
+        .context("mcp.json is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("`mcpServers` is not a JSON object")?;
+    let entry = servers
+        .entry(name.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(existing) = entry.as_object_mut() else {
+        anyhow::bail!("`mcpServers.{name}` is not a JSON object");
+    };
+    let Some(new) = spec.as_object() else {
+        anyhow::bail!("server spec must be a JSON object");
+    };
+    let mut report = Upsert::default();
+    let mut drop = |existing: &mut serde_json::Map<String, serde_json::Value>, key: &str| {
+        if existing.remove(key).is_some() {
+            report.dropped.push(key.to_string());
+        }
+    };
+    if new.contains_key("command") {
+        drop(existing, "url");
+        // ヘッダは HTTP のもの。stdio に変えたら要らない。
+        drop(existing, "headers");
+    }
+    if let Some(url) = new.get("url").and_then(|u| u.as_str()) {
+        drop(existing, "command");
+        drop(existing, "args");
+        // 別のホストに変えたら、前のホスト向けの Authorization を新しいホストへ送らない。
+        let old_origin = existing
+            .get("url")
+            .and_then(|u| u.as_str())
+            .and_then(origin_of);
+        if old_origin.is_some() && old_origin != origin_of(url) {
+            drop(existing, "headers");
+        }
+    }
+    for (k, v) in new {
+        existing.insert(k.clone(), v.clone());
+    }
+    report.kept = existing
+        .keys()
+        .filter(|k| !new.contains_key(*k))
+        .cloned()
+        .collect();
+    write_json(path, &root)?;
+    Ok(report)
+}
+
+/// `remove`: 無ければ `Ok(false)`。
+pub fn remove_server(path: &Path, name: &str) -> Result<bool> {
+    let mut root = read_json_or_empty(path)?;
+    let removed = root
+        .get_mut("mcpServers")
+        .and_then(|s| s.as_object_mut())
+        .and_then(|s| s.remove(name))
+        .is_some();
+    if removed {
+        write_json(path, &root)?;
+    }
+    Ok(removed)
+}
+
+fn read_json_or_empty(path: &Path) -> Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn write_json(path: &Path, root: &serde_json::Value) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let text = serde_json::to_string_pretty(root)?;
+    std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+    // `headers` / `env` に秘密が入る。transcript と同じく本人だけが読める形に (unix のみ)。
+    restrict_private(path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_private(_path: &Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_server_knobs_parse_and_default() {
+        let s = r#"{ "mcpServers": { "a": {
+            "command": "x", "trustAnnotations": true,
+            "enabledTools": ["read", "list"], "disabledTools": ["list"],
+            "toolTimeoutSecs": 5, "maxOutputBytes": 100 } } }"#;
+        let cfg: McpServersConfig = serde_json::from_str(s).unwrap();
+        let a = &cfg.mcp_servers["a"];
+        assert!(a.trust_annotations);
+        assert!(a.tool_enabled("read"));
+        assert!(!a.tool_enabled("list"), "disabled wins over enabled");
+        assert!(!a.tool_enabled("other"), "not in enabledTools");
+        assert_eq!(a.tool_timeout().as_secs(), 5);
+        assert_eq!(a.max_output_bytes(), 100);
+        let plain: McpServersConfig =
+            serde_json::from_str(r#"{ "mcpServers": { "b": { "command": "x" } } }"#).unwrap();
+        let b = &plain.mcp_servers["b"];
+        assert!(!b.trust_annotations && b.tool_enabled("anything"));
+        assert_eq!(b.tool_timeout().as_secs(), DEFAULT_TOOL_TIMEOUT_SECS);
+        assert_eq!(b.max_output_bytes(), DEFAULT_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn upsert_and_remove_keep_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/mcp.json");
+        upsert_server(
+            &path,
+            "fs",
+            serde_json::json!({ "command": "npx", "args": ["x"] }),
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "note": "keep me", "mcpServers": { "fs": { "command": "npx", "args": ["x"] } } }"#,
+        )
+        .unwrap();
+        upsert_server(&path, "web", serde_json::json!({ "url": "http://h/mcp" })).unwrap();
+        let cfg = McpServersConfig::load_from(&path).unwrap().unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 2);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["note"], "keep me");
+        // 同名を add し直しても、他のキー (headers / allowSampling) は残る。transport を変えたら古い側は外す。
+        std::fs::write(
+            &path,
+            r#"{ "mcpServers": { "web": { "url": "http://h/mcp", "headers": { "Authorization": "Bearer t" }, "allowSampling": true } } }"#,
+        )
+        .unwrap();
+        upsert_server(&path, "web", serde_json::json!({ "url": "http://h/mcp2" })).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["mcpServers"]["web"]["url"], "http://h/mcp2");
+        assert_eq!(
+            raw["mcpServers"]["web"]["headers"]["Authorization"],
+            "Bearer t"
+        );
+        assert_eq!(raw["mcpServers"]["web"]["allowSampling"], true);
+        // 別ホストへ変えたら headers は落ちる (同じホストのパス違いなら残る)。
+        let r = upsert_server(
+            &path,
+            "web",
+            serde_json::json!({ "url": "http://other/mcp" }),
+        )
+        .unwrap();
+        assert_eq!(r.dropped, ["headers"]);
+        assert!(r.kept.contains(&"allowSampling".to_string()));
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["mcpServers"]["web"].get("headers").is_none(), "{raw}");
+        let r = upsert_server(&path, "web", serde_json::json!({ "command": "local-mcp" })).unwrap();
+        assert!(r.dropped.contains(&"url".to_string()));
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            raw["mcpServers"]["web"].get("url").is_none(),
+            "switching transport drops url"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        upsert_server(&path, "fs", serde_json::json!({ "command": "npx" })).unwrap();
+        assert!(remove_server(&path, "fs").unwrap());
+        assert!(!remove_server(&path, "fs").unwrap());
+        let cfg = McpServersConfig::load_from(&path).unwrap().unwrap();
+        assert_eq!(cfg.mcp_servers.keys().collect::<Vec<_>>(), ["web"]);
+    }
 
     #[test]
     fn parses_minimal_config() {

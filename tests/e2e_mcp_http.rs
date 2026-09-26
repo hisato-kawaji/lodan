@@ -68,6 +68,11 @@ async fn http_handshake_list_and_call_round_trip() {
         url: Some(format!("http://127.0.0.1:{port}/")),
         headers: BTreeMap::new(),
         allow_sampling: false,
+        trust_annotations: false,
+        enabled_tools: Vec::new(),
+        disabled_tools: Vec::new(),
+        tool_timeout_secs: None,
+        max_output_bytes: None,
     };
 
     let client = McpClient::connect("mock-http", &spec, None)

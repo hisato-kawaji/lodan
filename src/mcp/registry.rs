@@ -23,6 +23,43 @@ pub struct SamplingContext {
     pub model: String,
 }
 
+/// サーバの公開ツールを lodan のツールに包む。`enabledTools` / `disabledTools` で絞り、
+/// `trustAnnotations` のサーバでは `readOnlyHint` を反映し、timeout と出力上限を付ける (#83)。
+pub fn wrap_tools(
+    server_name: &str,
+    spec: &crate::mcp::config::McpServerSpec,
+    tools: Vec<crate::mcp::protocol::McpToolMeta>,
+    client: &Arc<McpClient>,
+) -> Vec<McpTool> {
+    // `enabledTools` の綴り違いは黙って 0 個になるので、知らせる。
+    for wanted in &spec.enabled_tools {
+        if !tools.iter().any(|t| &t.name == wanted) {
+            eprintln!(
+                "{}",
+                crate::term::sanitize(&format!(
+                    "mcp[{server_name}]: enabledTools names `{wanted}`, but the server has no such tool"
+                ))
+            );
+        }
+    }
+    tools
+        .into_iter()
+        .filter(|meta| spec.tool_enabled(&meta.name))
+        .map(|meta| {
+            let full = namespaced(server_name, &meta.name);
+            let desc = meta.description.unwrap_or_default();
+            let schema = meta.input_schema.unwrap_or(serde_json::json!({}));
+            let tool = McpTool::new(full, meta.name, desc, schema, Arc::clone(client))
+                .with_limits(spec.tool_timeout(), spec.max_output_bytes());
+            if spec.trust_annotations {
+                tool.with_annotations(meta.annotations.as_ref())
+            } else {
+                tool
+            }
+        })
+        .collect()
+}
+
 /// Load `.mcp.json` from CWD, connect each server, and register their tools.
 /// Returns the live clients so the caller can keep them alive (Drop on session end).
 /// `sampling` を渡すと、allowSampling=true のサーバに sampling/createMessage を許可する。
@@ -30,10 +67,10 @@ pub async fn load_and_register(
     reg: &mut ToolRegistry,
     sampling: Option<SamplingContext>,
 ) -> Result<LoadOutcome> {
-    let cfg = match McpServersConfig::load_from_cwd()? {
-        Some(c) => c,
-        None => return Ok(LoadOutcome::default()),
-    };
+    let (cfg, _scopes) = McpServersConfig::load_effective()?;
+    if cfg.mcp_servers.is_empty() {
+        return Ok(LoadOutcome::default());
+    }
 
     let mut outcome = LoadOutcome::default();
     for (server_name, spec) in cfg.mcp_servers {
@@ -50,17 +87,8 @@ pub async fn load_and_register(
                 let client = Arc::new(client);
                 match client.list_tools().await {
                     Ok(tools) => {
-                        for meta in tools {
-                            let full = namespaced(&server_name, &meta.name);
-                            let desc = meta.description.unwrap_or_default();
-                            let schema = meta.input_schema.unwrap_or(serde_json::json!({}));
-                            reg.register(Arc::new(McpTool::new(
-                                full,
-                                meta.name,
-                                desc,
-                                schema,
-                                Arc::clone(&client),
-                            )));
+                        for tool in wrap_tools(&server_name, &spec, tools, &client) {
+                            reg.register(Arc::new(tool));
                             outcome.tools += 1;
                         }
                         outcome.servers += 1;

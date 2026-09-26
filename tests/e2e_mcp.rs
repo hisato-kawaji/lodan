@@ -31,6 +31,11 @@ async fn handshake_list_and_call_round_trip() {
         url: None,
         headers: BTreeMap::new(),
         allow_sampling: false,
+        trust_annotations: false,
+        enabled_tools: Vec::new(),
+        disabled_tools: Vec::new(),
+        tool_timeout_secs: None,
+        max_output_bytes: None,
     };
 
     let client = McpClient::connect("mock", &spec, None)
@@ -40,8 +45,8 @@ async fn handshake_list_and_call_round_trip() {
     let tools = client.list_tools().await.expect("list_tools");
     assert_eq!(
         tools.len(),
-        3,
-        "expected echo + get_roots + get_sample, got {tools:?}"
+        4,
+        "expected echo + get_roots + get_sample + sleep, got {tools:?}"
     );
     assert!(tools.iter().any(|t| t.name == "echo"));
 
@@ -141,6 +146,11 @@ async fn sampling_round_trip_when_opted_in() {
         url: None,
         headers: BTreeMap::new(),
         allow_sampling: true,
+        trust_annotations: false,
+        enabled_tools: Vec::new(),
+        disabled_tools: Vec::new(),
+        tool_timeout_secs: None,
+        max_output_bytes: None,
     };
 
     let sampling = Arc::new(SamplingProvider::new(
@@ -164,4 +174,85 @@ async fn sampling_round_trip_when_opted_in() {
         "expected the stub LLM reply to round-trip via sampling, got: {}",
         sample.content
     );
+}
+
+/// #83: `trustAnnotations` のサーバでだけ readOnlyHint が効き、enabled / disabled で絞れ、
+/// timeout と出力上限が呼び出しに掛かる。
+#[tokio::test]
+async fn annotations_filters_timeouts_and_output_caps_apply_per_server() {
+    use lodan::mcp::registry::wrap_tools;
+    use lodan::tools::{Tool, ToolCtx};
+    let base = McpServerSpec {
+        command: Some("python3".to_string()),
+        args: vec![fixture_script().to_string_lossy().into_owned()],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        allow_sampling: false,
+        trust_annotations: false,
+        enabled_tools: Vec::new(),
+        disabled_tools: Vec::new(),
+        tool_timeout_secs: None,
+        max_output_bytes: None,
+    };
+    let client = Arc::new(
+        McpClient::connect("mock", &base, None)
+            .await
+            .expect("connect"),
+    );
+    let tools = client.list_tools().await.expect("list_tools");
+
+    // 既定: 申告は信じない → echo も destructive。
+    let plain = wrap_tools("mock", &base, tools.clone(), &client);
+    let echo = plain
+        .iter()
+        .find(|t| t.name() == "mcp__mock__echo")
+        .unwrap();
+    assert!(echo.is_destructive() && !echo.is_read_only());
+
+    // trustAnnotations + 絞り込み + 上限。
+    let trusted = McpServerSpec {
+        trust_annotations: true,
+        enabled_tools: vec!["echo".into(), "sleep".into()],
+        disabled_tools: vec!["sleep".into()],
+        tool_timeout_secs: Some(1),
+        max_output_bytes: Some(100),
+        ..base.clone()
+    };
+    let wrapped = wrap_tools("mock", &trusted, tools.clone(), &client);
+    let names: Vec<&str> = wrapped.iter().map(|t| t.name()).collect();
+    assert_eq!(
+        names,
+        ["mcp__mock__echo"],
+        "disabled wins, others are not enabled"
+    );
+    assert!(wrapped[0].is_read_only() && !wrapped[0].is_destructive());
+
+    // timeout と出力上限は sleep で確かめる。
+    let limited = McpServerSpec {
+        tool_timeout_secs: Some(1),
+        max_output_bytes: Some(100),
+        ..base.clone()
+    };
+    let wrapped = wrap_tools("mock", &limited, tools, &client);
+    let sleep = wrapped
+        .iter()
+        .find(|t| t.name() == "mcp__mock__sleep")
+        .unwrap();
+    let ctx = ToolCtx::new(std::env::temp_dir());
+    let quick = sleep
+        .execute(serde_json::json!({ "ms": 0 }), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        quick.content.len() < 200 && quick.content.contains("truncated: 5000 bytes"),
+        "{}",
+        quick.content
+    );
+    let err = sleep
+        .execute(serde_json::json!({ "ms": 3000, "reply": "late" }), &ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("timed out after 1s"), "{err}");
 }

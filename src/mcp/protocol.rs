@@ -146,7 +146,7 @@ pub struct McpToolMeta {
     pub description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: Option<Value>,
-    #[allow(dead_code)]
+    /// `readOnlyHint` などのヒント。サーバの自己申告なので、`trustAnnotations` のサーバでだけ見る。
     #[serde(default)]
     pub annotations: Option<Value>,
 }

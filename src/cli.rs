@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::config::{Config, Provider};
@@ -176,6 +176,11 @@ pub enum Command {
     Repl,
     /// List saved sessions
     Sessions,
+    /// Manage MCP servers in ~/.config/lodan/mcp.json (user) or ./.mcp.json (project)
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCommand,
+    },
     /// Trust the current directory's project settings (or list / remove trusted directories)
     Trust {
         /// List trusted directories
@@ -187,10 +192,165 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// List configured servers (user + project) without connecting to them
+    List,
+    /// Add or replace a server (stdio with --command, or Streamable HTTP with --url)
+    Add {
+        name: String,
+        /// Command to spawn (stdio transport); remaining ARGS follow `--`
+        #[arg(long, conflicts_with = "url")]
+        command: Option<String>,
+        /// Streamable HTTP endpoint
+        #[arg(long, required_unless_present = "command")]
+        url: Option<String>,
+        /// Write to ~/.config/lodan/mcp.json instead of ./.mcp.json
+        #[arg(long)]
+        user: bool,
+        /// Trust the server's readOnlyHint annotations (read-only tools skip the approval gate)
+        #[arg(long)]
+        trust_annotations: bool,
+        /// Arguments for --command (after `--`)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Remove a server from ./.mcp.json (or ~/.config/lodan/mcp.json with --user)
+    Remove {
+        name: String,
+        #[arg(long)]
+        user: bool,
+    },
+}
+
+/// `lodan mcp …`。設定ファイルを読み書きするだけで、サーバには繋がない。
+fn manage_mcp(cmd: McpCommand) -> Result<()> {
+    use crate::mcp::config::{
+        McpServersConfig, Scope, remove_server, upsert_server, user_mcp_path,
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let path_for = |user: bool| -> Result<std::path::PathBuf> {
+        if user {
+            user_mcp_path().context("could not resolve the user config directory")
+        } else {
+            Ok(cwd.join(".mcp.json"))
+        }
+    };
+    match cmd {
+        McpCommand::List => {
+            let mut rows = Vec::new();
+            if let Some(path) = user_mcp_path()
+                && let Some(cfg) = McpServersConfig::load_from(&path)?
+            {
+                rows.extend(
+                    cfg.mcp_servers
+                        .into_iter()
+                        .map(|(n, s)| (Scope::User, n, s)),
+                );
+            }
+            // 一覧はファイルを読むだけ (プロセスは起動しない) ので、信頼の有無に関わらず出す。
+            if let Some(cfg) = McpServersConfig::load_from(&cwd.join(".mcp.json"))? {
+                rows.extend(
+                    cfg.mcp_servers
+                        .into_iter()
+                        .map(|(n, s)| (Scope::Project, n, s)),
+                );
+            }
+            if rows.is_empty() {
+                println!("no MCP servers configured (lodan mcp add <name> --command … | --url …)");
+                return Ok(());
+            }
+            for (scope, name, spec) in rows {
+                // 名前や URL は設定ファイル由来。ヘッダの値 (トークン) は出さない。
+                let target = match (&spec.command, &spec.url) {
+                    (Some(c), _) => format!("{c} {}", spec.args.join(" ")),
+                    (None, Some(u)) => u.clone(),
+                    _ => "(invalid: needs command or url)".to_string(),
+                };
+                let mut flags = Vec::new();
+                if spec.trust_annotations {
+                    flags.push("trustAnnotations".to_string());
+                }
+                if spec.allow_sampling {
+                    flags.push("allowSampling".to_string());
+                }
+                if !spec.enabled_tools.is_empty() {
+                    flags.push(format!("enabledTools={}", spec.enabled_tools.join(",")));
+                }
+                if !spec.disabled_tools.is_empty() {
+                    flags.push(format!("disabledTools={}", spec.disabled_tools.join(",")));
+                }
+                if !spec.headers.is_empty() {
+                    flags.push(format!("{} header(s)", spec.headers.len()));
+                }
+                println!(
+                    "{:<8} {}  {}{}",
+                    scope.as_str(),
+                    crate::term::sanitize(&name),
+                    crate::term::sanitize(target.trim_end()),
+                    if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{}]", flags.join(", "))
+                    }
+                );
+            }
+            Ok(())
+        }
+        McpCommand::Add {
+            name,
+            command,
+            url,
+            user,
+            trust_annotations,
+            args,
+        } => {
+            let mut spec = serde_json::Map::new();
+            match (command, url) {
+                (Some(c), _) => {
+                    spec.insert("command".into(), c.into());
+                    if !args.is_empty() {
+                        spec.insert("args".into(), args.into());
+                    }
+                }
+                (None, Some(u)) => {
+                    spec.insert("url".into(), u.into());
+                }
+                (None, None) => anyhow::bail!("give --command or --url"),
+            }
+            if trust_annotations {
+                spec.insert("trustAnnotations".into(), true.into());
+            }
+            let path = path_for(user)?;
+            let report = upsert_server(&path, &name, serde_json::Value::Object(spec))?;
+            println!("mcp: added {name} to {}", path.display());
+            if !report.kept.is_empty() {
+                println!("mcp: kept existing keys: {}", report.kept.join(", "));
+            }
+            if !report.dropped.is_empty() {
+                println!("mcp: dropped: {}", report.dropped.join(", "));
+            }
+            Ok(())
+        }
+        McpCommand::Remove { name, user } => {
+            let path = path_for(user)?;
+            if remove_server(&path, &name)? {
+                println!("mcp: removed {name} from {}", path.display());
+            } else {
+                println!("mcp: {name} is not in {}", path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
 /// 戻り値はプロセスの終了コード。
 pub async fn dispatch(args: Cli) -> Result<i32> {
     if let Some(Command::Trust { list, remove }) = &args.cmd {
         return manage_trust(*list, *remove).map(|()| 0);
+    }
+    if let Some(Command::Mcp { cmd }) = args.cmd {
+        return manage_mcp(cmd).map(|()| 0);
     }
     // プロジェクトのファイルを読むかどうかは、設定を読む前に決める (設定そのものが対象なので)。
     // バイナリでは main が `.env` を読む前に済ませている。ここは、それ以外の呼び出し元のための保険
@@ -275,7 +435,9 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Sessions => list_sessions().map(|()| 0),
-        Command::Trust { .. } => unreachable!("handled before the config is loaded"),
+        Command::Trust { .. } | Command::Mcp { .. } => {
+            unreachable!("handled before the config is loaded")
+        }
     }
 }
 
@@ -289,7 +451,10 @@ pub fn decide_project_trust(args: &Cli) {
         return;
     }
     // 信頼の管理と、プロジェクトのファイルを使わないサブコマンドでは尋ねない。読みもしない。
-    if matches!(args.cmd, Some(Command::Trust { .. } | Command::Sessions)) {
+    if matches!(
+        args.cmd,
+        Some(Command::Trust { .. } | Command::Sessions | Command::Mcp { .. })
+    ) {
         crate::trust::set_project_trusted(false);
         return;
     }

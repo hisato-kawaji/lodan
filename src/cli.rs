@@ -96,7 +96,7 @@ pub struct Cli {
     #[arg(long = "disallowed-tools", value_name = "RULE")]
     pub disallowed_tools: Vec<String>,
 
-    /// Trust this directory's project settings for this run only (.lodan/, .mcp.json, LODAN.md / CLAUDE.md)
+    /// Trust this directory's project settings for this run only (.lodan/, .mcp.json, LODAN.md / CLAUDE.md / AGENTS.md)
     #[arg(long, env = "LODAN_TRUST", value_parser = clap::builder::BoolishValueParser::new(), num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub trust: Option<bool>,
 

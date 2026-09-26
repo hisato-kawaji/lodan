@@ -186,7 +186,13 @@ fn expand_imports(
         }
         let mut shown = line.to_string();
         let mut bodies = String::new();
+        // 同じ行に同じ `@path` が 2 回あっても 1 回 (2 回目を循環と誤警告しない)。
+        let mut seen_in_line: Vec<&str> = Vec::new();
         for r in refs {
+            if seen_in_line.contains(&r) {
+                continue;
+            }
+            seen_in_line.push(r);
             shown = shown.replace(&format!("@{r}"), &format!("[import: {r}]"));
             let target = resolve_import(r, base, scope.home);
             let display = target.display().to_string();
@@ -453,6 +459,16 @@ mod tests {
         assert!(!m.text.contains("SHOULD NOT APPEAR"), "{}", m.text);
         assert!(m.text.contains("`@x.md`") && m.text.contains("me@x.md"));
         assert_eq!(m.sources.len(), 1);
+    }
+
+    #[test]
+    fn the_same_import_twice_on_one_line_is_not_a_cycle() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "AAA").unwrap();
+        fs::write(dir.path().join("LODAN.md"), "see @a.md and again @a.md\n").unwrap();
+        let m = detailed(dir.path());
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        assert_eq!(m.text.matches("AAA").count(), 1);
     }
 
     #[test]

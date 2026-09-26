@@ -63,12 +63,11 @@ pub fn project_files(cwd: &Path) -> Vec<String> {
         ".mcp.json",
         ".lodan/commands",
         ".lodan/skills",
-        "LODAN.md",
-        "CLAUDE.md",
-        "AGENTS.md",
     ];
+    // メモリのファイル名は MEMORY_FILES から導く (手で写すと、名前を足したときに片方を忘れる)。
     let mut found: Vec<String> = CANDIDATES
         .iter()
+        .chain(MEMORY_FILES)
         .filter(|name| cwd.join(name).exists())
         .map(|name| name.to_string())
         .collect();
@@ -304,8 +303,11 @@ mod tests {
                 "{name} is read as memory but not trust-gated"
             );
         }
-        let dir = project(&["AGENTS.md"]);
-        assert_eq!(project_files(dir.path()), ["AGENTS.md"]);
+        // cwd 直下のどのメモリ名でも候補に挙がる (祖先の走査は cwd 自身を見ないので、ここが要)。
+        for name in MEMORY_FILES {
+            let dir = project(&[name]);
+            assert_eq!(project_files(dir.path()), [*name]);
+        }
     }
 
     #[test]

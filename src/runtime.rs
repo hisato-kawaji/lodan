@@ -5,7 +5,7 @@
 //! 出すので、呼び出し側が行き先を決められる — REPL は stdout、ヘッドレスは stdout を
 //! 機械可読に保つため stderr。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +46,52 @@ pub struct Runtime {
     pub mcp_prompts: BTreeMap<String, McpPrompt>,
     /// セッションの間 MCP クライアントを生かしておく (Drop でサブプロセスが kill される)。
     _mcp_clients: Vec<Arc<mcp::client::McpClient>>,
+}
+
+/// 定義ファイル 1 つぶんの子エージェント設定を組み立てる。ツールは読み取り専用の範囲で絞り、
+/// モデル / provider が指定されていれば専用のクライアントを作る (台帳は共有)。
+fn build_agent_profile(
+    def: &agent::agents::AgentDef,
+    cfg: &Config,
+    parent_llm: &Arc<dyn LlmClient>,
+    ledger: &Arc<llm::metered::Ledger>,
+) -> Result<agent::subagent::AgentProfile> {
+    let mut tools = read_only_registry();
+    if !def.tools.is_empty() {
+        let unknown = tools.apply_profile(crate::config::ToolProfile::Full, &def.tools);
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "tools {} are not available to sub-agents (read-only: {})",
+                unknown.join(", "),
+                tools.all_names().join(", ")
+            );
+        }
+        if tools.is_empty() {
+            anyhow::bail!("no usable tools");
+        }
+    }
+    let (llm, model) = match (def.provider, &def.model) {
+        (None, None) => (Arc::clone(parent_llm), cfg.llm.active().model.clone()),
+        (provider, model) => {
+            let mut next = cfg.clone();
+            if let Some(p) = provider {
+                next.llm.provider = p;
+            }
+            if let Some(m) = model {
+                next.llm.active_mut().model = m.clone();
+            }
+            let client = llm::build_metered_with(&next, ledger)
+                .with_context(|| format!("building the client for agent `{}`", def.name))?;
+            (client, next.llm.active().model.clone())
+        }
+    };
+    Ok(agent::subagent::AgentProfile::new(
+        llm,
+        model,
+        Arc::new(tools),
+        def.max_turns.unwrap_or(cfg.agent.max_iterations),
+    )
+    .with_instructions(def.prompt.clone(), def.description.clone()))
 }
 
 impl Runtime {
@@ -115,21 +161,44 @@ impl Runtime {
         let rules = Arc::new(crate::permission_rules::RuleSet::parse(
             &p.allow, &p.deny, &p.ask,
         )?);
-        registry.register(Arc::new(
-            agent::subagent::SubAgentTool::new(
-                Arc::clone(&llm),
-                cfg.llm.active().model.clone(),
-                Arc::new(read_only_registry()),
-                cwd.clone(),
-                cfg.agent.max_iterations,
-            )
-            .with_rules(rules)
-            .with_reasoning_roundtrip(cfg.llm.active().reasoning_roundtrip)
-            .with_hooks(
-                crate::hooks::effective(&cfg.hooks, &cfg.disabled_hooks),
-                cfg.hooks_compat,
-            ),
-        ));
+        let mut task = agent::subagent::SubAgentTool::new(
+            Arc::clone(&llm),
+            cfg.llm.active().model.clone(),
+            Arc::new(read_only_registry()),
+            cwd.clone(),
+            cfg.agent.max_iterations,
+        )
+        .with_rules(rules)
+        .with_reasoning_roundtrip(cfg.llm.active().reasoning_roundtrip)
+        .with_hooks(
+            crate::hooks::effective(&cfg.hooks, &cfg.disabled_hooks),
+            cfg.hooks_compat,
+        );
+        // カスタムエージェント定義 (`.lodan/agents/*.md`, #77)。プロジェクトのものは信頼済みのときだけ。
+        let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+        let (defs, warnings) =
+            agent::agents::load_agent_defs(&cwd, home.as_deref(), crate::trust::project_trusted());
+        for w in warnings {
+            eprintln!("agents: {}", crate::term::sanitize(&w));
+        }
+        let mut agent_names = Vec::new();
+        for def in defs {
+            match build_agent_profile(&def, cfg, &llm, &ledger) {
+                Ok(profile) => {
+                    agent_names.push(def.name.clone());
+                    task = task.with_profile(def.name, profile);
+                }
+                Err(e) => eprintln!(
+                    "agents: {} skipped: {}",
+                    crate::term::sanitize(&def.name),
+                    crate::term::sanitize(&format!("{e:#}"))
+                ),
+            }
+        }
+        if !agent_names.is_empty() {
+            notices.say(&format!("agents: {}", agent_names.join(", ")));
+        }
+        registry.register(Arc::new(task));
 
         // Skill ツール: モデルが名前で手順書を読み込める。skill が無ければ登録しない。
         if !user_skills.is_empty() {

@@ -26,16 +26,55 @@ const SUBAGENT_MAX_ITERATIONS: usize = 12;
 struct TaskArgs {
     description: String,
     prompt: String,
+    /// `.lodan/agents/<name>.md` で定義した子の種類 (#77)。省略は既定の調査エージェント。
+    #[serde(default)]
+    subagent_type: Option<String>,
+}
+
+/// 子エージェント 1 種類ぶんの設定。既定の `general-purpose` も、定義ファイル由来もこの形。
+pub struct AgentProfile {
+    pub llm: Arc<dyn LlmClient>,
+    pub model: String,
+    /// 子に許可するツール (読み取り専用)。
+    pub tools: Arc<ToolRegistry>,
+    pub max_iterations: usize,
+    /// 定義ファイルの本文。子の system prompt の末尾に足す。
+    pub instructions: String,
+    pub description: String,
+}
+
+impl AgentProfile {
+    /// 反復上限は親の上限と子専用上限の小さい方。
+    pub fn new(
+        llm: Arc<dyn LlmClient>,
+        model: String,
+        tools: Arc<ToolRegistry>,
+        max_iterations: usize,
+    ) -> Self {
+        Self {
+            llm,
+            model,
+            tools,
+            max_iterations: max_iterations.min(SUBAGENT_MAX_ITERATIONS),
+            instructions: String::new(),
+            description: String::new(),
+        }
+    }
+
+    pub fn with_instructions(mut self, instructions: String, description: String) -> Self {
+        self.instructions = instructions;
+        self.description = description;
+        self
+    }
 }
 
 /// 子エージェントを起動する `Task` ツール。
 pub struct SubAgentTool {
-    llm: Arc<dyn LlmClient>,
-    model: String,
-    /// 子に許可するツール (読み取り専用)。
-    tools: Arc<ToolRegistry>,
+    /// 種類ごとの設定。`DEFAULT_AGENT` は必ずある。
+    profiles: std::collections::BTreeMap<String, AgentProfile>,
+    /// モデルに見せる説明。定義した種類の一覧を含むので、種類を足すたびに作り直す。
+    description: String,
     cwd: PathBuf,
-    max_iterations: usize,
     /// 親と同じ permission ルール。子は親の承認ゲートを通らずにツールを実行するので、
     /// ここで見ないと `deny = ["Read(**/.env)"]` を「Task に読ませる」だけですり抜けられる。
     rules: Arc<RuleSet>,
@@ -46,8 +85,12 @@ pub struct SubAgentTool {
     reasoning_roundtrip: bool,
 }
 
-/// hook の matcher と payload に出す子エージェントの種類。いまは調査用の 1 種類だけ。
-const AGENT_TYPE: &str = "general-purpose";
+use crate::agent::agents::DEFAULT_AGENT;
+
+/// 説明の 1 行目 (Task の説明に載せる用)。
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
+}
 
 impl SubAgentTool {
     pub fn new(
@@ -57,18 +100,71 @@ impl SubAgentTool {
         cwd: PathBuf,
         max_iterations: usize,
     ) -> Self {
-        Self {
-            llm,
-            model,
-            tools,
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            DEFAULT_AGENT.to_string(),
+            AgentProfile::new(llm, model, tools, max_iterations),
+        );
+        let mut tool = Self {
+            profiles,
+            description: String::new(),
             cwd,
-            // 親の上限と子専用上限の小さい方を採る。
-            max_iterations: max_iterations.min(SUBAGENT_MAX_ITERATIONS),
             rules: Arc::new(RuleSet::default()),
             hooks: Vec::new(),
             hooks_compat: crate::hooks::HooksCompat::default(),
             reasoning_roundtrip: true,
+        };
+        tool.refresh_description();
+        tool
+    }
+
+    /// 定義ファイル由来の種類を足す (#77)。
+    pub fn with_profile(mut self, name: String, profile: AgentProfile) -> Self {
+        self.profiles.insert(name, profile);
+        self.refresh_description();
+        self
+    }
+
+    /// 定義した種類の名前 (既定を除く)。
+    pub fn custom_names(&self) -> Vec<&str> {
+        self.profiles
+            .keys()
+            .filter(|n| n.as_str() != DEFAULT_AGENT)
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn refresh_description(&mut self) {
+        let mut text = String::from(
+            "Spawn a read-only sub-agent to investigate a question across the codebase. \
+             The sub-agent has Read / Grep / Glob and returns a single concise summary. \
+             Use it to offload focused searches; it cannot modify files or run commands.",
+        );
+        let custom = self.custom_names();
+        if !custom.is_empty() {
+            text.push_str("\nsubagent_type (optional): ");
+            text.push_str(DEFAULT_AGENT);
+            text.push_str(" (default)");
+            for name in custom {
+                let p = &self.profiles[name];
+                text.push_str(&format!("; {name} — {}", first_line(&p.description)));
+            }
         }
+        self.description = text;
+    }
+
+    fn profile(&self, name: Option<&str>) -> Result<(&str, &AgentProfile), ToolError> {
+        let name = name.unwrap_or(DEFAULT_AGENT);
+        self.profiles
+            .get_key_value(name)
+            .map(|(k, v)| (k.as_str(), v))
+            .ok_or_else(|| {
+                ToolError::InvalidArgs(format!(
+                    "Task: unknown subagent_type '{}' (available: {})",
+                    crate::term::sanitize(name),
+                    self.profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+                ))
+            })
     }
 
     pub fn with_reasoning_roundtrip(mut self, enabled: bool) -> Self {
@@ -88,18 +184,23 @@ impl SubAgentTool {
     }
 
     /// 通知用。子は既に走る (または走り終えた) ので、hook の結果では止めない。
-    async fn notify(&self, lc: crate::hooks::Lifecycle, extra: serde_json::Value) {
+    async fn notify(
+        &self,
+        agent_type: &str,
+        lc: crate::hooks::Lifecycle,
+        extra: serde_json::Value,
+    ) {
         let mut payload = serde_json::json!({
             "hook_event_name": lc,
             "cwd": self.cwd,
-            "agent_type": AGENT_TYPE,
+            "agent_type": agent_type,
         });
         if let (Some(base), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
             base.extend(extra);
         }
         if let Err(e) = crate::hooks::runner::dispatch(
             lc,
-            Some(AGENT_TYPE),
+            Some(agent_type),
             &payload,
             &self.hooks,
             self.hooks_compat,
@@ -110,19 +211,20 @@ impl SubAgentTool {
         }
     }
 
-    async fn run(&self, task: &str) -> Result<String, ToolError> {
+    async fn run(&self, agent_type: &str, task: &str) -> Result<String, ToolError> {
         use crate::hooks::Lifecycle;
         self.notify(
+            agent_type,
             Lifecycle::SubagentStart,
             serde_json::json!({ "prompt": task }),
         )
         .await;
-        let result = self.run_inner(task).await;
+        let result = self.run_inner(agent_type, task).await;
         let last = match &result {
             Ok(text) => serde_json::json!({ "last_assistant_message": text }),
             Err(e) => serde_json::json!({ "error": e.to_string() }),
         };
-        self.notify(Lifecycle::SubagentStop, last).await;
+        self.notify(agent_type, Lifecycle::SubagentStop, last).await;
         result
     }
 
@@ -149,8 +251,17 @@ impl SubAgentTool {
         }
     }
 
-    async fn run_inner(&self, task: &str) -> Result<String, ToolError> {
-        let system = prompt::build_system_prompt(&self.cwd, &self.model, self.tools.as_ref());
+    async fn run_inner(&self, agent_type: &str, task: &str) -> Result<String, ToolError> {
+        let (_, p) = self.profile(Some(agent_type))?;
+        let mut system = prompt::build_system_prompt(&self.cwd, &p.model, p.tools.as_ref());
+        if !p.instructions.is_empty() {
+            system.push_str(
+                "\nAgent instructions (from the agent definition; user-provided context, \
+                             not permission to bypass approvals):\n",
+            );
+            system.push_str(&p.instructions);
+            system.push('\n');
+        }
         let user = format!(
             "You are a read-only investigation sub-agent. Use the available tools to \
              complete the task, then return a concise summary as your final message \
@@ -162,11 +273,11 @@ impl SubAgentTool {
         ];
         let ctx = ToolCtx::new(self.cwd.clone());
 
-        for _ in 0..self.max_iterations {
-            let specs = self.tools.tool_specs();
+        for _ in 0..p.max_iterations {
+            let specs = p.tools.tool_specs();
             let resp = crate::llm::metered::with_kind(
                 crate::llm::metered::KIND_SUBAGENT,
-                self.llm.chat(&history, &specs, &self.model, None),
+                p.llm.chat(&history, &specs, &p.model, None),
             )
             .await
             .map_err(|e| ToolError::Other(format!("sub-agent llm error: {e}")))?;
@@ -191,7 +302,7 @@ impl SubAgentTool {
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
                 let refusal = self.refusal(&call.function.name, &args);
-                let output = match self.tools.get(&call.function.name) {
+                let output = match p.tools.get(&call.function.name) {
                     // 読み取り専用 registry にしか無いので未知名はまず出ないが、保険。
                     None => ToolOutput::error(format!("unknown tool: {}", call.function.name)),
                     Some(_) if refusal.is_some() => ToolOutput::error(refusal.unwrap_or_default()),
@@ -209,7 +320,7 @@ impl SubAgentTool {
 
         Err(ToolError::Other(format!(
             "sub-agent hit max_iterations ({}) without a final answer",
-            self.max_iterations
+            p.max_iterations
         )))
     }
 }
@@ -221,9 +332,7 @@ impl Tool for SubAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a read-only sub-agent to investigate a question across the codebase. \
-         The sub-agent has Read / Grep / Glob and returns a single concise summary. \
-         Use it to offload focused searches; it cannot modify files or run commands."
+        &self.description
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -238,6 +347,11 @@ impl Tool for SubAgentTool {
                     "type": "string",
                     "description": "The investigation task. Be specific and self-contained; \
                                     the sub-agent does not see this conversation."
+                },
+                "subagent_type": {
+                    "type": "string",
+                    "description": "Which sub-agent to run (see the tool description); omit for the default",
+                    "enum": self.profiles.keys().collect::<Vec<_>>()
                 }
             },
             "required": ["description", "prompt"]
@@ -260,9 +374,18 @@ impl Tool for SubAgentTool {
     ) -> Result<ToolOutput, ToolError> {
         let args: TaskArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("Task: {e}")))?;
+        let (agent_type, _) = self.profile(args.subagent_type.as_deref())?;
         // 子は静かに走るので、起動を 1 行知らせて可視性を確保する。
-        crate::say!("  ↳ Task: {}", crate::term::sanitize(&args.description));
-        let summary = self.run(&args.prompt).await?;
+        let label = if agent_type == DEFAULT_AGENT {
+            String::new()
+        } else {
+            format!(" [{agent_type}]")
+        };
+        crate::say!(
+            "  ↳ Task{label}: {}",
+            crate::term::sanitize(&args.description)
+        );
+        let summary = self.run(agent_type, &args.prompt).await?;
         Ok(ToolOutput::ok(summary))
     }
 }
@@ -359,6 +482,60 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// `subagent_type` で定義した種類を選ぶと、その種類のクライアント・ツール・指示で走る (#77)。
+    #[tokio::test]
+    async fn a_custom_profile_routes_to_its_own_client_tools_and_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(read_only_registry());
+        let mut only_read = read_only_registry();
+        only_read.apply_profile(crate::config::ToolProfile::Full, &["Read".to_string()]);
+        let tool = SubAgentTool::new(
+            Arc::new(ScriptedLlm::new(vec![ChatResponse {
+                content: Some("from default".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning: None,
+            }])),
+            "mock".into(),
+            Arc::clone(&registry),
+            dir.path().to_path_buf(),
+            8,
+        )
+        .with_profile(
+            "echo".into(),
+            AgentProfile::new(
+                Arc::new(EchoSystemLlm),
+                "other-model".into(),
+                Arc::new(only_read),
+                3,
+            )
+            .with_instructions("BE TERSE".into(), "echoes its prompt".into()),
+        );
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let run = |sub: Option<&str>| {
+            let mut args = serde_json::json!({ "description": "d", "prompt": "p" });
+            if let Some(s) = sub {
+                args["subagent_type"] = serde_json::Value::String(s.into());
+            }
+            tool.execute(args, &ctx)
+        };
+        assert_eq!(run(None).await.unwrap().content, "from default");
+        let echoed = run(Some("echo")).await.unwrap().content;
+        assert!(echoed.contains("model: other-model"), "{echoed}");
+        assert!(echoed.contains("Agent instructions") && echoed.contains("BE TERSE"));
+        assert!(
+            echoed.contains("- Read") && !echoed.contains("- Grep"),
+            "tools narrowed: {echoed}"
+        );
+        let err = run(Some("nope")).await.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown subagent_type") && err.contains("echo"),
+            "{err}"
+        );
+        assert!(tool.description().contains("echo — echoes its prompt"));
+        assert_eq!(tool.custom_names(), ["echo"]);
     }
 
     /// 子の system prompt は素の `build_system_prompt` のまま。親の `--append-system-prompt`
@@ -554,7 +731,10 @@ mod tests {
             tmp.path().to_path_buf(),
             8,
         );
-        assert_eq!(sub.run("look around").await.unwrap(), "child");
+        assert_eq!(
+            sub.run(DEFAULT_AGENT, "look around").await.unwrap(),
+            "child"
+        );
 
         let by_kind = ledger.by_kind();
         let kinds: Vec<&str> = by_kind.iter().map(|(k, _)| *k).collect();
@@ -562,7 +742,11 @@ mod tests {
         assert_eq!(ledger.total().total_tokens, 84, "parent + child");
 
         // 予算は共有: 2 件を使い切ったので、次の子は 1 回も LLM を呼べずに失敗する。
-        let err = sub.run("again").await.unwrap_err().to_string();
+        let err = sub
+            .run(DEFAULT_AGENT, "again")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("budget exhausted"), "{err}");
         assert_eq!(ledger.requests(), 2);
     }
@@ -597,7 +781,7 @@ mod tests {
             HooksCompat::V2,
         );
         assert_eq!(
-            sub.run("find the answer").await.unwrap(),
+            sub.run(DEFAULT_AGENT, "find the answer").await.unwrap(),
             "the answer is 42"
         );
 
@@ -627,7 +811,7 @@ mod tests {
             }],
             tmp.path().to_path_buf(),
         );
-        let out = sub.run("what is the answer").await.unwrap();
+        let out = sub.run(DEFAULT_AGENT, "what is the answer").await.unwrap();
         assert_eq!(out, "the answer is 42");
     }
 
@@ -653,7 +837,7 @@ mod tests {
             },
         ];
         let sub = subagent(steps, tmp.path().to_path_buf());
-        let out = sub.run("find the needle").await.unwrap();
+        let out = sub.run(DEFAULT_AGENT, "find the needle").await.unwrap();
         assert_eq!(out, "found the needle");
     }
 
@@ -722,7 +906,7 @@ mod tests {
                 8,
             )
             .with_reasoning_roundtrip(roundtrip);
-            async move { sub.run("look around").await.unwrap() }
+            async move { sub.run(DEFAULT_AGENT, "look around").await.unwrap() }
         };
         assert_eq!(run(true).await, "reasoning came back: true");
         assert_eq!(run(false).await, "reasoning came back: false");
@@ -741,7 +925,7 @@ mod tests {
             })
             .collect();
         let sub = subagent(looping, tmp.path().to_path_buf());
-        let err = sub.run("loop forever").await.unwrap_err();
+        let err = sub.run(DEFAULT_AGENT, "loop forever").await.unwrap_err();
         assert!(format!("{err}").contains("max_iterations"));
     }
 

@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod r#loop;
 pub mod messages;
 pub mod subagent;

@@ -784,6 +784,40 @@ fn hostile_model_text_is_defused_on_the_repl_screen() {
     assert!(stdout(&out).contains("done\\u{1b}[2A\\u{1b}[2Kall tests passed \\u{202e}txt.exe"));
 }
 
+/// REPL にプロンプトをパイプで流すと stdin は端末ではない。承認の問いに空行や次の入力行が
+/// 「はい」として読まれてはいけない (`stdin.is_terminal()` の配線を固定する: #91)。
+#[test]
+fn a_piped_repl_prompt_without_yes_does_not_get_destructive_tools_approved() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let server = start_mock(&demo);
+    // 空行は Enter に見えるが、パイプなので「はい」ではない。/exit の行も承認の答えとして
+    // 読まれ (yes ではないので拒否)、REPL は stdin の EOF で終わる。
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("run the demo\n\n\n\n\n\n\n/exit\n"),
+    );
+    // 正の対照: 承認の問いまでは届いている (mock が demo を走らせなければ何も守れていない)。
+    assert!(
+        stdout(&out).contains("Allow Write"),
+        "the Write prompt must be reached: {}",
+        stdout(&out)
+    );
+    assert!(
+        !demo.join("hello.txt").exists(),
+        "Write must not run without approval: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

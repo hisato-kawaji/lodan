@@ -55,6 +55,7 @@ def collect(path: Path) -> dict:
         "tools_used": sorted({t.get("name") for t in tool_rows if t.get("name")}),
         "malformed_retries": by_event.get("malformed_retry", 0),
         "finish_nudges": by_event.get("finish_nudge", 0),
+        "empty_reply_nudges": by_event.get("empty_reply_nudge", 0),
         "dup_suppressed": reasons.get("dup_readonly", 0),
         "denied": reasons.get("denied", 0),
         "compactions": by_event.get("compact", 0),

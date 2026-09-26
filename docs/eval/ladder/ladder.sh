@@ -66,18 +66,22 @@ touch "$RESULTS"
 # (mini-renovater ベンチの v1 → v2 → v4 に対応する)
 flags_for_config() {
   case "$1" in
-    base)  echo "--malformed-retry=false --dup-suppress=false --finish-nudge=false" ;;
-    temp)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false" ;;
-    mitig) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=false" ;;
-    nudge) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=true" ;;
+    # 「緩和策すべて off」の base に empty-reply-nudge (#111、既定 on) も含める。過去のベースラインと
+    # 比較できるよう、mitig / nudge 以外は全て off。
+    base)  echo "--malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false" ;;
+    temp)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false" ;;
+    mitig) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=false --empty-reply-nudge=true" ;;
+    nudge) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=true --empty-reply-nudge=true" ;;
+    # temp と同条件で空応答の促しだけを on にする (#111)。temp との差が促しの寄与。
+    empty-nudge) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=true" ;;
     # temp と同条件でツール定義だけを 6 個に絞る (#72)。temp との差がプロファイルの寄与。
-    core)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --tool-profile core" ;;
+    core)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --tool-profile core" ;;
     # core と同条件で、隠した 8 個を ToolSearch で読み込めるようにする (#72)。core との差が遅延ロードの寄与。
-    core-search) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --tool-profile core --tool-search" ;;
+    core-search) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --tool-profile core --tool-search" ;;
     # temp と同条件で推論の深さだけを変える (#78)。temp (サーバ既定) との差が effort の寄与。
     # 受け付ける語彙はサーバ次第: Ollama は none で thinking を切れる。kimi / gpt-oss は low。
-    think-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --reasoning-effort none" ;;
-    think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --reasoning-effort low" ;;
+    think-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none" ;;
+    think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
     *) echo "unknown config: $1" >&2; return 1 ;;
   esac
 }

@@ -1245,6 +1245,34 @@ mod tests {
         );
     }
 
+    /// timeout で諦めたら子を殺す (孤児を残さない)。
+    #[tokio::test]
+    async fn bang_timeout_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("still-alive");
+        // 1 秒で切られる。生き残っていれば 3 秒後にマーカーを書く。
+        let cmd = format!("sleep 3; touch '{}'", marker.display());
+        let out = super::run_shell_for_user(&cmd, dir.path(), 1).await;
+        assert!(out.contains("timed out after 1s"), "{out}");
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(!marker.exists(), "the child kept running after the timeout");
+    }
+
+    /// 長い出力は切り詰めた後に exit を付ける (失敗の印が消えない)。
+    #[tokio::test]
+    async fn bang_truncates_before_appending_the_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let out =
+            super::run_shell_for_user("yes 0123456789 | head -c 40000; exit 7", dir.path(), 10)
+                .await;
+        assert!(out.len() < 20_000, "truncated: {}", out.len());
+        assert!(
+            out.ends_with("… (truncated)\n(exit 7)"),
+            "{}",
+            &out[out.len() - 40..]
+        );
+    }
+
     #[test]
     fn bang_is_a_command_only_when_the_first_word_is_one() {
         assert_eq!(super::shell_escape("!echo hi"), Some("echo hi"));

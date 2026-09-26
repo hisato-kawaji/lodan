@@ -494,9 +494,16 @@ mod tests {
         assert!(session_dir("a/b").is_err());
         assert!(session_dir("").is_err());
         // 実際に読み書きする経路もガードを通る (#129 のレビュー: --resume ../evil が通っていた)。
-        assert!(load_transcript("../evil").is_err());
-        assert!(Recorder::open_resumed("../evil", &[]).is_err());
-        assert!(read_meta("../evil").is_err());
+        // 「無いから失敗」ではなく「id が不正だから失敗」であることを確かめる (ガードを外しても
+        // ENOENT で is_err にはなるので)。
+        for err in [
+            load_transcript("../evil").unwrap_err().to_string(),
+            Recorder::open_resumed("../evil", &[]).unwrap_err().to_string(),
+            read_meta("../evil").unwrap_err().to_string(),
+            fork_session("..//evil").unwrap_err().to_string(),
+        ] {
+            assert!(err.contains("invalid session id"), "{err}");
+        }
     }
 
     #[test]

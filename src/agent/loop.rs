@@ -1600,7 +1600,7 @@ async fn stream_once_to(
     history: &[Message],
     tools: &[crate::agent::messages::ToolSpec<'_>],
     model: &str,
-    stdout: &mut dyn Write,
+    stdout: &mut (dyn Write + Send),
     view: StreamView,
 ) -> Result<ChatResponse> {
     let show_wait = view.show_wait;
@@ -2044,6 +2044,54 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    /// tty では最初のトークンまで "…thinking" を出し、本文の前に行ごと消す。送信側が先に
+    /// 完了してチャネルに残った本文 (#89 の経路。EventsLlm は全部送ってから返る) でも、
+    /// 消去 → 本文の順は変わらず、インジケータが画面に残らない。
+    #[tokio::test]
+    async fn on_a_tty_the_wait_indicator_is_cleared_once_before_the_drained_text() {
+        let shown = on_a_tty(vec![
+            ChatEvent::TextDelta("six ".into()),
+            ChatEvent::TextDelta("times".into()),
+            done(Some("six times"), ""),
+        ])
+        .await;
+        let indicator = crate::term::dim("…thinking");
+        let clear = "\r\x1b[2K";
+        assert_eq!(shown, format!("{indicator}{clear}six times"), "{shown:?}");
+        assert_eq!(shown.matches(clear).count(), 1, "cleared exactly once");
+    }
+
+    /// 本文が来なくても (ツール呼び出しだけの応答)、インジケータは消える。
+    #[tokio::test]
+    async fn on_a_tty_the_wait_indicator_is_cleared_even_without_text() {
+        let shown = on_a_tty(vec![done(None, "")]).await;
+        assert_eq!(
+            shown,
+            format!("{}\r\x1b[2K", crate::term::dim("…thinking")),
+            "{shown:?}"
+        );
+    }
+
+    /// パイプ (tty でない) にはインジケータも消去列も出さない。
+    #[tokio::test]
+    async fn off_a_tty_nothing_but_the_text_is_written() {
+        let mut out = Vec::new();
+        stream_once_to(
+            &EventsLlm(vec![
+                ChatEvent::TextDelta("plain".into()),
+                done(Some("plain"), ""),
+            ]),
+            &[],
+            &[],
+            "m",
+            &mut out,
+            StreamView::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "plain");
     }
 
     /// thinking モデルの「ツールを呼ぶだけ」の応答は本文が 1 文字も無い。思考は一番長いのに、

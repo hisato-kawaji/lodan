@@ -355,6 +355,12 @@ impl Session {
                             "reasoning_chars": thought_chars,
                         }),
                     );
+                    // この空応答は次のリクエストで送り返される。`content: null` でツール呼び出しも
+                    // 無い assistant メッセージは Ollama が 400 で拒否する (実測: "invalid message
+                    // content type: <nil>") ので、空文字にしておく。
+                    if let Some(Message::Assistant { content, .. }) = self.history.last_mut() {
+                        *content = Some(String::new());
+                    }
                     self.history.push(Message::User {
                         content: EMPTY_REPLY_NOTE.to_string(),
                     });
@@ -4316,6 +4322,14 @@ mod tests {
             Some(Message::Assistant { content: Some(c), .. }) if c == "The port is 8123."
         ));
         assert_eq!(session.last_reply_thought_chars(), None);
+        // 送り返す空応答は `content: null` にしない (Ollama が 400 で拒否する)。
+        assert!(
+            !session.history().iter().any(|m| matches!(
+                m,
+                Message::Assistant { content: None, tool_calls, .. } if tool_calls.is_empty()
+            )),
+            "an assistant message with null content and no tool call would be rejected upstream"
+        );
     }
 
     /// 促しても空のままなら、2 度目は促さずに終える。思考の長さは記録に残る。

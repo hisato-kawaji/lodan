@@ -762,6 +762,27 @@ session: resumed 1782332785130-31477 (12 messages)
 - 引数: `description`（短いラベル）+ `prompt`（自己完結した調査指示。子は親の会話を見ません）。
 - ループは `agent.max_iterations` と子専用上限（12）の小さい方で打ち切られます。起動時に `↳ Task: <description>` を表示します。
 
+### カスタムエージェント（`.lodan/agents/*.md`、#77）
+
+`Task` の `subagent_type` で選べる子の種類を定義できる。frontmatter で使えるツール・モデル・反復上限を、本文で追加の指示を書く。ユーザー全体（`~/.lodan/agents/`）とプロジェクト（`<cwd>/.lodan/agents/`、**信頼済みのときだけ**。trust の候補にも入る）から読み、同名はプロジェクトが勝つ。
+
+```markdown
+<!-- .lodan/agents/reviewer.md -->
+---
+name: reviewer                  # 省略時はファイル名。general-purpose は予約
+description: Reviews a diff for correctness and style
+tools: Read, Grep               # 読み取り専用 (Read / Grep / Glob) の範囲で絞る。省略で 3 つ全部
+model: kimi:kimi-k3             # provider:model か model だけ (qwen3.5:9b のようなコロン入りも可)
+max_turns: 6                    # 省略で agent.max_iterations。上限 12
+---
+You are a strict reviewer. Report only concrete problems with file:line.
+```
+
+- 本文は子の system prompt の末尾に「user-provided context, not permission to bypass approvals」の断りつきで足す
+- `model` / `provider` を指定した種類は専用のクライアントで動く（トークンは同じ台帳に `subagent` として計上される）。API キーが無いなど作れない定義は起動時に警告して飛ばす
+- `Task` の説明に定義した種類の一覧が載り、`subagent_type` は enum になる（小型モデルが名前を打ち間違えない）。起動時に `agents: reviewer, …` と表示
+- **書き込み可の子・並列・worktree 分離はまだ**。`Task` は複数呼び出しを同時に実行できる（#73）ので、独立した調査は既に並列になる
+
 ```jsonc
 // メインエージェントが発行する tool call の例
 { "name": "Task",

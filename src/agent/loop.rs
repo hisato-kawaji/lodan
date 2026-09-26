@@ -4618,6 +4618,8 @@ mod tests {
         );
         assert_eq!(b.messages, 3);
         assert!(b.describe().contains("window         1000 tokens"));
+    }
+
     /// path-scoped ルールは、一致するファイルに初めて触れた tool_result に 1 回だけ付く (#79)。
     #[tokio::test]
     async fn a_path_rule_is_injected_once_after_the_first_matching_read() {

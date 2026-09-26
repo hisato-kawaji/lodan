@@ -323,6 +323,76 @@ mod tests {
         }
     }
 
+    /// 受け取った system prompt をそのまま最終応答にする LLM。子の system prompt を観測する。
+    struct EchoSystemLlm;
+
+    #[async_trait]
+    impl LlmClient for EchoSystemLlm {
+        async fn chat(
+            &self,
+            history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _max_tokens: Option<u32>,
+        ) -> Result<ChatResponse> {
+            let system = history
+                .iter()
+                .find_map(|m| match m {
+                    Message::System { content } => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Ok(ChatResponse {
+                content: Some(system),
+                tool_calls: vec![],
+                usage: None,
+                reasoning: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 子の system prompt は素の `build_system_prompt` のまま。親の `--append-system-prompt`
+    /// (`Session::with_prior` が足すもの) は子に渡らない (#71)。将来、子の起動を Session 経由に
+    /// 変えたときに黙って漏れないよう固定する。
+    #[tokio::test]
+    async fn the_sub_agents_system_prompt_has_no_appended_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(read_only_registry());
+        let tool = SubAgentTool::new(
+            Arc::new(EchoSystemLlm),
+            "mock".into(),
+            Arc::clone(&registry),
+            dir.path().to_path_buf(),
+            8,
+        );
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let out = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "p" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.content,
+            prompt::build_system_prompt(dir.path(), "mock", registry.as_ref())
+        );
+        assert!(
+            !out.content
+                .contains("Additional instructions from the user")
+        );
+    }
+
     fn tool_call(name: &str, args: &str) -> ToolCall {
         ToolCall {
             id: "call_1".into(),

@@ -57,6 +57,15 @@ python3 docs/eval/ladder/summarize.py docs/eval/ladder/results.jsonl
 (`label/config/task/run`) の行があるものはスキップされる。長時間の実行が
 中断しても、そのまま再実行すれば続きから進む。
 
+lodan はヘッドレス (`-p "<prompt>" --output-format json`) で起動する。実行ごとの
+ディレクトリ (`RUNS_DIR/<label>/<config>/<task>/<run>/`) に、結果オブジェクトが
+`result.json`、進行の表示 (stderr) が `stdout.log`、イベント列が `run.jsonl` として残る。
+`results.jsonl` の `exit_code` は lodan の終了コード (`0` 成功 / `1` エラー /
+`3` max_iterations / `4` 予算切れ / `124` は `timeout` による打ち切り)。
+**`status=pass` なのに `exit_code=1` なら、ツールで仕事を終えたあと本文を返さずに
+ターンを閉じた実行** (#111 のパターン。`result.json` の `error` が
+"the turn ended without a final answer")。合否は checks で決めているので集計には影響しない。
+
 ## タスク一覧
 
 | task | level | 測っているもの |

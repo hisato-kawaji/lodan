@@ -9,7 +9,7 @@
 //!
 //! | event | 主なフィールド |
 //! |---|---|
-//! | `run_start` | `version`, `provider`, `model`, `cwd` |
+//! | `run_start` | `version`, `provider`, `model`, `cwd`。設定が読めずに起動に失敗したときも出るが、その場合 `provider` / `model` は `null` |
 //! | `tools` | 起動時に 1 回。`profile`, `explicit`, `visible` (モデルに見せるツール名), `registered`, `spec_bytes` (毎リクエスト送るツール定義の JSON バイト数) |
 //! | `turn_start` | `turn`, `mode`, `input_chars` |
 //! | `llm_response` | `turn`, `iter`, `text_chars`, `tool_calls`, `prompt_tokens`, `completion_tokens`, `estimated` |

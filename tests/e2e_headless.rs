@@ -330,6 +330,96 @@ fn running_out_of_iterations_is_exit_code_3() {
 }
 
 #[test]
+fn max_turns_beats_the_config_files_max_iterations() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let cfg_dir = home.path().join("work/.lodan");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[agent]\nmax_iterations = 40\n",
+    )
+    .unwrap();
+    let server = start_mock(&demo);
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "--max-turns",
+            "2",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(v["error"].as_str().unwrap().contains("max_iterations (2)"));
+}
+
+#[test]
+fn append_system_prompt_lands_at_the_end_of_the_system_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("LODAN.md"), "project memory line\n").unwrap();
+    let server = start_mock_with(&demo, &[("MOCK_LLM_ECHO_SYSTEM", "1")]);
+
+    let plain = lodan(
+        home.path(),
+        server.port,
+        &["-p", "hi"],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(plain.status.code(), Some(0));
+    assert!(!stdout(&plain).contains("Additional instructions"));
+
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--append-system-prompt",
+            "Answer only in haiku.",
+            "-p",
+            "hi",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let system = stdout(&out);
+    let memory_at = system
+        .find("project memory line")
+        .expect("memory is in the system prompt");
+    let extra_at = system
+        .find("Answer only in haiku.")
+        .expect("the appended text is in the system prompt");
+    assert!(
+        extra_at > memory_at,
+        "appended text comes after project memory:\n{system}"
+    );
+    assert!(
+        system.trim_end().ends_with("Answer only in haiku."),
+        "{system}"
+    );
+}
+
+#[test]
 fn a_startup_failure_still_answers_in_the_requested_format() {
     // API キーの無い provider は LLM クライアントの構築で失敗する = ターンに入る前。
     // eval ハーネスで最もありがちな設定ミスなので、json を頼んだ呼び出し側には json で返す。
@@ -385,6 +475,46 @@ fn a_broken_config_file_is_reported_as_a_stream_json_result() {
         last["error"].as_str().unwrap().contains("config.toml"),
         "{last}"
     );
+}
+
+#[test]
+fn a_broken_config_file_in_text_mode_leaves_stdout_empty_but_still_writes_the_log() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg_dir = home.path().join("work/.lodan");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[agent]\nmax_iterations = \"many\"\n",
+    )
+    .unwrap();
+    let log = home.path().join("run.jsonl");
+    let out = lodan(
+        home.path(),
+        1,
+        &["-p", "hi", "--log-jsonl", log.to_str().unwrap()],
+        Stdin::OpenAndSilent,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "", "text mode has no answer to print");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("config.toml"),
+        "the reason goes to stderr"
+    );
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let first = events.first().unwrap();
+    assert_eq!(first["event"], "run_start");
+    assert!(
+        first["provider"].is_null() && first["model"].is_null(),
+        "no config was loaded, so provider / model are unknown: {first}"
+    );
+    let last = events.last().unwrap();
+    assert_eq!(last["event"], "result");
+    assert_eq!(last["is_error"], true);
+    assert!(last["error"].as_str().unwrap().contains("config.toml"));
 }
 
 #[test]

@@ -108,6 +108,14 @@ pub struct Cli {
     #[arg(long, env = "LODAN_MAX_REQUESTS", value_name = "N")]
     pub max_requests: Option<u64>,
 
+    /// Give up a turn after this many LLM round-trips without a final answer (overrides [agent] max_iterations)
+    #[arg(long, env = "LODAN_MAX_TURNS", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_turns: Option<u64>,
+
+    /// Extra instructions appended to the end of the system prompt (sub-agents do not see them)
+    #[arg(long, env = "LODAN_APPEND_SYSTEM_PROMPT", value_name = "TEXT")]
+    pub append_system_prompt: Option<String>,
+
     /// Stop once this many tokens have been used in this process (checked before each request)
     #[arg(long = "max-tokens", env = "LODAN_MAX_TOKENS", value_name = "N")]
     pub max_total_tokens: Option<u64>,
@@ -214,6 +222,8 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         sandbox_network: args.sandbox_network,
         max_requests: args.max_requests,
         max_total_tokens: args.max_total_tokens,
+        max_iterations: args.max_turns.map(|n| n as usize),
+        append_system_prompt: args.append_system_prompt,
         permission_mode: args.permission_mode,
         allowed_tools: args.allowed_tools,
         disallowed_tools: args.disallowed_tools,
@@ -391,6 +401,14 @@ mod tests {
         let cli = Cli::try_parse_from(["lodan", "--finish-nudge", "repl"]).unwrap();
         assert_eq!(cli.finish_nudge, Some(true));
         assert!(matches!(cli.cmd, Some(Command::Repl)));
+    }
+
+    #[test]
+    fn max_turns_must_be_at_least_one() {
+        let cli = Cli::try_parse_from(["lodan", "--max-turns", "3", "-p", "hi"]).unwrap();
+        assert_eq!(cli.max_turns, Some(3));
+        assert!(Cli::try_parse_from(["lodan", "--max-turns", "0", "-p", "hi"]).is_err());
+        assert!(Cli::try_parse_from(["lodan", "--max-turns", "-1", "-p", "hi"]).is_err());
     }
 
     #[test]

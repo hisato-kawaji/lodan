@@ -255,6 +255,15 @@ impl Ledger {
         self.state().by_kind.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
+    /// モデル別の使用量 (`/model` で切り替えた後の `/cost` 用)。
+    pub fn by_model(&self) -> Vec<(String, KindUsage)> {
+        self.state()
+            .by_model
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
     /// 予算の 8 割を超えた最初の 1 回だけ、モデルに渡す注意書きを返す。
     pub fn take_reminder(&self) -> Option<String> {
         let mut state = self.state();
@@ -331,6 +340,17 @@ impl Ledger {
                 out.push_str(&format!(
                     "\n  {kind}: {} tokens in {} call(s)",
                     u.total_tokens, u.calls
+                ));
+            }
+        }
+        // セッション中にモデルを切り替えたら (#81)、どのモデルにいくら使ったかを分ける。
+        if state.by_model.len() > 1 {
+            for (model, u) in &state.by_model {
+                out.push_str(&format!(
+                    "\n  model {}: {} tokens in {} call(s)",
+                    crate::term::sanitize(model),
+                    u.total_tokens,
+                    u.calls
                 ));
             }
         }

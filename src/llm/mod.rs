@@ -121,10 +121,19 @@ pub fn build_metered(cfg: &Config) -> Result<(Arc<dyn LlmClient>, Arc<metered::L
         })
         .with_pricing(cfg.pricing.clone()),
     );
-    let client = build_with(cfg, &|inner| {
-        Arc::new(metered::MeteredClient::new(inner, ledger.clone())) as Arc<dyn LlmClient>
-    })?;
+    let client = build_metered_with(cfg, &ledger)?;
     Ok((client, ledger))
+}
+
+/// 既存の台帳に計上するクライアント。`/model` でセッション中に作り直すとき、累計と予算を
+/// 引き継ぐために使う (#81)。
+pub fn build_metered_with(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+) -> Result<Arc<dyn LlmClient>> {
+    build_with(cfg, &|inner| {
+        Arc::new(metered::MeteredClient::new(inner, ledger.clone())) as Arc<dyn LlmClient>
+    })
 }
 
 /// `/goal` の評価器を別のモデルにする設定があれば、そのクライアントとモデル名。同じ台帳に載せるので、

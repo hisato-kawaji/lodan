@@ -582,12 +582,30 @@ impl LlmConfig {
     }
 
     pub fn active_mut(&mut self) -> &mut ProviderConfig {
-        match self.provider {
+        self.get_mut(self.provider)
+    }
+
+    pub fn get_mut(&mut self, provider: Provider) -> &mut ProviderConfig {
+        match provider {
             Provider::Local => &mut self.local,
             Provider::Sakana => &mut self.sakana,
             Provider::Sakura => &mut self.sakura,
             Provider::Kimi => &mut self.kimi,
         }
+    }
+
+    /// 設定済み (モデル名のある) provider を、`/model` の一覧用に。
+    pub fn configured(&self) -> Vec<(Provider, &ProviderConfig)> {
+        [
+            Provider::Local,
+            Provider::Sakana,
+            Provider::Sakura,
+            Provider::Kimi,
+        ]
+        .into_iter()
+        .map(|p| (p, self.get(p)))
+        .filter(|(_, c)| !c.model.is_empty())
+        .collect()
     }
 }
 

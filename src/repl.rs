@@ -22,7 +22,7 @@ use crate::slash::{self, SlashCommand};
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
     "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop", "plan", "accept",
-    "undo", "memory",
+    "undo", "memory", "model", "status", "context",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
@@ -352,6 +352,127 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                 for w in &loaded.warnings {
                     println!("warning: {}", crate::term::sanitize(w));
                 }
+                continue;
+            }
+
+            // /model: セッション中に provider / model を切り替える (#81)。台帳は引き継ぐ。
+            if head == "model" {
+                if args.is_empty() {
+                    let active = cfg.llm.active();
+                    println!(
+                        "model: {}:{}",
+                        cfg.llm.provider.as_str(),
+                        crate::term::sanitize(&active.model)
+                    );
+                    for (p, c) in cfg.llm.configured() {
+                        let marker = if p == cfg.llm.provider { "*" } else { " " };
+                        println!(
+                            "  {marker} {}:{}",
+                            p.as_str(),
+                            crate::term::sanitize(&c.model)
+                        );
+                    }
+                    println!(
+                        "usage: /model <provider> | /model <provider>:<model> | /model <model>"
+                    );
+                    continue;
+                }
+                let parse =
+                    |s: &str| <crate::config::Provider as clap::ValueEnum>::from_str(s, true);
+                let (provider, model) = match args.split_once(':') {
+                    Some((p, m)) => match parse(p) {
+                        Ok(p) => (p, Some(m.trim())),
+                        Err(_) => {
+                            println!(
+                                "model: unknown provider '{}' (local / sakana / sakura / kimi)",
+                                crate::term::sanitize(p)
+                            );
+                            continue;
+                        }
+                    },
+                    None => match parse(args) {
+                        Ok(p) => (p, None),
+                        Err(_) => (cfg.llm.provider, Some(args)),
+                    },
+                };
+                let mut next = cfg.clone();
+                next.llm.provider = provider;
+                if let Some(m) = model.filter(|m| !m.is_empty()) {
+                    next.llm.get_mut(provider).model = m.to_string();
+                }
+                match crate::llm::build_metered_with(&next, &runtime.ledger) {
+                    Ok(client) => {
+                        llm_client = client;
+                        cfg = next;
+                        session.switch_llm(cfg.llm.clone());
+                        println!(
+                            "model: now {}:{}",
+                            cfg.llm.provider.as_str(),
+                            crate::term::sanitize(&cfg.llm.active().model)
+                        );
+                    }
+                    Err(e) => println!(
+                        "model: not switched: {}",
+                        crate::term::sanitize(&format!("{e:#}"))
+                    ),
+                }
+                continue;
+            }
+
+            // /status: いま何で動いているか (#81)。
+            if head == "status" {
+                let active = cfg.llm.active();
+                let shown = cfg.redacted();
+                println!(
+                    "provider: {}  model: {}",
+                    cfg.llm.provider.as_str(),
+                    crate::term::sanitize(&active.model)
+                );
+                println!(
+                    "base_url: {}",
+                    crate::term::sanitize(&shown.llm.active().base_url)
+                );
+                let used = session.usage().last_context_tokens;
+                match (used * 100).checked_div(active.context_window) {
+                    Some(pct) => println!(
+                        "context: {used} / {} tokens ({pct}%; auto-compact at {}%)",
+                        active.context_window, cfg.agent.auto_compact_percent
+                    ),
+                    None => println!("context: {used} tokens (window unknown)"),
+                }
+                println!(
+                    "mode: {}  permissions: {}  sandbox: {}",
+                    match session.mode() {
+                        agent::Mode::Plan => "plan",
+                        agent::Mode::Normal => "normal",
+                    },
+                    cfg.permissions.mode.as_str(),
+                    cfg.sandbox.mode.as_str()
+                );
+                println!("cwd: {}", runtime.cwd.display());
+                println!(
+                    "session: {}",
+                    recorder.as_ref().map_or("(not saved)", |r| r.id())
+                );
+                let deferred = registry.deferred_names().len();
+                println!(
+                    "tools: {} of {} visible{}  hooks: {}  mcp prompts: {}",
+                    registry.len(),
+                    registry.registered_len(),
+                    if deferred > 0 {
+                        format!(" (+{deferred} loadable with ToolSearch)")
+                    } else {
+                        String::new()
+                    },
+                    cfg.hooks.len(),
+                    mcp_prompts.len()
+                );
+                continue;
+            }
+
+            // /context: コンテキストの内訳 (#81)。
+            if head == "context" {
+                println!("{}", session.context_breakdown().describe());
                 continue;
             }
 
@@ -885,6 +1006,18 @@ fn handle_slash(
                 ("/tools", "利用可能なツール一覧"),
                 ("/compact [指示]", "会話履歴を要約して圧縮"),
                 ("/cost", "セッション累積のトークン使用量を表示"),
+                (
+                    "/model [provider[:model]]",
+                    "セッション中にモデルを切り替え / 引数なしで現在値と設定済み provider",
+                ),
+                (
+                    "/status",
+                    "provider / model / コンテキスト使用率 / モード / cwd / session",
+                ),
+                (
+                    "/context",
+                    "コンテキストの内訳 (system / tools / user / assistant / tool)",
+                ),
                 ("/memory", "読み込まれているメモリファイルの一覧とサイズ"),
                 (
                     "/goal <条件> | /goal | /goal clear",

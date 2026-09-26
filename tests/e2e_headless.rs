@@ -894,6 +894,44 @@ fn a_piped_repl_prompt_without_yes_does_not_get_destructive_tools_approved() {
     );
 }
 
+/// `/memory` は読まれているファイルと import、取り込めなかった `@path` の警告を出す (#79)。
+#[test]
+fn memory_lists_loaded_files_imports_and_refused_imports() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock(home.path());
+    let work = home.path().join("work");
+    std::fs::create_dir_all(work.join("docs")).unwrap();
+    std::fs::write(home.path().join("outside.md"), "OUTSIDE").unwrap();
+    std::fs::write(
+        work.join("AGENTS.md"),
+        "rules\n@docs/style.md\n@../outside.md\n",
+    )
+    .unwrap();
+    std::fs::write(work.join("docs/style.md"), "STYLE RULES").unwrap();
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("/memory\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("AGENTS.md — "), "{text}");
+    assert!(
+        text.contains("docs/style.md — 11 bytes  (imported from"),
+        "{text}"
+    );
+    assert!(
+        text.contains("warning:") && text.contains("outside"),
+        "{text}"
+    );
+    assert!(text.contains("total: "), "{text}");
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

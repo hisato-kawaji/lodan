@@ -808,7 +808,7 @@ pub fn append_local_allow_rule(cwd: &Path, rule: &str) -> Result<PathBuf> {
         }
     }
     let mut table: toml::Table = match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
+        Ok(text) => parse_toml_table(&path, &text)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
@@ -876,13 +876,62 @@ fn read_toml(path: &Path) -> Result<Option<toml::Table>> {
         return Ok(None);
     }
     let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let table: toml::Table =
-        toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+    let table = parse_toml_table(path, &s)?;
     // 型の誤りは合成後だとどのファイルのせいか分からなくなるので、ここで単体検証する。
-    let _: Config = toml::Value::Table(table.clone())
-        .try_into()
-        .with_context(|| format!("parsing {}", path.display()))?;
+    // 文字列から読み直すのは、位置 (行・列) を得るため。
+    let _: Config = toml::from_str(&s).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing {}: {}",
+            path.display(),
+            describe_toml_error(&e, &s)
+        )
+    })?;
     Ok(Some(table))
+}
+
+/// 設定ファイルの TOML を読む。構文エラーは「行・列・メッセージ」だけにする — `toml` クレートの
+/// 表示は該当行をそのまま引用するので、`api_key = "sk-…` の閉じ忘れで値が画面に出る (#114)。
+fn parse_toml_table(path: &Path, text: &str) -> Result<toml::Table> {
+    toml::from_str(text).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing {}: {}",
+            path.display(),
+            describe_toml_error(&e, text)
+        )
+    })
+}
+
+/// `toml::de::Error` を、ファイルの中身を引用せずに言い直す。メッセージ中の引用文字列
+/// (型エラーの `invalid type: string "sk-…"`) も伏せる。
+fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
+    let message = redact_quoted(e.message());
+    match e.span() {
+        Some(span) => {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!("TOML error at line {line}, column {column}: {message}")
+        }
+        None => message,
+    }
+}
+
+/// 二重引用符の中身を `…` にする。
+fn redact_quoted(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut inside = false;
+    for c in message.chars() {
+        if c == '"' {
+            inside = !inside;
+            out.push(c);
+            if inside {
+                out.push('…');
+            }
+        } else if !inside {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// レイヤー (優先度の低い順) をフィールド単位で重ねてから 1 回だけ `Config` にする。
@@ -958,6 +1007,39 @@ fn merge_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 構文エラーの表示に、壊れた行の中身 (値) が出ない (#114)。
+    #[test]
+    fn a_toml_syntax_error_names_the_position_but_not_the_broken_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[llm.local]\napi_key = \"sk-BROKEN-SECRET\n").unwrap();
+        let err = format!("{:#}", read_toml(&path).unwrap_err());
+        assert!(!err.contains("BROKEN"), "{err}");
+        assert!(
+            err.contains("config.toml") && err.contains("line 2, column"),
+            "{err}"
+        );
+
+        // 型エラーも、メッセージに引用される値を伏せる。
+        std::fs::write(&path, "[agent]\nmax_iterations = \"many-SECRET\"\n").unwrap();
+        let err = format!("{:#}", read_toml(&path).unwrap_err());
+        assert!(!err.contains("SECRET"), "{err}");
+        assert!(
+            err.contains("config.toml") && err.contains("expected usize"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn redact_quoted_hides_every_quoted_segment() {
+        assert_eq!(
+            redact_quoted(r#"invalid type: string "sk-x", expected usize"#),
+            r#"invalid type: string "…", expected usize"#
+        );
+        assert_eq!(redact_quoted("no quotes"), "no quotes");
+        assert_eq!(redact_quoted(r#"unterminated "abc"#), r#"unterminated "…"#);
+    }
 
     fn layer(name: &str, toml_src: &str) -> (PathBuf, toml::Table) {
         (PathBuf::from(name), toml::from_str(toml_src).unwrap())

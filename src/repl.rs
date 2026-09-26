@@ -542,9 +542,10 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
                     runtime.cwd.join(args)
                 };
                 let markdown = crate::session::transcript_markdown(&id, session.history());
-                match std::fs::write(&path, markdown) {
+                // transcript と同じく本人だけが読める形で書く (中身は同じもの)。
+                match crate::session::write_private(&path, &markdown) {
                     Ok(()) => println!("session: exported to {}", path.display()),
-                    Err(e) => println!("session: export failed ({}): {e}", path.display()),
+                    Err(e) => println!("session: export failed ({}): {e:#}", path.display()),
                 }
                 continue;
             }

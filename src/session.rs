@@ -102,9 +102,7 @@ impl Recorder {
     /// （transcript の行数ではなく history を基準にするため、復元時の system 差し替え
     ///   や将来の履歴整形に依存しない。）
     pub fn open_resumed(id: &str, history: &[Message]) -> Result<Self> {
-        let dir = sessions_root()
-            .context("could not resolve sessions directory")?
-            .join(id);
+        let dir = session_dir(id)?;
         if !dir.join("transcript.jsonl").is_file() {
             anyhow::bail!("no such session: {id} (looked in {dir:?})");
         }
@@ -243,9 +241,7 @@ fn valid_prefix_len(messages: &[Message]) -> usize {
 
 /// 保存済みセッションの transcript を読み戻す。
 pub fn load_transcript(id: &str) -> Result<Vec<Message>> {
-    let dir = sessions_root()
-        .context("could not resolve sessions directory")?
-        .join(id);
+    let dir = session_dir(id)?;
     let path = dir.join("transcript.jsonl");
     let file =
         File::open(&path).with_context(|| format!("no such session: {id} (looked in {dir:?})"))?;
@@ -384,6 +380,13 @@ pub fn transcript_markdown(id: &str, history: &[Message]) -> String {
     out
 }
 
+/// 本人だけが読めるファイルとして書く (`/export` 用。transcript と同じ 0600)。既存ファイルは上書きする。
+pub fn write_private(path: &Path, text: &str) -> Result<()> {
+    fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+    restrict(path, 0o600);
+    Ok(())
+}
+
 /// この cwd のセッションだけ (`None` なら全部)。作成時刻の昇順。
 pub fn list_sessions_in(cwd: Option<&Path>) -> Result<Vec<SessionMeta>> {
     let mut all = list_sessions()?;
@@ -490,6 +493,10 @@ mod tests {
         assert!(session_dir("../etc").is_err());
         assert!(session_dir("a/b").is_err());
         assert!(session_dir("").is_err());
+        // 実際に読み書きする経路もガードを通る (#129 のレビュー: --resume ../evil が通っていた)。
+        assert!(load_transcript("../evil").is_err());
+        assert!(Recorder::open_resumed("../evil", &[]).is_err());
+        assert!(read_meta("../evil").is_err());
     }
 
     #[test]

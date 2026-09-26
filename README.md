@@ -748,7 +748,7 @@ REPL セッションは自動的に保存され、後から再開できます。
 - `lodan --continue` — この cwd の直近セッションを再開（無ければエラー。黙って新規にはしない）
 - `lodan --resume <id>` — 指定 id を再開（`--resume last` は**この cwd の直近**。`--all` を付けると全ディレクトリの直近）
 - `lodan --fork <id|last>` — transcript を新しいセッションに複製してその複製を再開（元は変わらない。`meta.json` に `forked_from`。未達の `goal.json` は写さない）
-- REPL 内: `/fork`（いまの会話を複製して以後は複製へ保存）/ `/rename <名前>` / `/export [path]`（Markdown。system prompt は含めない。既定は cwd の `lodan-session-<id>.md`）
+- REPL 内: `/fork`（いまの会話を複製して以後は複製へ保存）/ `/rename <名前>` / `/export [path]`（Markdown。system prompt は含めない。既定は cwd の `lodan-session-<id>.md`。パスは打ったとおりに解釈し、**既存ファイルは上書き**、cwd の外にも書ける。transcript と同じく本人だけが読める `0600` で書く）
 - 保存先は `LODAN_SESSIONS_DIR` で差し替えられる
 
 ```console

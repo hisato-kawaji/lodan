@@ -21,6 +21,17 @@ ECHO_TOOL = {
         "type": "object",
         "properties": {"msg": {"type": "string"}},
     },
+    # サーバの自己申告。trustAnnotations のサーバでだけ lodan が信じる (#83)。
+    "annotations": {"readOnlyHint": True},
+}
+
+SLEEP_TOOL = {
+    "name": "sleep",
+    "description": "Sleep for `ms` milliseconds, then return `reply` (default a long string).",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"ms": {"type": "integer"}, "reply": {"type": "string"}},
+    },
 }
 
 GREET_PROMPT = {
@@ -117,7 +128,7 @@ def handle(msg: dict[str, Any]) -> None:
             {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"tools": [ECHO_TOOL, GET_ROOTS_TOOL, GET_SAMPLE_TOOL]},
+                "result": {"tools": [ECHO_TOOL, GET_ROOTS_TOOL, GET_SAMPLE_TOOL, SLEEP_TOOL]},
             }
         )
         return
@@ -126,6 +137,21 @@ def handle(msg: dict[str, Any]) -> None:
         params = msg.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
+        if name == "sleep":
+            import time
+            time.sleep(int(args.get("ms", 0)) / 1000)
+            reply = args.get("reply") or ("x" * 5000)
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": reply}],
+                        "isError": False,
+                    },
+                }
+            )
+            return
         if name == "echo":
             text = json.dumps(args, separators=(",", ":"))
             send(

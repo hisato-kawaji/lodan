@@ -1034,6 +1034,56 @@ fn bang_runs_a_shell_command_and_the_prompt_stays_plain_off_a_tty() {
     );
 }
 
+/// `lodan mcp add / list / remove` は設定ファイルを読み書きするだけで、サーバには繋がない (#83)。
+#[test]
+fn mcp_subcommand_edits_user_and_project_config_files() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| lodan(home.path(), 1, args, Stdin::OpenAndSilent);
+    let added = run(&[
+        "mcp",
+        "add",
+        "fs",
+        "--user",
+        "--trust-annotations",
+        "--command",
+        "npx",
+        "--",
+        "-y",
+        "server-fs",
+        "/tmp",
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let web = run(&["mcp", "add", "web", "--url", "http://127.0.0.1:1/mcp"]);
+    assert!(
+        web.status.success(),
+        "{}",
+        String::from_utf8_lossy(&web.stderr)
+    );
+    assert!(
+        home.path().join("work/.mcp.json").is_file(),
+        "project scope by default"
+    );
+    let listed = stdout(&run(&["mcp", "list"]));
+    assert!(
+        listed.contains("user     fs  npx -y server-fs /tmp  [trustAnnotations]"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("project  web  http://127.0.0.1:1/mcp"),
+        "{listed}"
+    );
+    let removed = stdout(&run(&["mcp", "remove", "fs", "--user"]));
+    assert!(removed.contains("mcp: removed fs"), "{removed}");
+    let again = stdout(&run(&["mcp", "remove", "fs", "--user"]));
+    assert!(again.contains("is not in"), "{again}");
+    let listed = stdout(&run(&["mcp", "list"]));
+    assert!(!listed.contains("fs") && listed.contains("web"), "{listed}");
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

@@ -490,6 +490,14 @@ network = false            # 既定 true。false でサンドボックス内か�
 
 `$CWD/.mcp.json` を置くと REPL 起動時に MCP サーバへ接続し、公開された tools を `mcp__<server>__<tool>` 名で `ToolRegistry` に取り込む。サーバが prompts を公開していれば `mcp__<server>__<prompt>` 名の slash コマンドとしても取り込む。
 
+- **スコープ**（#83）: ユーザー全体の `<config_dir>/mcp.json`（`config.toml` と同じ場所。macOS なら `~/Library/Application Support/lodan/mcp.json`）と、プロジェクトの `$CWD/.mcp.json`（**信頼済みのときだけ**読む）を合成する。同名はプロジェクトが勝つ
+- **`lodan mcp list | add | remove`**: 設定ファイルの読み書きだけで、サーバには繋がない。`lodan mcp add fs --command npx -- -y @modelcontextprotocol/server-filesystem /path`、`lodan mcp add web --url https://…/mcp`。既定はプロジェクトの `.mcp.json`、`--user` でユーザー全体。`--trust-annotations` で下の `trustAnnotations` を付ける。`list` はヘッダの値（トークン）を出さない
+- **サーバ別の設定**（`.mcp.json` の各サーバに書く）:
+  - `"trustAnnotations": true` — ツールの `annotations.readOnlyHint: true` を信じて、そのツールを**非破壊**（承認ゲートを通さず、plan モードでも使える）にする。ヒントはサーバの自己申告なので既定 false。信頼するサーバだけ
+  - `"enabledTools": ["read_file"]` / `"disabledTools": ["delete"]` — 取り込むツールを絞る（`disabledTools` が優先）。使わないツールの定義でコンテキストを食わない
+  - `"toolTimeoutSecs": 60` / `"maxOutputBytes": 65536` — 1 回の呼び出しの上限と、結果をモデルに渡す上限（超えた分は切って注記）。既定はこの値
+
+
 ```json
 // .mcp.json (Claude Code 互換スキーマ)
 {

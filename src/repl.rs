@@ -152,7 +152,7 @@ fn normalize_input(input: &str) -> String {
         .join("\n")
 }
 
-pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
+pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl: Editor<ReplHelper, DefaultHistory> = Editor::new()?;
     println!(
         "{} {} — type {} for commands, {} to quit",
@@ -184,7 +184,8 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }
 
     let runtime = Runtime::build(&cfg, Notices::Stdout).await?;
-    let llm_client = Arc::clone(&runtime.llm);
+    // `/model` で作り直す。サブエージェント (Task) と MCP sampling は起動時のクライアントのまま。
+    let mut llm_client = Arc::clone(&runtime.llm);
     let registry = Arc::clone(&runtime.registry);
     let mcp_prompts = &runtime.mcp_prompts;
 

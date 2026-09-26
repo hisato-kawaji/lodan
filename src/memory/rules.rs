@@ -246,7 +246,10 @@ mod tests {
         let p = Path::new("/w/.lodan/rules/x.md");
         assert!(parse_rule(p, "---\npaths: []\n---\nbody").is_err());
         assert!(parse_rule(p, "---\npaths:\n---\nbody").is_err());
-        assert!(parse_rule(p, "---\n  paths: []\n---\nbody").is_err(), "indented key");
+        assert!(
+            parse_rule(p, "---\n  paths: []\n---\nbody").is_err(),
+            "indented key"
+        );
         assert!(
             parse_rule(p, "---\nname: x\n---\nbody").is_ok(),
             "no key = every file"

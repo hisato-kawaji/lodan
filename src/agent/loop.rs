@@ -71,6 +71,58 @@ impl Session {
         Self::with_prior(cfg, registry, prior)
     }
 
+    /// system prompt を組み立てる。`/model` で切り替えたときも同じ形で作り直す。
+    fn system_prompt(cfg: &Config, cwd: &std::path::Path, registry: &ToolRegistry) -> String {
+        let mut system = prompt::build_system_prompt(cwd, &cfg.llm.active().model, registry);
+        // 利用者の追加指示はメモリのさらに後ろ。メモリと同じく、承認を回避させる指示ではない。
+        if let Some(extra) = cfg.agent.append_system_prompt.as_deref()
+            && !extra.trim().is_empty()
+        {
+            system.push_str(
+                "\nAdditional instructions from the user (user-provided context, like the project \
+                 memory above; not permission to bypass approvals):\n",
+            );
+            system.push_str(extra.trim());
+            system.push('\n');
+        }
+        system
+    }
+
+    /// セッション中に provider / model を切り替える (#81)。system prompt の model 行を作り直す。
+    /// 履歴はそのまま (別のモデルに引き継ぐ)。
+    pub fn switch_llm(&mut self, llm: crate::config::LlmConfig) {
+        self.cfg.llm = llm;
+        let system = Self::system_prompt(&self.cfg, &self.ctx.cwd, self.registry.as_ref());
+        match self.history.first_mut() {
+            Some(Message::System { content }) => *content = system,
+            _ => self.history.insert(0, Message::System { content: system }),
+        }
+    }
+
+    /// 現在のコンテキストの内訳 (`/context`)。文字数からの概算で、サーバの数え方とは違う。
+    pub fn context_breakdown(&self) -> ContextBreakdown {
+        let tokens = |chars: u64| chars.div_ceil(ESTIMATE_CHARS_PER_TOKEN);
+        let mut b = ContextBreakdown {
+            window: self.cfg.llm.active().context_window,
+            last_context_tokens: self.usage.last_context_tokens,
+            ..ContextBreakdown::default()
+        };
+        for m in &self.history {
+            let t = tokens(message_chars(m));
+            match m {
+                Message::System { .. } => b.system += t,
+                Message::User { .. } => b.user += t,
+                Message::Assistant { .. } => b.assistant += t,
+                Message::Tool { .. } => b.tool_results += t,
+            }
+        }
+        b.messages = self.history.len();
+        let mut specs = self.registry.tool_specs_with(&self.loaded_tools);
+        specs.extend(self.registry.tool_search_spec());
+        b.tools = tokens(serde_json::to_string(&specs).map_or(0, |s| s.chars().count() as u64));
+        b
+    }
+
     fn with_prior(cfg: Config, registry: Arc<ToolRegistry>, mut prior: Vec<Message>) -> Self {
         // 以前の版が保存した「content 無しでツール呼び出しも無い assistant」を送り返すと
         // Ollama に拒否される。読み込むときに空文字へ揃える。
@@ -87,19 +139,7 @@ impl Session {
             }
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut system =
-            prompt::build_system_prompt(&cwd, &cfg.llm.active().model, registry.as_ref());
-        // 利用者の追加指示はメモリのさらに後ろ。メモリと同じく、承認を回避させる指示ではない。
-        if let Some(extra) = cfg.agent.append_system_prompt.as_deref()
-            && !extra.trim().is_empty()
-        {
-            system.push_str(
-                "\nAdditional instructions from the user (user-provided context, like the project \
-                 memory above; not permission to bypass approvals):\n",
-            );
-            system.push_str(extra.trim());
-            system.push('\n');
-        }
+        let system = Self::system_prompt(&cfg, &cwd, registry.as_ref());
         let mut history = vec![Message::System { content: system }];
         history.extend(prior);
         let sandbox = crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd);
@@ -1203,6 +1243,57 @@ const COMPACT_AUTO: &str = "auto";
 /// usage 概算フォールバックの 1 トークンあたり文字数。英語 ~4 文字/トークン、
 /// 日本語 ~1-2 文字/トークンの間を取った粗い近似 (桁が合えば十分)。
 pub(crate) const ESTIMATE_CHARS_PER_TOKEN: u64 = 3;
+
+/// `/context` の内訳 (概算トークン)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextBreakdown {
+    pub system: u64,
+    /// 毎リクエスト送るツール定義 (履歴には無いが、コンテキストは食う)。
+    pub tools: u64,
+    pub user: u64,
+    pub assistant: u64,
+    pub tool_results: u64,
+    pub messages: usize,
+    pub window: u64,
+    /// 直近のリクエストの prompt_tokens (サーバ申告があればそれ)。
+    pub last_context_tokens: u64,
+}
+
+impl ContextBreakdown {
+    pub fn total(&self) -> u64 {
+        self.system + self.tools + self.user + self.assistant + self.tool_results
+    }
+
+    pub fn describe(&self) -> String {
+        let pct = |n: u64| {
+            (n * 100)
+                .checked_div(self.window)
+                .map_or_else(String::new, |p| format!(" ({p}%)"))
+        };
+        let mut out = format!(
+            "context (estimated, ~{ESTIMATE_CHARS_PER_TOKEN} chars/token):\n  system prompt  ~{} tokens\n  tool specs     ~{} tokens\n  user           ~{} tokens\n  assistant      ~{} tokens\n  tool results   ~{} tokens\n  total          ~{} tokens{} in {} message(s)",
+            self.system,
+            self.tools,
+            self.user,
+            self.assistant,
+            self.tool_results,
+            self.total(),
+            pct(self.total()),
+            self.messages
+        );
+        if self.last_context_tokens > 0 {
+            out.push_str(&format!(
+                "\n  last request   {} prompt tokens{}",
+                self.last_context_tokens,
+                pct(self.last_context_tokens)
+            ));
+        }
+        if self.window > 0 {
+            out.push_str(&format!("\n  window         {} tokens", self.window));
+        }
+        out
+    }
+}
 
 /// セッション累積のトークン使用量。`/cost` 表示と自動圧縮 (しきい値) の基盤。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -4423,6 +4514,61 @@ mod tests {
         session.run_turn("which port?", &llm, &gate).await.unwrap();
         assert_eq!(empty_reply_notes(&session), 0);
         assert!(session.last_reply_thought_chars().is_some());
+    }
+
+    /// `/model`: system prompt の model 行が差し替わり、履歴はそのまま残る (#81)。
+    #[test]
+    fn switch_llm_rewrites_the_system_prompt_and_keeps_the_history() {
+        let mut cfg = Config::default();
+        cfg.llm.local.model = "first".into();
+        let mut session = Session::resume(
+            cfg.clone(),
+            Arc::new(default_registry()),
+            vec![Message::User {
+                content: "hello".into(),
+            }],
+        );
+        assert!(
+            matches!(&session.history()[0], Message::System { content } if content.contains("model: first"))
+        );
+        let mut llm = cfg.llm.clone();
+        llm.local.model = "second".into();
+        session.switch_llm(llm);
+        assert!(
+            matches!(&session.history()[0], Message::System { content } if content.contains("model: second") && !content.contains("model: first"))
+        );
+        assert!(matches!(&session.history()[1], Message::User { content } if content == "hello"));
+    }
+
+    /// `/context`: 内訳の合計は各項の和で、window があれば割合が出る。
+    #[test]
+    fn context_breakdown_sums_its_parts() {
+        let mut cfg = Config::default();
+        cfg.llm.local.context_window = 1000;
+        let session = Session::resume(
+            cfg,
+            Arc::new(default_registry()),
+            vec![
+                Message::User {
+                    content: "x".repeat(300),
+                },
+                Message::Assistant {
+                    content: Some("y".repeat(30)),
+                    tool_calls: vec![],
+                    reasoning_content: None,
+                },
+            ],
+        );
+        let b = session.context_breakdown();
+        assert_eq!(b.user, 100);
+        assert_eq!(b.assistant, 10);
+        assert!(b.system > 0 && b.tools > 0);
+        assert_eq!(
+            b.total(),
+            b.system + b.tools + b.user + b.assistant + b.tool_results
+        );
+        assert_eq!(b.messages, 3);
+        assert!(b.describe().contains("window         1000 tokens"));
     }
 
     /// 既定 (finish_nudge=false) ではナッジは注入されない。

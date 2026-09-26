@@ -334,6 +334,17 @@ impl Ledger {
                 ));
             }
         }
+        // セッション中にモデルを切り替えたら (#81)、どのモデルにいくら使ったかを分ける。
+        if state.by_model.len() > 1 {
+            for (model, u) in &state.by_model {
+                out.push_str(&format!(
+                    "\n  model {}: {} tokens in {} call(s)",
+                    crate::term::sanitize(model),
+                    u.total_tokens,
+                    u.calls
+                ));
+            }
+        }
         let failed = state.requests.saturating_sub(all.calls);
         if failed > 0 {
             out.push_str(&format!(

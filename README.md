@@ -284,7 +284,10 @@ cwd の中のファイルや単純な Bash コマンドでは、5 つ目の選�
 
 承認プロンプトは **Enter だけで yes** だが、それは stdin が端末のときに限る。プロンプトをパイプで渡した実行 (`echo "..." | lodan`) では、空行は答えとして扱わず、誰も答えないまま入力が尽きた (EOF) 承認は `(no input — denied)` で**拒否**する。無人実行で破壊的ツールを通したいときは `--yes` を明示すること。
 
-組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept` `/undo` `/memory`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
+組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept` `/undo` `/model` `/status` `/context` `/memory`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
+- **`/model [provider[:model]]`**: セッション中に provider / model を切り替える（#81）。`/model kimi` は設定済みの kimi のモデルへ、`/model local:qwen3.5:9b` は provider とモデルを同時に、`/model qwen3.5:9b` はいまの provider のモデルだけを変える。引数なしで現在値と設定済み provider の一覧。会話履歴はそのまま引き継ぎ、system prompt の model 行だけ作り直す。トークンの台帳と予算も引き継ぐ（`/cost` にモデル別の内訳が出る）。`Task` のサブエージェントと MCP sampling は起動時のモデルのまま。クライアントを作れない指定（API キーが無い、など）は切り替えずに理由を表示する
+- **`/status`**: provider / model / base_url（秘密は伏せる）/ コンテキスト使用量（直近リクエストの prompt トークン ÷ `context_window`、自動圧縮のしきい値）/ モード / 権限モード / サンドボックス / cwd / session id / ツールの見せ方 / hooks の数
+- **`/context`**: コンテキストの内訳を概算トークンで — system prompt / ツール定義（履歴には無いが毎リクエスト送る）/ user / assistant / tool results。`--tool-profile` や `--tool-search` の効きを見るためのもの。文字数からの概算（~3 chars/token）なのでサーバの数え方とは違う。直近リクエストのサーバ申告 prompt トークンも並べて出す
 
 **端末装飾**: ツール出力・エラー・承認プロンプトを ANSI で色分けし、LLM 応答待ちは `…thinking` インジケータを表示する。stdout が tty でない（パイプ／リダイレクト）とき、または `NO_COLOR` 環境変数が設定されているときは着色・インジケータを一切出さない。
 

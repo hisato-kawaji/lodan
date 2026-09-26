@@ -932,6 +932,79 @@ fn memory_lists_loaded_files_imports_and_refused_imports() {
     assert!(text.contains("total: "), "{text}");
 }
 
+/// `/model` で別の provider に切り替えると、次のリクエストはそちらへ飛ぶ (#81)。mock を 2 台
+/// 立て、2 台目を `[llm.sakana]` に設定しておく。
+#[test]
+fn model_switch_sends_the_next_request_to_the_other_provider() {
+    let home = tempfile::tempdir().unwrap();
+    let first = start_mock(home.path());
+    let second = start_mock_saying(home.path(), Some("Hello from the second mock."));
+    let work = home.path().join("work/.lodan");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("config.toml"),
+        format!(
+            "[llm.local]\ncontext_window = 8000\n\n[llm.sakana]\nbase_url = \"http://127.0.0.1:{}/v1\"\nmodel = \"second-model\"\napi_key = \"test-key\"\n",
+            second.port
+        ),
+    )
+    .unwrap();
+    let out = lodan(
+        home.path(),
+        first.port,
+        &[],
+        Stdin::Piped("hi\n/model sakana\nhi\n/status\n/context\n/cost\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    let a = text.find(GREETING).expect("first answer from mock 1");
+    let b = text
+        .find("Hello from the second mock.")
+        .expect("second answer from mock 2");
+    assert!(a < b, "{text}");
+    assert!(text.contains("model: now sakana:second-model"), "{text}");
+    assert!(
+        text.contains("provider: sakana  model: second-model"),
+        "{text}"
+    );
+    assert!(
+        text.contains("system prompt  ~"),
+        "/context breakdown: {text}"
+    );
+    assert!(
+        text.contains("model second-model:") && text.matches("\n  model ").count() == 2,
+        "/cost splits usage by model: {text}"
+    );
+}
+
+/// 作れない指定 (API キーの無い provider) は切り替えず、いまのモデルのまま続く。
+#[test]
+fn a_model_switch_that_cannot_build_a_client_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let server = start_mock(home.path());
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("/model kimi\nhi\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("model: not switched"), "{text}");
+    assert!(
+        text.contains(GREETING),
+        "still answered by the original provider: {text}"
+    );
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

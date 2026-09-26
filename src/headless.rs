@@ -58,6 +58,10 @@ pub struct Options {
 /// スキーマに合わない応答を、直させるために再要求する回数。
 const SCHEMA_RETRIES: u32 = 2;
 
+/// 本文の無いターンの `error`。思考だけだったと分かるときは `with_thought_only` が言い分ける。
+const NO_ANSWER: &str = "the turn ended without a final answer (the prompt was blocked by a hook, \
+    or the model returned no text)";
+
 /// 読み込んだ `--output-schema`。
 struct OutputSchema {
     schema: crate::schema::Schema,
@@ -247,6 +251,7 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         recorder.as_ref().map(|r| r.id().to_string()),
         session.usage(),
     )
+    .with_thought_only(session.last_reply_thought_chars())
     .with_schema_result(structured, schema_failure)
     .with_ledger(&runtime.ledger))
 }
@@ -371,14 +376,7 @@ impl Report {
         let (exit_code, result, error) = match outcome {
             // UserPromptSubmit hook がプロンプトをブロックしたか、モデルが本文の無い応答で
             // ターンを終えた。成功扱いで空を返すと、呼び出し側は「空の回答」と区別できない。
-            Outcome::Done if text.is_none() => (
-                EXIT_ERROR,
-                None,
-                Some(
-                    "the turn ended without a final answer (the prompt was blocked by a hook, or the model returned no text)"
-                        .to_string(),
-                ),
-            ),
+            Outcome::Done if text.is_none() => (EXIT_ERROR, None, Some(NO_ANSWER.to_string())),
             Outcome::Done => (EXIT_OK, text, None),
             Outcome::Interrupted => (EXIT_INTERRUPTED, None, Some("interrupted".to_string())),
             Outcome::Failed(e) => {
@@ -403,6 +401,22 @@ impl Report {
             usage: usage_json(usage),
             structured_output: None,
         }
+    }
+
+    /// 本文の無いターンが「思考だけ」だったと分かるなら、`error` をそう言い分ける (#111)。
+    /// 促しても書かなかった後なので、呼び出し側が取れる手は `--reasoning-effort` を下げるか
+    /// `--show-reasoning` で思考を読むこと。
+    fn with_thought_only(mut self, thought_chars: Option<usize>) -> Self {
+        if let Some(n) = thought_chars
+            && self.error.as_deref() == Some(NO_ANSWER)
+        {
+            self.error = Some(format!(
+                "the model thought ({n} chars of reasoning) but wrote no answer, even after being \
+                 asked once to write it (--show-reasoning prints the reasoning; a lower \
+                 --reasoning-effort often helps)"
+            ));
+        }
+        self
     }
 
     /// `--output-schema` の結果を載せる。合格なら `result` をその JSON (余計な前置きやコードフェンスを
@@ -612,6 +626,20 @@ mod tests {
 
         let cut = Report::new(&Outcome::Interrupted, None, None, &usage());
         assert_eq!(cut.exit_code, EXIT_INTERRUPTED);
+
+        let thought =
+            Report::new(&Outcome::Done, None, None, &usage()).with_thought_only(Some(106));
+        assert_eq!(thought.exit_code, EXIT_ERROR);
+        assert!(
+            thought
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("106 chars of reasoning")
+        );
+        let spoken = Report::new(&Outcome::Done, Some("hi".into()), None, &usage())
+            .with_thought_only(Some(3));
+        assert_eq!(spoken.exit_code, EXIT_OK, "an answer is an answer");
 
         let silent = Report::new(&Outcome::Done, None, None, &usage());
         assert_eq!(

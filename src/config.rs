@@ -293,6 +293,9 @@ pub struct AgentConfig {
     /// モデルの思考過程 (`reasoning_content`) を画面に全文流す。既定は畳んで長さだけ示す (#78)。
     pub show_reasoning: bool,
     pub auto_approve: bool,
+    /// 本文もツール呼び出しも無い応答 (thinking モデルの「思考だけ」) を、1 回だけ「答えを
+    /// 書け」と促して続ける (#111)。既定 true。思考を返さないモデルでは発火しない。
+    pub empty_reply_nudge: bool,
     /// ターン終了直前に 1 回だけ自己検証を促す (#63)。小型ローカルモデルの
     /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
     /// (良行儀なモデルに余計な LLM ラウンドトリップを課さない)。
@@ -452,6 +455,7 @@ impl Default for AgentConfig {
             show_reasoning: false,
             auto_approve: false,
             finish_nudge: false,
+            empty_reply_nudge: true,
             malformed_retry: true,
             dup_suppress: true,
             parallel_tools: true,
@@ -688,6 +692,10 @@ impl Config {
             self.agent.finish_nudge = v;
             mark("agent.finish_nudge".into());
         }
+        if let Some(v) = o.empty_reply_nudge {
+            self.agent.empty_reply_nudge = v;
+            mark("agent.empty_reply_nudge".into());
+        }
         if let Some(v) = o.malformed_retry {
             self.agent.malformed_retry = v;
             mark("agent.malformed_retry".into());
@@ -778,6 +786,7 @@ pub struct Overrides {
     /// `true` のときだけ有効化する (既存 `--yes` の意味を保つ)。
     pub auto_approve: bool,
     pub finish_nudge: Option<bool>,
+    pub empty_reply_nudge: Option<bool>,
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,
     pub parallel_tools: Option<bool>,

@@ -42,6 +42,9 @@ pub struct Session {
     ledger: Option<Arc<crate::llm::metered::Ledger>>,
     /// `ToolSearch` で読み込んだ遅延ツール。次のリクエストから定義を送る (#72)。
     loaded_tools: std::collections::BTreeSet<String>,
+    /// 直近のターンが「思考だけで本文の無い応答」で終わったなら、その思考の文字数 (#111)。
+    /// ヘッドレスの結果で「hook に止められた」と言い分けるためのもの。
+    last_reply_thought_chars: Option<usize>,
 }
 
 /// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
@@ -102,6 +105,7 @@ impl Session {
             pending_context: Vec::new(),
             ledger: None,
             loaded_tools: std::collections::BTreeSet::new(),
+            last_reply_thought_chars: None,
         }
     }
 
@@ -166,6 +170,12 @@ impl Session {
     }
 
     /// セッション累積のトークン使用量 (`/cost` 表示・自動圧縮の判断材料)。
+    /// 直近のターンが、思考だけで本文もツール呼び出しも無い応答で終わったなら、その思考の
+    /// 文字数 (#111)。本文があったか、思考の無い空応答なら `None`。
+    pub fn last_reply_thought_chars(&self) -> Option<usize> {
+        self.last_reply_thought_chars
+    }
+
     pub fn usage(&self) -> &SessionUsage {
         &self.usage
     }
@@ -230,6 +240,9 @@ impl Session {
         // #63: 終了前自己検証ナッジの状態 (ターン内でツールを使ったか / 注入済みか)。
         let mut used_tools = false;
         let mut finish_nudged = false;
+        // #111: 思考だけで本文の無い応答を「答えを書け」と促した回数。
+        let mut empty_reply_nudges = 0u32;
+        self.last_reply_thought_chars = None;
 
         // 評価ハーネス向けの計測 (runlog 無効時はいずれも no-op)。
         end.arm(self.turn_seq);
@@ -318,6 +331,38 @@ impl Session {
 
             if tool_calls.is_empty() {
                 crate::say!();
+                // #111: 本文もツール呼び出しも無い応答。thinking モデルは思考だけ書いてそのまま
+                // 応答を閉じることがある (qwen3.5:9b で 20 実行中 13)。利用者には思考が見えない
+                // ので、答えとして書き直させる。1 回だけ — それでも空なら、そのまま終える。
+                let text_is_empty = resp.content.as_deref().is_none_or(|c| c.trim().is_empty());
+                let thought_chars = resp.reasoning.as_deref().map_or(0, |r| r.chars().count());
+                if text_is_empty
+                    && self.cfg.agent.empty_reply_nudge
+                    && empty_reply_nudges < MAX_EMPTY_REPLY_NUDGES
+                {
+                    empty_reply_nudges += 1;
+                    crate::say!(
+                        "{}",
+                        crate::term::dim(
+                            "[lodan] the reply had no text — asking the model to write its answer"
+                        )
+                    );
+                    crate::runlog::record(
+                        "empty_reply_nudge",
+                        serde_json::json!({
+                            "turn": self.turn_seq,
+                            "iter": iterations,
+                            "reasoning_chars": thought_chars,
+                        }),
+                    );
+                    self.history.push(Message::User {
+                        content: EMPTY_REPLY_NOTE.to_string(),
+                    });
+                    continue;
+                }
+                if text_is_empty && thought_chars > 0 {
+                    self.last_reply_thought_chars = Some(thought_chars);
+                }
                 // #61: ツール呼び出しがテキストとして漏れてきた (サーバ側でパース
                 // できず素通しになった) 痕跡があれば、正しい形式での再発行を求めて
                 // ターンを継続する。誤検知してもナッジが 1 回入るだけで無害。
@@ -1442,6 +1487,14 @@ const FINISH_NUDGE_VERIFY: &str = "[lodan] Before you finish: re-read the origin
     check that EVERY stated requirement is implemented and verified (run the verification \
     command if one was given, and confirm required files/outputs actually exist). If anything \
     is missing or unverified, continue working now; otherwise give your final answer.";
+
+/// #111: 空応答を答えとして書き直させる回数の上限。
+const MAX_EMPTY_REPLY_NUDGES: u32 = 1;
+
+/// #111: 本文もツール呼び出しも無い応答に注入する指示。
+const EMPTY_REPLY_NOTE: &str = "[lodan] Your last reply had no text and no tool call — only \
+    private reasoning, which the user cannot see. Based on what you were thinking, either write \
+    your answer now as normal text, or call the next tool.";
 
 /// #61: 壊れツールコール検知時に注入する修正指示。
 const MALFORMED_CALL_NOTE: &str = "[lodan] Your previous reply contained tool-call markup as \
@@ -4191,6 +4244,116 @@ mod tests {
         let mut cfg = Config::default();
         cfg.agent.finish_nudge = true;
         Session::new(cfg, Arc::new(default_registry()))
+    }
+
+    /// 思考だけ返して本文の無い応答を、指定回数だけ続けてから本文を返す LLM (#111)。
+    struct ThoughtThenTextLlm {
+        thought_only_replies: usize,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for ThoughtThenTextLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            unreachable!("not used")
+        }
+
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let i = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let resp = if i < self.thought_only_replies {
+                ChatResponse {
+                    content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning: Some("I should say the port is 8123".into()),
+                }
+            } else {
+                ChatResponse {
+                    content: Some("The port is 8123.".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning: Some("ok".into()),
+                }
+            };
+            let _ = sink.send(ChatEvent::Done(resp));
+            Ok(())
+        }
+    }
+
+    fn empty_reply_notes(session: &Session) -> usize {
+        session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content == EMPTY_REPLY_NOTE))
+            .count()
+    }
+
+    /// 思考だけの応答は 1 回促されて、本文が返れば普通に終わる (#111)。
+    #[tokio::test]
+    async fn an_empty_reply_is_nudged_once_and_the_rewritten_answer_ends_the_turn() {
+        let mut session = session_with_stop_hook(None);
+        let llm = ThoughtThenTextLlm {
+            thought_only_replies: 1,
+            seen: 0.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("which port?", &llm, &gate).await.unwrap();
+        assert_eq!(empty_reply_notes(&session), 1);
+        assert!(matches!(
+            session.history().last(),
+            Some(Message::Assistant { content: Some(c), .. }) if c == "The port is 8123."
+        ));
+        assert_eq!(session.last_reply_thought_chars(), None);
+    }
+
+    /// 促しても空のままなら、2 度目は促さずに終える。思考の長さは記録に残る。
+    #[tokio::test]
+    async fn a_second_empty_reply_ends_the_turn_and_is_reported() {
+        let mut session = session_with_stop_hook(None);
+        let llm = ThoughtThenTextLlm {
+            thought_only_replies: 5,
+            seen: 0.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("which port?", &llm, &gate).await.unwrap();
+        assert_eq!(empty_reply_notes(&session), 1, "nudged exactly once");
+        assert_eq!(
+            llm.seen.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one nudge = one extra round trip"
+        );
+        assert_eq!(
+            session.last_reply_thought_chars(),
+            Some("I should say the port is 8123".chars().count())
+        );
+    }
+
+    /// ablation で切れる (`empty_reply_nudge = false`)。
+    #[tokio::test]
+    async fn the_empty_reply_nudge_can_be_disabled() {
+        let mut cfg = Config::default();
+        cfg.agent.empty_reply_nudge = false;
+        let mut session = Session::new(cfg, Arc::new(default_registry()));
+        let llm = ThoughtThenTextLlm {
+            thought_only_replies: 1,
+            seen: 0.into(),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn("which port?", &llm, &gate).await.unwrap();
+        assert_eq!(empty_reply_notes(&session), 0);
+        assert!(session.last_reply_thought_chars().is_some());
     }
 
     /// 既定 (finish_nudge=false) ではナッジは注入されない。

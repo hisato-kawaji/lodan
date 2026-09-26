@@ -59,6 +59,10 @@ pub struct Cli {
     #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub finish_nudge: Option<bool>,
 
+    /// Ask the model to write its answer when a reply had no text and no tool call (#111)
+    #[arg(long, env = "LODAN_EMPTY_REPLY_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub empty_reply_nudge: Option<bool>,
+
     /// Ask the model to re-issue tool calls that leaked as text (#61)
     #[arg(long, env = "LODAN_MALFORMED_RETRY", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub malformed_retry: Option<bool>,
@@ -219,6 +223,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         show_reasoning: args.show_reasoning,
         auto_approve: args.yes,
         finish_nudge: args.finish_nudge,
+        empty_reply_nudge: args.empty_reply_nudge,
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,
         parallel_tools: args.parallel_tools,

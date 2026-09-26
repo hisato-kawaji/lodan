@@ -71,7 +71,21 @@ impl Session {
         Self::with_prior(cfg, registry, prior)
     }
 
-    fn with_prior(cfg: Config, registry: Arc<ToolRegistry>, prior: Vec<Message>) -> Self {
+    fn with_prior(cfg: Config, registry: Arc<ToolRegistry>, mut prior: Vec<Message>) -> Self {
+        // 以前の版が保存した「content 無しでツール呼び出しも無い assistant」を送り返すと
+        // Ollama に拒否される。読み込むときに空文字へ揃える。
+        for m in &mut prior {
+            if let Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } = m
+                && content.is_none()
+                && tool_calls.is_empty()
+            {
+                *content = Some(String::new());
+            }
+        }
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut system =
             prompt::build_system_prompt(&cwd, &cfg.llm.active().model, registry.as_ref());
@@ -211,6 +225,8 @@ impl Session {
                 serde_json::json!({ "prompt": user_input }),
             )
             .await?;
+        // ターンごとの値。hook にブロックされたターンでも前の値を残さない。
+        self.last_reply_thought_chars = None;
         if let Some(reason) = &submitted.block {
             crate::say!("prompt blocked by hook: {}", crate::term::sanitize(reason));
             return Ok(());
@@ -240,9 +256,8 @@ impl Session {
         // #63: 終了前自己検証ナッジの状態 (ターン内でツールを使ったか / 注入済みか)。
         let mut used_tools = false;
         let mut finish_nudged = false;
-        // #111: 思考だけで本文の無い応答を「答えを書け」と促した回数。
+        // #111: 本文もツール呼び出しも無い応答を「答えを書け」と促した回数。
         let mut empty_reply_nudges = 0u32;
-        self.last_reply_thought_chars = None;
 
         // 評価ハーネス向けの計測 (runlog 無効時はいずれも no-op)。
         end.arm(self.turn_seq);
@@ -323,8 +338,16 @@ impl Session {
                 .reasoning
                 .clone()
                 .filter(|_| !tool_calls.is_empty() && self.cfg.llm.active().reasoning_roundtrip);
+            // 本文もツール呼び出しも無い応答は `content` を空文字にして積む。`content` 無し (null) の
+            // assistant メッセージは、送り返すと Ollama が 400 で拒否する (実測: "invalid message
+            // content type: <nil>")。送り返す経路は #111 の促しだけでなく、次のターン・`--resume`・
+            // 自動圧縮でもある。空文字は最終応答としては扱わない (`final_text` は空白だけを無視する)。
+            let content = resp
+                .content
+                .clone()
+                .or_else(|| tool_calls.is_empty().then(String::new));
             self.history.push(Message::Assistant {
-                content: resp.content.clone(),
+                content,
                 tool_calls: tool_calls.clone(),
                 reasoning_content,
             });
@@ -355,11 +378,14 @@ impl Session {
                             "reasoning_chars": thought_chars,
                         }),
                     );
-                    // この空応答は次のリクエストで送り返される。`content: null` でツール呼び出しも
-                    // 無い assistant メッセージは Ollama が 400 で拒否する (実測: "invalid message
-                    // content type: <nil>") ので、空文字にしておく。
-                    if let Some(Message::Assistant { content, .. }) = self.history.last_mut() {
-                        *content = Some(String::new());
+                    // 「考えた内容を踏まえて」と言うのだから、思考を送り返せるサーバには
+                    // この空応答の思考も持ち回る (ツール往復のときと同じ扱い)。
+                    if self.cfg.llm.active().reasoning_roundtrip
+                        && let Some(Message::Assistant {
+                            reasoning_content, ..
+                        }) = self.history.last_mut()
+                    {
+                        *reasoning_content = resp.reasoning.clone();
                     }
                     self.history.push(Message::User {
                         content: EMPTY_REPLY_NOTE.to_string(),
@@ -4352,6 +4378,35 @@ mod tests {
             session.last_reply_thought_chars(),
             Some("I should say the port is 8123".chars().count())
         );
+        // 促した後の空応答も、次のターンで送り返される。content 無しにしない。
+        assert!(
+            !session.history().iter().any(|m| matches!(
+                m,
+                Message::Assistant { content: None, tool_calls, .. } if tool_calls.is_empty()
+            )),
+            "{:?}",
+            session.history().last()
+        );
+    }
+
+    /// 以前の版の transcript に残る content 無しの assistant は、再開時に空文字へ揃える。
+    #[test]
+    fn resume_normalizes_content_less_assistant_messages() {
+        let prior = vec![
+            Message::User {
+                content: "hi".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+        ];
+        let session = Session::resume(Config::default(), Arc::new(default_registry()), prior);
+        assert!(matches!(
+            session.history().last(),
+            Some(Message::Assistant { content: Some(c), .. }) if c.is_empty()
+        ));
     }
 
     /// ablation で切れる (`empty_reply_nudge = false`)。

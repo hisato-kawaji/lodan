@@ -331,7 +331,8 @@ fn final_text(history: &[Message]) -> Option<String> {
             content: Some(text),
             tool_calls,
             ..
-        } if tool_calls.is_empty() => Some(text.clone()),
+        } if tool_calls.is_empty() && !text.trim().is_empty() => Some(text.clone()),
+        // 空文字は「本文の無い応答」を送り返せる形にしただけで、答えではない。
         _ => None,
     }
 }

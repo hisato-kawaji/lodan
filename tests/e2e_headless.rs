@@ -353,9 +353,10 @@ fn a_broken_config_file_is_reported_as_a_stream_json_result() {
     let home = tempfile::tempdir().unwrap();
     let cfg_dir = home.path().join("work/.lodan");
     std::fs::create_dir_all(&cfg_dir).unwrap();
+    // 閉じ忘れの api_key: 壊れた行の値がエラー文に出てはいけない (#114)。
     std::fs::write(
         cfg_dir.join("config.toml"),
-        "[agent]\nmax_iterations = \"many\"\n",
+        "[llm.local]\napi_key = \"sk-BROKEN-SECRET\n",
     )
     .unwrap();
     let out = lodan(
@@ -384,6 +385,11 @@ fn a_broken_config_file_is_reported_as_a_stream_json_result() {
     assert!(
         last["error"].as_str().unwrap().contains("config.toml"),
         "{last}"
+    );
+    assert!(
+        !stdout(&out).contains("BROKEN")
+            && !String::from_utf8_lossy(&out.stderr).contains("BROKEN"),
+        "the broken line's value must not be quoted: {last}"
     );
 }
 

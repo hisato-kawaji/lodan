@@ -22,7 +22,7 @@ use crate::slash::{self, SlashCommand};
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
     "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop", "plan", "accept",
-    "undo",
+    "undo", "memory",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
@@ -322,6 +322,35 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                         "last context: {} prompt tokens",
                         session.usage().last_context_tokens
                     );
+                }
+                continue;
+            }
+
+            // /memory: いま読まれているメモリの一覧 (#79)。
+            if head == "memory" {
+                let loaded = crate::memory::load_memory_detailed(&runtime.cwd);
+                if loaded.sources.is_empty() {
+                    println!(
+                        "no memory files (LODAN.md / CLAUDE.md / AGENTS.md in the cwd hierarchy, ~/.lodan/LODAN.md)"
+                    );
+                }
+                // パスは clone したリポジトリの中の名前かもしれない。端末に出す前に無害化する。
+                for s in &loaded.sources {
+                    let via = s.imported_from.as_ref().map_or(String::new(), |f| {
+                        format!("  (imported from {})", crate::trust::shown(f))
+                    });
+                    println!("{} — {} bytes{via}", crate::trust::shown(&s.path), s.bytes);
+                }
+                if !loaded.sources.is_empty() {
+                    println!(
+                        "total: {} bytes in the system prompt (cap {} bytes){}",
+                        loaded.text.len(),
+                        crate::memory::MEMORY_CAP,
+                        if loaded.truncated { ", truncated" } else { "" }
+                    );
+                }
+                for w in &loaded.warnings {
+                    println!("warning: {}", crate::term::sanitize(w));
                 }
                 continue;
             }
@@ -856,6 +885,7 @@ fn handle_slash(
                 ("/tools", "利用可能なツール一覧"),
                 ("/compact [指示]", "会話履歴を要約して圧縮"),
                 ("/cost", "セッション累積のトークン使用量を表示"),
+                ("/memory", "読み込まれているメモリファイルの一覧とサイズ"),
                 (
                     "/goal <条件> | /goal | /goal clear",
                     "条件達成までターンを自律継続 / 状態表示 / 解除",

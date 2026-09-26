@@ -18,7 +18,7 @@
 - **ユーザー定義 slash コマンド**: `.lodan/commands/*.md` をプロンプトテンプレートとして読み込み、`/name 引数` で展開（後述）
 - **サブエージェント (`Task`)**: 読み取り専用ツールで調査タスクを子エージェントに委譲（後述）
 - **skills**: `.lodan/skills/<name>/SKILL.md` を読み込み、`Skill` ツールとしてモデルへ公開（後述）
-- **プロジェクトメモリ**: cwd 階層の `LODAN.md`（無ければ `CLAUDE.md`）と `~/.lodan/LODAN.md` を読み、system prompt へ注入（後述）
+- **プロジェクトメモリ**: cwd 階層の `LODAN.md`（無ければ `CLAUDE.md`、無ければ `AGENTS.md`）と `~/.lodan/LODAN.md` を読み、system prompt へ注入。`@path` で別ファイルを取り込める（後述）
 
 ## 必要環境
 
@@ -284,7 +284,7 @@ cwd の中のファイルや単純な Bash コマンドでは、5 つ目の選�
 
 承認プロンプトは **Enter だけで yes** だが、それは stdin が端末のときに限る。プロンプトをパイプで渡した実行 (`echo "..." | lodan`) では、空行は答えとして扱わず、誰も答えないまま入力が尽きた (EOF) 承認は `(no input — denied)` で**拒否**する。無人実行で破壊的ツールを通したいときは `--yes` を明示すること。
 
-組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept` `/undo`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
+組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept` `/undo` `/memory`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
 
 **端末装飾**: ツール出力・エラー・承認プロンプトを ANSI で色分けし、LLM 応答待ちは `…thinking` インジケータを表示する。stdout が tty でない（パイプ／リダイレクト）とき、または `NO_COLOR` 環境変数が設定されているときは着色・インジケータを一切出さない。
 
@@ -798,9 +798,12 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 `Monitor` は読み取り専用なのでパーミッションゲートを経ない（`Bash` の起動自体は従来どおりゲート対象）。
 `KillShell` はプロセスを終了させる副作用があるため**破壊的ツール扱い**で承認ゲートを通る。
 
-## プロジェクトメモリ（`LODAN.md` / `CLAUDE.md`）
+## プロジェクトメモリ（`LODAN.md` / `CLAUDE.md` / `AGENTS.md`）
 
-起動時に **cwd から上方向**（`$HOME` まで、無ければ root まで）の各ディレクトリにある `LODAN.md`（無ければ `CLAUDE.md`）と、ユーザ全体の `~/.lodan/LODAN.md` を読み込み、**system prompt の末尾へ注入**する。Claude Code の `CLAUDE.md` 階層に相当。
+起動時に **cwd から上方向**（`$HOME` まで、無ければ root まで）の各ディレクトリにある `LODAN.md`（無ければ `CLAUDE.md`、無ければ `AGENTS.md`）と、ユーザ全体の `~/.lodan/LODAN.md` を読み込み、**system prompt の末尾へ注入**する。Claude Code の `CLAUDE.md` 階層に相当。`AGENTS.md` は Codex の標準で、Claude Code も `CLAUDE.md` が無ければ読む（#79）。
+
+- **`@path` import**: 行頭か空白の直後の `@docs/style.md` を、そのファイルの中身で置き換える（元の行は `[import: docs/style.md]` になり、その後ろに `# Import: <path>` ヘッダつきで本文が続く）。相対パスは**書いたファイルの場所**基準、`@~/x.md` はホーム、絶対パスも可。最大 4 ホップ、循環は 1 回で止める。バッククォートの中と ``` フェンスの中は展開しない。`me@example.com` のように直前が空白でないものも展開しない。**取り込めるのは、書いたファイルのディレクトリ配下か cwd 配下だけ**（それ以外は警告して読まない。未信頼ディレクトリでは cwd 配下も不可）。32 KiB の上限は展開後に効く
+- **`/memory`**: いま読まれているファイルの一覧（パス・バイト数・どこから import されたか）と、system prompt に入っている合計バイト数、取り込めなかった `@path` の警告
 
 - 連結順は **外側（汎用）→ 内側（具体）**。各エントリに `# Memory: <path>` ヘッダが付く。
 - 合計 32 KiB を上限に、超過分は文字境界で打ち切る（`...[memory truncated]...`）。

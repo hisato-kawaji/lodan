@@ -775,6 +775,14 @@ impl Session {
                 if reason == TOOL_REASON_OK && output.is_error {
                     reason = "tool_reported_error";
                 }
+                // path-scoped ルール: 該当ファイルに初めて触れた tool_result の後ろに 1 回だけ (#79)。
+                // 失敗した呼び出し (存在しないパスなど) には足さない。runlog の output_bytes に
+                // 含めるため、記録より前に足す。
+                if !output.is_error
+                    && let Some(extra) = self.rules_for_call(&name, &args)
+                {
+                    output.content.push_str(&extra);
+                }
                 crate::runlog::record(
                     "tool_result",
                     serde_json::json!({
@@ -796,13 +804,6 @@ impl Session {
                     }),
                 );
                 last_call = Some((name.clone(), call.function.arguments.clone()));
-                // path-scoped ルール: 該当ファイルに初めて触れた tool_result の後ろに 1 回だけ (#79)。
-                // 失敗した呼び出し (存在しないパスなど) には足さない。
-                if !output.is_error
-                    && let Some(extra) = self.rules_for_call(&name, &args)
-                {
-                    output.content.push_str(&extra);
-                }
                 self.history.push(Message::Tool {
                     tool_call_id: call.id,
                     content: output.content,
@@ -4661,7 +4662,8 @@ mod tests {
             "b.txt does not match"
         );
         assert!(
-            tool_replies[1].contains("[lodan] Rules for this path"),
+            tool_replies[1].contains("<path-rules source=")
+                && tool_replies[1].contains("USE THISERROR"),
             "{}",
             tool_replies[1]
         );

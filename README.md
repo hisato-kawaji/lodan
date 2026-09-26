@@ -807,7 +807,12 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 - **`@path` import**: 行頭か空白の直後の `@docs/style.md` を、そのファイルの中身で置き換える（元の行は `[import: docs/style.md]` になり、その後ろに `# Import: <path>` ヘッダつきで本文が続く）。相対パスは**書いたファイルの場所**基準、`@~/x.md` はホーム、絶対パスも可。最大 4 ホップ、循環は 1 回で止める。バッククォートの中と ``` フェンスの中は展開しない。`me@example.com` のように直前が空白でないものも展開しない。**取り込めるのは、書いたファイルのディレクトリ配下か cwd 配下だけ**（それ以外は警告して読まない。未信頼ディレクトリでは cwd 配下も不可）。32 KiB の上限は展開後に効く
 - **`/memory`**: いま読まれているファイルの一覧（パス・バイト数・どこから import されたか）と、system prompt に入っている合計バイト数、取り込めなかった `@path` の警告、path-scoped ルールの一覧
-- **path-scoped ルール**（`.lodan/rules/*.md`）: frontmatter の `paths:` に一致するファイルを Read / Write / Edit / MultiEdit / NotebookEdit したとき、**その tool_result の後ろに 1 回だけ**本文を足す（system prompt には常駐させない — 小型モデルのコンテキストを圧迫しないため）。`paths: ["src/**/*.rs", "*.toml"]` / `paths: src/**, docs/*.md` / YAML のリスト、の 3 通り。`/` の無いパターンはどの階層のファイル名にも一致（権限ルールと同じ）。`paths:` が無ければ全てのファイル。cwd の外のファイルには一致しない。1 ルールはセッション中 1 回だけ注入され、失敗した呼び出し（存在しないパスなど）には足さない。読むのは**信頼済みディレクトリ**の cwd 直下 `.lodan/rules/` だけ。`--log-jsonl` に `rule_injected` が残る
+- 連結順は **外側（汎用）→ 内側（具体）**。各エントリに `# Memory: <path>` ヘッダが付く。
+- 合計 32 KiB を上限に、超過分は文字境界で打ち切る（`...[memory truncated]...`）。
+- 中身が空（空白のみ）のファイルは無視する。
+- cwd が `$HOME` 配下なら遡上は `$HOME` で打ち切る。cwd が home 外（例 `/opt/proj`）の場合は filesystem root まで遡る（Claude Code と同じ挙動）。
+
+- **path-scoped ルール**（`.lodan/rules/*.md`）: frontmatter の `paths:` に一致するファイルを Read / Write / Edit / MultiEdit / NotebookEdit したとき、**その tool_result の後ろに 1 回だけ**本文を足す（system prompt には常駐させない — 小型モデルのコンテキストを圧迫しないため）。`paths: ["src/**/*.rs", "*.toml"]` / `paths: src/**, docs/*.md` / YAML のリスト、の 3 通り。`/` の無いパターンはどの階層のファイル名にも一致（権限ルールと同じ）。`paths:` が無ければ全てのファイル。cwd の外のファイルには一致しない。1 ルールはセッション中 1 回だけ注入され、失敗した呼び出し（存在しないパスなど）には足さない。読むのは**信頼済みディレクトリ**の cwd 直下 `.lodan/rules/` だけ（trust の候補にも入る）。ルールはセッション開始時に読まれ、セッション中にファイルを変えても次の起動まで反映されない（`/memory` はディスクの現在値を表示する）。注入は `<path-rules source="…">` … `</path-rules>` で囲み、本文中の閉じタグは潰す。`--log-jsonl` に `rule_injected` が残り、`tool_result` の `output_bytes` はルールを含んだ大きさ
 
 ```markdown
 <!-- .lodan/rules/rust.md -->
@@ -818,12 +823,8 @@ paths: ["src/**/*.rs"]
 - `println!` ではなく tracing
 ```
 
-- 連結順は **外側（汎用）→ 内側（具体）**。各エントリに `# Memory: <path>` ヘッダが付く。
-- 合計 32 KiB を上限に、超過分は文字境界で打ち切る（`...[memory truncated]...`）。
-- 中身が空（空白のみ）のファイルは無視する。
-- cwd が `$HOME` 配下なら遡上は `$HOME` で打ち切る。cwd が home 外（例 `/opt/proj`）の場合は filesystem root まで遡る（Claude Code と同じ挙動）。
 
-> ⚠️ **信頼前提**: memory は CWD 階層からそのままプロンプトへ注入される。信頼できないリポジトリの `LODAN.md` / `CLAUDE.md` は prompt injection ベクタになり得る（skills / hooks / `.mcp.json` と同じ CWD 信頼前提）。注入時に「承認ゲートを回避する指示ではない」旨を system prompt に明記している。
+> ⚠️ **信頼前提**: memory は CWD 階層からそのままプロンプトへ注入される。信頼できないリポジトリの `LODAN.md` / `CLAUDE.md` / `AGENTS.md` / `.lodan/rules/` は prompt injection ベクタになり得る（skills / hooks / `.mcp.json` と同じ CWD 信頼前提）。注入時に「承認ゲートを回避する指示ではない」旨を system prompt に明記している。
 
 ## コンテキスト圧縮（`/compact` ＋ 自動圧縮）
 

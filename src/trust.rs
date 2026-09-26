@@ -8,7 +8,7 @@
 //! - `.env` — `LODAN_BASE_URL` / `LODAN_PERMISSION_MODE=bypass` / `LODAN_TRUST=1` のように、
 //!   環境変数で渡せる設定は全部ここから渡せる (だから信頼の判断より後に読む)
 //! - `.mcp.json` — 任意のプロセスを起動する
-//! - `.lodan/commands` / `.lodan/skills` / `LODAN.md` / `CLAUDE.md` / `AGENTS.md` — モデルへの指示を差し込む
+//! - `.lodan/commands` / `.lodan/skills` / `.lodan/rules` / `LODAN.md` / `CLAUDE.md` / `AGENTS.md` — モデルへの指示を差し込む
 //!
 //! clone してきたリポジトリで `lodan` を起動するだけでこれらが効くのは危ない。信頼済みの
 //! ディレクトリ (とその配下) でだけ読む。信頼の記録はユーザの設定ディレクトリに置くので、
@@ -63,6 +63,7 @@ pub fn project_files(cwd: &Path) -> Vec<String> {
         ".mcp.json",
         ".lodan/commands",
         ".lodan/skills",
+        ".lodan/rules",
     ];
     // メモリのファイル名は MEMORY_FILES から導く (手で写すと、名前を足したときに片方を忘れる)。
     let mut found: Vec<String> = CANDIDATES

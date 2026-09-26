@@ -255,15 +255,6 @@ impl Ledger {
         self.state().by_kind.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
-    /// モデル別の使用量 (`/model` で切り替えた後の `/cost` 用)。
-    pub fn by_model(&self) -> Vec<(String, KindUsage)> {
-        self.state()
-            .by_model
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect()
-    }
-
     /// 予算の 8 割を超えた最初の 1 回だけ、モデルに渡す注意書きを返す。
     pub fn take_reminder(&self) -> Option<String> {
         let mut state = self.state();

@@ -1244,7 +1244,6 @@ const COMPACT_AUTO: &str = "auto";
 /// 日本語 ~1-2 文字/トークンの間を取った粗い近似 (桁が合えば十分)。
 pub(crate) const ESTIMATE_CHARS_PER_TOKEN: u64 = 3;
 
-/// セッション累積のトークン使用量。`/cost` 表示と自動圧縮 (しきい値) の基盤。
 /// `/context` の内訳 (概算トークン)。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContextBreakdown {
@@ -1296,6 +1295,7 @@ impl ContextBreakdown {
     }
 }
 
+/// セッション累積のトークン使用量。`/cost` 表示と自動圧縮 (しきい値) の基盤。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionUsage {
     pub llm_calls: u64,

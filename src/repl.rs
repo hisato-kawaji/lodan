@@ -377,28 +377,16 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                     );
                     continue;
                 }
-                let parse =
-                    |s: &str| <crate::config::Provider as clap::ValueEnum>::from_str(s, true);
-                let (provider, model) = match args.split_once(':') {
-                    Some((p, m)) => match parse(p) {
-                        Ok(p) => (p, Some(m.trim())),
-                        Err(_) => {
-                            println!(
-                                "model: unknown provider '{}' (local / sakana / sakura / kimi)",
-                                crate::term::sanitize(p)
-                            );
-                            continue;
-                        }
-                    },
-                    None => match parse(args) {
-                        Ok(p) => (p, None),
-                        Err(_) => (cfg.llm.provider, Some(args)),
-                    },
+                let Some((provider, model)) = parse_model_arg(args, cfg.llm.provider) else {
+                    println!(
+                        "model: nothing to switch to (usage: /model <provider> | /model <provider>:<model> | /model <model>)"
+                    );
+                    continue;
                 };
                 let mut next = cfg.clone();
                 next.llm.provider = provider;
-                if let Some(m) = model.filter(|m| !m.is_empty()) {
-                    next.llm.get_mut(provider).model = m.to_string();
+                if let Some(m) = model {
+                    next.llm.get_mut(provider).model = m;
                 }
                 match crate::llm::build_metered_with(&next, &runtime.ledger) {
                     Ok(client) => {
@@ -989,6 +977,31 @@ fn first_line(desc: &str) -> String {
     }
 }
 
+/// `/model` の引数。provider 名そのもの / `provider:model` / モデル名 (コロンを含んでよい —
+/// ollama の `qwen2.5-coder:7b` が local の標準)。`:` の前が provider として読めるときだけ
+/// provider:model と解釈し、それ以外は全体をいまの provider のモデル名にする。
+fn parse_model_arg(
+    args: &str,
+    current: crate::config::Provider,
+) -> Option<(crate::config::Provider, Option<String>)> {
+    let parse =
+        |s: &str| <crate::config::Provider as clap::ValueEnum>::from_str(s.trim(), true).ok();
+    let args = args.trim();
+    if args.is_empty() || args == ":" {
+        return None;
+    }
+    if let Some(p) = parse(args) {
+        return Some((p, None));
+    }
+    if let Some((head, rest)) = args.split_once(':')
+        && let Some(p) = parse(head)
+    {
+        let rest = rest.trim();
+        return Some((p, (!rest.is_empty()).then(|| rest.to_string())));
+    }
+    Some((current, Some(args.to_string())))
+}
+
 fn handle_slash(
     cmd: &str,
     registry: &crate::tools::registry::ToolRegistry,
@@ -1203,5 +1216,33 @@ mod tests {
         assert!(looks_like_slash_command("help"));
         assert!(looks_like_slash_command("tools "));
         assert!(looks_like_slash_command("tools list"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_arg_keeps_colons_inside_model_names() {
+        use crate::config::Provider;
+        let p = |s: &str| parse_model_arg(s, Provider::Local);
+        assert_eq!(
+            p("qwen2.5-coder:7b"),
+            Some((Provider::Local, Some("qwen2.5-coder:7b".into())))
+        );
+        assert_eq!(p("kimi"), Some((Provider::Kimi, None)));
+        assert_eq!(p("LOCAL"), Some((Provider::Local, None)));
+        assert_eq!(
+            p("local:qwen3.5:9b"),
+            Some((Provider::Local, Some("qwen3.5:9b".into())))
+        );
+        assert_eq!(p("sakana:"), Some((Provider::Sakana, None)));
+        assert_eq!(p(":"), None);
+        assert_eq!(p(""), None);
+        assert_eq!(
+            parse_model_arg("gpt-oss:20b", Provider::Kimi),
+            Some((Provider::Kimi, Some("gpt-oss:20b".into())))
+        );
     }
 }

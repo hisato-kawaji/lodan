@@ -235,6 +235,7 @@ timeout_secs = 30
 - `LODAN_TOOL_PROFILE` / `LODAN_TOOLS` (カンマ区切り)
 - `LODAN_PARALLEL_TOOLS` (真偽値。既定 true)
 - `LODAN_MAX_REQUESTS` / `LODAN_MAX_TOKENS` (LLM リクエスト数 / 合計トークン数の上限。既定は無制限)
+- `LODAN_MAX_TURNS` (1 ターンの LLM 往復の上限 = `agent.max_iterations`) / `LODAN_APPEND_SYSTEM_PROMPT` (system prompt の末尾に足す指示)
 - `LODAN_TRUST` (真偽値。この実行に限ってプロジェクトの設定を信頼する)
 - `LODAN_PERMISSION_MODE` (`default` | `accept-edits` | `plan` | `dont-ask` | `bypass`)
 - `LODAN_SANDBOX` (`off` | `workspace-write` | `read-only`) / `LODAN_SANDBOX_NETWORK` (真偽値。既定 true)
@@ -321,7 +322,7 @@ lodan -p "..." --max-turns 5 --append-system-prompt "Reply in Japanese."
 - **終了コード**: `0` 成功 / `1` エラー（起動時の失敗を含む。`json` / `stream-json` ではこの場合も結果オブジェクトを出す）/ `2` 引数の誤り（clap。stdout は空）/ `3` 最終応答に至らず `max_iterations` を使い切った / `4` [予算](#予算)（`max_requests` / `max_total_tokens`）を使い切った / `5` 再要求しても最終応答が `--output-schema` に合わなかった / `130` SIGINT
 - **承認**: 尋ねる相手がいないので、`--yes` が無ければ破壊的ツール（Write / Edit / Bash …）は**尋ねずに拒否**され、モデルには「非対話実行なので再試行するな」と返る。ハングしない。`AskUserQuestion` も同様に即エラーを返す
 - **stdin**: プロンプト引数があるときは stdin を**読まない**。CI や親プロセスから継承した stdin は端末でなくても閉じられないことがあり、EOF 待ちで固まるため。引数に stdin を足したいときは `--stdin` を明示する（上限 10 MiB）
-- **`--max-turns <N>`**（`LODAN_MAX_TURNS`）: 最終応答に至らないまま N 回 LLM と往復したら打ち切る（終了コード `3`）。`[agent] max_iterations` の上書きで、REPL でも効く。`--output-schema` の出し直しは別のターンなので、それぞれに N 回ある
+- **`--max-turns <N>`**（`LODAN_MAX_TURNS`）: 最終応答に至らないまま N 回 LLM と往復したら打ち切る（終了コード `3`）。`[agent] max_iterations` の上書きで、REPL でも効く。`--output-schema` の出し直しは別のターンなので、それぞれに N 回ある。`Task` のサブエージェントの上限（`min(N, 12)`）も一緒に下がる
 - **`--append-system-prompt <TEXT>`**（`LODAN_APPEND_SYSTEM_PROMPT`、設定は `[agent] append_system_prompt`）: system prompt の**末尾**（プロジェクトメモリより後ろ）に足す。メモリと同じく「利用者の文脈」であって、承認ゲートを回避させる指示にはならない。`Task` の内側のサブエージェントには渡らない
 - **`--output-schema <FILE>`**: 最終応答を、指定した JSON Schema に合う JSON にさせる。結果を機械で読むスクリプト向け
   - スキーマはプロンプトの後ろに添えてモデルに渡す。最終応答から JSON を取り出し（応答全体が JSON / コードフェンスがちょうど 1 つ / 前置きの後ろに JSON があって**その後ろに何も続かない**、のどれか。それ以外は JSON 無しとして扱う。本文の途中に出てくる例示を答えと取り違えないための制限だが、完全ではない: 断りの文が例示の JSON で**終わっている**場合や、フェンスつきの例示の後ろに断りが続く場合は、正しい答えと形が同じなので拾ってしまう）、検証して、合わなければ**どこが違うかを伝えて最大 2 回出し直させる**（`$.score: expected integer, got string` のような 1 行ずつ）。出し直しも普通のターンなので、予算（`max_requests` など）から引かれる

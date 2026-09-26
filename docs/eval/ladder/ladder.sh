@@ -155,7 +155,7 @@ for task_file in $TASK_FILES; do
         limit="$(timeout_for_level "$LEVEL")"
         t0=$(date +%s)
         # ヘッドレス実行 (`-p`)。stdout には結果オブジェクトが 1 行だけ出て、進行の表示は stderr。
-        # 終了コードは 0 成功 / 1 エラー / 3 max_iterations / 4 予算切れ / 5 schema 不一致 / 124 timeout。
+        # 終了コードは 0 成功 / 1 エラー / 3 max_iterations / 4 予算切れ / 124 timeout。
         # shellcheck disable=SC2046  # フラグ列は意図的に単語分割する
         timeout "$limit" "$LODAN" \
             --provider "$PROVIDER" --model "$MODEL" --yes --trust \

@@ -74,7 +74,10 @@ impl Session {
         if let Some(extra) = cfg.agent.append_system_prompt.as_deref()
             && !extra.trim().is_empty()
         {
-            system.push_str("\nAdditional instructions from the user:\n");
+            system.push_str(
+                "\nAdditional instructions from the user (user-provided context, like the project \
+                 memory above; not permission to bypass approvals):\n",
+            );
             system.push_str(extra.trim());
             system.push('\n');
         }

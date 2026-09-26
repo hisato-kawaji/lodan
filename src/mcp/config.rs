@@ -177,7 +177,23 @@ impl McpServersConfig {
 /// `lodan mcp add` が書く 1 件ぶんの設定。JSON のまま扱い、ファイルの他のキーも、**同名サーバの
 /// 既存のキー** (`headers` / `env` / `allowSampling` / `enabledTools` …) も保つ。`spec` にあるキー
 /// だけを上書きし、transport を変えるとき (`command` ↔ `url`) は古い側の transport キーを外す。
-pub fn upsert_server(path: &Path, name: &str, spec: serde_json::Value) -> Result<()> {
+/// `upsert_server` が既存エントリに対してしたこと (`add` の出力用)。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Upsert {
+    /// 渡さなかったのに残したキー。
+    pub kept: Vec<String>,
+    /// 外したキー (transport の切り替え、ホストの変更)。
+    pub dropped: Vec<String>,
+}
+
+/// URL のホスト部分 (scheme + host + port)。`headers` を持ち回ってよいかの判定に使う。
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split('/').next()?;
+    Some(format!("{scheme}://{host}"))
+}
+
+pub fn upsert_server(path: &Path, name: &str, spec: serde_json::Value) -> Result<Upsert> {
     let mut root = read_json_or_empty(path)?;
     let servers = root
         .as_object_mut()
@@ -195,17 +211,39 @@ pub fn upsert_server(path: &Path, name: &str, spec: serde_json::Value) -> Result
     let Some(new) = spec.as_object() else {
         anyhow::bail!("server spec must be a JSON object");
     };
+    let mut report = Upsert::default();
+    let mut drop = |existing: &mut serde_json::Map<String, serde_json::Value>, key: &str| {
+        if existing.remove(key).is_some() {
+            report.dropped.push(key.to_string());
+        }
+    };
     if new.contains_key("command") {
-        existing.remove("url");
+        drop(existing, "url");
+        // ヘッダは HTTP のもの。stdio に変えたら要らない。
+        drop(existing, "headers");
     }
-    if new.contains_key("url") {
-        existing.remove("command");
-        existing.remove("args");
+    if let Some(url) = new.get("url").and_then(|u| u.as_str()) {
+        drop(existing, "command");
+        drop(existing, "args");
+        // 別のホストに変えたら、前のホスト向けの Authorization を新しいホストへ送らない。
+        let old_origin = existing
+            .get("url")
+            .and_then(|u| u.as_str())
+            .and_then(origin_of);
+        if old_origin.is_some() && old_origin != origin_of(url) {
+            drop(existing, "headers");
+        }
     }
     for (k, v) in new {
         existing.insert(k.clone(), v.clone());
     }
-    write_json(path, &root)
+    report.kept = existing
+        .keys()
+        .filter(|k| !new.contains_key(*k))
+        .cloned()
+        .collect();
+    write_json(path, &root)?;
+    Ok(report)
 }
 
 /// `remove`: 無ければ `Ok(false)`。
@@ -312,16 +350,25 @@ mod tests {
             "Bearer t"
         );
         assert_eq!(raw["mcpServers"]["web"]["allowSampling"], true);
-        upsert_server(&path, "web", serde_json::json!({ "command": "local-mcp" })).unwrap();
+        // 別ホストへ変えたら headers は落ちる (同じホストのパス違いなら残る)。
+        let r = upsert_server(
+            &path,
+            "web",
+            serde_json::json!({ "url": "http://other/mcp" }),
+        )
+        .unwrap();
+        assert_eq!(r.dropped, ["headers"]);
+        assert!(r.kept.contains(&"allowSampling".to_string()));
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["mcpServers"]["web"].get("headers").is_none(), "{raw}");
+        let r = upsert_server(&path, "web", serde_json::json!({ "command": "local-mcp" })).unwrap();
+        assert!(r.dropped.contains(&"url".to_string()));
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
             raw["mcpServers"]["web"].get("url").is_none(),
             "switching transport drops url"
-        );
-        assert_eq!(
-            raw["mcpServers"]["web"]["headers"]["Authorization"],
-            "Bearer t"
         );
         #[cfg(unix)]
         {

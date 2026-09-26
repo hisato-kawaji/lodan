@@ -322,8 +322,14 @@ fn manage_mcp(cmd: McpCommand) -> Result<()> {
                 spec.insert("trustAnnotations".into(), true.into());
             }
             let path = path_for(user)?;
-            upsert_server(&path, &name, serde_json::Value::Object(spec))?;
+            let report = upsert_server(&path, &name, serde_json::Value::Object(spec))?;
             println!("mcp: added {name} to {}", path.display());
+            if !report.kept.is_empty() {
+                println!("mcp: kept existing keys: {}", report.kept.join(", "));
+            }
+            if !report.dropped.is_empty() {
+                println!("mcp: dropped: {}", report.dropped.join(", "));
+            }
             Ok(())
         }
         McpCommand::Remove { name, user } => {

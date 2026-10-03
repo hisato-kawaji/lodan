@@ -10,6 +10,10 @@
 #   MODEL=llama3.1:8b PROVIDER=local bash ladder.sh
 #   TASKS="L0-write L1-fix-bug" CONFIGS=mitig REPEAT=1 bash ladder.sh   # 速い反復
 #   MODEL=fugu PROVIDER=sakana CONFIGS=mitig bash ladder.sh             # 参照実装
+#   MODEL=gpt-oss-120b PROVIDER=sakura CONFIGS=mitig bash ladder.sh     # さくらのAI
+#
+# リモート provider は作業 cwd に .env が無いので、API キーは export しておくこと
+# (SAKANA_API_KEY / SAKURA_API_KEY)。
 #
 # 結果は results.jsonl へ 1 実行 1 行で追記され、同じ key の行があるものは
 # スキップされる (中断しても再開できる)。表にするには summarize.py。
@@ -139,7 +143,7 @@ for task_file in $TASK_FILES; do
         # LLM リクエストのタイムアウトは作業 cwd の設定で引き上げる
         # (ローカルモデルの生成は既定 120s を超える)。
         mkdir -p "$work/.lodan"
-        printf '[llm.local]\ntimeout_secs = 900\n\n[llm.sakana]\ntimeout_secs = 900\n' \
+        printf '[llm.local]\ntimeout_secs = 900\n\n[llm.sakana]\ntimeout_secs = 900\n\n[llm.sakura]\ntimeout_secs = 900\n' \
           > "$work/.lodan/config.toml"
 
         cd "$work" || exit 1

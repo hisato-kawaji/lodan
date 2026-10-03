@@ -44,6 +44,7 @@ TASKS="L0 L1-fix-bug" CONFIGS=mitig REPEAT=1 MODEL=llama3.1:8b bash docs/eval/la
 
 # 参照実装 (API 級) と比較する
 MODEL=fugu PROVIDER=sakana CONFIGS=mitig bash docs/eval/ladder/ladder.sh
+MODEL=gpt-oss-120b PROVIDER=sakura CONFIGS=mitig bash docs/eval/ladder/ladder.sh
 
 python3 docs/eval/ladder/summarize.py docs/eval/ladder/results.jsonl
 ```

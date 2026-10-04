@@ -17,7 +17,9 @@ pub struct ToolRegistry {
 }
 
 /// `tool_profile = "core"` でモデルに見せるツール。
-pub const CORE_TOOLS: &[&str] = &["Read", "Write", "Edit", "Bash", "Grep", "Glob"];
+/// TodoWrite を入れるのは、小型モデルが「計画だけ述べて実行しない」「要件を途中で落とす」のを、
+/// やることリストを書かせて抑えるため (#72 の判断。定義は約 +0.5 KB)。
+pub const CORE_TOOLS: &[&str] = &["Read", "Write", "Edit", "Bash", "Grep", "Glob", "TodoWrite"];
 
 /// 遅延ツールを読み込む擬似ツール (#72)。registry には登録せず、ループが横取りする。
 pub const TOOL_SEARCH: &str = "ToolSearch";
@@ -377,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn core_profile_shows_exactly_the_six_core_tools() {
+    fn core_profile_shows_exactly_the_core_tools() {
         let mut r = default_registry();
         r.apply_profile(crate::config::ToolProfile::Core, &[]);
         let mut expected: Vec<String> = CORE_TOOLS.iter().map(|s| s.to_string()).collect();
@@ -432,18 +434,23 @@ mod tests {
             .iter()
             .map(|s| s.function.name.to_string())
             .collect();
-        assert_eq!(names, ["Glob", "Grep", "Read"]);
+        // TodoWrite は共有状態を書くが破壊的ではない (plan モードでも使える)。
+        assert_eq!(names, ["Glob", "Grep", "Read", "TodoWrite"]);
     }
 
     #[test]
-    fn core_profile_at_least_halves_the_tool_spec_payload() {
-        // #72 の受け入れ条件。毎リクエスト送る JSON の大きさで比べる。
+    fn core_profile_cuts_the_tool_spec_payload_by_nearly_half() {
+        // #72 の受け入れ条件は「半減以上」だったが、TodoWrite を core に足した (2026-10-04) ので
+        // 実測 6,036 → 3,065 バイト (-49%)。45% 以上の削減を固定する。
         let bytes = |r: &ToolRegistry| serde_json::to_string(&r.tool_specs()).unwrap().len();
         let full = bytes(&default_registry());
         let mut core = default_registry();
         core.apply_profile(crate::config::ToolProfile::Core, &[]);
         let core = bytes(&core);
-        assert!(core * 2 <= full, "core = {core} bytes, full = {full} bytes");
+        assert!(
+            core * 100 <= full * 55,
+            "core = {core} bytes, full = {full} bytes"
+        );
     }
     use async_trait::async_trait;
     use serde_json::json;
@@ -481,15 +488,30 @@ mod tests {
         })
     }
 
+    /// ToolSearch のテスト用: TodoWrite を隠す明示リスト (core に TodoWrite が入ったので、
+    /// 「隠したツールを読み込む」の例には明示リストを使う)。
+    fn six_without_todo() -> Vec<String> {
+        ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     #[test]
     fn tool_search_defers_the_tools_the_profile_hides() {
         let mut r = default_registry();
-        r.apply_profile_with_search(crate::config::ToolProfile::Core, &[], true);
+        r.apply_profile_with_search(crate::config::ToolProfile::Full, &six_without_todo(), true);
         assert!(r.is_visible("Read") && !r.is_visible("TodoWrite"));
         assert!(r.is_deferred("TodoWrite") && !r.is_deferred("Read"));
         // 定義は送らないが、ToolSearch の説明には名前と 1 行説明が載る。
         let names: BTreeSet<&str> = r.tool_specs().iter().map(|s| s.function.name).collect();
-        assert_eq!(names, CORE_TOOLS.iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(
+            names,
+            six_without_todo()
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        );
         let search = r.tool_search_spec().expect("deferred tools exist");
         assert!(search.function.description.contains("- TodoWrite:"));
         // 読み込んだら次の specs に入り、呼び出しにも応じる。
@@ -533,7 +555,7 @@ mod tests {
     #[test]
     fn select_ignores_case() {
         let mut r = default_registry();
-        r.apply_profile_with_search(crate::config::ToolProfile::Core, &[], true);
+        r.apply_profile_with_search(crate::config::ToolProfile::Full, &six_without_todo(), true);
         let hits = r.search_deferred("select:todowrite");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name(), "TodoWrite");
@@ -559,7 +581,7 @@ mod tests {
     fn search_deferred_matches_by_exact_name_or_keyword_and_caps_the_results() {
         let mut r = default_registry();
         r.register(dyn_tool("mcp__fs__read", "Read a file over MCP"));
-        r.apply_profile_with_search(crate::config::ToolProfile::Core, &[], true);
+        r.apply_profile_with_search(crate::config::ToolProfile::Full, &six_without_todo(), true);
         let names = |hits: Vec<Arc<dyn Tool>>| -> Vec<String> {
             hits.iter().map(|t| t.name().to_string()).collect()
         };

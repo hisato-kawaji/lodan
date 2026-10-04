@@ -136,7 +136,7 @@ pub struct Cli {
     #[arg(long = "max-tokens", env = "LODAN_MAX_TOKENS", value_name = "N")]
     pub max_total_tokens: Option<u64>,
 
-    /// Which tools the model sees: full (default), core (Read/Write/Edit/Bash/Grep/Glob), readonly
+    /// Which tools the model sees: full (default), core (Read/Write/Edit/Bash/Grep/Glob/TodoWrite), readonly
     #[arg(long, env = "LODAN_TOOL_PROFILE", value_enum)]
     pub tool_profile: Option<crate::config::ToolProfile>,
 

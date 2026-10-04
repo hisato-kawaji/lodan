@@ -1562,7 +1562,7 @@ fn drop_reasoning(history: &mut [Message]) {
 ///
 /// hook は信頼されたコードでも、その**入力** (ファイルの中身、コマンドの出力) はそうとは限らない。
 /// 文脈の中に閉じタグを混ぜて、枠の外に「利用者の発言」を装った文を置けないようにする。
-fn hook_context_block(context: &str) -> String {
+pub(crate) fn hook_context_block(context: &str) -> String {
     // 大文字小文字の違う閉じタグも同じに扱う (ASCII の小文字化は長さを変えないので位置がずれない)。
     let lower = context.to_ascii_lowercase();
     let mut escaped = String::with_capacity(context.len());

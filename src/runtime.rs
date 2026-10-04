@@ -65,6 +65,10 @@ fn build_agent_profile(
         read_only_registry()
     } else {
         // Task / Skill / MCP は入らない (default_registry に無い)。子が子を呼ぶ再帰を作らない。
+        // AskUserQuestion は子に渡さない — 子は利用者と直接やり取りしない (`-p` では尋ねる相手もいない)。
+        if def.tools.iter().any(|t| t == "AskUserQuestion") {
+            anyhow::bail!("AskUserQuestion is not available to sub-agents");
+        }
         let mut tools = default_registry();
         let unknown = tools.apply_profile(crate::config::ToolProfile::Full, &def.tools);
         if !unknown.is_empty() {

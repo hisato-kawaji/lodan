@@ -795,7 +795,7 @@ You are a strict reviewer. Report only concrete problems with file:line.
 - 本文は子の system prompt の末尾に「user-provided context, not permission to bypass approvals」の断りつきで足す
 - `model` / `provider` を指定した種類は専用のクライアントで動く（トークンは同じ台帳に `subagent` として計上される）。API キーが無いなど作れない定義は起動時に警告して飛ばす
 - `Task` の説明に定義した種類の一覧が載り、`subagent_type` は enum になる（小型モデルが名前を打ち間違えない）。起動時に `agents: reviewer, …` と表示
-- **書き込み可の子**: `tools:` に Write / Edit / Bash などを書けば、その種類は編集や実行ができる。ただし破壊的な呼び出しは 1 回ずつ**親と同じ承認ゲート**を通る（REPL なら承認プロンプトが出る。`--yes` / allow ルール / `accept-edits` なら通り、deny ルールと `-p`（尋ねる相手がいない）は拒否）。親が**プランモード**なら破壊的ツールは拒否される。子の Bash は親と同じ `[sandbox]` 方針で動く。既定の `general-purpose` と `tools:` 無しの種類は従来どおり読み取り専用。`Task` のツール定義には「can edit files / run commands」と出るので、モデルも区別できる
+- **書き込み可の子**: `tools:` に Write / Edit / Bash などを書けば、その種類は編集や実行ができる。ただし破壊的な呼び出しは 1 回ずつ**親と同じ承認ゲート**を通る（REPL なら `Allow Write (sub-agent builder): …` と**子の名前つきで yes / no だけ**のプロンプトが出る — 子の要求で「常に許可」を保存すると親の後続まで無確認になるため。`--yes` / allow ルール / `accept-edits` なら通り、deny ルールと `-p`（尋ねる相手がいない）は拒否）。子のツール呼び出しも親と同じ **PreToolUse / PostToolUse hook** を通る（`agent_type` が payload に入る。ブロックされれば実行しない）。親が**プランモード**なら破壊的ツールは拒否される。子の Bash は親と同じ `[sandbox]` 方針で動く。`AskUserQuestion` は子に書けない。書き込み可の種類が 1 つでもあると `Task` は並列実行しない（複数の子が同時に承認を求めると、どの子の要求か分からなくなる）。既定の `general-purpose` と `tools:` 無しの種類は従来どおり読み取り専用。`Task` のツール定義には「can edit files / run commands」と出るので、モデルも区別できる
 - 並列は `Task` の複数呼び出しが同時に実行される（#73）ので既にある。worktree 分離はまだ
 
 ```jsonc

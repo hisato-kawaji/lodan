@@ -196,6 +196,57 @@ impl PermissionGate {
         }
     }
 
+    /// サブエージェントの中からの呼び出し (#77)。ルール・モード・hook の希望の扱いは親と同じだが、
+    /// 尋ねるときは **yes / no だけ** — 子の要求で「常に許可」を保存すると、親の後続の呼び出しまで
+    /// 無確認で通ってしまう。プロンプトには子の名前を出し、親自身の要求と区別できるようにする。
+    pub fn decide_for_subagent(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        agent: &str,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> Decision {
+        use crate::hooks::PermissionHint;
+        let Assessment {
+            asked_by_rule,
+            quiet,
+        } = self.assess(tool_name, args, destructive);
+        match (hint, quiet) {
+            (_, Some(Decision::Deny(why))) => Decision::Deny(why),
+            (Some(PermissionHint::Allow), None) if !asked_by_rule && !self.dont_ask => {
+                Decision::Allow
+            }
+            (Some(PermissionHint::Ask), Some(Decision::Allow)) | (_, None) => {
+                self.ask_user_as(tool_name, args, agent)
+            }
+            (_, Some(Decision::Allow)) => Decision::Allow,
+        }
+    }
+
+    fn ask_user_as(&self, tool_name: &str, args: &serde_json::Value, agent: &str) -> Decision {
+        if self.non_interactive {
+            return Decision::Deny(DENIED_NON_INTERACTIVE.to_string());
+        }
+        use std::io::IsTerminal;
+        let stdin = io::stdin();
+        let enter_means_yes = stdin.is_terminal();
+        let label = format!("sub-agent {}", crate::term::sanitize(agent));
+        if self.prompt_full(
+            tool_name,
+            args,
+            &mut stdin.lock(),
+            &mut io::stdout().lock(),
+            enter_means_yes,
+            true,
+            Some(&label),
+        ) {
+            Decision::Allow
+        } else {
+            Decision::Deny(DENIED_BY_USER.to_string())
+        }
+    }
+
     /// 承認プロンプトを実際に出せるか (REPL で、`dont-ask` でもない)。
     pub fn can_prompt(&self) -> bool {
         !self.non_interactive
@@ -289,6 +340,7 @@ impl PermissionGate {
             &mut io::stdout().lock(),
             enter_means_yes,
             once_only,
+            None,
         )
     }
 
@@ -302,10 +354,12 @@ impl PermissionGate {
         stdout: &mut dyn Write,
         enter_means_yes: bool,
     ) -> bool {
-        self.prompt_full(tool_name, args, input, stdout, enter_means_yes, false)
+        self.prompt_full(tool_name, args, input, stdout, enter_means_yes, false, None)
     }
 
-    /// `prompt` の本体。`once_only` は hook が確認を求めた場合: 選べるのは yes / no だけ。
+    /// `prompt` の本体。`once_only` は hook が確認を求めた場合 (とサブエージェントからの要求):
+    /// 選べるのは yes / no だけ。`origin` は誰の要求かの注記 (`sub-agent builder`)。
+    #[allow(clippy::too_many_arguments)]
     fn prompt_full(
         &self,
         tool_name: &str,
@@ -314,10 +368,15 @@ impl PermissionGate {
         stdout: &mut dyn Write,
         enter_means_yes: bool,
         once_only: bool,
+        origin: Option<&str>,
     ) -> bool {
         let summary = summarize(tool_name, args);
         // MCP ツールの名前はサーバが決める。プロンプトに出すのは無害化した形。
         let shown_name = visible(tool_name);
+        let shown_name = match origin {
+            Some(o) => format!("{shown_name} ({o})"),
+            None => shown_name,
+        };
         let tool_label = shown_name.as_str();
         // 保存しても意図どおりに効かない呼び出しには (p) を出さない。
         // ask ルールに当たる呼び出しは、allow を保存しても毎回尋ねられる (ask が優先)。
@@ -342,6 +401,8 @@ impl PermissionGate {
                 stdout,
                 "{}",
                 crate::term::dim(&match &persistable {
+                    _ if once_only && origin.is_some() =>
+                        "  asked by a sub-agent:  (y) yes once  (n) no".to_string(),
                     _ if once_only =>
                         "  a hook asked for confirmation:  (y) yes once  (n) no".to_string(),
                     Some(rule) => format!(
@@ -578,6 +639,35 @@ mod tests {
 
     fn bash(cmd: &str) -> serde_json::Value {
         serde_json::json!({ "command": cmd })
+    }
+
+    /// サブエージェントからの要求は、子の名前つきで yes / no だけ (「常に許可」を親へ波及させない)。
+    #[test]
+    fn a_sub_agents_prompt_is_labelled_and_offers_only_yes_or_no() {
+        let gate = gate_in(Path::new("/work"));
+        let mut shown = Vec::new();
+        let allowed = gate.prompt_full(
+            "Write",
+            &serde_json::json!({ "path": "/work/a.txt", "content": "x" }),
+            &mut "a\ny\n".as_bytes(),
+            &mut shown,
+            false,
+            true,
+            Some("sub-agent builder"),
+        );
+        let text = String::from_utf8(shown).unwrap();
+        assert!(allowed, "the `y` after the ignored `a` wins: {text}");
+        assert!(text.contains("Write (sub-agent builder)"), "{text}");
+        assert!(
+            text.contains("asked by a sub-agent") && !text.contains("(a) always"),
+            "{text}"
+        );
+        // `a` は選べないので保存されない。
+        assert!(
+            gate.decide_quietly("Write", &serde_json::json!({ "path": "/work/b.txt" }), true)
+                .is_none(),
+            "nothing was persisted as always-allow"
+        );
     }
 
     fn gate_in(cwd: &Path) -> PermissionGate {
@@ -883,6 +973,7 @@ mod tests {
             &mut out,
             true,
             true,
+            None,
         );
         assert!(!allowed);
         let shown = String::from_utf8_lossy(&out);

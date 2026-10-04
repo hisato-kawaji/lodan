@@ -713,7 +713,7 @@ MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memo
 - **PostToolUse**: `tool_name` / `tool_input` / `tool_response`（旧名 `tool_output` も同じ値）。**成功した実行の後**に発火。実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。
 - **PostToolUseFailure**: PostToolUse の項目に加えて `error`。ツールを**実行して失敗した**ときに発火。PostToolUse と同じく実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。hook やゲートが止めて実行に至らなかった呼び出しでは、PostToolUse も PostToolUseFailure も発火しない（`hooks_compat = "v1"` では従来どおり、全ての呼び出しで PostToolUse）。
 - **PreCompact** / **PostCompact**: `trigger`（`manual` | `auto`）、PreCompact には `custom_instructions`（`/compact <指示>` の指示）。PreCompact をブロックすると圧縮しない。畳むものが無くて圧縮が見送られるときは発火しない。
-- **SubagentStart** / **SubagentStop**: `agent_type` / `cwd`、Start には `prompt`（依頼文）、Stop には `last_assistant_message`（失敗時は `error`）。`Task` の子エージェントの開始と終了。通知用で、ブロックはできない。`session_id` などの共通フィールドは付かない。
+- **SubagentStart** / **SubagentStop**: `agent_type` / `cwd`、Start には `prompt`（依頼文）、Stop には `last_assistant_message`（失敗時は `error`）。`Task` の子エージェントの開始と終了。通知用で、ブロックはできない。
 - **Stop**: `last_assistant_message`（旧名 `last_message` も同じ値）。ターン終端で発火。**ブロックすると停止せず、その理由をユーザー入力として注入し次ターンへ継続する**（暴走は `max_iterations` で停止）。「条件を満たすまで作業を続ける」系の自律ループの土台。
 
 > ⚠️ **信頼前提**: hook コマンドは `sh -c` で実行され、パーミッションゲートを経ません。プロジェクトの `config.toml` の hook が動くのは、そのディレクトリを[信頼した](#workspace-trust--信頼していないディレクトリの設定は読まない)ときだけです。信頼するのは中身を確認したリポジトリに限ってください（任意コード実行になります）。

@@ -3152,11 +3152,15 @@ mod tests {
     /// ToolSearch で読み込んだ遅延ツールは、その応答の中でも次のリクエストでも使える (#72)。
     #[tokio::test]
     async fn tool_search_loads_a_deferred_tool_for_the_rest_of_the_session() {
+        // core には TodoWrite が入ったので、隠す例には明示リスト (6 個) を使う。
         let mut cfg = Config::default();
-        cfg.agent.tool_profile = crate::config::ToolProfile::Core;
+        cfg.agent.tools = ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         cfg.agent.tool_search = true;
         let mut registry = default_registry();
-        registry.apply_profile_with_search(cfg.agent.tool_profile, &[], true);
+        registry.apply_profile_with_search(cfg.agent.tool_profile, &cfg.agent.tools, true);
         let mut session = Session::new(cfg, Arc::new(registry));
         let todo = r#"{"todos": [{"id": "1", "content": "x", "status": "pending"}]}"#;
         let llm = CallThenDoneLlm {

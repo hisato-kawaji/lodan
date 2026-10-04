@@ -278,7 +278,7 @@ pub enum ToolProfile {
     /// 登録された全ツール (built-in / Task / Skill / MCP)。
     #[default]
     Full,
-    /// コーディングに最低限必要な 6 個: Read / Write / Edit / Bash / Grep / Glob。
+    /// コーディングに最低限必要な 7 個: Read / Write / Edit / Bash / Grep / Glob / TodoWrite。
     Core,
     /// 破壊的でないツールだけ。
     Readonly,
@@ -336,7 +336,7 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_system_prompt: Option<String>,
     /// プロファイルで隠したツールと MCP ツールを、定義を送らずに `ToolSearch` で読み込ませる (#72)。
-    /// 既定 false (`core` はこれまでどおり 6 個だけ、`full` は全部をそのまま送る)。
+    /// 既定 false (`core` はこれまでどおり 7 個だけ、`full` は全部をそのまま送る)。
     pub tool_search: bool,
 }
 

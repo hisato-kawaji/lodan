@@ -589,7 +589,7 @@ fn tool_profile_core_is_reported_and_shrinks_the_tool_specs() {
     assert_eq!(core["profile"], "core");
     assert_eq!(
         core["visible"],
-        serde_json::json!(["Bash", "Edit", "Glob", "Grep", "Read", "Write"])
+        serde_json::json!(["Bash", "Edit", "Glob", "Grep", "Read", "TodoWrite", "Write"])
     );
     assert_eq!(
         full["registered"], core["registered"],
@@ -599,6 +599,7 @@ fn tool_profile_core_is_reported_and_shrinks_the_tool_specs() {
         full["spec_bytes"].as_u64().unwrap(),
         core["spec_bytes"].as_u64().unwrap(),
     );
+    // ランタイム (Task 込み 15 個) では 6,643 → 3,065 で、TodoWrite を足した後も半減以上。
     assert!(
         core_bytes * 2 <= full_bytes,
         "core = {core_bytes}, full = {full_bytes}"
@@ -621,8 +622,8 @@ fn tool_search_loads_a_hidden_tool_on_demand() {
         server.port,
         &[
             "--yes",
-            "--tool-profile",
-            "core",
+            "--tools",
+            "Read,Write,Edit,Bash,Grep,Glob",
             "--tool-search",
             "-p",
             "run the demo",
@@ -728,7 +729,7 @@ fn a_runtime_tool_profile_beats_a_tool_list_in_the_config_file() {
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
         .find(|e| e["event"] == "tools")
         .unwrap();
-    assert_eq!(tools["visible"].as_array().unwrap().len(), 6, "{tools}");
+    assert_eq!(tools["visible"].as_array().unwrap().len(), 7, "{tools}");
     assert_eq!(tools["explicit"], false);
 }
 

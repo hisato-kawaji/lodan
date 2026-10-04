@@ -1027,7 +1027,7 @@ cargo test
 - `tools/edit.rs` — 一意マッチ / 多重マッチ拒否 / Read 必須
 - `tools/read.rs` — offset / limit
 - `tools/todo_write.rs` — replace / clear / multi-in_progress 拒否 / 引数不正
-- `tools/registry.rs` — 動的名登録 / built-in 既定 14 ツール / ツールプロファイル (core はちょうど 7 個・readonly は破壊系なし・明示リスト優先・plan モードにも効く・定義が半減以上)
+- `tools/registry.rs` — 動的名登録 / built-in 既定 14 ツール / ツールプロファイル (core はちょうど 7 個・readonly は破壊系なし・明示リスト優先・plan モードにも効く・定義の削減は built-in 14 個基準で 45% 以上。ランタイムの Task 込み 15 個基準の半減以上は e2e で固定)
 - `tools/background.rs` / `tools/bash.rs` — BG ストアの増分読み出し・上限 append・kill 合図 / Bash の run_in_background → Monitor / KillShell 一周
 - `memory/mod.rs` — LODAN.md/CLAUDE.md 探索・優先順・外内連結・空ファイル除外・上限の文字境界打ち切り
 - `permission.rs` — auto_approve / always-tool / always-command の判定

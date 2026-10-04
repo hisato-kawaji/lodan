@@ -525,6 +525,21 @@ mod tests {
         );
     }
 
+    /// `core` + `tool_search` (ラダーの `core-search`): TodoWrite は core に入ったので遅延にならず、
+    /// 残り (NotebookEdit など) が遅延になる。
+    #[test]
+    fn core_profile_with_tool_search_defers_only_what_core_hides() {
+        let mut r = default_registry();
+        r.apply_profile_with_search(crate::config::ToolProfile::Core, &[], true);
+        assert!(r.is_visible("TodoWrite") && !r.is_deferred("TodoWrite"));
+        assert!(!r.is_visible("NotebookEdit") && r.is_deferred("NotebookEdit"));
+        assert_eq!(
+            r.deferred_names().len(),
+            r.registered_len() - CORE_TOOLS.len()
+        );
+        assert!(r.tool_search_spec().is_some());
+    }
+
     #[test]
     fn without_tool_search_nothing_is_deferred_and_there_is_no_search_spec() {
         let mut r = default_registry();

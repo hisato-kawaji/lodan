@@ -41,6 +41,8 @@ pub struct Runtime {
     pub gate: Arc<crate::permission::PermissionGate>,
     /// 親がプランモードにいるか。子エージェントが破壊的ツールを拒否する判断に使う。
     pub plan_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// hook の payload の共通フィールド (`session_id` / `transcript_path`)。親と子で共有する。
+    pub hook_env: Arc<std::sync::Mutex<agent::HookEnv>>,
     /// `llm` を通った全ての呼び出しの使用量と予算 (`/cost`、`-p` の結果)。
     pub ledger: Arc<llm::metered::Ledger>,
     /// `/goal` の評価器を別のモデルにする設定があるとき、そのクライアントとモデル名。
@@ -117,6 +119,7 @@ impl Runtime {
             interactive,
         )?);
         let plan_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_env = Arc::new(std::sync::Mutex::new(agent::HookEnv::default()));
 
         // 壊れた matcher の hook は一度も発火しない。guard のつもりで置かれたものが黙って
         // 効いていない、という状態で走り出さない。
@@ -198,6 +201,7 @@ impl Runtime {
         // 親と同じサンドボックス方針で Bash を走らせる。
         .with_gate(Arc::clone(&gate))
         .with_plan_flag(Arc::clone(&plan_flag))
+        .with_hook_env(Arc::clone(&hook_env), cfg.permissions.mode)
         .with_sandbox(crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd));
         // カスタムエージェント定義 (`.lodan/agents/*.md`, #77)。プロジェクトのものは信頼済みのときだけ。
         let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
@@ -285,6 +289,7 @@ impl Runtime {
             llm,
             gate,
             plan_flag,
+            hook_env,
             ledger,
             goal_evaluator,
             registry: Arc::new(registry),
@@ -309,10 +314,14 @@ impl Runtime {
         // 子エージェントが親のプランモードを見られるように (#77)。
         session.set_plan_flag(Arc::clone(&self.plan_flag));
         // hook の payload に載せる (`session_id` / `transcript_path`)。
-        session.set_hook_env(agent::HookEnv {
+        let env = agent::HookEnv {
             session_id: recorder.as_ref().map(|r| r.id().to_string()),
             transcript_path: recorder.as_ref().map(Recorder::transcript_path),
-        });
+        };
+        if let Ok(mut shared) = self.hook_env.lock() {
+            *shared = env.clone();
+        }
+        session.set_hook_env(env);
         (session, recorder)
     }
 }

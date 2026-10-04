@@ -698,7 +698,7 @@ command = "./scripts/lint-changed.sh"
 | 英数と `_` `-` 空白 `,` `\|` だけ | 完全一致。`Edit\|Write` のような並びはどれかに完全一致 |
 | それ以外の文字を含む | 正規表現（**部分一致**）。`Edit.*` は `NotebookEdit` にも当たる。全体一致は `^Edit$` |
 
-MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memory` だけだと完全一致扱いで何にも当たりません）。正規表現として壊れている matcher は**起動時にエラー**にします（一度も発火しない guard を黙って受け入れないため）。matcher が照合する相手: PreToolUse / PostToolUse / PostToolUseFailure / PermissionRequest はツール名、SessionStart は `startup` / `resume`、PreCompact / PostCompact は `manual`（`/compact`）/ `auto`、SubagentStart / SubagentStop は子エージェントの種類（いまは `general-purpose` のみ）、Notification は通知の種類（`permission_prompt`）。UserPromptSubmit / Stop / SessionEnd は matcher を見ません。
+MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memory` だけだと完全一致扱いで何にも当たりません）。正規表現として壊れている matcher は**起動時にエラー**にします（一度も発火しない guard を黙って受け入れないため）。matcher が照合する相手: PreToolUse / PostToolUse / PostToolUseFailure / PermissionRequest はツール名、SessionStart は `startup` / `resume`、PreCompact / PostCompact は `manual`（`/compact`）/ `auto`、SubagentStart / SubagentStop は子エージェントの種類（`general-purpose` か `.lodan/agents/` で定義した名前）、Notification は通知の種類（`permission_prompt`）。UserPromptSubmit / Stop / SessionEnd は matcher を見ません。
 
 ### ペイロード
 

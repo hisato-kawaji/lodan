@@ -90,6 +90,10 @@ pub struct SubAgentTool {
     plan_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 子の Bash に掛けるサンドボックス方針 (親と同じ)。
     sandbox: Option<crate::sandbox::SandboxPolicy>,
+    /// hook の payload に載せる共通フィールドの素性 (親と共有。`session_id` / `transcript_path`)。
+    hook_env: Option<Arc<std::sync::Mutex<crate::agent::HookEnv>>>,
+    /// 親の権限モード (payload の `permission_mode`。プランモード中は `plan`)。
+    permission_mode: crate::config::PermissionMode,
 }
 
 use crate::agent::agents::DEFAULT_AGENT;
@@ -123,9 +127,52 @@ impl SubAgentTool {
             gate: None,
             plan_flag: None,
             sandbox: None,
+            hook_env: None,
+            permission_mode: crate::config::PermissionMode::default(),
         };
         tool.refresh_description();
         tool
+    }
+
+    /// hook の payload に親と同じ共通フィールドを載せるための素性 (#134 のレビュー: 子の payload に
+    /// `hook_event_name` などが無く、イベントで分岐する guard を素通りした)。
+    pub fn with_hook_env(
+        mut self,
+        env: Arc<std::sync::Mutex<crate::agent::HookEnv>>,
+        permission_mode: crate::config::PermissionMode,
+    ) -> Self {
+        self.hook_env = Some(env);
+        self.permission_mode = permission_mode;
+        self
+    }
+
+    /// 親の `fire_hook` と同じ共通フィールド + イベント固有の `extra`。
+    fn hook_payload(&self, lc: Lifecycle, extra: serde_json::Value) -> serde_json::Value {
+        let env = self
+            .hook_env
+            .as_ref()
+            .and_then(|e| e.lock().ok().map(|g| g.clone()))
+            .unwrap_or_default();
+        let in_plan = self
+            .plan_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst));
+        let permission_mode = if in_plan {
+            serde_json::json!("plan")
+        } else {
+            serde_json::to_value(self.permission_mode).unwrap_or(serde_json::Value::Null)
+        };
+        let mut payload = serde_json::json!({
+            "session_id": env.session_id,
+            "transcript_path": env.transcript_path,
+            "cwd": self.cwd,
+            "permission_mode": permission_mode,
+            "hook_event_name": lc,
+        });
+        if let (Some(base), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
+            base.extend(extra);
+        }
+        payload
     }
 
     /// 親の承認ゲートを共有する (#77)。これが無い子は破壊的ツールを実行しない。
@@ -232,13 +279,9 @@ impl SubAgentTool {
         lc: crate::hooks::Lifecycle,
         extra: serde_json::Value,
     ) {
-        let mut payload = serde_json::json!({
-            "hook_event_name": lc,
-            "cwd": self.cwd,
-            "agent_type": agent_type,
-        });
-        if let (Some(base), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
-            base.extend(extra);
+        let mut payload = self.hook_payload(lc, extra);
+        if let Some(base) = payload.as_object_mut() {
+            base.insert("agent_type".into(), serde_json::json!(agent_type));
         }
         if let Err(e) = crate::hooks::runner::dispatch(
             lc,
@@ -282,12 +325,13 @@ impl SubAgentTool {
         &self,
         lc: Lifecycle,
         tool_name: &str,
-        payload: &serde_json::Value,
+        extra: serde_json::Value,
     ) -> crate::hooks::HookOutcome {
+        let payload = self.hook_payload(lc, extra);
         match crate::hooks::runner::dispatch(
             lc,
             Some(tool_name),
-            payload,
+            &payload,
             &self.hooks,
             self.hooks_compat,
         )
@@ -439,7 +483,7 @@ impl SubAgentTool {
                     "tool_name": name, "tool_input": args, "agent_type": agent_type,
                 });
                 let pre = self
-                    .tool_hook(Lifecycle::PreToolUse, &name, &pre_payload)
+                    .tool_hook(Lifecycle::PreToolUse, &name, pre_payload)
                     .await;
                 let mut executed = false;
                 let mut output = if let Some(reason) = pre.block {
@@ -481,11 +525,14 @@ impl SubAgentTool {
                     (_, false, _) => None,
                 };
                 if let Some(event) = post_event {
+                    // `tool_output` は v1 からの名前、`tool_response` は Claude Code の名前 (親と同じ)。
                     let post_payload = serde_json::json!({
-                        "tool_name": name, "tool_input": args, "tool_response": output.content,
+                        "tool_name": name, "tool_input": args,
+                        "tool_output": output.content, "tool_response": output.content,
+                        "error": output.is_error.then_some(&output.content),
                         "agent_type": agent_type,
                     });
-                    let post = self.tool_hook(event, &name, &post_payload).await;
+                    let post = self.tool_hook(event, &name, post_payload).await;
                     if let Some(reason) = post.block {
                         output
                             .content
@@ -913,10 +960,11 @@ mod tests {
         let args =
             serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "writer" });
 
-        // PreToolUse が exit 2 でブロック → 実行されない。
+        // PreToolUse が exit 2 でブロック → 実行されない。guard は親と同じ共通フィールドで分岐できる
+        // (`hook_event_name` が無いと `exit 0` = 許可に落ちる)。
         let blocked = build(vec![hook(
             Lifecycle::PreToolUse,
-            "cat > /dev/null; echo 'no writes from children' >&2; exit 2",
+            r#"p=$(cat); for k in '"hook_event_name":"PreToolUse"' '"cwd"' '"permission_mode"' '"session_id"'; do printf '%s' "$p" | grep -q "$k" || exit 0; done; echo 'no writes from children' >&2; exit 2"#,
         )]);
         let out = blocked.execute(args.clone(), &ctx).await.unwrap().content;
         assert!(

@@ -45,6 +45,8 @@ pub struct Session {
     /// 直近のターンが「思考だけで本文の無い応答」で終わったなら、その思考の文字数 (#111)。
     /// ヘッドレスの結果で「hook に止められた」と言い分けるためのもの。
     last_reply_thought_chars: Option<usize>,
+    /// 親がプランモードにいるかを子エージェントへ伝える共有フラグ (#77)。
+    plan_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// path-scoped ルール (`.lodan/rules/*.md`, #79) と、このセッションで注入済みの添字。
     rules: Vec<crate::memory::rules::Rule>,
     rules_injected: std::collections::BTreeSet<usize>,
@@ -164,8 +166,21 @@ impl Session {
             ledger: None,
             loaded_tools: std::collections::BTreeSet::new(),
             last_reply_thought_chars: None,
+            plan_flag: None,
             rules,
             rules_injected: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// 子エージェント (Task) と共有するプランモードのフラグ (#77)。
+    pub fn set_plan_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        flag.store(self.mode == Mode::Plan, std::sync::atomic::Ordering::SeqCst);
+        self.plan_flag = Some(flag);
+    }
+
+    fn sync_plan_flag(&self) {
+        if let Some(flag) = &self.plan_flag {
+            flag.store(self.mode == Mode::Plan, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -257,6 +272,7 @@ impl Session {
 
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+        self.sync_plan_flag();
     }
 
     /// 永続化のための会話履歴 (system を含む全メッセージ)。
@@ -1128,6 +1144,7 @@ impl Session {
 
         if gate.allow(EXIT_PLAN_MODE, args) {
             self.mode = Mode::Normal;
+            self.sync_plan_flag();
             ToolOutput::ok(
                 "Plan approved by the user. Plan mode exited — all tools are available again; \
                  proceed to execute the plan.",
@@ -1545,7 +1562,7 @@ fn drop_reasoning(history: &mut [Message]) {
 ///
 /// hook は信頼されたコードでも、その**入力** (ファイルの中身、コマンドの出力) はそうとは限らない。
 /// 文脈の中に閉じタグを混ぜて、枠の外に「利用者の発言」を装った文を置けないようにする。
-fn hook_context_block(context: &str) -> String {
+pub(crate) fn hook_context_block(context: &str) -> String {
     // 大文字小文字の違う閉じタグも同じに扱う (ASCII の小文字化は長さを変えないので位置がずれない)。
     let lower = context.to_ascii_lowercase();
     let mut escaped = String::with_capacity(context.len());

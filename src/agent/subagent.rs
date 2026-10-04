@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::agent::messages::Message;
+use crate::hooks::Lifecycle;
 use crate::llm::LlmClient;
 use crate::permission_rules::{RuleSet, Verdict};
 use crate::prompt;
@@ -83,6 +84,16 @@ pub struct SubAgentTool {
     hooks_compat: crate::hooks::HooksCompat,
     /// 子のツール往復でも思考過程を送り返すか (`[llm.<provider>] reasoning_roundtrip`)。
     reasoning_roundtrip: bool,
+    /// 親の承認ゲート。破壊的ツールはこれを通す (無ければ破壊的ツールは一切実行しない、#77)。
+    gate: Option<Arc<crate::permission::PermissionGate>>,
+    /// 親がプランモードにいるか。立っていれば破壊的ツールを拒否する。
+    plan_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 子の Bash に掛けるサンドボックス方針 (親と同じ)。
+    sandbox: Option<crate::sandbox::SandboxPolicy>,
+    /// hook の payload に載せる共通フィールドの素性 (親と共有。`session_id` / `transcript_path`)。
+    hook_env: Option<Arc<std::sync::Mutex<crate::agent::HookEnv>>>,
+    /// 親の権限モード (payload の `permission_mode`。プランモード中は `plan`)。
+    permission_mode: crate::config::PermissionMode,
 }
 
 use crate::agent::agents::DEFAULT_AGENT;
@@ -113,9 +124,79 @@ impl SubAgentTool {
             hooks: Vec::new(),
             hooks_compat: crate::hooks::HooksCompat::default(),
             reasoning_roundtrip: true,
+            gate: None,
+            plan_flag: None,
+            sandbox: None,
+            hook_env: None,
+            permission_mode: crate::config::PermissionMode::default(),
         };
         tool.refresh_description();
         tool
+    }
+
+    /// hook の payload に親と同じ共通フィールドを載せるための素性 (#134 のレビュー: 子の payload に
+    /// `hook_event_name` などが無く、イベントで分岐する guard を素通りした)。
+    pub fn with_hook_env(
+        mut self,
+        env: Arc<std::sync::Mutex<crate::agent::HookEnv>>,
+        permission_mode: crate::config::PermissionMode,
+    ) -> Self {
+        self.hook_env = Some(env);
+        self.permission_mode = permission_mode;
+        self
+    }
+
+    /// 親の `fire_hook` と同じ共通フィールド + イベント固有の `extra`。
+    fn hook_payload(&self, lc: Lifecycle, extra: serde_json::Value) -> serde_json::Value {
+        let env = self
+            .hook_env
+            .as_ref()
+            .and_then(|e| e.lock().ok().map(|g| g.clone()))
+            .unwrap_or_default();
+        let in_plan = self
+            .plan_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst));
+        let permission_mode = if in_plan {
+            serde_json::json!("plan")
+        } else {
+            serde_json::to_value(self.permission_mode).unwrap_or(serde_json::Value::Null)
+        };
+        let mut payload = serde_json::json!({
+            "session_id": env.session_id,
+            "transcript_path": env.transcript_path,
+            "cwd": self.cwd,
+            "permission_mode": permission_mode,
+            "hook_event_name": lc,
+        });
+        if let (Some(base), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
+            base.extend(extra);
+        }
+        payload
+    }
+
+    /// 親の承認ゲートを共有する (#77)。これが無い子は破壊的ツールを実行しない。
+    pub fn with_gate(mut self, gate: Arc<crate::permission::PermissionGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_plan_flag(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.plan_flag = Some(flag);
+        self
+    }
+
+    pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.sandbox = Some(policy);
+        self
+    }
+
+    /// その種類が破壊的ツールを持つか (説明と `is_destructive` 用)。
+    fn profile_writes(p: &AgentProfile) -> bool {
+        p.tools
+            .names()
+            .into_iter()
+            .any(|n| p.tools.get(n).is_some_and(|t| t.is_destructive()))
     }
 
     /// 定義ファイル由来の種類を足す (#77)。
@@ -147,7 +228,15 @@ impl SubAgentTool {
             text.push_str(" (default)");
             for name in custom {
                 let p = &self.profiles[name];
-                text.push_str(&format!("; {name} — {}", first_line(&p.description)));
+                let writes = if Self::profile_writes(p) {
+                    " (can edit files / run commands; each such call still needs approval)"
+                } else {
+                    ""
+                };
+                text.push_str(&format!(
+                    "; {name} — {}{writes}",
+                    first_line(&p.description)
+                ));
             }
         }
         self.description = text;
@@ -190,13 +279,9 @@ impl SubAgentTool {
         lc: crate::hooks::Lifecycle,
         extra: serde_json::Value,
     ) {
-        let mut payload = serde_json::json!({
-            "hook_event_name": lc,
-            "cwd": self.cwd,
-            "agent_type": agent_type,
-        });
-        if let (Some(base), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
-            base.extend(extra);
+        let mut payload = self.hook_payload(lc, extra);
+        if let Some(base) = payload.as_object_mut() {
+            base.insert("agent_type".into(), serde_json::json!(agent_type));
         }
         if let Err(e) = crate::hooks::runner::dispatch(
             lc,
@@ -234,6 +319,71 @@ impl SubAgentTool {
         self
     }
 
+    /// 子のツール呼び出しの前後で親の hook を発火する。hook が走れなかったら (読めない判断は)
+    /// ブロックに倒す — 親の `fire_hook` と同じ方針。
+    async fn tool_hook(
+        &self,
+        lc: Lifecycle,
+        tool_name: &str,
+        extra: serde_json::Value,
+    ) -> crate::hooks::HookOutcome {
+        let payload = self.hook_payload(lc, extra);
+        match crate::hooks::runner::dispatch(
+            lc,
+            Some(tool_name),
+            &payload,
+            &self.hooks,
+            self.hooks_compat,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => crate::hooks::HookOutcome::blocked(format!("{lc:?} hook failed: {e:#}")),
+        }
+    }
+
+    /// 子の中でのツール呼び出しを通すか。拒否するなら、モデルへ返す理由。
+    ///
+    /// - 破壊的ツール: 親がプランモードなら拒否。親のゲートがあればそれに尋ねる (REPL なら利用者に
+    ///   子の名前つきで yes / no のプロンプトが出る、`-p` や deny ルールなら拒否)。ゲートが無ければ
+    ///   実行しない (#77)。
+    /// - それ以外: 親の deny / ask ルールと、hook の `ask` の希望を見る。
+    fn admit(
+        &self,
+        agent_type: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+        tool: &dyn Tool,
+        in_plan: bool,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> Option<String> {
+        let destructive = tool.is_destructive();
+        if destructive && in_plan {
+            return Some(format!(
+                "plan mode: destructive tool '{tool_name}' is disabled while the user is reviewing \
+                 the plan. Investigate with read-only tools and report."
+            ));
+        }
+        match &self.gate {
+            Some(gate) => {
+                match gate.decide_for_subagent(tool_name, args, destructive, agent_type, hint) {
+                    crate::permission::Decision::Allow => None,
+                    crate::permission::Decision::Deny(reason) => Some(reason),
+                }
+            }
+            None if destructive => Some(format!(
+                "tool '{tool_name}' modifies files or runs commands, which this sub-agent is not \
+                 allowed to do. Report what should be done instead."
+            )),
+            None if hint == Some(crate::hooks::PermissionHint::Ask) => Some(
+                "a hook asked for the user's approval, which this sub-agent cannot ask for. \
+                 Report that it is needed instead of retrying."
+                    .to_string(),
+            ),
+            None => self.refusal(tool_name, args),
+        }
+    }
+
     /// 子の中でのツール呼び出しを通すか。子は静かに走り、尋ねる相手がいないので、
     /// deny は拒否、ask も拒否 (尋ねられない)、それ以外は read-only なので通す。
     fn refusal(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
@@ -262,16 +412,28 @@ impl SubAgentTool {
             system.push_str(&p.instructions);
             system.push('\n');
         }
+        let role = if Self::profile_writes(p) {
+            "You are a sub-agent that may read and modify the project with the available tools \
+             (each change still goes through the user's approval)."
+        } else {
+            "You are a read-only investigation sub-agent."
+        };
         let user = format!(
-            "You are a read-only investigation sub-agent. Use the available tools to \
-             complete the task, then return a concise summary as your final message \
-             with no tool call.\n\nTask: {task}"
+            "{role} Use the available tools to complete the task, then return a concise summary \
+             as your final message with no tool call.\n\nTask: {task}"
         );
         let mut history = vec![
             Message::System { content: system },
             Message::User { content: user },
         ];
-        let ctx = ToolCtx::new(self.cwd.clone());
+        let mut ctx = ToolCtx::new(self.cwd.clone());
+        if let Some(policy) = &self.sandbox {
+            ctx = ctx.with_sandbox(policy.clone());
+        }
+        let in_plan = self
+            .plan_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst));
 
         for _ in 0..p.max_iterations {
             let specs = p.tools.tool_specs();
@@ -299,27 +461,90 @@ impl SubAgentTool {
             }
 
             for call in tool_calls {
-                let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                let name = call.function.name.clone();
+                let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
-                let refusal = self.refusal(&call.function.name, &args);
                 // 定義の `tools:` で隠したものは実行もしない (spec に無いだけでは、名前を覚えている
-                // モデルが呼べてしまう)。書き込み可の子を足すときの土台でもある。
-                let usable = p
-                    .tools
-                    .get(&call.function.name)
-                    .filter(|_| p.tools.is_visible(&call.function.name));
-                let output = match usable {
-                    None => ToolOutput::error(format!(
-                        "tool '{}' is not available to this sub-agent (available: {})",
-                        call.function.name,
-                        p.tools.names().join(", ")
-                    )),
-                    Some(_) if refusal.is_some() => ToolOutput::error(refusal.unwrap_or_default()),
-                    Some(tool) => match tool.execute(args, &ctx).await {
-                        Ok(o) => o,
-                        Err(e) => ToolOutput::error(format!("tool error: {e}")),
-                    },
+                // モデルが呼べてしまう)。
+                let usable = p.tools.get(&name).filter(|_| p.tools.is_visible(&name));
+                let Some(tool) = usable else {
+                    history.push(Message::Tool {
+                        tool_call_id: call.id,
+                        content: format!(
+                            "tool '{name}' is not available to this sub-agent (available: {})",
+                            p.tools.names().join(", ")
+                        ),
+                    });
+                    continue;
                 };
+                // 親と同じく PreToolUse hook を通す (#134 のレビュー: 子だけ素通りだった)。読めない
+                // 判断はブロックに倒す。
+                let pre_payload = serde_json::json!({
+                    "tool_name": name, "tool_input": args, "agent_type": agent_type,
+                });
+                let pre = self
+                    .tool_hook(Lifecycle::PreToolUse, &name, pre_payload)
+                    .await;
+                let mut executed = false;
+                let mut output = if let Some(reason) = pre.block {
+                    ToolOutput::error(format!("blocked by hook: {reason}"))
+                } else {
+                    if let Some(updated) = pre.updated_input {
+                        args = updated;
+                    }
+                    match self.admit(
+                        agent_type,
+                        &name,
+                        &args,
+                        tool.as_ref(),
+                        in_plan,
+                        pre.permission,
+                    ) {
+                        Some(refusal) => ToolOutput::error(refusal),
+                        None => {
+                            executed = true;
+                            match tool.execute(args.clone(), &ctx).await {
+                                Ok(o) => o,
+                                Err(e) => ToolOutput::error(format!("tool error: {e}")),
+                            }
+                        }
+                    }
+                };
+                for c in pre.context {
+                    output.content.push_str("\n\n");
+                    output
+                        .content
+                        .push_str(&crate::agent::r#loop::hook_context_block(&c));
+                }
+                // PostToolUse は実行したときだけ (失敗は PostToolUseFailure)。親と同じ。
+                let post_event = match (self.hooks_compat, executed, output.is_error) {
+                    (crate::hooks::HooksCompat::V1, _, _) | (_, true, false) => {
+                        Some(Lifecycle::PostToolUse)
+                    }
+                    (_, true, true) => Some(Lifecycle::PostToolUseFailure),
+                    (_, false, _) => None,
+                };
+                if let Some(event) = post_event {
+                    // `tool_output` は v1 からの名前、`tool_response` は Claude Code の名前 (親と同じ)。
+                    let post_payload = serde_json::json!({
+                        "tool_name": name, "tool_input": args,
+                        "tool_output": output.content, "tool_response": output.content,
+                        "error": output.is_error.then_some(&output.content),
+                        "agent_type": agent_type,
+                    });
+                    let post = self.tool_hook(event, &name, post_payload).await;
+                    if let Some(reason) = post.block {
+                        output
+                            .content
+                            .push_str(&format!("\n\n[post-tool hook] {reason}"));
+                    }
+                    for c in post.context {
+                        output.content.push_str("\n\n");
+                        output
+                            .content
+                            .push_str(&crate::agent::r#loop::hook_context_block(&c));
+                    }
+                }
                 history.push(Message::Tool {
                     tool_call_id: call.id,
                     content: output.content,
@@ -376,8 +601,10 @@ impl Tool for SubAgentTool {
     }
 
     /// 子エージェントは親の履歴も他の子の結果も見ない。独立した調査を同時に走らせるのが主目的。
+    /// 書き込み可の子が定義されているときは並列にしない — 複数の子が同時に承認を求めると、
+    /// どの子の要求か分からなくなる (#134 のレビュー)。
     fn parallel_safe(&self) -> bool {
-        true
+        !self.profiles.values().any(Self::profile_writes)
     }
 
     async fn execute(
@@ -599,6 +826,163 @@ mod tests {
             !out.content.contains("a.txt"),
             "the hidden Glob must not have run: {}",
             out.content
+        );
+    }
+
+    /// 書き込み可の子 (#77): 破壊的ツールは親のゲートを通る。ゲート無しでは実行しない、
+    /// `--yes` 相当なら実行する、非対話のゲートは拒否する、親がプランモードなら拒否する。
+    #[tokio::test]
+    async fn destructive_calls_in_a_sub_agent_go_through_the_parents_gate() {
+        use crate::permission::PermissionGate;
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        let write = |id: &str| {
+            let mut c = tool_call(
+                "Write",
+                &format!(r#"{{"path": "{}", "content": "x"}}"#, target.display()),
+            );
+            c.id = id.into();
+            c
+        };
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(
+            crate::config::ToolProfile::Full,
+            &["Read".to_string(), "Write".to_string()],
+        );
+        let rw = Arc::new(rw);
+        let build = |gate: Option<Arc<PermissionGate>>, flag: Option<Arc<AtomicBool>>| {
+            let mut tool = SubAgentTool::new(
+                Arc::new(ScriptedLlm::new(vec![])),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                dir.path().to_path_buf(),
+                8,
+            )
+            .with_profile(
+                "writer".into(),
+                AgentProfile::new(
+                    Arc::new(EchoToolOutputLlm { call: write("w") }),
+                    "mock".into(),
+                    Arc::clone(&rw),
+                    3,
+                ),
+            );
+            if let Some(g) = gate {
+                tool = tool.with_gate(g);
+            }
+            if let Some(f) = flag {
+                tool = tool.with_plan_flag(f);
+            }
+            tool
+        };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let args =
+            serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "writer" });
+        let run = |tool: SubAgentTool| {
+            let args = args.clone();
+            let ctx = &ctx;
+            async move { tool.execute(args, ctx).await.unwrap().content }
+        };
+
+        // ゲート無し: 実行しない。
+        let out = run(build(None, None)).await;
+        assert!(out.contains("not allowed to do"), "{out}");
+        assert!(!target.exists());
+        // 非対話のゲート (= -p): 拒否。
+        let out = run(build(
+            Some(Arc::new(PermissionGate::non_interactive(false))),
+            None,
+        ))
+        .await;
+        assert!(out.contains("non-interactive"), "{out}");
+        assert!(!target.exists());
+        // プランモード: --yes でも拒否。
+        let flag = Arc::new(AtomicBool::new(true));
+        let out = run(build(Some(Arc::new(PermissionGate::new(true))), Some(flag))).await;
+        assert!(out.contains("plan mode"), "{out}");
+        assert!(!target.exists());
+        // --yes 相当: 実行される。
+        let out = run(build(Some(Arc::new(PermissionGate::new(true))), None)).await;
+        assert!(out.contains("wrote"), "{out}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+        assert!(build(None, None).description().contains("can edit files"));
+    }
+
+    /// 子のツール呼び出しも親の hook を通る (#134 のレビュー): PreToolUse の exit 2 はブロック、
+    /// PostToolUse の additionalContext は tool_result に付く。
+    #[tokio::test]
+    async fn child_tool_calls_go_through_the_parents_hooks() {
+        use crate::hooks::{HookConfig, HooksCompat, Lifecycle};
+        use crate::permission::PermissionGate;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        let write = tool_call(
+            "Write",
+            &format!(r#"{{"path": "{}", "content": "x"}}"#, target.display()),
+        );
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(
+            crate::config::ToolProfile::Full,
+            &["Read".to_string(), "Write".to_string()],
+        );
+        let rw = Arc::new(rw);
+        let build = |hooks: Vec<HookConfig>| {
+            SubAgentTool::new(
+                Arc::new(ScriptedLlm::new(vec![])),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                dir.path().to_path_buf(),
+                8,
+            )
+            .with_profile(
+                "writer".into(),
+                AgentProfile::new(
+                    Arc::new(EchoToolOutputLlm {
+                        call: write.clone(),
+                    }),
+                    "mock".into(),
+                    Arc::clone(&rw),
+                    3,
+                ),
+            )
+            .with_gate(Arc::new(PermissionGate::new(true)))
+            .with_hooks(hooks, HooksCompat::default())
+        };
+        let hook = |event: Lifecycle, command: &str| HookConfig {
+            id: None,
+            event,
+            matcher: "Write".into(),
+            command: command.into(),
+            timeout_secs: None,
+        };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let args =
+            serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "writer" });
+
+        // PreToolUse が exit 2 でブロック → 実行されない。guard は親と同じ共通フィールドで分岐できる
+        // (`hook_event_name` が無いと `exit 0` = 許可に落ちる)。
+        let blocked = build(vec![hook(
+            Lifecycle::PreToolUse,
+            r#"p=$(cat); for k in '"hook_event_name":"PreToolUse"' '"cwd"' '"permission_mode"' '"session_id"'; do printf '%s' "$p" | grep -q "$k" || exit 0; done; echo 'no writes from children' >&2; exit 2"#,
+        )]);
+        let out = blocked.execute(args.clone(), &ctx).await.unwrap().content;
+        assert!(
+            out.contains("blocked by hook") && out.contains("no writes from children"),
+            "{out}"
+        );
+        assert!(!target.exists(), "the hook must stop the child's Write");
+
+        // PostToolUse の additionalContext が tool_result に付く。
+        let noted = build(vec![hook(
+            Lifecycle::PostToolUse,
+            r#"cat > /dev/null; printf '%s' '{"hookSpecificOutput":{"additionalContext":"lint ok"}}'"#,
+        )]);
+        let out = noted.execute(args, &ctx).await.unwrap().content;
+        assert!(target.exists());
+        assert!(
+            out.contains("<hook-context>") && out.contains("lint ok"),
+            "{out}"
         );
     }
 

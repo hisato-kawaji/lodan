@@ -183,7 +183,7 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
         println!("slash: {} user command(s) loaded", user_commands.len());
     }
 
-    let runtime = Runtime::build(&cfg, Notices::Stdout).await?;
+    let runtime = Runtime::build(&cfg, Notices::Stdout, true).await?;
     // `/model` で作り直す。サブエージェント (Task) と MCP sampling は起動時のクライアントのまま。
     let mut llm_client = Arc::clone(&runtime.llm);
     let registry = Arc::clone(&runtime.registry);
@@ -198,7 +198,7 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
         .collect();
     rl.set_helper(Some(ReplHelper::new(completion_names)));
 
-    let gate = PermissionGate::from_config(&cfg, &runtime.cwd, true)?;
+    let gate = Arc::clone(&runtime.gate);
 
     let (mut session, mut recorder) =
         runtime.open_session(&cfg, resume.as_deref(), Notices::Stdout);

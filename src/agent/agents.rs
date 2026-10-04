@@ -1,8 +1,8 @@
 //! カスタムエージェント定義 (`.lodan/agents/<name>.md`, #77)。
 //!
 //! `Task` の `subagent_type` で選べる子エージェントの種類。frontmatter で使えるツール・モデル・
-//! 反復上限を、本文で追加の指示を書く。いまは読み取り専用のツール (Read / Grep / Glob) の範囲で
-//! 絞り込むだけ — 書き込み可の子は、親の承認ゲートとプランモードを通す形が要るので別 PR。
+//! 反復上限を、本文で追加の指示を書く。`tools:` には組み込みツールなら破壊的なもの (Write / Edit /
+//! Bash …) も書ける — 実行は親の承認ゲートを通り、親がプランモードなら拒否される (#77)。
 //!
 //! ```markdown
 //! ---
@@ -29,7 +29,7 @@ pub const DEFAULT_AGENT: &str = "general-purpose";
 pub struct AgentDef {
     pub name: String,
     pub description: String,
-    /// 使えるツール名。空なら既定 (Read / Grep / Glob)。
+    /// 使えるツール名 (組み込みツール。破壊的なものも可)。空なら既定 (Read / Grep / Glob)。
     pub tools: Vec<String>,
     pub provider: Option<Provider>,
     pub model: Option<String>,

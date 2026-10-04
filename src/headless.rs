@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read};
+use std::sync::Arc;
 
 use crate::agent::r#loop::MaxIterationsError;
 use crate::agent::messages::Message;
@@ -163,8 +164,8 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         None => prompt,
     };
 
-    let runtime = Runtime::build(&cfg, Notices::Stderr).await?;
-    let gate = PermissionGate::from_config(&cfg, &runtime.cwd, false)?;
+    let runtime = Runtime::build(&cfg, Notices::Stderr, false).await?;
+    let gate = Arc::clone(&runtime.gate);
     let (mut session, mut recorder) =
         runtime.open_session(&cfg, resume.as_deref(), Notices::Stderr);
     if cfg.permissions.mode == crate::config::PermissionMode::Plan {

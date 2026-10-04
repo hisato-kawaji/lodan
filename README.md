@@ -697,7 +697,7 @@ command = "./scripts/lint-changed.sh"
 | 英数と `_` `-` 空白 `,` `\|` だけ | 完全一致。`Edit\|Write` のような並びはどれかに完全一致 |
 | それ以外の文字を含む | 正規表現（**部分一致**）。`Edit.*` は `NotebookEdit` にも当たる。全体一致は `^Edit$` |
 
-MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memory` だけだと完全一致扱いで何にも当たりません）。正規表現として壊れている matcher は**起動時にエラー**にします（一度も発火しない guard を黙って受け入れないため）。matcher が照合する相手: PreToolUse / PostToolUse / PostToolUseFailure / PermissionRequest はツール名、SessionStart は `startup` / `resume`、PreCompact / PostCompact は `manual`（`/compact`）/ `auto`、SubagentStart / SubagentStop は子エージェントの種類（いまは `general-purpose` のみ）、Notification は通知の種類（`permission_prompt`）。UserPromptSubmit / Stop / SessionEnd は matcher を見ません。
+MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memory` だけだと完全一致扱いで何にも当たりません）。正規表現として壊れている matcher は**起動時にエラー**にします（一度も発火しない guard を黙って受け入れないため）。matcher が照合する相手: PreToolUse / PostToolUse / PostToolUseFailure / PermissionRequest はツール名、SessionStart は `startup` / `resume`、PreCompact / PostCompact は `manual`（`/compact`）/ `auto`、SubagentStart / SubagentStop は子エージェントの種類（`general-purpose` か `.lodan/agents/` で定義した名前）、Notification は通知の種類（`permission_prompt`）。UserPromptSubmit / Stop / SessionEnd は matcher を見ません。
 
 ### ペイロード
 
@@ -712,7 +712,7 @@ MCP のツールをサーバ単位で拾うなら `mcp__memory__.*`（`mcp__memo
 - **PostToolUse**: `tool_name` / `tool_input` / `tool_response`（旧名 `tool_output` も同じ値）。**成功した実行の後**に発火。実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。
 - **PostToolUseFailure**: PostToolUse の項目に加えて `error`。ツールを**実行して失敗した**ときに発火。PostToolUse と同じく実行後なので取り消せず、ブロックの理由はツール結果に追記されてモデルへ返る。hook やゲートが止めて実行に至らなかった呼び出しでは、PostToolUse も PostToolUseFailure も発火しない（`hooks_compat = "v1"` では従来どおり、全ての呼び出しで PostToolUse）。
 - **PreCompact** / **PostCompact**: `trigger`（`manual` | `auto`）、PreCompact には `custom_instructions`（`/compact <指示>` の指示）。PreCompact をブロックすると圧縮しない。畳むものが無くて圧縮が見送られるときは発火しない。
-- **SubagentStart** / **SubagentStop**: `agent_type` / `cwd`、Start には `prompt`（依頼文）、Stop には `last_assistant_message`（失敗時は `error`）。`Task` の子エージェントの開始と終了。通知用で、ブロックはできない。`session_id` などの共通フィールドは付かない。
+- **SubagentStart** / **SubagentStop**: `agent_type` / `cwd`、Start には `prompt`（依頼文）、Stop には `last_assistant_message`（失敗時は `error`）。`Task` の子エージェントの開始と終了。通知用で、ブロックはできない。
 - **Stop**: `last_assistant_message`（旧名 `last_message` も同じ値）。ターン終端で発火。**ブロックすると停止せず、その理由をユーザー入力として注入し次ターンへ継続する**（暴走は `max_iterations` で停止）。「条件を満たすまで作業を続ける」系の自律ループの土台。
 
 > ⚠️ **信頼前提**: hook コマンドは `sh -c` で実行され、パーミッションゲートを経ません。プロジェクトの `config.toml` の hook が動くのは、そのディレクトリを[信頼した](#workspace-trust--信頼していないディレクトリの設定は読まない)ときだけです。信頼するのは中身を確認したリポジトリに限ってください（任意コード実行になります）。
@@ -784,7 +784,7 @@ session: resumed 1782332785130-31477 (12 messages)
 ---
 name: reviewer                  # 省略時はファイル名。general-purpose は予約
 description: Reviews a diff for correctness and style
-tools: Read, Grep               # 読み取り専用 (Read / Grep / Glob) の範囲で絞る。省略で 3 つ全部
+tools: Read, Grep, Edit         # 組み込みツールから選ぶ (Write / Edit / Bash も可)。省略で Read / Grep / Glob
 model: kimi:kimi-k3             # provider:model か model だけ (qwen3.5:9b のようなコロン入りも可)
 max_turns: 6                    # 省略で agent.max_iterations。上限 12
 ---
@@ -794,7 +794,8 @@ You are a strict reviewer. Report only concrete problems with file:line.
 - 本文は子の system prompt の末尾に「user-provided context, not permission to bypass approvals」の断りつきで足す
 - `model` / `provider` を指定した種類は専用のクライアントで動く（トークンは同じ台帳に `subagent` として計上される）。API キーが無いなど作れない定義は起動時に警告して飛ばす
 - `Task` の説明に定義した種類の一覧が載り、`subagent_type` は enum になる（小型モデルが名前を打ち間違えない）。起動時に `agents: reviewer, …` と表示
-- **書き込み可の子・並列・worktree 分離はまだ**。`Task` は複数呼び出しを同時に実行できる（#73）ので、独立した調査は既に並列になる
+- **書き込み可の子**: `tools:` に Write / Edit / Bash などを書けば、その種類は編集や実行ができる。ただし破壊的な呼び出しは 1 回ずつ**親と同じ承認ゲート**を通る（REPL なら `Allow Write (sub-agent builder): …` と**子の名前つきで yes / no だけ**のプロンプトが出る — 子の要求で「常に許可」を保存すると親の後続まで無確認になるため。`--yes` / allow ルール / `accept-edits` なら通り、deny ルールと `-p`（尋ねる相手がいない）は拒否）。子のツール呼び出しも親と同じ **PreToolUse / PostToolUse hook** を通る（`agent_type` が payload に入る。ブロックされれば実行しない）。親が**プランモード**なら破壊的ツールは拒否される。子の Bash は親と同じ `[sandbox]` 方針で動く。`AskUserQuestion` は子に書けない。書き込み可の種類が 1 つでもあると `Task` は並列実行しない（複数の子が同時に承認を求めると、どの子の要求か分からなくなる）。既定の `general-purpose` と `tools:` 無しの種類は従来どおり読み取り専用。`Task` のツール定義には「can edit files / run commands」と出るので、モデルも区別できる
+- 並列は `Task` の複数呼び出しが同時に実行される（#73）ので既にある。worktree 分離はまだ
 
 ```jsonc
 // メインエージェントが発行する tool call の例

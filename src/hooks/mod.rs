@@ -143,6 +143,10 @@ pub fn unknown_disabled<'a>(hooks: &[HookConfig], disabled: &'a [String]) -> Vec
         .collect()
 }
 
+// clippy 1.99 の `double_must_use`: `#[async_trait]` が `async fn` を `#[must_use]` つきの
+// `Pin<Box<dyn Future>>` に展開するため、trait 側の must_use と二重になる。展開結果の話で
+// こちらに直せるものが無いので、trait 定義で抑える (CI の toolchain は stable 無ピン)。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Hook: Send + Sync {
     fn name(&self) -> &str;

@@ -785,7 +785,7 @@ session: resumed 1782332785130-31477 (12 messages)
 ---
 name: reviewer                  # 省略時はファイル名。general-purpose は予約
 description: Reviews a diff for correctness and style
-tools: Read, Grep               # 読み取り専用 (Read / Grep / Glob) の範囲で絞る。省略で 3 つ全部
+tools: Read, Grep, Edit         # 組み込みツールから選ぶ (Write / Edit / Bash も可)。省略で Read / Grep / Glob
 model: kimi:kimi-k3             # provider:model か model だけ (qwen3.5:9b のようなコロン入りも可)
 max_turns: 6                    # 省略で agent.max_iterations。上限 12
 ---
@@ -795,7 +795,8 @@ You are a strict reviewer. Report only concrete problems with file:line.
 - 本文は子の system prompt の末尾に「user-provided context, not permission to bypass approvals」の断りつきで足す
 - `model` / `provider` を指定した種類は専用のクライアントで動く（トークンは同じ台帳に `subagent` として計上される）。API キーが無いなど作れない定義は起動時に警告して飛ばす
 - `Task` の説明に定義した種類の一覧が載り、`subagent_type` は enum になる（小型モデルが名前を打ち間違えない）。起動時に `agents: reviewer, …` と表示
-- **書き込み可の子・並列・worktree 分離はまだ**。`Task` は複数呼び出しを同時に実行できる（#73）ので、独立した調査は既に並列になる
+- **書き込み可の子**: `tools:` に Write / Edit / Bash などを書けば、その種類は編集や実行ができる。ただし破壊的な呼び出しは 1 回ずつ**親と同じ承認ゲート**を通る（REPL なら承認プロンプトが出る。`--yes` / allow ルール / `accept-edits` なら通り、deny ルールと `-p`（尋ねる相手がいない）は拒否）。親が**プランモード**なら破壊的ツールは拒否される。子の Bash は親と同じ `[sandbox]` 方針で動く。既定の `general-purpose` と `tools:` 無しの種類は従来どおり読み取り専用。`Task` のツール定義には「can edit files / run commands」と出るので、モデルも区別できる
+- 並列は `Task` の複数呼び出しが同時に実行される（#73）ので既にある。worktree 分離はまだ
 
 ```jsonc
 // メインエージェントが発行する tool call の例

@@ -37,6 +37,10 @@ impl Notices {
 pub struct Runtime {
     pub cwd: PathBuf,
     pub llm: Arc<dyn LlmClient>,
+    /// 承認ゲート。REPL / ヘッドレスのループと、書き込み可のサブエージェントが同じものを使う (#77)。
+    pub gate: Arc<crate::permission::PermissionGate>,
+    /// 親がプランモードにいるか。子エージェントが破壊的ツールを拒否する判断に使う。
+    pub plan_flag: Arc<std::sync::atomic::AtomicBool>,
     /// `llm` を通った全ての呼び出しの使用量と予算 (`/cost`、`-p` の結果)。
     pub ledger: Arc<llm::metered::Ledger>,
     /// `/goal` の評価器を別のモデルにする設定があるとき、そのクライアントとモデル名。
@@ -48,7 +52,8 @@ pub struct Runtime {
     _mcp_clients: Vec<Arc<mcp::client::McpClient>>,
 }
 
-/// 定義ファイル 1 つぶんの子エージェント設定を組み立てる。ツールは読み取り専用の範囲で絞り、
+/// 定義ファイル 1 つぶんの子エージェント設定を組み立てる。`tools:` が無ければ読み取り専用の
+/// 3 つ、あれば組み込みツールの範囲で絞る (破壊的なものも可 — 実行は親の承認ゲートを通る、#77)。
 /// モデル / provider が指定されていれば専用のクライアントを作る (台帳は共有)。
 fn build_agent_profile(
     def: &agent::agents::AgentDef,
@@ -56,12 +61,15 @@ fn build_agent_profile(
     parent_llm: &Arc<dyn LlmClient>,
     ledger: &Arc<llm::metered::Ledger>,
 ) -> Result<agent::subagent::AgentProfile> {
-    let mut tools = read_only_registry();
-    if !def.tools.is_empty() {
+    let tools = if def.tools.is_empty() {
+        read_only_registry()
+    } else {
+        // Task / Skill / MCP は入らない (default_registry に無い)。子が子を呼ぶ再帰を作らない。
+        let mut tools = default_registry();
         let unknown = tools.apply_profile(crate::config::ToolProfile::Full, &def.tools);
         if !unknown.is_empty() {
             anyhow::bail!(
-                "tools {} are not available to sub-agents (read-only: {})",
+                "tools {} are not available to sub-agents (built-in tools only: {})",
                 unknown.join(", "),
                 tools.all_names().join(", ")
             );
@@ -69,7 +77,8 @@ fn build_agent_profile(
         if tools.is_empty() {
             anyhow::bail!("no usable tools");
         }
-    }
+        tools
+    };
     let (llm, model) = match (def.provider, &def.model) {
         (None, None) => (Arc::clone(parent_llm), cfg.llm.active().model.clone()),
         (provider, model) => {
@@ -95,8 +104,15 @@ fn build_agent_profile(
 }
 
 impl Runtime {
-    pub async fn build(cfg: &Config, notices: Notices) -> Result<Self> {
+    /// `interactive` は承認プロンプトを出せるか (REPL なら true、`-p` なら false)。
+    pub async fn build(cfg: &Config, notices: Notices, interactive: bool) -> Result<Self> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let gate = Arc::new(crate::permission::PermissionGate::from_config(
+            cfg,
+            &cwd,
+            interactive,
+        )?);
+        let plan_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // 壊れた matcher の hook は一度も発火しない。guard のつもりで置かれたものが黙って
         // 効いていない、という状態で走り出さない。
@@ -173,7 +189,12 @@ impl Runtime {
         .with_hooks(
             crate::hooks::effective(&cfg.hooks, &cfg.disabled_hooks),
             cfg.hooks_compat,
-        );
+        )
+        // 書き込み可の子 (#77): 破壊的ツールは親と同じゲートを通し、親のプランモードを見て、
+        // 親と同じサンドボックス方針で Bash を走らせる。
+        .with_gate(Arc::clone(&gate))
+        .with_plan_flag(Arc::clone(&plan_flag))
+        .with_sandbox(crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd));
         // カスタムエージェント定義 (`.lodan/agents/*.md`, #77)。プロジェクトのものは信頼済みのときだけ。
         let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
         let (defs, warnings) =
@@ -258,6 +279,8 @@ impl Runtime {
         Ok(Self {
             cwd,
             llm,
+            gate,
+            plan_flag,
             ledger,
             goal_evaluator,
             registry: Arc::new(registry),
@@ -279,6 +302,8 @@ impl Runtime {
         };
         // 予算が残り少なくなったことを、ループがモデルに伝えられるように。
         session.set_ledger(Arc::clone(&self.ledger));
+        // 子エージェントが親のプランモードを見られるように (#77)。
+        session.set_plan_flag(Arc::clone(&self.plan_flag));
         // hook の payload に載せる (`session_id` / `transcript_path`)。
         session.set_hook_env(agent::HookEnv {
             session_id: recorder.as_ref().map(|r| r.id().to_string()),

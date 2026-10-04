@@ -83,6 +83,12 @@ pub struct SubAgentTool {
     hooks_compat: crate::hooks::HooksCompat,
     /// 子のツール往復でも思考過程を送り返すか (`[llm.<provider>] reasoning_roundtrip`)。
     reasoning_roundtrip: bool,
+    /// 親の承認ゲート。破壊的ツールはこれを通す (無ければ破壊的ツールは一切実行しない、#77)。
+    gate: Option<Arc<crate::permission::PermissionGate>>,
+    /// 親がプランモードにいるか。立っていれば破壊的ツールを拒否する。
+    plan_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 子の Bash に掛けるサンドボックス方針 (親と同じ)。
+    sandbox: Option<crate::sandbox::SandboxPolicy>,
 }
 
 use crate::agent::agents::DEFAULT_AGENT;
@@ -113,9 +119,36 @@ impl SubAgentTool {
             hooks: Vec::new(),
             hooks_compat: crate::hooks::HooksCompat::default(),
             reasoning_roundtrip: true,
+            gate: None,
+            plan_flag: None,
+            sandbox: None,
         };
         tool.refresh_description();
         tool
+    }
+
+    /// 親の承認ゲートを共有する (#77)。これが無い子は破壊的ツールを実行しない。
+    pub fn with_gate(mut self, gate: Arc<crate::permission::PermissionGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_plan_flag(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.plan_flag = Some(flag);
+        self
+    }
+
+    pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.sandbox = Some(policy);
+        self
+    }
+
+    /// その種類が破壊的ツールを持つか (説明と `is_destructive` 用)。
+    fn profile_writes(p: &AgentProfile) -> bool {
+        p.tools
+            .names()
+            .into_iter()
+            .any(|n| p.tools.get(n).is_some_and(|t| t.is_destructive()))
     }
 
     /// 定義ファイル由来の種類を足す (#77)。
@@ -147,7 +180,15 @@ impl SubAgentTool {
             text.push_str(" (default)");
             for name in custom {
                 let p = &self.profiles[name];
-                text.push_str(&format!("; {name} — {}", first_line(&p.description)));
+                let writes = if Self::profile_writes(p) {
+                    " (can edit files / run commands; each such call still needs approval)"
+                } else {
+                    ""
+                };
+                text.push_str(&format!(
+                    "; {name} — {}{writes}",
+                    first_line(&p.description)
+                ));
             }
         }
         self.description = text;
@@ -234,6 +275,39 @@ impl SubAgentTool {
         self
     }
 
+    /// 子の中でのツール呼び出しを通すか。拒否するなら、モデルへ返す理由。
+    ///
+    /// - 破壊的ツール: 親がプランモードなら拒否。親のゲートがあればそれに尋ねる (REPL なら利用者に
+    ///   プロンプトが出る、`-p` や deny ルールなら拒否)。ゲートが無ければ実行しない (#77)。
+    /// - それ以外: 親の deny / ask ルールだけ見る (従来どおり)。
+    fn admit(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        tool: &dyn Tool,
+        in_plan: bool,
+    ) -> Option<String> {
+        if !tool.is_destructive() {
+            return self.refusal(tool_name, args);
+        }
+        if in_plan {
+            return Some(format!(
+                "plan mode: destructive tool '{tool_name}' is disabled while the user is reviewing \
+                 the plan. Investigate with read-only tools and report."
+            ));
+        }
+        let Some(gate) = &self.gate else {
+            return Some(format!(
+                "tool '{tool_name}' modifies files or runs commands, which this sub-agent is not \
+                 allowed to do. Report what should be done instead."
+            ));
+        };
+        match gate.decide(tool_name, args, true) {
+            crate::permission::Decision::Allow => None,
+            crate::permission::Decision::Deny(reason) => Some(reason),
+        }
+    }
+
     /// 子の中でのツール呼び出しを通すか。子は静かに走り、尋ねる相手がいないので、
     /// deny は拒否、ask も拒否 (尋ねられない)、それ以外は read-only なので通す。
     fn refusal(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
@@ -271,7 +345,14 @@ impl SubAgentTool {
             Message::System { content: system },
             Message::User { content: user },
         ];
-        let ctx = ToolCtx::new(self.cwd.clone());
+        let mut ctx = ToolCtx::new(self.cwd.clone());
+        if let Some(policy) = &self.sandbox {
+            ctx = ctx.with_sandbox(policy.clone());
+        }
+        let in_plan = self
+            .plan_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst));
 
         for _ in 0..p.max_iterations {
             let specs = p.tools.tool_specs();
@@ -301,9 +382,8 @@ impl SubAgentTool {
             for call in tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments }));
-                let refusal = self.refusal(&call.function.name, &args);
                 // 定義の `tools:` で隠したものは実行もしない (spec に無いだけでは、名前を覚えている
-                // モデルが呼べてしまう)。書き込み可の子を足すときの土台でもある。
+                // モデルが呼べてしまう)。
                 let usable = p
                     .tools
                     .get(&call.function.name)
@@ -314,11 +394,15 @@ impl SubAgentTool {
                         call.function.name,
                         p.tools.names().join(", ")
                     )),
-                    Some(_) if refusal.is_some() => ToolOutput::error(refusal.unwrap_or_default()),
-                    Some(tool) => match tool.execute(args, &ctx).await {
-                        Ok(o) => o,
-                        Err(e) => ToolOutput::error(format!("tool error: {e}")),
-                    },
+                    Some(tool) => {
+                        match self.admit(&call.function.name, &args, tool.as_ref(), in_plan) {
+                            Some(refusal) => ToolOutput::error(refusal),
+                            None => match tool.execute(args, &ctx).await {
+                                Ok(o) => o,
+                                Err(e) => ToolOutput::error(format!("tool error: {e}")),
+                            },
+                        }
+                    }
                 };
                 history.push(Message::Tool {
                     tool_call_id: call.id,
@@ -600,6 +684,86 @@ mod tests {
             "the hidden Glob must not have run: {}",
             out.content
         );
+    }
+
+    /// 書き込み可の子 (#77): 破壊的ツールは親のゲートを通る。ゲート無しでは実行しない、
+    /// `--yes` 相当なら実行する、非対話のゲートは拒否する、親がプランモードなら拒否する。
+    #[tokio::test]
+    async fn destructive_calls_in_a_sub_agent_go_through_the_parents_gate() {
+        use crate::permission::PermissionGate;
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        let write = |id: &str| {
+            let mut c = tool_call(
+                "Write",
+                &format!(r#"{{"path": "{}", "content": "x"}}"#, target.display()),
+            );
+            c.id = id.into();
+            c
+        };
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(
+            crate::config::ToolProfile::Full,
+            &["Read".to_string(), "Write".to_string()],
+        );
+        let rw = Arc::new(rw);
+        let build = |gate: Option<Arc<PermissionGate>>, flag: Option<Arc<AtomicBool>>| {
+            let mut tool = SubAgentTool::new(
+                Arc::new(ScriptedLlm::new(vec![])),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                dir.path().to_path_buf(),
+                8,
+            )
+            .with_profile(
+                "writer".into(),
+                AgentProfile::new(
+                    Arc::new(EchoToolOutputLlm { call: write("w") }),
+                    "mock".into(),
+                    Arc::clone(&rw),
+                    3,
+                ),
+            );
+            if let Some(g) = gate {
+                tool = tool.with_gate(g);
+            }
+            if let Some(f) = flag {
+                tool = tool.with_plan_flag(f);
+            }
+            tool
+        };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let args =
+            serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "writer" });
+        let run = |tool: SubAgentTool| {
+            let args = args.clone();
+            let ctx = &ctx;
+            async move { tool.execute(args, ctx).await.unwrap().content }
+        };
+
+        // ゲート無し: 実行しない。
+        let out = run(build(None, None)).await;
+        assert!(out.contains("not allowed to do"), "{out}");
+        assert!(!target.exists());
+        // 非対話のゲート (= -p): 拒否。
+        let out = run(build(
+            Some(Arc::new(PermissionGate::non_interactive(false))),
+            None,
+        ))
+        .await;
+        assert!(out.contains("non-interactive"), "{out}");
+        assert!(!target.exists());
+        // プランモード: --yes でも拒否。
+        let flag = Arc::new(AtomicBool::new(true));
+        let out = run(build(Some(Arc::new(PermissionGate::new(true))), Some(flag))).await;
+        assert!(out.contains("plan mode"), "{out}");
+        assert!(!target.exists());
+        // --yes 相当: 実行される。
+        let out = run(build(Some(Arc::new(PermissionGate::new(true))), None)).await;
+        assert!(out.contains("wrote"), "{out}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+        assert!(build(None, None).description().contains("can edit files"));
     }
 
     /// 定義が無ければ Task の schema は従来と同じ (subagent_type を見せない)。

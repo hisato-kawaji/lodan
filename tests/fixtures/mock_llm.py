@@ -23,11 +23,14 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-def build_steps(demo_dir):
+def build_steps(demo_dir, model=None):
     # MOCK_LLM_STEPS: demo をこの手順に差し替える。JSON 配列 [[name, args], ...]。
     # 1 手順 = 1 応答で、順にツールを呼んでから最後に本文を返す。
+    # MOCK_LLM_STEPS_MODEL を置くと、そのモデル名のリクエストだけに差し替えが効く
+    # (親は Task を呼び、子 (別モデル) は既定の demo を走らせる、という組み合わせ用)。
     scripted = os.environ.get("MOCK_LLM_STEPS")
-    if scripted:
+    only_for = os.environ.get("MOCK_LLM_STEPS_MODEL")
+    if scripted and (not only_for or model == only_for):
         return [(name, args) for name, args in json.loads(scripted)]
     # MOCK_LLM_BASH: demo を「この Bash コマンド 1 回」に差し替える (サンドボックスの e2e 用)。
     bash_only = os.environ.get("MOCK_LLM_BASH")
@@ -45,7 +48,7 @@ def build_steps(demo_dir):
 
 
 def make_handler(demo_dir):
-    steps = build_steps(demo_dir)
+    default_steps = build_steps(demo_dir)
     # MOCK_LLM_TEXTS: JSON 配列。本文の返事を呼ばれるたびに順に返す (尽きたら最後を繰り返す)。
     # 「1 回目は駄目な答え、直せと言われたら正しい答え」を再現するためのもの。
     scripted = json.loads(os.environ.get("MOCK_LLM_TEXTS", "[]"))
@@ -71,6 +74,7 @@ def make_handler(demo_dir):
         tool_count = sum(1 for m in messages if m.get("role") == "tool")
 
         if "demo" in user_content.lower():
+            steps = build_steps(demo_dir, model) if os.environ.get("MOCK_LLM_STEPS_MODEL") else default_steps
             if tool_count < len(steps):
                 name, args = steps[tool_count]
                 return ("tools", [(name, args)])

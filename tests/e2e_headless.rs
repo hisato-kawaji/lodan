@@ -1245,6 +1245,66 @@ fn mcp_subcommand_edits_user_and_project_config_files() {
     assert!(!listed.contains("fs") && listed.contains("web"), "{listed}");
 }
 
+/// 書き込み可のカスタムエージェント (#77): 子の Write は親のゲートを通る。`--yes` で実行され、
+/// 無ければ (尋ねる相手がいないので) 拒否される。
+#[test]
+fn a_writable_sub_agent_needs_the_parents_approval() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let agents = home.path().join("work/.lodan/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("builder.md"),
+        "---\ndescription: builds things\nmodel: child-model\ntools: Read, Write, Edit, Grep, Glob, Bash\n---\nDo the task.\n",
+    )
+    .unwrap();
+    // 親 (parent-model) は Task を 1 回呼ぶ。子 (child-model) の user メッセージに "demo" が入るので、
+    // 子が既定の demo の手順 (Write …) を走らせる。
+    let steps = serde_json::json!([["Task", { "description": "d", "prompt": "run the demo", "subagent_type": "builder" }]]).to_string();
+    let server = start_mock_with(
+        &demo,
+        &[
+            ("MOCK_LLM_STEPS", &steps),
+            ("MOCK_LLM_STEPS_MODEL", "parent-model"),
+        ],
+    );
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--model",
+            "parent-model",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "stream-json",
+        ];
+        args.extend_from_slice(extra);
+        lodan(home.path(), server.port, &args, Stdin::OpenAndSilent)
+    };
+    let denied = run(&[]);
+    assert!(
+        denied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        !demo.join("hello.txt").exists(),
+        "without --yes the child's Write is refused"
+    );
+
+    let allowed = run(&["--yes"]);
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(demo.join("hello.txt")).unwrap(),
+        "hello world",
+        "with --yes the child ran the demo"
+    );
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

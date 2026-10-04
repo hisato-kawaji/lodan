@@ -440,8 +440,8 @@ mod tests {
 
     #[test]
     fn core_profile_cuts_the_tool_spec_payload_by_nearly_half() {
-        // #72 の受け入れ条件は「半減以上」だったが、TodoWrite を core に足した (2026-10-04) ので
-        // 実測 6,036 → 3,065 バイト (-49%)。45% 以上の削減を固定する。
+        // この registry は built-in 14 個 (Task 無し) なので 6,036 → 3,065 (-49%) で半減に 1% 届かない。
+        // ランタイムの `tools` イベント (Task 込み 15 個、6,643) では半減以上で、そちらは e2e が固定する。
         let bytes = |r: &ToolRegistry| serde_json::to_string(&r.tool_specs()).unwrap().len();
         let full = bytes(&default_registry());
         let mut core = default_registry();

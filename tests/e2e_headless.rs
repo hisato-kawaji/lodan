@@ -599,9 +599,9 @@ fn tool_profile_core_is_reported_and_shrinks_the_tool_specs() {
         full["spec_bytes"].as_u64().unwrap(),
         core["spec_bytes"].as_u64().unwrap(),
     );
-    // TodoWrite を core に足したので半減ではなく -49% (6,036 → 3,065)。45% 以上の削減を固定。
+    // ランタイム (Task 込み 15 個) では 6,643 → 3,065 で、TodoWrite を足した後も半減以上。
     assert!(
-        core_bytes * 100 <= full_bytes * 55,
+        core_bytes * 2 <= full_bytes,
         "core = {core_bytes}, full = {full_bytes}"
     );
 }

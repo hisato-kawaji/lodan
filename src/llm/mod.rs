@@ -74,6 +74,10 @@ pub enum ChatEvent {
     Done(ChatResponse),
 }
 
+// clippy 1.99 の `double_must_use`: `#[async_trait]` が `async fn` を `#[must_use]` つきの
+// `Pin<Box<dyn Future>>` に展開するため、trait 側の must_use と二重になる。展開結果の話で
+// こちらに直せるものが無いので、trait 定義で抑える (CI の toolchain は stable 無ピン)。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// `max_tokens` で 1 応答の生成上限を渡せる (`None` はモデル既定)。MCP sampling は

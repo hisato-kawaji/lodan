@@ -569,9 +569,12 @@ impl SubAgentTool {
                 )
             }
         };
-        let cwd = worktree
-            .as_ref()
-            .map_or_else(|| self.cwd.clone(), |w| w.cwd.clone());
+        // 続きは前の子と同じ場所で (worktree が消えていれば、記録した cwd)。
+        let cwd = match (&worktree, &prior) {
+            (Some(w), _) => w.cwd.clone(),
+            (None, Some(p)) => p.cwd.clone(),
+            (None, None) => self.cwd.clone(),
+        };
         self.notify(
             agent_type,
             Lifecycle::SubagentStart,

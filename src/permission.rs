@@ -146,10 +146,22 @@ impl PermissionGate {
         args: &serde_json::Value,
         destructive: bool,
     ) -> Assessment {
-        let verdict = self.rules.evaluate(tool_name, args, &self.cwd);
+        self.assess_in(tool_name, args, destructive, &self.cwd)
+    }
+
+    /// [`Self::assess`] を、別の作業ディレクトリを基準に。worktree の中で走る子エージェントの
+    /// 呼び出しは、その cwd で相対パターンを照合しないと deny をすり抜ける (#137 のレビュー)。
+    pub fn assess_in(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        cwd: &Path,
+    ) -> Assessment {
+        let verdict = self.rules.evaluate(tool_name, args, cwd);
         Assessment {
             asked_by_rule: verdict == Some(Verdict::Ask),
-            quiet: self.quiet_decision(verdict, tool_name, args, destructive),
+            quiet: self.quiet_decision(verdict, tool_name, args, destructive, cwd),
         }
     }
 
@@ -206,12 +218,13 @@ impl PermissionGate {
         destructive: bool,
         agent: &str,
         hint: Option<crate::hooks::PermissionHint>,
+        cwd: &Path,
     ) -> Decision {
         use crate::hooks::PermissionHint;
         let Assessment {
             asked_by_rule,
             quiet,
-        } = self.assess(tool_name, args, destructive);
+        } = self.assess_in(tool_name, args, destructive, cwd);
         match (hint, quiet) {
             (_, Some(Decision::Deny(why))) => Decision::Deny(why),
             (Some(PermissionHint::Allow), None) if !asked_by_rule && !self.dont_ask => {
@@ -276,17 +289,30 @@ impl PermissionGate {
         args: &serde_json::Value,
         destructive: bool,
     ) -> Option<Decision> {
-        let verdict = self.rules.evaluate(tool_name, args, &self.cwd);
-        self.quiet_decision(verdict, tool_name, args, destructive)
+        self.decide_quietly_in(tool_name, args, destructive, &self.cwd)
+    }
+
+    /// [`Self::decide_quietly`] を、別の作業ディレクトリを基準に (worktree の中の子エージェント)。
+    pub fn decide_quietly_in(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        cwd: &Path,
+    ) -> Option<Decision> {
+        let verdict = self.rules.evaluate(tool_name, args, cwd);
+        self.quiet_decision(verdict, tool_name, args, destructive, cwd)
     }
 
     /// `decide_quietly` の本体。ルールの評価結果を受け取る (呼び出し側が使い回せるように)。
+    /// `cwd` は保存済みルールの照合基準。
     fn quiet_decision(
         &self,
         verdict: Option<Verdict>,
         tool_name: &str,
         args: &serde_json::Value,
         destructive: bool,
+        cwd: &Path,
     ) -> Option<Decision> {
         // deny は `--yes` にも勝つ。「全部通す」と「これだけは絶対に通さない」を両立させるため。
         if let Some(Verdict::Deny(rule)) = &verdict {
@@ -308,9 +334,7 @@ impl PermissionGate {
         }
         if let Ok(p) = self.policy.lock() {
             if p.always_tools.contains(tool_name)
-                || p.saved_rules
-                    .iter()
-                    .any(|r| r.allows(tool_name, args, &self.cwd))
+                || p.saved_rules.iter().any(|r| r.allows(tool_name, args, cwd))
             {
                 return Some(Decision::Allow);
             }
@@ -1034,7 +1058,13 @@ mod tests {
         let bypass = gate(Bypass, "none");
         let unverifiable = Some(Verdict::Unverifiable("Grep(**/.env)".into()));
         assert!(matches!(
-            bypass.quiet_decision(unverifiable, "Grep", &serde_json::json!({}), false),
+            bypass.quiet_decision(
+                unverifiable,
+                "Grep",
+                &serde_json::json!({}),
+                false,
+                Path::new("/work")
+            ),
             Some(Decision::Deny(_))
         ));
     }

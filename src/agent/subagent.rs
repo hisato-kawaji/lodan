@@ -5,7 +5,7 @@
 //! 最終テキストを 1 つの要約として返す。破壊的操作を持たないため承認ゲート不要、
 //! `Task` 自身を含めないため無限再帰しない。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,6 +30,9 @@ struct TaskArgs {
     /// `.lodan/agents/<name>.md` で定義した子の種類 (#77)。省略は既定の調査エージェント。
     #[serde(default)]
     subagent_type: Option<String>,
+    /// `worktree` なら git worktree を切ってその中で走らせる (#77)。省略は種類の既定。
+    #[serde(default)]
+    isolation: Option<String>,
 }
 
 /// 子エージェント 1 種類ぶんの設定。既定の `general-purpose` も、定義ファイル由来もこの形。
@@ -42,6 +45,8 @@ pub struct AgentProfile {
     /// 定義ファイルの本文。子の system prompt の末尾に足す。
     pub instructions: String,
     pub description: String,
+    /// 既定の作業場所 (`isolation:`)。
+    pub isolation: Isolation,
 }
 
 impl AgentProfile {
@@ -59,6 +64,7 @@ impl AgentProfile {
             max_iterations: max_iterations.min(SUBAGENT_MAX_ITERATIONS),
             instructions: String::new(),
             description: String::new(),
+            isolation: Isolation::None,
         }
     }
 
@@ -66,6 +72,170 @@ impl AgentProfile {
         self.instructions = instructions;
         self.description = description;
         self
+    }
+
+    pub fn with_isolation(mut self, isolation: Isolation) -> Self {
+        self.isolation = isolation;
+        self
+    }
+}
+
+/// 子のために切った git worktree (#77)。`<git root>/.lodan/worktrees/<種類>-<連番>` に HEAD を
+/// detached でチェックアウトする。終わったとき変更が無ければ消し、あれば残して場所を親へ伝える。
+struct Worktree {
+    git_root: PathBuf,
+    /// worktree のルート。
+    root: PathBuf,
+    /// 子の作業ディレクトリ (親の cwd がリポジトリの下位なら、その相対位置を worktree の中に写す)。
+    cwd: PathBuf,
+    /// 切ったときの HEAD。
+    base: String,
+}
+
+/// 残した worktree の説明 (親への結果と SubagentStop の payload)。
+struct KeptWorktree {
+    path: PathBuf,
+    note: String,
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed ({}): {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `cwd` を含む git リポジトリのトップ。リポジトリでなければ (git が無くても) None。
+pub fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+    git(cwd, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// worktree を置く場所 (git root 直下)。
+const WORKTREES_DIR: &str = ".lodan/worktrees";
+
+impl Worktree {
+    fn create(git_root: &Path, parent_cwd: &Path, agent_type: &str) -> Result<Self, String> {
+        let base = git(git_root, &["rev-parse", "HEAD"])
+            .map_err(|e| format!("{e} (the repository needs at least one commit)"))?;
+        let dir = git_root.join(WORKTREES_DIR);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        Self::exclude_from_status(git_root);
+        // 同じ種類の子が同時に走っても衝突しないよう、空いている連番を探す。
+        let root = (1..)
+            .map(|n| dir.join(format!("{agent_type}-{n}")))
+            .find(|p| !p.exists())
+            .expect("unbounded range");
+        let root_str = root.to_string_lossy().into_owned();
+        git(
+            git_root,
+            &["worktree", "add", "--detach", "--quiet", &root_str, "HEAD"],
+        )?;
+        // 親の cwd がリポジトリの下位なら、その相対位置を worktree の中に写す (無ければルート)。
+        let real_root = std::fs::canonicalize(git_root).unwrap_or_else(|_| git_root.to_path_buf());
+        let real_cwd =
+            std::fs::canonicalize(parent_cwd).unwrap_or_else(|_| parent_cwd.to_path_buf());
+        let cwd = real_cwd
+            .strip_prefix(&real_root)
+            .ok()
+            .map(|rel| root.join(rel))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| root.clone());
+        Ok(Self {
+            git_root: git_root.to_path_buf(),
+            root,
+            cwd,
+            base,
+        })
+    }
+
+    /// `.lodan/worktrees/` が親の `git status` に untracked として出ないよう、`.git/info/exclude`
+    /// に 1 行足す (コミットされないローカルの除外。既にあれば何もしない)。失敗しても致命ではない。
+    fn exclude_from_status(git_root: &Path) {
+        let Ok(rel) = git(git_root, &["rev-parse", "--git-path", "info/exclude"]) else {
+            return;
+        };
+        let path = git_root.join(rel);
+        let line = format!("/{WORKTREES_DIR}/");
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        if current.lines().any(|l| l.trim() == line) {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let sep = if current.is_empty() || current.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        let _ = std::fs::write(&path, format!("{current}{sep}{line}\n"));
+    }
+
+    fn short(sha: &str) -> &str {
+        &sha[..sha.len().min(12)]
+    }
+
+    /// 子の system prompt に足す説明。
+    fn prompt_note(&self) -> String {
+        format!(
+            "\nYou are working in an isolated git worktree at {} (a fresh checkout of {}; the main \
+             checkout is untouched). Make your changes there; the caller will be told where the \
+             worktree is.\n",
+            self.cwd.display(),
+            Self::short(&self.base)
+        )
+    }
+
+    /// 変更が無ければ worktree を消して None。あれば残して、その説明を返す。
+    fn finish(&self) -> Result<Option<KeptWorktree>, String> {
+        let status = git(
+            &self.root,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?;
+        let head = git(&self.root, &["rev-parse", "HEAD"])?;
+        let changed = status.lines().filter(|l| !l.trim().is_empty()).count();
+        if changed == 0 && head == self.base {
+            let root = self.root.to_string_lossy().into_owned();
+            git(&self.git_root, &["worktree", "remove", "--force", &root])?;
+            return Ok(None);
+        }
+        let mut what = Vec::new();
+        if head != self.base {
+            what.push(format!(
+                "commits {}..{}",
+                Self::short(&self.base),
+                Self::short(&head)
+            ));
+        }
+        if changed > 0 {
+            what.push(format!("{changed} uncommitted change(s)"));
+        }
+        let note = format!(
+            "[worktree] The sub-agent worked in an isolated git worktree at {} ({}). The main \
+             checkout is untouched. Review it there (e.g. `git -C {} diff`), merge or cherry-pick \
+             what you want, then remove it with `git worktree remove {}`.",
+            self.root.display(),
+            what.join(", "),
+            self.root.display(),
+            self.root.display()
+        );
+        Ok(Some(KeptWorktree {
+            path: self.root.clone(),
+            note,
+        }))
     }
 }
 
@@ -94,9 +264,11 @@ pub struct SubAgentTool {
     hook_env: Option<Arc<std::sync::Mutex<crate::agent::HookEnv>>>,
     /// 親の権限モード (payload の `permission_mode`。プランモード中は `plan`)。
     permission_mode: crate::config::PermissionMode,
+    /// cwd を含む git リポジトリのトップ。無ければ `isolation: worktree` は使えない (#77)。
+    git_root: Option<PathBuf>,
 }
 
-use crate::agent::agents::DEFAULT_AGENT;
+use crate::agent::agents::{DEFAULT_AGENT, Isolation};
 
 /// 説明の 1 行目 (Task の説明に載せる用)。
 fn first_line(text: &str) -> &str {
@@ -129,9 +301,16 @@ impl SubAgentTool {
             sandbox: None,
             hook_env: None,
             permission_mode: crate::config::PermissionMode::default(),
+            git_root: None,
         };
         tool.refresh_description();
         tool
+    }
+
+    /// `isolation: worktree` のための git リポジトリのトップ (#77)。None なら worktree は切れない。
+    pub fn with_git_root(mut self, root: Option<PathBuf>) -> Self {
+        self.git_root = root;
+        self
     }
 
     /// hook の payload に親と同じ共通フィールドを載せるための素性 (#134 のレビュー: 子の payload に
@@ -146,8 +325,14 @@ impl SubAgentTool {
         self
     }
 
-    /// 親の `fire_hook` と同じ共通フィールド + イベント固有の `extra`。
-    fn hook_payload(&self, lc: Lifecycle, extra: serde_json::Value) -> serde_json::Value {
+    /// 親の `fire_hook` と同じ共通フィールド + イベント固有の `extra`。`cwd` は子の作業ディレクトリ
+    /// (worktree の中で走っていればそこ)。
+    fn hook_payload(
+        &self,
+        lc: Lifecycle,
+        extra: serde_json::Value,
+        cwd: &Path,
+    ) -> serde_json::Value {
         let env = self
             .hook_env
             .as_ref()
@@ -165,7 +350,7 @@ impl SubAgentTool {
         let mut payload = serde_json::json!({
             "session_id": env.session_id,
             "transcript_path": env.transcript_path,
-            "cwd": self.cwd,
+            "cwd": cwd,
             "permission_mode": permission_mode,
             "hook_event_name": lc,
         });
@@ -233,8 +418,13 @@ impl SubAgentTool {
                 } else {
                     ""
                 };
+                let isolated = if p.isolation == Isolation::Worktree {
+                    " (runs in its own git worktree)"
+                } else {
+                    ""
+                };
                 text.push_str(&format!(
-                    "; {name} — {}{writes}",
+                    "; {name} — {}{writes}{isolated}",
                     first_line(&p.description)
                 ));
             }
@@ -279,7 +469,7 @@ impl SubAgentTool {
         lc: crate::hooks::Lifecycle,
         extra: serde_json::Value,
     ) {
-        let mut payload = self.hook_payload(lc, extra);
+        let mut payload = self.hook_payload(lc, extra, &self.cwd);
         if let Some(base) = payload.as_object_mut() {
             base.insert("agent_type".into(), serde_json::json!(agent_type));
         }
@@ -296,19 +486,79 @@ impl SubAgentTool {
         }
     }
 
-    async fn run(&self, agent_type: &str, task: &str) -> Result<String, ToolError> {
+    async fn run(
+        &self,
+        agent_type: &str,
+        task: &str,
+        isolation: Isolation,
+    ) -> Result<String, ToolError> {
         use crate::hooks::Lifecycle;
+        // worktree は hook を鳴らす前に切る (切れなければ子は走らないので Start も鳴らさない)。
+        let worktree = match isolation {
+            Isolation::None => None,
+            Isolation::Worktree => {
+                let Some(git_root) = &self.git_root else {
+                    return Err(ToolError::InvalidArgs(
+                        "isolation: worktree needs a git repository (the working directory is \
+                         not inside one)"
+                            .into(),
+                    ));
+                };
+                Some(
+                    Worktree::create(git_root, &self.cwd, agent_type)
+                        .map_err(|e| ToolError::Other(format!("worktree: {e}")))?,
+                )
+            }
+        };
+        let cwd = worktree
+            .as_ref()
+            .map_or_else(|| self.cwd.clone(), |w| w.cwd.clone());
         self.notify(
             agent_type,
             Lifecycle::SubagentStart,
-            serde_json::json!({ "prompt": task }),
+            serde_json::json!({ "prompt": task, "worktree": worktree.as_ref().map(|w| &w.root) }),
         )
         .await;
-        let result = self.run_inner(agent_type, task).await;
-        let last = match &result {
+        let mut result = self
+            .run_inner(agent_type, task, &cwd, worktree.as_ref())
+            .await;
+        // 結果の成否に関わらず後始末する。残した worktree は親の結果に書き添える (後始末に
+        // 失敗したときも、残っている場所は伝える)。
+        let kept = match worktree.as_ref().map(Worktree::finish) {
+            None => None,
+            Some(Ok(kept)) => kept,
+            Some(Err(e)) => {
+                crate::say!("  ↳ worktree cleanup failed: {}", crate::term::sanitize(&e));
+                worktree.as_ref().map(|w| KeptWorktree {
+                    path: w.root.clone(),
+                    note: format!(
+                        "[worktree] The sub-agent's worktree at {} could not be cleaned up ({e}); \
+                         it is left in place. Remove it with `git worktree remove --force {}`.",
+                        w.root.display(),
+                        w.root.display()
+                    ),
+                })
+            }
+        };
+        if let Some(kept) = &kept {
+            crate::say!("  ↳ worktree kept at {}", kept.path.display());
+            match &mut result {
+                Ok(text) => {
+                    text.push_str("\n\n");
+                    text.push_str(&kept.note);
+                }
+                Err(e) => {
+                    *e = ToolError::Other(format!("{e}\n\n{}", kept.note));
+                }
+            }
+        }
+        let mut last = match &result {
             Ok(text) => serde_json::json!({ "last_assistant_message": text }),
             Err(e) => serde_json::json!({ "error": e.to_string() }),
         };
+        if let (Some(kept), Some(obj)) = (&kept, last.as_object_mut()) {
+            obj.insert("worktree".into(), serde_json::json!(kept.path));
+        }
         self.notify(agent_type, Lifecycle::SubagentStop, last).await;
         result
     }
@@ -326,8 +576,9 @@ impl SubAgentTool {
         lc: Lifecycle,
         tool_name: &str,
         extra: serde_json::Value,
+        cwd: &Path,
     ) -> crate::hooks::HookOutcome {
-        let payload = self.hook_payload(lc, extra);
+        let payload = self.hook_payload(lc, extra, cwd);
         match crate::hooks::runner::dispatch(
             lc,
             Some(tool_name),
@@ -348,6 +599,7 @@ impl SubAgentTool {
     ///   子の名前つきで yes / no のプロンプトが出る、`-p` や deny ルールなら拒否)。ゲートが無ければ
     ///   実行しない (#77)。
     /// - それ以外: 親の deny / ask ルールと、hook の `ask` の希望を見る。
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         &self,
         agent_type: &str,
@@ -356,6 +608,7 @@ impl SubAgentTool {
         tool: &dyn Tool,
         in_plan: bool,
         hint: Option<crate::hooks::PermissionHint>,
+        cwd: &Path,
     ) -> Option<String> {
         let destructive = tool.is_destructive();
         if destructive && in_plan {
@@ -366,7 +619,8 @@ impl SubAgentTool {
         }
         match &self.gate {
             Some(gate) => {
-                match gate.decide_for_subagent(tool_name, args, destructive, agent_type, hint) {
+                match gate.decide_for_subagent(tool_name, args, destructive, agent_type, hint, cwd)
+                {
                     crate::permission::Decision::Allow => None,
                     crate::permission::Decision::Deny(reason) => Some(reason),
                 }
@@ -380,14 +634,14 @@ impl SubAgentTool {
                  Report that it is needed instead of retrying."
                     .to_string(),
             ),
-            None => self.refusal(tool_name, args),
+            None => self.refusal(tool_name, args, cwd),
         }
     }
 
     /// 子の中でのツール呼び出しを通すか。子は静かに走り、尋ねる相手がいないので、
     /// deny は拒否、ask も拒否 (尋ねられない)、それ以外は read-only なので通す。
-    fn refusal(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
-        match self.rules.evaluate(tool, args, &self.cwd)? {
+    fn refusal(&self, tool: &str, args: &serde_json::Value, cwd: &Path) -> Option<String> {
+        match self.rules.evaluate(tool, args, cwd)? {
             Verdict::Deny(rule) => Some(format!(
                 "denied by permission rule `{rule}`. Do not retry this call or work around it."
             )),
@@ -401,9 +655,19 @@ impl SubAgentTool {
         }
     }
 
-    async fn run_inner(&self, agent_type: &str, task: &str) -> Result<String, ToolError> {
+    /// `cwd` は子の作業ディレクトリ (worktree の中なら `worktree` も渡る)。
+    async fn run_inner(
+        &self,
+        agent_type: &str,
+        task: &str,
+        cwd: &Path,
+        worktree: Option<&Worktree>,
+    ) -> Result<String, ToolError> {
         let (_, p) = self.profile(Some(agent_type))?;
-        let mut system = prompt::build_system_prompt(&self.cwd, &p.model, p.tools.as_ref());
+        let mut system = prompt::build_system_prompt(cwd, &p.model, p.tools.as_ref());
+        if let Some(w) = worktree {
+            system.push_str(&w.prompt_note());
+        }
         if !p.instructions.is_empty() {
             system.push_str(
                 "\nAgent instructions (from the agent definition; user-provided context, \
@@ -426,9 +690,14 @@ impl SubAgentTool {
             Message::System { content: system },
             Message::User { content: user },
         ];
-        let mut ctx = ToolCtx::new(self.cwd.clone());
+        let mut ctx = ToolCtx::new(cwd.to_path_buf());
         if let Some(policy) = &self.sandbox {
-            ctx = ctx.with_sandbox(policy.clone());
+            // worktree の中で走る子には、そこを「書ける作業ディレクトリ」とする同じ方針。
+            let mut policy = policy.clone();
+            if worktree.is_some() {
+                policy.cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            }
+            ctx = ctx.with_sandbox(policy);
         }
         let in_plan = self
             .plan_flag
@@ -483,11 +752,25 @@ impl SubAgentTool {
                     "tool_name": name, "tool_input": args, "agent_type": agent_type,
                 });
                 let pre = self
-                    .tool_hook(Lifecycle::PreToolUse, &name, pre_payload)
+                    .tool_hook(Lifecycle::PreToolUse, &name, pre_payload, cwd)
                     .await;
                 let mut executed = false;
+                // worktree の中の子は、その外のファイルに触れない (`..` で親のチェックアウトに戻れる
+                // ので、ルールの照合基準を worktree にするだけでは足りない)。
+                let escaped = worktree.and_then(|w| {
+                    crate::permission_rules::escapes_root(&name, &args, cwd, &w.root)
+                });
                 let mut output = if let Some(reason) = pre.block {
                     ToolOutput::error(format!("blocked by hook: {reason}"))
+                } else if let Some(path) = escaped {
+                    ToolOutput::error(format!(
+                        "path {} is outside this sub-agent's worktree ({}); it can only read and \
+                         change files inside the worktree. Do not retry with another spelling.",
+                        path.display(),
+                        worktree
+                            .map(|w| w.root.display().to_string())
+                            .unwrap_or_default()
+                    ))
                 } else {
                     if let Some(updated) = pre.updated_input {
                         args = updated;
@@ -499,6 +782,7 @@ impl SubAgentTool {
                         tool.as_ref(),
                         in_plan,
                         pre.permission,
+                        cwd,
                     ) {
                         Some(refusal) => ToolOutput::error(refusal),
                         None => {
@@ -532,7 +816,7 @@ impl SubAgentTool {
                         "error": output.is_error.then_some(&output.content),
                         "agent_type": agent_type,
                     });
-                    let post = self.tool_hook(event, &name, post_payload).await;
+                    let post = self.tool_hook(event, &name, post_payload, cwd).await;
                     if let Some(reason) = post.block {
                         output
                             .content
@@ -593,6 +877,18 @@ impl Tool for SubAgentTool {
                 "enum": self.profiles.keys().collect::<Vec<_>>()
             });
         }
+        // git リポジトリの中でだけ見せる (外では使えないので)。
+        if self.git_root.is_some() {
+            schema["properties"]["isolation"] = serde_json::json!({
+                "type": "string",
+                "enum": ["worktree", "none"],
+                "description": "worktree: run the sub-agent in its own git worktree (a fresh \
+                                checkout of HEAD under .lodan/worktrees/) so the main checkout is \
+                                untouched; the worktree is removed afterwards if it has no \
+                                changes, otherwise its path is reported. Omit for the agent's \
+                                default."
+            });
+        }
         schema
     }
 
@@ -614,18 +910,32 @@ impl Tool for SubAgentTool {
     ) -> Result<ToolOutput, ToolError> {
         let args: TaskArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("Task: {e}")))?;
-        let (agent_type, _) = self.profile(args.subagent_type.as_deref())?;
+        let (agent_type, profile) = self.profile(args.subagent_type.as_deref())?;
+        let isolation = match args.isolation.as_deref() {
+            None => profile.isolation,
+            Some(s) => Isolation::parse(s).ok_or_else(|| {
+                ToolError::InvalidArgs(format!(
+                    "Task: isolation must be `worktree` or `none` (got '{}')",
+                    crate::term::sanitize(s)
+                ))
+            })?,
+        };
         // 子は静かに走るので、起動を 1 行知らせて可視性を確保する。
         let label = if agent_type == DEFAULT_AGENT {
             String::new()
         } else {
             format!(" [{agent_type}]")
         };
+        let where_ = if isolation == Isolation::Worktree {
+            " (worktree)"
+        } else {
+            ""
+        };
         crate::say!(
-            "  ↳ Task{label}: {}",
+            "  ↳ Task{label}{where_}: {}",
             crate::term::sanitize(&args.description)
         );
-        let summary = self.run(agent_type, &args.prompt).await?;
+        let summary = self.run(agent_type, &args.prompt, isolation).await?;
         Ok(ToolOutput::ok(summary))
     }
 }
@@ -995,6 +1305,264 @@ mod tests {
         assert!(tool.custom_names().is_empty());
     }
 
+    /// 1 コミットある git リポジトリ (worktree のテスト用)。
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.path().join("tracked.txt"), "tracked").unwrap();
+        run(&["add", "tracked.txt"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        dir
+    }
+
+    /// `isolation: worktree` (#77): 子は HEAD の新しいチェックアウトで動く (親の未コミットの
+    /// ファイルは見えない)。変更が無ければ worktree は消える。リポジトリの外では使えない。
+    #[tokio::test]
+    async fn a_worktree_child_runs_in_a_fresh_checkout_that_is_removed_when_clean() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("scratch.txt"), "SCRATCH-ONLY-IN-MAIN").unwrap();
+        let peek = || {
+            AgentProfile::new(
+                Arc::new(EchoToolOutputLlm {
+                    call: tool_call("Read", r#"{"path": "scratch.txt"}"#),
+                }),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                3,
+            )
+        };
+        let tool = subagent(vec![], repo.path().to_path_buf())
+            .with_profile("peek".into(), peek())
+            .with_git_root(Some(repo.path().to_path_buf()));
+        assert!(tool.schema()["properties"].get("isolation").is_some());
+        let ctx = ToolCtx::new(repo.path().to_path_buf());
+        let run = |isolation: &str| {
+            let args = serde_json::json!({
+                "description": "d", "prompt": "p", "subagent_type": "peek", "isolation": isolation,
+            });
+            tool.execute(args, &ctx)
+        };
+        // 陽性対照: 同じ cwd なら未コミットのファイルが読める。
+        let same = run("none").await.unwrap().content;
+        assert!(same.contains("SCRATCH-ONLY-IN-MAIN"), "{same}");
+        // worktree の中には無い。
+        let isolated = run("worktree").await.unwrap().content;
+        assert!(!isolated.contains("SCRATCH-ONLY-IN-MAIN"), "{isolated}");
+        assert!(
+            !isolated.contains("[worktree]"),
+            "clean worktree is not reported: {isolated}"
+        );
+        // 変更が無かったので消えている。
+        let left: Vec<_> = std::fs::read_dir(repo.path().join(".lodan/worktrees"))
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|l| l == "/.lodan/worktrees/"),
+            "{exclude}"
+        );
+
+        // リポジトリの外 (git root 無し) では worktree を切れないと言う。schema にも出さない。
+        let plain = tempfile::tempdir().unwrap();
+        let outside =
+            subagent(vec![], plain.path().to_path_buf()).with_profile("peek".into(), peek());
+        assert!(outside.schema()["properties"].get("isolation").is_none());
+        let err = outside
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "peek", "isolation": "worktree" }),
+                &ToolCtx::new(plain.path().to_path_buf()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a git repository"), "{err}");
+    }
+
+    /// worktree の中の子は外のファイルに触れず、permission ルールは worktree の cwd を基準に照合される
+    /// (#137 のレビュー: worktree はリポジトリの中にあるので `..` で親のチェックアウトに戻れ、ルールを
+    /// 親の cwd 基準で照合すると相対パターンが一致せず deny をすり抜けた)。
+    #[tokio::test]
+    async fn a_worktree_child_stays_inside_its_worktree_and_deny_rules_follow_its_cwd() {
+        use crate::permission::PermissionGate;
+        let repo = git_repo();
+        std::fs::write(repo.path().join(".env"), "SECRET-IN-MAIN").unwrap();
+        let read = |path: &str| {
+            AgentProfile::new(
+                Arc::new(EchoToolOutputLlm {
+                    call: tool_call("Read", &format!(r#"{{"path": "{path}"}}"#)),
+                }),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                3,
+            )
+            .with_isolation(Isolation::Worktree)
+        };
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(
+            crate::config::ToolProfile::Full,
+            &["Read".to_string(), "Write".to_string()],
+        );
+        let rw = Arc::new(rw);
+        let write = |path: &str| {
+            AgentProfile::new(
+                Arc::new(EchoToolOutputLlm {
+                    call: tool_call("Write", &format!(r#"{{"path": "{path}", "content": "x"}}"#)),
+                }),
+                "mock".into(),
+                Arc::clone(&rw),
+                3,
+            )
+            .with_isolation(Isolation::Worktree)
+        };
+        let gate = |deny: &[&str]| {
+            let mut cfg = crate::config::Config::default();
+            cfg.agent.auto_approve = true;
+            cfg.permissions.deny = deny.iter().map(|s| s.to_string()).collect();
+            Arc::new(PermissionGate::from_config(&cfg, repo.path(), true).unwrap())
+        };
+        let build = |deny: &[&str]| {
+            subagent(vec![], repo.path().to_path_buf())
+                .with_profile("up-env".into(), read("../../../.env"))
+                .with_profile(
+                    "abs-env".into(),
+                    read(&repo.path().join(".env").display().to_string()),
+                )
+                .with_profile("tracked".into(), read("tracked.txt"))
+                .with_profile("up-write".into(), write("../../config.toml"))
+                .with_profile("notes".into(), write("notes/a.txt"))
+                .with_git_root(Some(repo.path().to_path_buf()))
+                .with_gate(gate(deny))
+        };
+        let ctx = ToolCtx::new(repo.path().to_path_buf());
+        let run = |tool: SubAgentTool, kind: &str| {
+            let args =
+                serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": kind });
+            let ctx = &ctx;
+            async move { tool.execute(args, ctx).await.unwrap().content }
+        };
+        // 閉じ込め: 相対でも絶対でも、worktree の外は読めない・書けない (ルールが無くても)。
+        let out = run(build(&[]), "up-env").await;
+        assert!(
+            out.contains("outside this sub-agent's worktree") && !out.contains("SECRET"),
+            "{out}"
+        );
+        let out = run(build(&[]), "abs-env").await;
+        assert!(
+            out.contains("outside this sub-agent's worktree") && !out.contains("SECRET"),
+            "{out}"
+        );
+        let out = run(build(&[]), "up-write").await;
+        assert!(out.contains("outside this sub-agent's worktree"), "{out}");
+        assert!(!repo.path().join(".lodan/config.toml").exists());
+        // 陽性対照: 中のファイルは読める。
+        let out = run(build(&[]), "tracked").await;
+        assert!(out.contains("tracked"), "{out}");
+
+        // ルールは worktree の cwd 基準: `/` を含む相対パターンが worktree の中のパスに当たる。
+        let ruled = || build(&["Read(tracked.txt)", "Write(notes/**)"]);
+        let out = run(ruled(), "tracked").await;
+        assert!(out.contains("denied by permission rule"), "{out}");
+        let out = run(ruled(), "notes").await;
+        assert!(out.contains("denied by permission rule"), "{out}");
+        assert!(
+            std::fs::read_dir(repo.path().join(".lodan/worktrees"))
+                .unwrap()
+                .flatten()
+                .all(|e| !e.path().join("notes/a.txt").exists()),
+            "the denied write must not land in any worktree"
+        );
+    }
+
+    /// 書き込み可の子が worktree の中で書くと、メインのチェックアウトは変わらず、残した worktree
+    /// の場所が結果と SubagentStop の payload で親に伝わる。
+    #[tokio::test]
+    async fn a_writable_worktree_child_leaves_the_main_checkout_untouched_and_reports_the_worktree()
+    {
+        let repo = git_repo();
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(
+            crate::config::ToolProfile::Full,
+            &["Read".to_string(), "Write".to_string()],
+        );
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let tool = subagent(vec![], repo.path().to_path_buf())
+            .with_profile(
+                "writer".into(),
+                AgentProfile::new(
+                    Arc::new(EchoToolOutputLlm {
+                        call: tool_call(
+                            "Write",
+                            r#"{"path": "note.txt", "content": "from child"}"#,
+                        ),
+                    }),
+                    "mock".into(),
+                    Arc::new(rw),
+                    3,
+                )
+                .with_isolation(Isolation::Worktree),
+            )
+            .with_git_root(Some(repo.path().to_path_buf()))
+            .with_gate(Arc::new(crate::permission::PermissionGate::new(true)))
+            .with_hooks(
+                vec![crate::hooks::HookConfig {
+                    id: None,
+                    event: Lifecycle::SubagentStop,
+                    matcher: String::new(),
+                    command: format!("cat >> {}", log.path().display()),
+                    timeout_secs: None,
+                }],
+                crate::hooks::HooksCompat::V2,
+            );
+        let out = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "writer" }),
+                &ToolCtx::new(repo.path().to_path_buf()),
+            )
+            .await
+            .unwrap()
+            .content;
+        assert!(
+            !repo.path().join("note.txt").exists(),
+            "main checkout must stay untouched"
+        );
+        let wt = repo.path().join(".lodan/worktrees/writer-1");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("note.txt")).unwrap(),
+            "from child"
+        );
+        assert!(
+            out.contains("[worktree]") && out.contains("1 uncommitted change(s)"),
+            "{out}"
+        );
+        assert!(out.contains(&wt.display().to_string()), "{out}");
+        let payload: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(log.path()).unwrap()).unwrap();
+        assert_eq!(payload["worktree"], wt.display().to_string());
+        assert_eq!(payload["agent_type"], "writer");
+    }
+
     /// 子の system prompt は素の `build_system_prompt` のまま。親の `--append-system-prompt`
     /// (`Session::with_prior` が足すもの) は子に渡らない (#71)。将来、子の起動を Session 経由に
     /// 変えたときに黙って漏れないよう固定する。
@@ -1189,7 +1757,9 @@ mod tests {
             8,
         );
         assert_eq!(
-            sub.run(DEFAULT_AGENT, "look around").await.unwrap(),
+            sub.run(DEFAULT_AGENT, "look around", Isolation::None)
+                .await
+                .unwrap(),
             "child"
         );
 
@@ -1200,7 +1770,7 @@ mod tests {
 
         // 予算は共有: 2 件を使い切ったので、次の子は 1 回も LLM を呼べずに失敗する。
         let err = sub
-            .run(DEFAULT_AGENT, "again")
+            .run(DEFAULT_AGENT, "again", Isolation::None)
             .await
             .unwrap_err()
             .to_string();
@@ -1238,7 +1808,9 @@ mod tests {
             HooksCompat::V2,
         );
         assert_eq!(
-            sub.run(DEFAULT_AGENT, "find the answer").await.unwrap(),
+            sub.run(DEFAULT_AGENT, "find the answer", Isolation::None)
+                .await
+                .unwrap(),
             "the answer is 42"
         );
 
@@ -1268,7 +1840,10 @@ mod tests {
             }],
             tmp.path().to_path_buf(),
         );
-        let out = sub.run(DEFAULT_AGENT, "what is the answer").await.unwrap();
+        let out = sub
+            .run(DEFAULT_AGENT, "what is the answer", Isolation::None)
+            .await
+            .unwrap();
         assert_eq!(out, "the answer is 42");
     }
 
@@ -1294,7 +1869,10 @@ mod tests {
             },
         ];
         let sub = subagent(steps, tmp.path().to_path_buf());
-        let out = sub.run(DEFAULT_AGENT, "find the needle").await.unwrap();
+        let out = sub
+            .run(DEFAULT_AGENT, "find the needle", Isolation::None)
+            .await
+            .unwrap();
         assert_eq!(out, "found the needle");
     }
 
@@ -1363,7 +1941,11 @@ mod tests {
                 8,
             )
             .with_reasoning_roundtrip(roundtrip);
-            async move { sub.run(DEFAULT_AGENT, "look around").await.unwrap() }
+            async move {
+                sub.run(DEFAULT_AGENT, "look around", Isolation::None)
+                    .await
+                    .unwrap()
+            }
         };
         assert_eq!(run(true).await, "reasoning came back: true");
         assert_eq!(run(false).await, "reasoning came back: false");
@@ -1382,7 +1964,10 @@ mod tests {
             })
             .collect();
         let sub = subagent(looping, tmp.path().to_path_buf());
-        let err = sub.run(DEFAULT_AGENT, "loop forever").await.unwrap_err();
+        let err = sub
+            .run(DEFAULT_AGENT, "loop forever", Isolation::None)
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("max_iterations"));
     }
 

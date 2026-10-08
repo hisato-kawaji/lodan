@@ -106,7 +106,8 @@ fn build_agent_profile(
         Arc::new(tools),
         def.max_turns.unwrap_or(cfg.agent.max_iterations),
     )
-    .with_instructions(def.prompt.clone(), def.description.clone()))
+    .with_instructions(def.prompt.clone(), def.description.clone())
+    .with_isolation(def.isolation))
 }
 
 impl Runtime {
@@ -202,7 +203,9 @@ impl Runtime {
         .with_gate(Arc::clone(&gate))
         .with_plan_flag(Arc::clone(&plan_flag))
         .with_hook_env(Arc::clone(&hook_env), cfg.permissions.mode)
-        .with_sandbox(crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd));
+        .with_sandbox(crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd))
+        // `isolation: worktree` (#77) は git リポジトリの中でだけ。
+        .with_git_root(agent::subagent::git_toplevel(&cwd));
         // カスタムエージェント定義 (`.lodan/agents/*.md`, #77)。プロジェクトのものは信頼済みのときだけ。
         let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
         let (defs, warnings) =

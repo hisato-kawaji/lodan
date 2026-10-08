@@ -338,6 +338,27 @@ impl Session {
             return Ok(());
         }
         self.pending_context.extend(submitted.context);
+        // 終わったバックグラウンドの子エージェント (#77) の結果を、この入力に添えて知らせる。
+        let finished = self
+            .ctx
+            .bg
+            .lock()
+            .map(|mut store| store.drain_announcements())
+            .unwrap_or_default();
+        for a in finished {
+            crate::say!(
+                "  ↳ background sub-agent {} finished ({})",
+                a.id,
+                a.status.label()
+            );
+            self.pending_context.push(format!(
+                "Background sub-agent {} ({}) finished with status {}:\n{}",
+                a.id,
+                a.label,
+                a.status.label(),
+                a.output
+            ));
+        }
         self.turn_seq += 1;
         // Plan 中はモデルに「調査と計画のみ」を毎ターン明示する (system prompt は
         // モード切替で作り直さないため、入力への前置で伝える)。
@@ -1558,7 +1579,7 @@ fn strip_budget_reminders(history: &mut Vec<Message>) {
 
 /// 履歴から思考過程を取り除く。新しいターンの入口で呼ぶ (再開したセッションの transcript に残って
 /// いた分も、最初のターンでここを通って落ちる)。
-fn drop_reasoning(history: &mut [Message]) {
+pub(crate) fn drop_reasoning(history: &mut [Message]) {
     for message in history {
         if let Message::Assistant {
             reasoning_content, ..

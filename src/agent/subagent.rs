@@ -33,9 +33,16 @@ struct TaskArgs {
     /// `worktree` なら git worktree を切ってその中で走らせる (#77)。省略は種類の既定。
     #[serde(default)]
     isolation: Option<String>,
+    /// 走らせたまま戻る (#77)。結果は次のターンの入口で知らせる。
+    #[serde(default)]
+    run_in_background: bool,
+    /// 走り終えた子の id (`agent_N`)。その履歴の続きとして `prompt` を頼む (#77)。
+    #[serde(default)]
+    resume: Option<String>,
 }
 
 /// 子エージェント 1 種類ぶんの設定。既定の `general-purpose` も、定義ファイル由来もこの形。
+#[derive(Clone)]
 pub struct AgentProfile {
     pub llm: Arc<dyn LlmClient>,
     pub model: String,
@@ -80,8 +87,20 @@ impl AgentProfile {
     }
 }
 
+/// 走り終えた子の記録。`resume` で続きを頼める (#77)。
+#[derive(Clone)]
+struct ChildRecord {
+    agent_type: String,
+    /// 子の会話 (system から最後の応答まで)。続きはこの後ろに積む。
+    history: Vec<Message>,
+    cwd: PathBuf,
+    /// 残した worktree (消えていれば続きは親の cwd で走る)。
+    worktree: Option<Worktree>,
+}
+
 /// 子のために切った git worktree (#77)。`<git root>/.lodan/worktrees/<種類>-<連番>` に HEAD を
 /// detached でチェックアウトする。終わったとき変更が無ければ消し、あれば残して場所を親へ伝える。
+#[derive(Clone)]
 struct Worktree {
     git_root: PathBuf,
     /// worktree のルート。
@@ -239,7 +258,9 @@ impl Worktree {
     }
 }
 
-/// 子エージェントを起動する `Task` ツール。
+/// 子エージェントを起動する `Task` ツール。`Clone` はバックグラウンド実行のため (走らせる
+/// タスクに写しを渡す。共有すべきものは全て `Arc`)。
+#[derive(Clone)]
 pub struct SubAgentTool {
     /// 種類ごとの設定。`DEFAULT_AGENT` は必ずある。
     profiles: std::collections::BTreeMap<String, AgentProfile>,
@@ -266,6 +287,12 @@ pub struct SubAgentTool {
     permission_mode: crate::config::PermissionMode,
     /// cwd を含む git リポジトリのトップ。無ければ `isolation: worktree` は使えない (#77)。
     git_root: Option<PathBuf>,
+    /// `run_in_background` を受け付けるか (REPL だけ。`-p` では知らせる次のターンが無い)。
+    background: bool,
+    /// 子の id (`agent_N`) の連番。
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// 走り終えた子 (`resume` 用)。
+    children: Arc<std::sync::Mutex<std::collections::BTreeMap<String, ChildRecord>>>,
 }
 
 use crate::agent::agents::{DEFAULT_AGENT, Isolation};
@@ -302,9 +329,34 @@ impl SubAgentTool {
             hook_env: None,
             permission_mode: crate::config::PermissionMode::default(),
             git_root: None,
+            background: false,
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            children: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         };
         tool.refresh_description();
         tool
+    }
+
+    /// `run_in_background` を受け付ける (#77)。REPL なら true。
+    pub fn with_background(mut self, enabled: bool) -> Self {
+        self.background = enabled;
+        self
+    }
+
+    fn new_id(&self) -> String {
+        let n = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        format!("agent_{n}")
+    }
+
+    fn child(&self, id: &str) -> Option<ChildRecord> {
+        self.children.lock().ok().and_then(|c| c.get(id).cloned())
+    }
+
+    fn has_children(&self) -> bool {
+        self.children.lock().is_ok_and(|c| !c.is_empty())
     }
 
     /// `isolation: worktree` のための git リポジトリのトップ (#77)。None なら worktree は切れない。
@@ -486,17 +538,24 @@ impl SubAgentTool {
         }
     }
 
+    /// `prior` があれば続き (その cwd と worktree を引き継ぐ)。`quiet` はバックグラウンド: 尋ねる
+    /// 相手がいないので、承認が要る呼び出しは拒否する。
     async fn run(
         &self,
+        id: &str,
         agent_type: &str,
         task: &str,
         isolation: Isolation,
+        prior: Option<ChildRecord>,
+        quiet: bool,
     ) -> Result<String, ToolError> {
         use crate::hooks::Lifecycle;
         // worktree は hook を鳴らす前に切る (切れなければ子は走らないので Start も鳴らさない)。
-        let worktree = match isolation {
-            Isolation::None => None,
-            Isolation::Worktree => {
+        let worktree = match (&prior, isolation) {
+            // 続きは前の worktree で (残っていれば)。
+            (Some(p), _) => p.worktree.clone().filter(|w| w.root.is_dir()),
+            (None, Isolation::None) => None,
+            (None, Isolation::Worktree) => {
                 let Some(git_root) = &self.git_root else {
                     return Err(ToolError::InvalidArgs(
                         "isolation: worktree needs a git repository (the working directory is \
@@ -510,17 +569,31 @@ impl SubAgentTool {
                 )
             }
         };
-        let cwd = worktree
-            .as_ref()
-            .map_or_else(|| self.cwd.clone(), |w| w.cwd.clone());
+        // 続きは前の子と同じ場所で (worktree が消えていれば、記録した cwd)。
+        let cwd = match (&worktree, &prior) {
+            (Some(w), _) => w.cwd.clone(),
+            (None, Some(p)) => p.cwd.clone(),
+            (None, None) => self.cwd.clone(),
+        };
         self.notify(
             agent_type,
             Lifecycle::SubagentStart,
-            serde_json::json!({ "prompt": task, "worktree": worktree.as_ref().map(|w| &w.root) }),
+            serde_json::json!({
+                "prompt": task, "agent_id": id, "resumed": prior.is_some(),
+                "worktree": worktree.as_ref().map(|w| &w.root),
+            }),
         )
         .await;
+        let mut history = prior.map(|p| p.history).unwrap_or_default();
         let mut result = self
-            .run_inner(agent_type, task, &cwd, worktree.as_ref())
+            .run_inner(
+                agent_type,
+                task,
+                &cwd,
+                worktree.as_ref(),
+                quiet,
+                &mut history,
+            )
             .await;
         // 結果の成否に関わらず後始末する。残した worktree は親の結果に書き添える (後始末に
         // 失敗したときも、残っている場所は伝える)。
@@ -540,6 +613,17 @@ impl SubAgentTool {
                 })
             }
         };
+        if let Ok(mut children) = self.children.lock() {
+            children.insert(
+                id.to_string(),
+                ChildRecord {
+                    agent_type: agent_type.to_string(),
+                    history,
+                    cwd,
+                    worktree: worktree.filter(|_| kept.is_some()),
+                },
+            );
+        }
         if let Some(kept) = &kept {
             crate::say!("  ↳ worktree kept at {}", kept.path.display());
             match &mut result {
@@ -553,14 +637,74 @@ impl SubAgentTool {
             }
         }
         let mut last = match &result {
-            Ok(text) => serde_json::json!({ "last_assistant_message": text }),
-            Err(e) => serde_json::json!({ "error": e.to_string() }),
+            Ok(text) => serde_json::json!({ "last_assistant_message": text, "agent_id": id }),
+            Err(e) => serde_json::json!({ "error": e.to_string(), "agent_id": id }),
         };
         if let (Some(kept), Some(obj)) = (&kept, last.as_object_mut()) {
             obj.insert("worktree".into(), serde_json::json!(kept.path));
         }
         self.notify(agent_type, Lifecycle::SubagentStop, last).await;
         result
+    }
+
+    /// 子を走らせたまま戻る (#77)。結果は `ToolCtx::bg` に `agent_N` として載り、次のターンの入口で
+    /// モデルに知らされる (`Monitor` でも読める)。`KillShell` で止められる (その場合 worktree の
+    /// 後始末は走らない)。
+    fn spawn_background(
+        &self,
+        id: String,
+        agent_type: String,
+        args: TaskArgs,
+        isolation: Isolation,
+        prior: Option<ChildRecord>,
+        ctx: &ToolCtx,
+    ) -> Result<String, ToolError> {
+        use crate::tools::background::{BgStatus, append_capped};
+        let output: crate::tools::background::SharedBuf =
+            Arc::new(std::sync::Mutex::new(String::new()));
+        let status: crate::tools::background::SharedStatus =
+            Arc::new(std::sync::Mutex::new(BgStatus::Running));
+        let kill = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut store = ctx
+                .bg
+                .lock()
+                .map_err(|_| ToolError::Other("background store poisoned".into()))?;
+            store.register_agent(
+                id.clone(),
+                format!("Task [{agent_type}]: {}", args.description),
+                Arc::clone(&output),
+                Arc::clone(&status),
+                Arc::clone(&kill),
+            );
+        }
+        let me = self.clone();
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            let next = tokio::select! {
+                res = me.run(&task_id, &agent_type, &args.prompt, isolation, prior, true) => {
+                    match res {
+                        Ok(text) => {
+                            append_capped(&output, &text);
+                            BgStatus::Exited(0)
+                        }
+                        Err(e) => {
+                            append_capped(&output, &e.to_string());
+                            BgStatus::Failed(e.to_string())
+                        }
+                    }
+                }
+                _ = kill.notified() => BgStatus::Killed,
+            };
+            if let Ok(mut s) = status.lock() {
+                *s = next;
+            }
+        });
+        Ok(format!(
+            "started background sub-agent {id}: {}\nIts result will be reported when it finishes \
+             (or read it with Monitor id=\"{id}\"). Continue with other work meanwhile.",
+            args.description
+        ))
     }
 
     /// 親の permission ルールを子にも適用する。
@@ -609,6 +753,7 @@ impl SubAgentTool {
         in_plan: bool,
         hint: Option<crate::hooks::PermissionHint>,
         cwd: &Path,
+        quiet: bool,
     ) -> Option<String> {
         let destructive = tool.is_destructive();
         if destructive && in_plan {
@@ -618,6 +763,25 @@ impl SubAgentTool {
             ));
         }
         match &self.gate {
+            // バックグラウンドの子は尋ねられない: 尋ねずに決まるものだけ通す。
+            Some(gate) if quiet => {
+                if hint == Some(crate::hooks::PermissionHint::Ask) {
+                    return Some(
+                        "a hook asked for the user's approval, which a background sub-agent \
+                         cannot ask for. Report that it is needed instead of retrying."
+                            .to_string(),
+                    );
+                }
+                match gate.decide_quietly_in(tool_name, args, destructive, cwd) {
+                    Some(crate::permission::Decision::Allow) => None,
+                    Some(crate::permission::Decision::Deny(reason)) => Some(reason),
+                    None => Some(format!(
+                        "tool '{tool_name}' needs the user's approval, which a background \
+                         sub-agent cannot ask for. Report what should be done; the caller can run \
+                         it in the foreground."
+                    )),
+                }
+            }
             Some(gate) => {
                 match gate.decide_for_subagent(tool_name, args, destructive, agent_type, hint, cwd)
                 {
@@ -655,41 +819,54 @@ impl SubAgentTool {
         }
     }
 
-    /// `cwd` は子の作業ディレクトリ (worktree の中なら `worktree` も渡る)。
+    /// `cwd` は子の作業ディレクトリ (worktree の中なら `worktree` も渡る)。`history` が空なら
+    /// 新規 (system と依頼を積む)、続きなら依頼だけ積む。終わったとき `history` に全てが残る。
     async fn run_inner(
         &self,
         agent_type: &str,
         task: &str,
         cwd: &Path,
         worktree: Option<&Worktree>,
+        quiet: bool,
+        history: &mut Vec<Message>,
     ) -> Result<String, ToolError> {
         let (_, p) = self.profile(Some(agent_type))?;
-        let mut system = prompt::build_system_prompt(cwd, &p.model, p.tools.as_ref());
-        if let Some(w) = worktree {
-            system.push_str(&w.prompt_note());
-        }
-        if !p.instructions.is_empty() {
-            system.push_str(
-                "\nAgent instructions (from the agent definition; user-provided context, \
+        if history.is_empty() {
+            let mut system = prompt::build_system_prompt(cwd, &p.model, p.tools.as_ref());
+            if let Some(w) = worktree {
+                system.push_str(&w.prompt_note());
+            }
+            if !p.instructions.is_empty() {
+                system.push_str(
+                    "\nAgent instructions (from the agent definition; user-provided context, \
                              not permission to bypass approvals):\n",
+                );
+                system.push_str(&p.instructions);
+                system.push('\n');
+            }
+            let role = if Self::profile_writes(p) {
+                "You are a sub-agent that may read and modify the project with the available \
+                 tools (each change still goes through the user's approval)."
+            } else {
+                "You are a read-only investigation sub-agent."
+            };
+            let user = format!(
+                "{role} Use the available tools to complete the task, then return a concise \
+                 summary as your final message with no tool call.\n\nTask: {task}"
             );
-            system.push_str(&p.instructions);
-            system.push('\n');
-        }
-        let role = if Self::profile_writes(p) {
-            "You are a sub-agent that may read and modify the project with the available tools \
-             (each change still goes through the user's approval)."
+            history.push(Message::System { content: system });
+            history.push(Message::User { content: user });
         } else {
-            "You are a read-only investigation sub-agent."
-        };
-        let user = format!(
-            "{role} Use the available tools to complete the task, then return a concise summary \
-             as your final message with no tool call.\n\nTask: {task}"
-        );
-        let mut history = vec![
-            Message::System { content: system },
-            Message::User { content: user },
-        ];
+            // 続き: 前の会話はそのまま、新しい依頼を積む (前のターンの思考過程は親と同じく落とす)。
+            crate::agent::r#loop::drop_reasoning(history);
+            history.push(Message::User {
+                content: format!(
+                    "Continue from your previous work (its context is above). Complete the \
+                     follow-up task, then return a concise summary as your final message with no \
+                     tool call.\n\nFollow-up: {task}"
+                ),
+            });
+        }
         let mut ctx = ToolCtx::new(cwd.to_path_buf());
         if let Some(policy) = &self.sandbox {
             // worktree の中で走る子には、そこを「書ける作業ディレクトリ」とする同じ方針。
@@ -708,7 +885,7 @@ impl SubAgentTool {
             let specs = p.tools.tool_specs();
             let resp = crate::llm::metered::with_kind(
                 crate::llm::metered::KIND_SUBAGENT,
-                p.llm.chat(&history, &specs, &p.model, None),
+                p.llm.chat(history, &specs, &p.model, None),
             )
             .await
             .map_err(|e| ToolError::Other(format!("sub-agent llm error: {e}")))?;
@@ -783,6 +960,7 @@ impl SubAgentTool {
                         in_plan,
                         pre.permission,
                         cwd,
+                        quiet,
                     ) {
                         Some(refusal) => ToolOutput::error(refusal),
                         None => {
@@ -877,6 +1055,25 @@ impl Tool for SubAgentTool {
                 "enum": self.profiles.keys().collect::<Vec<_>>()
             });
         }
+        // 走り終えた子がいるときだけ見せる (無いうちは選べるものが無い)。
+        if self.has_children() {
+            schema["properties"]["resume"] = serde_json::json!({
+                "type": "string",
+                "description": "Continue a finished sub-agent with its context: pass the id \
+                                reported in its result (agent_N) and put the follow-up in prompt. \
+                                subagent_type and isolation are taken from the original run."
+            });
+        }
+        // REPL でだけ見せる (`-p` では知らせる次のターンが無い)。
+        if self.background {
+            schema["properties"]["run_in_background"] = serde_json::json!({
+                "type": "boolean",
+                "description": "Start the sub-agent and return its id at once instead of waiting. \
+                                Its result is reported at the start of a later turn (or read it \
+                                with Monitor). A background sub-agent cannot ask for approval, \
+                                so calls that would need one are refused. Default false"
+            });
+        }
         // git リポジトリの中でだけ見せる (外では使えないので)。
         if self.git_root.is_some() {
             schema["properties"]["isolation"] = serde_json::json!({
@@ -906,11 +1103,24 @@ impl Tool for SubAgentTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
         let args: TaskArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("Task: {e}")))?;
-        let (agent_type, profile) = self.profile(args.subagent_type.as_deref())?;
+        // 続きなら種類と作業場所は元の子のもの。
+        let prior = match &args.resume {
+            None => None,
+            Some(id) => Some(self.child(id).ok_or_else(|| {
+                ToolError::InvalidArgs(format!(
+                    "Task: no finished sub-agent with id '{}' to resume",
+                    crate::term::sanitize(id)
+                ))
+            })?),
+        };
+        let (agent_type, profile) = match &prior {
+            Some(p) => self.profile(Some(&p.agent_type))?,
+            None => self.profile(args.subagent_type.as_deref())?,
+        };
         let isolation = match args.isolation.as_deref() {
             None => profile.isolation,
             Some(s) => Isolation::parse(s).ok_or_else(|| {
@@ -920,23 +1130,40 @@ impl Tool for SubAgentTool {
                 ))
             })?,
         };
+        let id = self.new_id();
         // 子は静かに走るので、起動を 1 行知らせて可視性を確保する。
         let label = if agent_type == DEFAULT_AGENT {
             String::new()
         } else {
             format!(" [{agent_type}]")
         };
-        let where_ = if isolation == Isolation::Worktree {
-            " (worktree)"
-        } else {
-            ""
+        let where_ = match (&prior, isolation) {
+            (Some(p), _) => format!(" (resuming {})", p.agent_type),
+            (None, Isolation::Worktree) => " (worktree)".to_string(),
+            (None, Isolation::None) => String::new(),
         };
+        let background = args.run_in_background && self.background;
+        let bg = if background { " in background" } else { "" };
         crate::say!(
-            "  ↳ Task{label}{where_}: {}",
+            "  ↳ Task{label}{where_}{bg} [{id}]: {}",
             crate::term::sanitize(&args.description)
         );
-        let summary = self.run(agent_type, &args.prompt, isolation).await?;
-        Ok(ToolOutput::ok(summary))
+        if background {
+            return Ok(ToolOutput::ok(self.spawn_background(
+                id,
+                agent_type.to_string(),
+                args,
+                isolation,
+                prior,
+                ctx,
+            )?));
+        }
+        let summary = self
+            .run(&id, agent_type, &args.prompt, isolation, prior, false)
+            .await?;
+        Ok(ToolOutput::ok(format!(
+            "{summary}\n\n[sub-agent id: {id}; pass resume: \"{id}\" to continue it with its context]"
+        )))
     }
 }
 
@@ -1071,7 +1298,14 @@ mod tests {
             }
             tool.execute(args, &ctx)
         };
-        assert_eq!(run(None).await.unwrap().content, "from default");
+        // 結果の末尾には resume 用の id が付く (#77)。
+        assert!(
+            run(None)
+                .await
+                .unwrap()
+                .content
+                .starts_with("from default\n\n[sub-agent id: agent_")
+        );
         let echoed = run(Some("echo")).await.unwrap().content;
         assert!(echoed.contains("model: other-model"), "{echoed}");
         assert!(echoed.contains("Agent instructions") && echoed.contains("BE TERSE"));
@@ -1563,6 +1797,216 @@ mod tests {
         assert_eq!(payload["agent_type"], "writer");
     }
 
+    /// 履歴の user メッセージ数を本文にして返す LLM (続きが前の会話の上に積まれたかを見る)。
+    struct CountUsersLlm;
+
+    #[async_trait]
+    impl LlmClient for CountUsersLlm {
+        async fn chat(
+            &self,
+            history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _max_tokens: Option<u32>,
+        ) -> Result<ChatResponse> {
+            let users = history
+                .iter()
+                .filter(|m| matches!(m, Message::User { .. }))
+                .count();
+            Ok(ChatResponse {
+                content: Some(format!("users={users}")),
+                tool_calls: vec![],
+                usage: None,
+                reasoning: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `resume` (#77): 走り終えた子の履歴の上に続きの依頼を積む。id は結果に出る。知らない id は
+    /// エラー。`resume` は走り終えた子がいるときだけ schema に出る。
+    #[tokio::test]
+    async fn a_finished_sub_agent_can_be_resumed_with_its_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = subagent(vec![], dir.path().to_path_buf()).with_profile(
+            "counter".into(),
+            AgentProfile::new(
+                Arc::new(CountUsersLlm),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                3,
+            ),
+        );
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        assert!(tool.schema()["properties"].get("resume").is_none());
+        let first = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "one", "subagent_type": "counter" }),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .content;
+        assert!(first.starts_with("users=1"), "{first}");
+        assert!(first.contains("[sub-agent id: agent_1;"), "{first}");
+        assert!(tool.schema()["properties"].get("resume").is_some());
+
+        // 続き: 種類は元の子のもの (subagent_type を渡さなくてよい)。履歴は前の上に積む。
+        let second = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "two", "resume": "agent_1" }),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .content;
+        assert!(second.starts_with("users=2"), "{second}");
+        assert!(second.contains("[sub-agent id: agent_2;"), "{second}");
+        let record = tool.child("agent_2").unwrap();
+        assert_eq!(record.agent_type, "counter");
+        assert!(
+            matches!(&record.history[record.history.len() - 2], Message::User { content } if content.contains("Follow-up: two"))
+        );
+
+        let err = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "x", "resume": "agent_9" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no finished sub-agent"), "{err}");
+    }
+
+    /// `run_in_background` (#77): 即座に id を返し、結果はストアに載って次のターンで知らされる。
+    /// REPL でないとき (`with_background(false)`) はそのまま前景で走る。
+    #[tokio::test]
+    async fn a_background_sub_agent_reports_through_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let steps = || {
+            vec![ChatResponse {
+                content: Some("looked around".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning: None,
+            }]
+        };
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let args =
+            serde_json::json!({ "description": "look", "prompt": "p", "run_in_background": true });
+
+        // 前景扱い (`-p`): schema にも出ない。
+        let fg = subagent(steps(), dir.path().to_path_buf());
+        assert!(fg.schema()["properties"].get("run_in_background").is_none());
+        let out = fg.execute(args.clone(), &ctx).await.unwrap().content;
+        assert!(out.starts_with("looked around"), "{out}");
+
+        let bg = subagent(steps(), dir.path().to_path_buf()).with_background(true);
+        assert!(bg.schema()["properties"].get("run_in_background").is_some());
+        let out = bg.execute(args, &ctx).await.unwrap().content;
+        assert!(
+            out.starts_with("started background sub-agent agent_1"),
+            "{out}"
+        );
+        // 終わるまで待つ (mock なので一瞬)。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let read = ctx.bg.lock().unwrap().read("agent_1").unwrap();
+            if !read.status.is_running() {
+                assert_eq!(read.status.label(), "exited(0)");
+                assert_eq!(read.new_output, "looked around");
+                assert!(read.command.contains("look"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background child never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // 次のターンで 1 回だけ知らせる。走り終えた子として resume もできる。
+        let announced = ctx.bg.lock().unwrap().drain_announcements();
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].id, "agent_1");
+        assert!(ctx.bg.lock().unwrap().drain_announcements().is_empty());
+        assert!(bg.child("agent_1").is_some());
+    }
+
+    /// バックグラウンドの子は承認を求められない: 尋ねずに決まる呼び出しだけ通る。
+    #[tokio::test]
+    async fn a_background_child_cannot_ask_for_approval() {
+        use crate::permission::PermissionGate;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bg.txt");
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(
+            crate::config::ToolProfile::Full,
+            &["Read".to_string(), "Write".to_string()],
+        );
+        let rw = Arc::new(rw);
+        let build = |gate: PermissionGate| {
+            subagent(vec![], dir.path().to_path_buf())
+                .with_profile(
+                    "writer".into(),
+                    AgentProfile::new(
+                        Arc::new(EchoToolOutputLlm {
+                            call: tool_call(
+                                "Write",
+                                &format!(r#"{{"path": "{}", "content": "x"}}"#, target.display()),
+                            ),
+                        }),
+                        "mock".into(),
+                        Arc::clone(&rw),
+                        3,
+                    ),
+                )
+                .with_background(true)
+                .with_gate(Arc::new(gate))
+        };
+        let args = serde_json::json!({
+            "description": "d", "prompt": "p", "subagent_type": "writer", "run_in_background": true,
+        });
+        async fn wait(ctx: &ToolCtx) -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let read = ctx.bg.lock().unwrap().read("agent_1").unwrap();
+                if !read.status.is_running() {
+                    return read.new_output;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        // 対話ゲート (尋ねれば通るはず) でも、バックグラウンドでは尋ねない → 拒否。
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        build(PermissionGate::new(false))
+            .execute(args.clone(), &ctx)
+            .await
+            .unwrap();
+        let out = wait(&ctx).await;
+        assert!(out.contains("cannot ask for"), "{out}");
+        assert!(!target.exists());
+        // --yes なら尋ねずに決まるので通る。
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        build(PermissionGate::new(true))
+            .execute(args, &ctx)
+            .await
+            .unwrap();
+        let out = wait(&ctx).await;
+        assert!(!out.contains("cannot ask for"), "{out}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+    }
+
     /// 子の system prompt は素の `build_system_prompt` のまま。親の `--append-system-prompt`
     /// (`Session::with_prior` が足すもの) は子に渡らない (#71)。将来、子の起動を Session 経由に
     /// 変えたときに黙って漏れないよう固定する。
@@ -1585,9 +2029,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            out.content,
-            prompt::build_system_prompt(dir.path(), "mock", registry.as_ref())
+        let system = prompt::build_system_prompt(dir.path(), "mock", registry.as_ref());
+        assert!(
+            out.content
+                .starts_with(&format!("{system}\n\n[sub-agent id: agent_")),
+            "{}",
+            out.content
         );
         assert!(
             !out.content
@@ -1757,9 +2204,16 @@ mod tests {
             8,
         );
         assert_eq!(
-            sub.run(DEFAULT_AGENT, "look around", Isolation::None)
-                .await
-                .unwrap(),
+            sub.run(
+                "agent_t",
+                DEFAULT_AGENT,
+                "look around",
+                Isolation::None,
+                None,
+                false
+            )
+            .await
+            .unwrap(),
             "child"
         );
 
@@ -1770,7 +2224,14 @@ mod tests {
 
         // 予算は共有: 2 件を使い切ったので、次の子は 1 回も LLM を呼べずに失敗する。
         let err = sub
-            .run(DEFAULT_AGENT, "again", Isolation::None)
+            .run(
+                "agent_t",
+                DEFAULT_AGENT,
+                "again",
+                Isolation::None,
+                None,
+                false,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1808,9 +2269,16 @@ mod tests {
             HooksCompat::V2,
         );
         assert_eq!(
-            sub.run(DEFAULT_AGENT, "find the answer", Isolation::None)
-                .await
-                .unwrap(),
+            sub.run(
+                "agent_t",
+                DEFAULT_AGENT,
+                "find the answer",
+                Isolation::None,
+                None,
+                false
+            )
+            .await
+            .unwrap(),
             "the answer is 42"
         );
 
@@ -1841,7 +2309,14 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         let out = sub
-            .run(DEFAULT_AGENT, "what is the answer", Isolation::None)
+            .run(
+                "agent_t",
+                DEFAULT_AGENT,
+                "what is the answer",
+                Isolation::None,
+                None,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(out, "the answer is 42");
@@ -1870,7 +2345,14 @@ mod tests {
         ];
         let sub = subagent(steps, tmp.path().to_path_buf());
         let out = sub
-            .run(DEFAULT_AGENT, "find the needle", Isolation::None)
+            .run(
+                "agent_t",
+                DEFAULT_AGENT,
+                "find the needle",
+                Isolation::None,
+                None,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(out, "found the needle");
@@ -1942,9 +2424,16 @@ mod tests {
             )
             .with_reasoning_roundtrip(roundtrip);
             async move {
-                sub.run(DEFAULT_AGENT, "look around", Isolation::None)
-                    .await
-                    .unwrap()
+                sub.run(
+                    "agent_t",
+                    DEFAULT_AGENT,
+                    "look around",
+                    Isolation::None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
             }
         };
         assert_eq!(run(true).await, "reasoning came back: true");
@@ -1965,7 +2454,14 @@ mod tests {
             .collect();
         let sub = subagent(looping, tmp.path().to_path_buf());
         let err = sub
-            .run(DEFAULT_AGENT, "loop forever", Isolation::None)
+            .run(
+                "agent_t",
+                DEFAULT_AGENT,
+                "loop forever",
+                Isolation::None,
+                None,
+                false,
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("max_iterations"));

@@ -57,6 +57,8 @@ pub struct Recorder {
     dir: PathBuf,
     /// transcript.jsonl に書き込み済みのメッセージ数。
     persisted: usize,
+    /// 前回 `sync_with` したときの [`Session::compacted_away`](crate::agent::Session::compacted_away)。
+    compacted_seen: usize,
 }
 
 impl Recorder {
@@ -89,7 +91,11 @@ impl Recorder {
         restrict(&meta_path, 0o600);
         restrict(&transcript_path, 0o600);
 
-        Ok(Self { dir, persisted: 0 })
+        Ok(Self {
+            dir,
+            persisted: 0,
+            compacted_seen: 0,
+        })
     }
 
     /// `/rename`: このセッションに名前を付ける。
@@ -101,7 +107,9 @@ impl Recorder {
     /// 接頭辞ぶんを保存済みとして扱い、以降の `sync` は新規ぶんだけ追記する。
     /// （transcript の行数ではなく history を基準にするため、復元時の system 差し替え
     ///   や将来の履歴整形に依存しない。）
-    pub fn open_resumed(id: &str, history: &[Message]) -> Result<Self> {
+    /// `compacted_away` はそのセッションの現在値 (`/fork` では圧縮済みの会話を引き継ぐので、
+    /// 次の `sync_with` が過去の圧縮を新しいものと数えないように)。
+    pub fn open_resumed(id: &str, history: &[Message], compacted_away: usize) -> Result<Self> {
         let dir = session_dir(id)?;
         if !dir.join("transcript.jsonl").is_file() {
             anyhow::bail!("no such session: {id} (looked in {dir:?})");
@@ -109,12 +117,36 @@ impl Recorder {
         Ok(Self {
             dir,
             persisted: valid_prefix_len(history),
+            compacted_seen: compacted_away,
         })
+    }
+
+    /// [`sync`](Self::sync) に、圧縮で履歴が縮んだ分の追従を加えたもの (#131)。
+    /// `compacted_away` は [`Session::compacted_away`](crate::agent::Session::compacted_away)。
+    ///
+    /// transcript は追記専用で、圧縮前の原文を残す (要約は書かない。再開すれば原文から復元され、
+    /// 必要ならまた圧縮される)。圧縮はユーザターンの境界で起き、sync は毎ターンの終わりに呼ばれる
+    /// ので、畳まれた範囲は書き込み済みの接頭辞に収まる。書き込み済みの位置をその分だけ縮めれば、
+    /// 未保存の末尾は圧縮後の履歴でも同じ末尾を指す。
+    pub fn sync_with(&mut self, history: &[Message], compacted_away: usize) -> Result<()> {
+        if compacted_away > self.compacted_seen {
+            let removed = compacted_away - self.compacted_seen;
+            // 書き込み済みの範囲より深くまで畳まれていたら (sync を挟まずに複数ターン進んだ場合)、
+            // system だけが共通の接頭辞。未保存のまま畳まれた分は要約の中にしか残らない。
+            self.persisted = if self.persisted == 0 {
+                0
+            } else {
+                self.persisted.saturating_sub(removed).max(1)
+            };
+            self.compacted_seen = compacted_away;
+        }
+        self.sync(history)
     }
 
     /// `history` のうち未保存かつ API 上有効な末尾を transcript.jsonl へ追記する。
     /// 宙ぶらりんの `Assistant(tool_calls)`（直後に Tool 結果が無い）は、解決される
     /// まで書き込まない。これにより transcript は常に再投入可能な整合状態を保つ。
+    /// 圧縮を挟むセッションでは [`sync_with`](Self::sync_with) を使う。
     pub fn sync(&mut self, history: &[Message]) -> Result<()> {
         let valid = valid_prefix_len(history);
         if valid <= self.persisted {
@@ -498,7 +530,7 @@ mod tests {
         // ENOENT で is_err にはなるので)。
         for err in [
             load_transcript("../evil").unwrap_err().to_string(),
-            Recorder::open_resumed("../evil", &[])
+            Recorder::open_resumed("../evil", &[], 0)
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
@@ -518,6 +550,7 @@ mod tests {
         let mut rec = Recorder {
             dir: tmp.path().to_path_buf(),
             persisted: 0,
+            compacted_seen: 0,
         };
 
         let mut history = vec![
@@ -547,6 +580,69 @@ mod tests {
         assert_eq!(body.lines().count(), 3);
     }
 
+    /// 圧縮で history が縮んでも、その後のメッセージは transcript に追記される (#131)。
+    /// 原文は残り、要約は書かない。
+    #[test]
+    fn sync_with_keeps_appending_after_a_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        File::create(tmp.path().join("transcript.jsonl")).unwrap();
+        let mut rec = Recorder {
+            dir: tmp.path().to_path_buf(),
+            persisted: 0,
+            compacted_seen: 0,
+        };
+        let user = |s: &str| Message::User { content: s.into() };
+        let reply = |s: &str| Message::Assistant {
+            content: Some(s.into()),
+            tool_calls: vec![],
+            reasoning_content: None,
+        };
+        // 3 ターン進めて全て保存済み。
+        let mut history = vec![
+            Message::System {
+                content: "sys".into(),
+            },
+            user("one"),
+            reply("a1"),
+            user("two"),
+            reply("a2"),
+            user("three"),
+            reply("a3"),
+        ];
+        rec.sync_with(&history, 0).unwrap();
+        assert_eq!(rec.persisted, 7);
+
+        // 圧縮: system を残し、直近 2 ターンより前 (one / a1) を要約に畳んで kept の先頭へ前置。
+        let kept = history.split_off(3);
+        history.truncate(1);
+        history.extend(kept);
+        history[1] = user("[summary]\ntwo");
+        assert_eq!(history.len(), 5);
+        let compacted_away = 7 - 5;
+
+        // 圧縮直後の sync は何も書かない。続けたターンは書く。
+        rec.sync_with(&history, compacted_away).unwrap();
+        assert_eq!(rec.persisted, 5);
+        history.push(user("four"));
+        history.push(reply("a4"));
+        rec.sync_with(&history, compacted_away).unwrap();
+        assert_eq!(rec.persisted, 7);
+
+        let body = fs::read_to_string(tmp.path().join("transcript.jsonl")).unwrap();
+        let users: Vec<String> = body
+            .lines()
+            .map(|l| serde_json::from_str::<Message>(l).unwrap())
+            .filter_map(|m| match m {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["one", "two", "three", "four"]);
+        // 同じ累計で再 sync しても二重に縮めない。
+        rec.sync_with(&history, compacted_away).unwrap();
+        assert_eq!(rec.persisted, 7);
+    }
+
     #[test]
     fn transcript_lines_roundtrip_as_messages() {
         let tmp = tempfile::tempdir().unwrap();
@@ -554,6 +650,7 @@ mod tests {
         let mut rec = Recorder {
             dir: tmp.path().to_path_buf(),
             persisted: 0,
+            compacted_seen: 0,
         };
         let history = vec![
             Message::User {
@@ -587,6 +684,7 @@ mod tests {
         let mut rec = Recorder {
             dir: tmp.path().to_path_buf(),
             persisted: 0,
+            compacted_seen: 0,
         };
 
         // Tool 結果がまだ無い宙ぶらりんの tool_call。
@@ -663,6 +761,7 @@ mod tests {
         let rec = Recorder {
             dir: tmp.path().to_path_buf(),
             persisted: 0,
+            compacted_seen: 0,
         };
         assert_eq!(rec.load_goal().unwrap(), None);
 

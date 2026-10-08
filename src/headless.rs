@@ -237,7 +237,7 @@ async fn run_turn(cfg: Config, opts: Options) -> Result<Report> {
         session.interrupt_repair();
     }
     if let Some(rec) = recorder.as_mut()
-        && let Err(e) = rec.sync(session.history())
+        && let Err(e) = rec.sync_with(session.history(), session.compacted_away())
     {
         eprintln!("session: save failed: {e}");
     }

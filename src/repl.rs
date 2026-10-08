@@ -500,7 +500,11 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
                 {
                     None => println!("session: persistence is disabled; nothing to fork"),
                     Some(Err(e)) => println!("session: fork failed: {e:#}"),
-                    Some(Ok(meta)) => match Recorder::open_resumed(&meta.id, session.history()) {
+                    Some(Ok(meta)) => match Recorder::open_resumed(
+                        &meta.id,
+                        session.history(),
+                        session.compacted_away(),
+                    ) {
                         Ok(rec) => {
                             println!(
                                 "session: forked {} -> {} (now saving to the fork)",
@@ -789,7 +793,7 @@ async fn run_goal_command(
     let outcome = {
         let fut = crate::goal::drive_with(&mut goal, session, llm, evaluator, gate, |s, g| {
             if let Some(rec) = recorder.as_mut()
-                && let Err(e) = rec.sync(s.history())
+                && let Err(e) = rec.sync_with(s.history(), s.compacted_away())
             {
                 eprintln!("session: save failed: {e}");
             }
@@ -807,7 +811,7 @@ async fn run_goal_command(
         goal.pause();
         session.interrupt_repair();
         if let Some(rec) = recorder.as_mut()
-            && let Err(e) = rec.sync(session.history())
+            && let Err(e) = rec.sync_with(session.history(), session.compacted_away())
         {
             eprintln!("session: save failed: {e}");
         }
@@ -941,7 +945,7 @@ async fn handle_loop(
     let outcome = {
         let fut = drive(&spec, session, llm, gate, |s| {
             if let Some(rec) = recorder.as_mut()
-                && let Err(e) = rec.sync(s.history())
+                && let Err(e) = rec.sync_with(s.history(), s.compacted_away())
             {
                 eprintln!("session: save failed: {e}");
             }
@@ -1021,7 +1025,7 @@ async fn run_turn_interruptible(
 /// ターン後に履歴を transcript へ追記する (レコーダ無効時は no-op)。
 fn persist(recorder: &mut Option<Recorder>, session: &agent::Session) {
     if let Some(rec) = recorder.as_mut()
-        && let Err(e) = rec.sync(session.history())
+        && let Err(e) = rec.sync_with(session.history(), session.compacted_away())
     {
         eprintln!("session: save failed: {e}");
     }

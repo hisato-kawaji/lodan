@@ -50,6 +50,9 @@ pub struct Session {
     /// path-scoped ルール (`.lodan/rules/*.md`, #79) と、このセッションで注入済みの添字。
     rules: Vec<crate::memory::rules::Rule>,
     rules_injected: std::collections::BTreeSet<usize>,
+    /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。transcript のレコーダはこれが増えた分だけ
+    /// 「書き込み済み」の位置を縮めて数え直す (履歴が短くなっても末尾を取りこぼさない)。
+    compacted_away: usize,
 }
 
 /// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
@@ -169,6 +172,7 @@ impl Session {
             plan_flag: None,
             rules,
             rules_injected: std::collections::BTreeSet::new(),
+            compacted_away: 0,
         }
     }
 
@@ -278,6 +282,11 @@ impl Session {
     /// 永続化のための会話履歴 (system を含む全メッセージ)。
     pub fn history(&self) -> &[Message] {
         &self.history
+    }
+
+    /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。[`crate::session::Recorder::sync_with`] に渡す。
+    pub fn compacted_away(&self) -> usize {
+        self.compacted_away
     }
 
     /// セッション累積のトークン使用量 (`/cost` 表示・自動圧縮の判断材料)。
@@ -1296,6 +1305,7 @@ impl Session {
         new_history.extend(kept);
         let after = new_history.len();
         self.history = new_history;
+        self.compacted_away += before - after;
         Ok(CompactOutcome::Compacted { before, after })
     }
 }
@@ -2731,6 +2741,8 @@ mod tests {
             }
             other => panic!("expected Compacted, got {other:?}"),
         }
+        // レコーダが追従するための累計は、縮んだ分だけ増える (#131)。
+        assert_eq!(session.compacted_away(), before - session.history().len());
         let hist = session.history();
         // 先頭は System、2 番目は要約ユーザメッセージ。
         assert!(matches!(hist[0], Message::System { .. }));

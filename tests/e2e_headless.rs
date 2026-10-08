@@ -1396,6 +1396,46 @@ fn a_worktree_sub_agent_writes_in_its_own_checkout() {
     assert!(!status.contains("worktrees"), "{status}");
 }
 
+/// `run_in_background` (#77): 子を走らせたまま戻り、終わった結果は次のターンの入力に添えられる。
+#[test]
+fn a_background_sub_agents_result_is_reported_on_the_next_turn() {
+    let home = tempfile::tempdir().unwrap();
+    // 親も子も同じ手順を受ける: 親は Task を背景で呼び、子は Task を持たないので 2 回目で本文を返す。
+    let steps = serde_json::json!([["Task", { "description": "look around", "prompt": "look", "run_in_background": true }]]).to_string();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_STEPS", &steps)]);
+    // `!sleep` で子が終わるのを待ってから次のターンへ。
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("run the demo\n!sleep 2\nnext\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(shown.contains("in background [agent_1]"), "{shown}");
+    assert!(
+        shown.contains("background sub-agent agent_1 finished (exited(0))"),
+        "{shown}"
+    );
+    let transcript = std::fs::read_to_string(only_transcript(home.path())).unwrap();
+    let users: Vec<String> = transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(users.len(), 2, "{users:?}");
+    assert!(
+        users[1].starts_with("next") && users[1].contains("Background sub-agent agent_1 (Task [general-purpose]: look around) finished with status exited(0)"),
+        "{}",
+        users[1]
+    );
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

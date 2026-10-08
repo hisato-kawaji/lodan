@@ -205,7 +205,9 @@ impl Runtime {
         .with_hook_env(Arc::clone(&hook_env), cfg.permissions.mode)
         .with_sandbox(crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd))
         // `isolation: worktree` (#77) は git リポジトリの中でだけ。
-        .with_git_root(agent::subagent::git_toplevel(&cwd));
+        .with_git_root(agent::subagent::git_toplevel(&cwd))
+        // バックグラウンド実行 (#77) は REPL だけ (`-p` では結果を知らせる次のターンが無い)。
+        .with_background(interactive);
         // カスタムエージェント定義 (`.lodan/agents/*.md`, #77)。プロジェクトのものは信頼済みのときだけ。
         let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
         let (defs, warnings) =

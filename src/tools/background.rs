@@ -4,6 +4,9 @@
 //! 増分出力（前回読んだ位置以降）と終了状態を読み出す。Bash の reader タスクが
 //! 出力バッファへ append し、wait タスクが終了コードを書き込む。両者は `Arc<Mutex>`
 //! 越しに共有され、ストア本体は `ToolCtx::bg`（セッション単位）に置かれる。
+//!
+//! `Task` の `run_in_background` も同じストアに `agent_N` として載る (#77)。終わった子の結果は
+//! 次のターンの入口で [`BgStore::drain_announcements`] が拾い、モデルへの入力に添えられる。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -50,6 +53,18 @@ struct BgEntry {
     cursor: usize,
     /// `KillShell` が叩くと wait タスクが child を kill する合図。
     kill: Arc<Notify>,
+    /// 終わったら次のターンでモデルに知らせるか (`Task` の子は true、Bash は false)。
+    announce: bool,
+    /// 知らせ済み。
+    announced: bool,
+}
+
+/// 終わった子エージェントの知らせ (次のターンの入口でモデルに添える)。
+pub struct Announcement {
+    pub id: String,
+    pub label: String,
+    pub status: BgStatus,
+    pub output: String,
 }
 
 /// `Monitor` 1 回分の読み出し結果。
@@ -85,9 +100,69 @@ impl BgStore {
                 status,
                 cursor: 0,
                 kill,
+                announce: false,
+                announced: false,
             },
         );
         id
+    }
+
+    /// バックグラウンドの子エージェント (#77)。ID は `Task` が振る (`agent_N`)。終わったら
+    /// `drain_announcements` で 1 回だけ知らせる。
+    pub fn register_agent(
+        &mut self,
+        id: String,
+        label: String,
+        output: SharedBuf,
+        status: SharedStatus,
+        kill: Arc<Notify>,
+    ) {
+        self.procs.insert(
+            id,
+            BgEntry {
+                command: label,
+                output,
+                status,
+                cursor: 0,
+                kill,
+                announce: true,
+                announced: false,
+            },
+        );
+    }
+
+    /// 終わっていて、まだ知らせていない子エージェントの結果。知らせ済みにし、`Monitor` の
+    /// cursor も進める (同じ本文を二度読ませない)。
+    pub fn drain_announcements(&mut self) -> Vec<Announcement> {
+        let mut out = Vec::new();
+        for (id, entry) in self.procs.iter_mut() {
+            if !entry.announce || entry.announced {
+                continue;
+            }
+            let status = entry
+                .status
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_else(|_| BgStatus::Failed("status lock poisoned".into()));
+            if status.is_running() {
+                continue;
+            }
+            entry.announced = true;
+            let output = match entry.output.lock() {
+                Ok(buf) => {
+                    entry.cursor = buf.len();
+                    buf.clone()
+                }
+                Err(_) => String::new(),
+            };
+            out.push(Announcement {
+                id: id.clone(),
+                label: entry.command.clone(),
+                status,
+                output,
+            });
+        }
+        out
     }
 
     /// `id` のプロセスに kill 合図を送り、合図直前の状態を返す。未知 ID は `None`。
@@ -187,6 +262,35 @@ mod tests {
         assert_eq!(third.new_output, "line2\n");
         assert_eq!(third.status.label(), "exited(0)");
         assert!(!third.status.is_running());
+    }
+
+    /// 子エージェントは終わったときに 1 回だけ知らせる。Bash は知らせない。
+    #[test]
+    fn finished_agents_are_announced_once() {
+        let mut store = BgStore::default();
+        let status = Arc::new(Mutex::new(BgStatus::Running));
+        let out = shared("");
+        store.register_agent(
+            "agent_1".into(),
+            "Task: look".into(),
+            out.clone(),
+            status.clone(),
+            Arc::new(Notify::new()),
+        );
+        let bash = Arc::new(Mutex::new(BgStatus::Exited(0)));
+        store.register("echo".into(), shared("done"), bash, Arc::new(Notify::new()));
+        // 走っている間は何も無い。
+        assert!(store.drain_announcements().is_empty());
+        append_capped(&out, "summary");
+        *status.lock().unwrap() = BgStatus::Exited(0);
+        let got = store.drain_announcements();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "agent_1");
+        assert_eq!(got[0].output, "summary");
+        assert_eq!(got[0].status.label(), "exited(0)");
+        // 二度目は無い。Monitor も同じ本文を返さない。
+        assert!(store.drain_announcements().is_empty());
+        assert_eq!(store.read("agent_1").unwrap().new_output, "");
     }
 
     #[test]

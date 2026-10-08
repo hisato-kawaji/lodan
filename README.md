@@ -798,6 +798,8 @@ You are a strict reviewer. Report only concrete problems with file:line.
 - **書き込み可の子**: `tools:` に Write / Edit / Bash などを書けば、その種類は編集や実行ができる。ただし破壊的な呼び出しは 1 回ずつ**親と同じ承認ゲート**を通る（REPL なら `Allow Write (sub-agent builder): …` と**子の名前つきで yes / no だけ**のプロンプトが出る — 子の要求で「常に許可」を保存すると親の後続まで無確認になるため。`--yes` / allow ルール / `accept-edits` なら通り、deny ルールと `-p`（尋ねる相手がいない）は拒否）。子のツール呼び出しも親と同じ **PreToolUse / PostToolUse hook** を通る（`agent_type` が payload に入る。ブロックされれば実行しない）。親が**プランモード**なら破壊的ツールは拒否される。子の Bash は親と同じ `[sandbox]` 方針で動く。`AskUserQuestion` は子に書けない。書き込み可の種類が 1 つでもあると `Task` は並列実行しない（複数の子が同時に承認を求めると、どの子の要求か分からなくなる）。既定の `general-purpose` と `tools:` 無しの種類は従来どおり読み取り専用。`Task` のツール定義には「can edit files / run commands」と出るので、モデルも区別できる
 - 並列は `Task` の複数呼び出しが同時に実行される（#73）ので既にある
 - **worktree 分離**（`isolation: worktree`、または `Task` の `isolation` 引数 — git リポジトリの中でだけツール定義に出る）: 実行ごとに `<git root>/.lodan/worktrees/<種類>-<連番>` へ HEAD を detached でチェックアウトし、子はその中を cwd にして動く（system prompt にその旨を足す。permission ルールと `[sandbox]` の「書ける作業ディレクトリ」もそこになる）。終わったとき変更もコミットも無ければ worktree を消し、あれば残して結果の末尾に `[worktree] … at <path> (N uncommitted change(s))` と書き添える（SubagentStop の payload にも `worktree`）。メインのチェックアウトは変わらない — `git -C <path> diff` で見て merge / cherry-pick し、`git worktree remove <path>` で消す。子のファイルツール（Read / Write / Edit / Grep / Glob …）は **worktree の外に出られない**（`..` や絶対パスで外を指す呼び出しは拒否。worktree はリポジトリの中にあるので、これが無いと `../../../.env` で親に戻れる）。permission ルールの相対パターンは worktree の cwd を基準に照合する。`.lodan/worktrees/` は `.git/info/exclude` に足すので親の `git status` に出ない。リポジトリの外やコミットの無いリポジトリでは使えない（エラーで返す）。プランモード中の扱いは worktree でも同じ（破壊的ツールは拒否）
+- **バックグラウンド実行**（`Task` の `run_in_background: true`、REPL でだけツール定義に出る）: 子を走らせたまま `started background sub-agent agent_N` と返す。結果は**次のターンの入口**で `Background sub-agent agent_N (…) finished with status exited(0): <要約>` として入力に添えられ（`↳ background sub-agent agent_N finished` と表示）、`Monitor { id: "agent_N" }` でも読める。`KillShell { id: "agent_N" }` で止められる（その場合 worktree の後始末は走らない）。バックグラウンドの子は**尋ねられない**ので、承認が要る呼び出し（`--yes` / allow ルール / `accept-edits` で尋ねずに通るもの以外）は拒否して「前景で走らせて」と返す。`-p` では次のターンが無いので前景で走る
+- **再開**（`resume: "agent_N"`、走り終えた子がいるときだけツール定義に出る）: 子の結果の末尾に `[sub-agent id: agent_N; …]` が付く。その id を `resume` に渡すと、その子の会話の上に続きの依頼を積んで走る（種類と、残っていれば worktree も引き継ぐ。`subagent_type` は要らない）。続きの子にも新しい id が付く。SubagentStart / SubagentStop の payload に `agent_id`、Start には `resumed`
 
 ```jsonc
 // メインエージェントが発行する tool call の例
@@ -842,6 +844,8 @@ KillShell { "id": "bash_1" }                                   → kill 合図 �
 
 `Monitor` は読み取り専用なのでパーミッションゲートを経ない（`Bash` の起動自体は従来どおりゲート対象）。
 `KillShell` はプロセスを終了させる副作用があるため**破壊的ツール扱い**で承認ゲートを通る。
+
+`Task` の `run_in_background` で走らせた子エージェントも同じストアに `agent_N` として載る（[カスタムエージェント](#カスタムエージェントlodanagentsmd77) を参照）。
 
 ## プロジェクトメモリ（`LODAN.md` / `CLAUDE.md` / `AGENTS.md`）
 

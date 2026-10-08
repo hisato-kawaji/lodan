@@ -11,6 +11,7 @@
 //! tools: Read, Grep
 //! model: kimi:kimi-k3
 //! max_turns: 6
+//! isolation: worktree
 //! ---
 //! You are a strict reviewer. Report only concrete problems with file:line.
 //! ```
@@ -25,6 +26,27 @@ use crate::config::Provider;
 /// 既定の子 (読み取り専用の調査エージェント) の名前。定義ファイルでは使えない。
 pub const DEFAULT_AGENT: &str = "general-purpose";
 
+/// 子の作業場所 (`isolation:`, #77)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    /// 親と同じ作業ディレクトリ。
+    #[default]
+    None,
+    /// 実行ごとに git worktree (HEAD の新しいチェックアウト) を切り、その中で動く。
+    Worktree,
+}
+
+impl Isolation {
+    /// frontmatter と `Task` の `isolation` 引数の語彙。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "" | "none" => Some(Self::None),
+            "worktree" => Some(Self::Worktree),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDef {
     pub name: String,
@@ -34,6 +56,8 @@ pub struct AgentDef {
     pub provider: Option<Provider>,
     pub model: Option<String>,
     pub max_turns: Option<usize>,
+    /// 既定の作業場所。`Task` の `isolation` 引数で上書きできる。
+    pub isolation: Isolation,
     /// 本文。子の system prompt の末尾に足す。
     pub prompt: String,
     pub path: PathBuf,
@@ -128,6 +152,13 @@ pub fn parse_agent_def(path: &Path, content: &str) -> Result<AgentDef, String> {
                 .ok_or_else(|| format!("max_turns `{v}` must be a positive integer"))
         })
         .transpose()?;
+    let isolation = field("isolation")
+        .map(|v| {
+            Isolation::parse(&v)
+                .ok_or_else(|| format!("isolation `{v}` must be `none` or `worktree`"))
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(AgentDef {
         name,
         description: field("description").unwrap_or_default(),
@@ -135,6 +166,7 @@ pub fn parse_agent_def(path: &Path, content: &str) -> Result<AgentDef, String> {
         provider,
         model,
         max_turns,
+        isolation,
         prompt: body.trim().to_string(),
         path: path.to_path_buf(),
     })
@@ -152,7 +184,7 @@ mod tests {
     fn parses_every_field_and_splits_provider_from_model() {
         let def = parse_agent_def(
             Path::new("/p/.lodan/agents/reviewer.md"),
-            "---\nname: reviewer\ndescription: strict review\ntools: [Read, \"Grep\"]\nmodel: kimi:kimi-k3\nmax_turns: 6\n---\nReport only problems.\n",
+            "---\nname: reviewer\ndescription: strict review\ntools: [Read, \"Grep\"]\nmodel: kimi:kimi-k3\nmax_turns: 6\nisolation: worktree\n---\nReport only problems.\n",
         )
         .unwrap();
         assert_eq!(def.name, "reviewer");
@@ -160,6 +192,7 @@ mod tests {
         assert_eq!(def.provider, Some(Provider::Kimi));
         assert_eq!(def.model.as_deref(), Some("kimi-k3"));
         assert_eq!(def.max_turns, Some(6));
+        assert_eq!(def.isolation, Isolation::Worktree);
         assert_eq!(def.prompt, "Report only problems.");
     }
 
@@ -183,6 +216,13 @@ mod tests {
         assert!(parse_agent_def(p, "---\nname: has space\n---\nx").is_err());
         assert!(parse_agent_def(p, "---\nprovider: openai\n---\nx").is_err());
         assert!(parse_agent_def(p, "---\nmax_turns: 0\n---\nx").is_err());
+        assert!(parse_agent_def(p, "---\nisolation: docker\n---\nx").is_err());
+        assert_eq!(
+            parse_agent_def(p, "---\nisolation: none\n---\nx")
+                .unwrap()
+                .isolation,
+            Isolation::None
+        );
         assert!(parse_agent_def(p, "no frontmatter at all").is_ok());
     }
 

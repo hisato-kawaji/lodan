@@ -1306,6 +1306,96 @@ fn a_writable_sub_agent_needs_the_parents_approval() {
     );
 }
 
+/// `isolation: worktree` (#77): 子は `.lodan/worktrees/<name>-N` に切った git worktree の中で
+/// 書き、メインのチェックアウトは変わらない。残した worktree の場所が親に伝わる。
+#[test]
+fn a_worktree_sub_agent_writes_in_its_own_checkout() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&work)
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(work.join("README"), "x").unwrap();
+    git(&["add", "README"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+    let agents = work.join(".lodan/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("builder.md"),
+        "---\ndescription: builds things\nmodel: child-model\ntools: Read, Write, Edit, Grep, Glob, Bash\nisolation: worktree\n---\nDo the task.\n",
+    )
+    .unwrap();
+    // demo の手順は相対パス (`./hello.txt`) で書かせる: 子の cwd (= worktree) に落ちる。
+    let steps = serde_json::json!([["Task", { "description": "d", "prompt": "run the demo", "subagent_type": "builder" }]]).to_string();
+    let server = start_mock_with(
+        Path::new("."),
+        &[
+            ("MOCK_LLM_STEPS", &steps),
+            ("MOCK_LLM_STEPS_MODEL", "parent-model"),
+        ],
+    );
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "--model",
+            "parent-model",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !work.join("hello.txt").exists(),
+        "the main checkout must stay untouched"
+    );
+    let wt = work.join(".lodan/worktrees/builder-1");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("hello.txt")).unwrap(),
+        "hello world",
+        "the child wrote inside its worktree"
+    );
+    // 残した worktree は進行表示 (stderr) に出る。結果本文への注記は単体テストで固定している。
+    let progress = String::from_utf8_lossy(&out.stderr);
+    assert!(progress.contains("worktree kept at"), "{progress}");
+    // 親の git status には worktree が出ない (`.git/info/exclude`)。
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(!status.contains("worktrees"), "{status}");
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

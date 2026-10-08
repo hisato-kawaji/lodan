@@ -375,7 +375,7 @@ fn resume_session(
             let n = prior.len();
             let session = agent::Session::resume(cfg.clone(), Arc::clone(registry), prior);
             // recorder は復元後の history を基準に「保存済み」位置を決める。
-            match Recorder::open_resumed(&id, session.history()) {
+            match Recorder::open_resumed(&id, session.history(), session.compacted_away()) {
                 Ok(recorder) => {
                     notices.say(&format!("session: resumed {id} ({n} messages)"));
                     (session, Some(recorder))

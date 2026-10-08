@@ -1827,6 +1827,59 @@ fn running_out_of_budget_is_exit_code_4_and_leaves_a_resumable_history() {
     assert_eq!(resumed.status.code(), Some(0), "{}", stdout(&resumed));
 }
 
+/// `/compact` のあと fork せずに続けると、transcript から圧縮直後のターンが欠けていた (#131)。
+/// 圧縮で history が縮んでも、レコーダは「未保存の末尾」を正しく数え直す。
+#[test]
+fn turns_after_a_compaction_still_reach_the_transcript() {
+    let home = tempfile::tempdir().unwrap();
+    // 既定の挨拶文は "demo" を含み、要約の依頼文には返事の原文が引用されるので、mock が要約の
+    // 問い合わせをデモの手順と取り違える。短い定型文で答えさせる (要約にもその文が返る)。
+    let server = start_mock_saying(home.path(), Some("noted"));
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[],
+        Stdin::Piped("q one\nq two\nq three\n/compact\nq four\nq five\n/exit\n"),
+    );
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("compacted"),
+        "the compaction must actually happen (positive control): {}",
+        stdout(&out)
+    );
+    let transcript = std::fs::read_to_string(only_transcript(home.path())).unwrap();
+    let users: Vec<String> = transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].as_str().unwrap_or("").to_string())
+        .collect();
+    // 圧縮前の原文はそのまま残り (要約で置き換えない)、圧縮後のターンも全て続く。
+    assert_eq!(users, ["q one", "q two", "q three", "q four", "q five"]);
+}
+
+/// `home` の下にある唯一の transcript.jsonl。
+fn only_transcript(home: &Path) -> PathBuf {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(home, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one session under {home:?}: {found:?}"
+    );
+    found.pop().unwrap()
+}
+
 fn find_transcript(home: &Path, session_id: &str) -> PathBuf {
     fn walk(dir: &Path, session_id: &str) -> Option<PathBuf> {
         for entry in std::fs::read_dir(dir).ok()?.flatten() {

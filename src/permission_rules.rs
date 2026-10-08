@@ -459,6 +459,21 @@ fn path_candidates(tool: &str, args: &serde_json::Value, cwd: &Path) -> Vec<Path
     out
 }
 
+/// `tool` の呼び出しが触るパスのうち `root` の外にあるもの (symlink 解決後の行き先も見る)。
+/// worktree の中で走る子エージェントを、その中に閉じ込めるためのもの (#77): worktree はリポジトリの
+/// 中にあるので、`..` で親のチェックアウトに戻れてしまう。パスを取らないツールは None。
+pub fn escapes_root(
+    tool: &str,
+    args: &serde_json::Value,
+    cwd: &Path,
+    root: &Path,
+) -> Option<PathBuf> {
+    let root = real_cwd(root);
+    path_candidates(tool, args, &real_cwd(cwd))
+        .into_iter()
+        .find(|p| !p.starts_with(&root))
+}
+
 /// cwd 自身を symlink 解決した形。パスの候補は symlink を解決して比べるので、基準の cwd も
 /// 揃えておかないと、cwd が symlink 越し (macOS の `/var` → `/private/var` など) のときに
 /// 「cwd 以下」の判定が食い違い、相対パターンの allow が一切効かなくなる。

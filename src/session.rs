@@ -146,8 +146,8 @@ impl Recorder {
     /// `history` のうち未保存かつ API 上有効な末尾を transcript.jsonl へ追記する。
     /// 宙ぶらりんの `Assistant(tool_calls)`（直後に Tool 結果が無い）は、解決される
     /// まで書き込まない。これにより transcript は常に再投入可能な整合状態を保つ。
-    /// 圧縮を挟むセッションでは [`sync_with`](Self::sync_with) を使う。
-    pub fn sync(&mut self, history: &[Message]) -> Result<()> {
+    /// 本体は圧縮の追従を含む [`sync_with`](Self::sync_with) だけを使う。
+    fn sync(&mut self, history: &[Message]) -> Result<()> {
         let valid = valid_prefix_len(history);
         if valid <= self.persisted {
             return Ok(());

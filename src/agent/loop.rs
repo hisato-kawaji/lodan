@@ -583,7 +583,9 @@ impl Session {
                             "stop_hook_block",
                             serde_json::json!({ "turn": self.turn_seq, "iter": iterations }),
                         );
-                        self.history.push(Message::User { content: reason });
+                        self.history.push(Message::User {
+                            content: format!("{HARNESS_NOTE_PREFIX}stop hook: {reason}"),
+                        });
                         continue;
                     }
                 }
@@ -1224,11 +1226,10 @@ impl Session {
             .history
             .iter()
             .enumerate()
-            // ツール往復の途中に足した予算の注意書きは user メッセージだが、利用者のターンではない。
-            .filter(|(_, m)| {
-                matches!(m, Message::User { content }
-                    if !crate::llm::metered::is_budget_reminder(content))
-            })
+            // ターンの途中に lodan が足した user メッセージ (予算の注意書き・ナッジ・stop hook の
+            // 理由) は利用者のターンではない。数えると境界が未保存の末尾に入り、transcript の
+            // レコーダが「畳まれた範囲は書き込み済み」という前提を失う (#131 のレビュー)。
+            .filter(|(_, m)| matches!(m, Message::User { content } if !is_harness_note(content)))
             .map(|(i, _)| i)
             .collect();
         if user_idxs.len() <= KEEP_RECENT_USER_TURNS {
@@ -1672,6 +1673,14 @@ pub(crate) const EXIT_PLAN_MODE: &str = "ExitPlanMode";
 /// `/undo` の巻き戻し対象 (args の `path` を変更前退避するファイル系ツール)。
 /// Bash 等の副作用は巻き戻せないため対象外。
 const UNDOABLE_FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// lodan がターンの途中に注入する user メッセージの印。利用者のターンと区別するために揃える。
+const HARNESS_NOTE_PREFIX: &str = "[lodan] ";
+
+/// lodan が注入した user メッセージ (ナッジ・注意書き・stop hook の理由) か。
+fn is_harness_note(content: &str) -> bool {
+    content.starts_with(HARNESS_NOTE_PREFIX) || crate::llm::metered::is_budget_reminder(content)
+}
 
 /// #61: 壊れツールコール再要求のターン内上限 (無限ループ防止)。
 const MAX_MALFORMED_RETRIES: u32 = 2;
@@ -2700,6 +2709,38 @@ mod tests {
             injected,
             "a blocked Stop hook should inject its reason as a user turn"
         );
+    }
+
+    /// lodan が注入した user メッセージ (ナッジ・stop hook の理由) は、圧縮の境界を決めるときに
+    /// 利用者のターンとして数えない (#131 のレビュー: 数えると境界が直近ターンの途中に入る)。
+    #[test]
+    fn compact_boundary_ignores_harness_notes() {
+        let mut session = session_with_stop_hook(None);
+        let user = |s: &str| Message::User { content: s.into() };
+        let reply = || Message::Assistant {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            reasoning_content: None,
+        };
+        session.history = vec![
+            Message::System {
+                content: "sys".into(),
+            },
+            user("t1"),
+            reply(),
+            user("t2"),
+            reply(),
+            user(EMPTY_REPLY_NOTE),
+            reply(),
+            user(&format!("{HARNESS_NOTE_PREFIX}stop hook: keep going")),
+            reply(),
+            user("t3"),
+            reply(),
+            user(FINISH_NUDGE_VERIFY),
+            reply(),
+        ];
+        // 直近 2 ユーザターン (t2 / t3) を残す境界は t2 の位置。注入分を数えると 7 になる。
+        assert_eq!(session.compact_boundary(), Some(3));
     }
 
     /// ユーザターンが少ないうちは compact は Skipped。

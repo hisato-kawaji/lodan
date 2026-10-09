@@ -168,8 +168,9 @@ impl McpServersConfig {
         }
         let s =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: McpServersConfig =
-            serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+        let cfg: McpServersConfig = serde_json::from_str(&s).map_err(|e| {
+            anyhow::anyhow!("parsing {}: {}", path.display(), describe_json_error(&e))
+        })?;
         Ok(Some(cfg))
     }
 }
@@ -265,7 +266,15 @@ fn read_json_or_empty(path: &Path) -> Result<serde_json::Value> {
         return Ok(serde_json::json!({}));
     }
     let s = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))
+    serde_json::from_str(&s)
+        .map_err(|e| anyhow::anyhow!("parsing {}: {}", path.display(), describe_json_error(&e)))
+}
+
+/// `serde_json::Error` を、ファイルの中身を引用せずに言い直す (#123)。`headers` / `env` には
+/// トークンが書かれるので、型エラーの `invalid type: string "Bearer …"` をそのまま出さない。
+/// 位置 (`at line N column M`) は serde_json のメッセージに含まれているのでそのまま残る。
+fn describe_json_error(e: &serde_json::Error) -> String {
+    crate::config::redact_quoted(&e.to_string())
 }
 
 fn write_json(path: &Path, root: &serde_json::Value) -> Result<()> {
@@ -291,6 +300,42 @@ fn restrict_private(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 型エラーの表示は値を引用しない (#123)。位置は残る。
+    #[test]
+    fn a_type_error_in_mcp_json_hides_the_value_but_keeps_the_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{ "mcpServers": { "a": { "url": "http://h", "headers": "Bearer sk-secret-token" } } }"#,
+        )
+        .unwrap();
+        for err in [
+            McpServersConfig::load_from(&path).unwrap_err().to_string(),
+            read_json_or_empty(&path).map(|_| ()).err().map_or_else(
+                || {
+                    // 構文は正しい JSON なので read_json_or_empty は通る。型エラーは load_from 側。
+                    String::new()
+                },
+                |e| e.to_string(),
+            ),
+        ] {
+            assert!(!err.contains("sk-secret-token"), "{err}");
+        }
+        let err = McpServersConfig::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("parsing") && err.contains("line 1"), "{err}");
+
+        // 構文エラー (引用の途中で切れている) でも、引用された断片は出さない。
+        std::fs::write(
+            &path,
+            r#"{ "mcpServers": { "a": { "env": { "TOKEN": "sk-secret"#,
+        )
+        .unwrap();
+        let err = read_json_or_empty(&path).unwrap_err().to_string();
+        assert!(!err.contains("sk-secret"), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+    }
 
     #[test]
     fn per_server_knobs_parse_and_default() {

@@ -957,7 +957,7 @@ fn parse_toml_table(path: &Path, text: &str) -> Result<toml::Table> {
 
 /// `toml::de::Error` を、ファイルの中身を引用せずに言い直す。メッセージ中の引用文字列
 /// (型エラーの `invalid type: string "sk-…"`) も伏せる。
-fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
+pub(crate) fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
     let message = redact_quoted(e.message());
     match e.span() {
         Some(span) => {
@@ -971,7 +971,7 @@ fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
 }
 
 /// 二重引用符の中身を `…` にする。
-fn redact_quoted(message: &str) -> String {
+pub(crate) fn redact_quoted(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut inside = false;
     for c in message.chars() {
@@ -997,9 +997,13 @@ fn from_layers(layers: Vec<(PathBuf, toml::Table)>) -> Result<(Config, Origins)>
     for (path, table) in layers {
         merge_table(&mut merged, table, "", &path, &mut origins);
     }
+    // 各レイヤーは単体で検証済みなのでここでは落ちないはずだが、落ちたときも値を引用しない
+    // (#123: 不変条件に頼らず、エラー表示の出口ごとに伏せる)。
     let cfg: Config = toml::Value::Table(merged)
         .try_into()
-        .context("merging config layers")?;
+        .map_err(|e: toml::de::Error| {
+            anyhow::anyhow!("merging config layers: {}", redact_quoted(e.message()))
+        })?;
     Ok((cfg, origins))
 }
 
@@ -1083,6 +1087,20 @@ mod tests {
             err.contains("config.toml") && err.contains("expected usize"),
             "{err}"
         );
+    }
+
+    /// レイヤーを重ねた後の型エラーも値を引用しない (#123)。
+    #[test]
+    fn a_type_error_after_merging_layers_hides_the_value() {
+        let err = from_layers(vec![layer(
+            "project",
+            r#"[agent]
+max_iterations = "sk-not-a-number""#,
+        )])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("merging config layers"), "{err}");
+        assert!(!err.contains("sk-not-a-number"), "{err}");
     }
 
     #[test]

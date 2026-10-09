@@ -101,7 +101,14 @@ pub fn store_path() -> Option<PathBuf> {
 
 fn read_store(path: &Path) -> Result<Store> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+        // 壊れた行を値ごと引用しない (#123。中身はパスだけだが、config と同じ出口にする)。
+        Ok(text) => toml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "parsing {}: {}",
+                path.display(),
+                crate::config::describe_toml_error(&e, &text)
+            )
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -242,6 +249,17 @@ pub fn decide(req: &Request<'_>, input: &mut dyn BufRead, out: &mut dyn Write) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 壊れた trusted.toml のエラー表示は、その行の値を引用しない (#123)。
+    #[test]
+    fn a_broken_store_is_reported_without_quoting_its_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trusted.toml");
+        std::fs::write(&path, "dirs = \"/Users/someone/private-project\"\n").unwrap();
+        let err = read_store(&path).unwrap_err().to_string();
+        assert!(err.contains("parsing") && err.contains("line 1"), "{err}");
+        assert!(!err.contains("private-project"), "{err}");
+    }
 
     #[cfg(unix)]
     #[test]

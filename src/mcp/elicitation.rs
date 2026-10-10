@@ -77,6 +77,23 @@ fn prompt(server: &str, params: &Value) -> Value {
         crate::term::sanitize(server),
         crate::term::sanitize(message)
     );
+    // 尋ねる項目が無い (schema が無い / object でない / properties が空) ときは「承諾するか」だけを
+    // 確かめる。黙って accept を返さない (#143 のレビュー)。
+    if properties.is_empty() {
+        let _ = write!(stdout, "  accept? [y/N]> ");
+        let _ = stdout.flush();
+        let mut line = String::new();
+        return match stdin.lock().read_line(&mut line) {
+            Ok(n)
+                if n > 0
+                    && parse_value(&serde_json::json!({ "type": "boolean" }), line.trim())
+                        == Ok(Value::Bool(true)) =>
+            {
+                serde_json::json!({ "action": "accept", "content": {} })
+            }
+            _ => decline(),
+        };
+    }
     // serde_json の Map はキー順なのでサーバが書いた順は分からない。必須のものを `required` の順に
     // 先に、残りをキー順に尋ねる。
     let ordered: Vec<(&String, &Value)> = required

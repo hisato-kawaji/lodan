@@ -52,6 +52,8 @@ pub struct Session {
     rules_injected: std::collections::BTreeSet<usize>,
     /// 繋いだ MCP サーバ。`tools/list_changed` が届いていたら次のターンの入口で取り直す (#83)。
     mcp_servers: Vec<crate::mcp::registry::McpServer>,
+    /// system prompt に描画済みの要件台帳の版 (#65)。台帳が変わったら描画し直す。
+    requirements_version: u64,
     /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。transcript のレコーダはこれが増えた分だけ
     /// 「書き込み済み」の位置を縮めて数え直す (履歴が短くなっても末尾を取りこぼさない)。
     compacted_away: usize,
@@ -81,9 +83,18 @@ impl Session {
         Self::with_prior(cfg, registry, prior)
     }
 
-    /// system prompt を組み立てる。`/model` で切り替えたときも同じ形で作り直す。
-    fn system_prompt(cfg: &Config, cwd: &std::path::Path, registry: &ToolRegistry) -> String {
+    /// system prompt を組み立てる。`/model` で切り替えたときも同じ形で作り直す。`ledger` は
+    /// 要件台帳の pinned block (#65 B2): 履歴ではなく system に置くので圧縮しても消えない。
+    fn system_prompt(
+        cfg: &Config,
+        cwd: &std::path::Path,
+        registry: &ToolRegistry,
+        ledger: &crate::agent::requirements::Ledger,
+    ) -> String {
         let mut system = prompt::build_system_prompt(cwd, &cfg.llm.active().model, registry);
+        if cfg.agent.requirements {
+            system.push_str(&ledger.render());
+        }
         // 利用者の追加指示はメモリのさらに後ろ。メモリと同じく、承認を回避させる指示ではない。
         if let Some(extra) = cfg.agent.append_system_prompt.as_deref()
             && !extra.trim().is_empty()
@@ -102,11 +113,7 @@ impl Session {
     /// 履歴はそのまま (別のモデルに引き継ぐ)。
     pub fn switch_llm(&mut self, llm: crate::config::LlmConfig) {
         self.cfg.llm = llm;
-        let system = Self::system_prompt(&self.cfg, &self.ctx.cwd, self.registry.as_ref());
-        match self.history.first_mut() {
-            Some(Message::System { content }) => *content = system,
-            _ => self.history.insert(0, Message::System { content: system }),
-        }
+        self.refresh_system_prompt();
     }
 
     /// 現在のコンテキストの内訳 (`/context`)。文字数からの概算で、サーバの数え方とは違う。
@@ -150,11 +157,19 @@ impl Session {
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let rules = crate::memory::rules::load_rules(&cwd);
-        let system = Self::system_prompt(&cfg, &cwd, registry.as_ref());
+        // 要件台帳 (#65) は有効なときだけファイルを読む (無効なら空のまま、ファイルにも触らない)。
+        let ledger = if cfg.agent.requirements {
+            crate::agent::requirements::Ledger::load(&cwd)
+        } else {
+            crate::agent::requirements::Ledger::default()
+        };
+        let system = Self::system_prompt(&cfg, &cwd, registry.as_ref(), &ledger);
         let mut history = vec![Message::System { content: system }];
         history.extend(prior);
         let sandbox = crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd);
-        let ctx = ToolCtx::new(cwd).with_sandbox(sandbox);
+        let ctx = ToolCtx::new(cwd)
+            .with_sandbox(sandbox)
+            .with_requirements(ledger);
         let active_hooks = hooks::effective(&cfg.hooks, &cfg.disabled_hooks);
         Self {
             cfg,
@@ -175,6 +190,7 @@ impl Session {
             rules,
             rules_injected: std::collections::BTreeSet::new(),
             mcp_servers: Vec::new(),
+            requirements_version: 0,
             compacted_away: 0,
         }
     }
@@ -231,6 +247,11 @@ impl Session {
         &self.registry
     }
 
+    /// 要件台帳 (#65)。`/requirements` 用。
+    pub fn requirements(&self) -> &Arc<std::sync::Mutex<crate::agent::requirements::Ledger>> {
+        &self.ctx.requirements
+    }
+
     /// `tools/list_changed` の追従のために、繋いだ MCP サーバを持つ (#83)。
     pub fn set_mcp_servers(&mut self, servers: Vec<crate::mcp::registry::McpServer>) {
         self.mcp_servers = servers;
@@ -275,10 +296,88 @@ impl Session {
         // 消えたツールを読み込み済みのままにしない。
         let registry = Arc::clone(&self.registry);
         self.loaded_tools.retain(|n| registry.get(n).is_some());
-        let system = Self::system_prompt(&self.cfg, &self.ctx.cwd, self.registry.as_ref());
+        self.refresh_system_prompt();
+    }
+
+    /// history[0] の system prompt を今の設定・ツール・要件台帳で作り直す。
+    fn refresh_system_prompt(&mut self) {
+        let system = {
+            let ledger = self.ctx.requirements.lock();
+            let empty = crate::agent::requirements::Ledger::default();
+            let ledger_ref = ledger.as_deref().unwrap_or(&empty);
+            Self::system_prompt(&self.cfg, &self.ctx.cwd, self.registry.as_ref(), ledger_ref)
+        };
         match self.history.first_mut() {
             Some(Message::System { content }) => *content = system,
             _ => self.history.insert(0, Message::System { content: system }),
+        }
+        self.requirements_version = self.requirements_version();
+    }
+
+    fn requirements_version(&self) -> u64 {
+        self.ctx
+            .requirements
+            .lock()
+            .map(|l| l.version())
+            .unwrap_or(0)
+    }
+
+    /// 依頼から要件を抜き出して台帳に足す (#65 B1)。LLM 1 回。読めない応答は何も足さない。
+    async fn extract_requirements(&mut self, llm: &dyn LlmClient, user_input: &str) {
+        if !self.cfg.agent.requirements
+            || user_input.chars().count() < crate::agent::requirements::MIN_PROMPT_CHARS
+        {
+            return;
+        }
+        let messages = [
+            Message::System {
+                content: crate::agent::requirements::EXTRACT_SYSTEM.to_string(),
+            },
+            Message::User {
+                content: user_input.to_string(),
+            },
+        ];
+        let resp = crate::llm::metered::with_kind(
+            crate::llm::metered::KIND_REQUIREMENTS,
+            llm.chat(&messages, &[], &self.cfg.llm.active().model, Some(512)),
+        )
+        .await;
+        let found = match resp {
+            Ok(r) => {
+                let (u, estimated) = resolve_usage(&r, &messages);
+                self.usage.record(u, estimated);
+                crate::agent::requirements::parse_extraction(r.content.as_deref().unwrap_or(""))
+            }
+            Err(e) => {
+                crate::say!(
+                    "{}",
+                    crate::term::dim(&format!(
+                        "[lodan] requirements: extraction failed: {}",
+                        crate::term::sanitize(&e.to_string())
+                    ))
+                );
+                Vec::new()
+            }
+        };
+        let n = found.len();
+        let ids = match self.ctx.requirements.lock() {
+            Ok(mut ledger) => ledger.add(found),
+            Err(_) => Vec::new(),
+        };
+        crate::runlog::record(
+            "requirements_extracted",
+            serde_json::json!({ "turn": self.turn_seq, "found": n, "added": ids.len() }),
+        );
+        if !ids.is_empty() {
+            crate::say!(
+                "{}",
+                crate::term::dim(&format!(
+                    "[lodan] requirements: {} recorded (ids {}..{}); see /requirements",
+                    ids.len(),
+                    ids[0],
+                    ids[ids.len() - 1]
+                ))
+            );
         }
     }
 
@@ -398,6 +497,7 @@ impl Session {
         }
         self.pending_context.extend(submitted.context);
         self.refresh_mcp_tools().await;
+        self.extract_requirements(llm, user_input).await;
         // 終わったバックグラウンドの子エージェント (#77) の結果を、この入力に添えて知らせる。
         let finished = self
             .ctx
@@ -445,6 +545,8 @@ impl Session {
         let mut finish_nudged = false;
         // #111: 本文もツール呼び出しも無い応答を「答えを書け」と促した回数。
         let mut empty_reply_nudges = 0u32;
+        // #65: 未達の要件を残したまま終わろうとしたのを促した回数。
+        let mut requirements_nudges = 0u32;
 
         // 評価ハーネス向けの計測 (runlog 無効時はいずれも no-op)。
         end.arm(self.turn_seq);
@@ -463,6 +565,12 @@ impl Session {
             // Plan 中は read-only specs に ExitPlanMode (承認要求の擬似ツール) を
             // 加える。Normal では不可視。モードはターン途中でも切り替わり得る
             // (ExitPlanMode 承認直後) ため、毎イテレーション組み直す。
+            // 要件台帳が変わっていたら (抽出・ツール更新)、pinned block を描き直す (#65 B2)。
+            if self.cfg.agent.requirements
+                && self.requirements_version != self.requirements_version()
+            {
+                self.refresh_system_prompt();
+            }
             let mut specs = match self.mode {
                 Mode::Plan => {
                     let mut s = self.registry.read_only_tool_specs_with(&self.loaded_tools);
@@ -611,6 +719,51 @@ impl Session {
                         content: MALFORMED_CALL_NOTE.to_string(),
                     });
                     continue;
+                }
+                // #65: 要件台帳に未達が残ったまま終わろうとしたら、一覧を示して続けさせる
+                // (最大 MAX_REQUIREMENTS_NUDGES 回。それでも残れば、残ったと知らせて終える)。
+                if self.cfg.agent.requirements {
+                    let unmet = self
+                        .ctx
+                        .requirements
+                        .lock()
+                        .map(|l| l.describe_unmet())
+                        .unwrap_or_default();
+                    if !unmet.is_empty() {
+                        if requirements_nudges < MAX_REQUIREMENTS_NUDGES {
+                            requirements_nudges += 1;
+                            crate::say!(
+                                "{}",
+                                crate::term::dim(
+                                    "[lodan] requirements still open — asking the model to finish or mark them"
+                                )
+                            );
+                            crate::runlog::record(
+                                "requirements_nudge",
+                                serde_json::json!({
+                                    "turn": self.turn_seq,
+                                    "iter": iterations,
+                                    "n": requirements_nudges,
+                                }),
+                            );
+                            self.history.push(Message::User {
+                                content: format!(
+                                    "{REQUIREMENTS_NUDGE}\n{unmet}\n{REQUIREMENTS_NUDGE_TAIL}"
+                                ),
+                            });
+                            continue;
+                        }
+                        crate::say!(
+                            "{}",
+                            crate::term::dim(
+                                "[lodan] finishing with requirements still open (see /requirements)"
+                            )
+                        );
+                        crate::runlog::record(
+                            "requirements_open_at_end",
+                            serde_json::json!({ "turn": self.turn_seq, "open": unmet.lines().count() }),
+                        );
+                    }
                 }
                 // #63: 終了前自己検証ナッジ (opt-in、1 ターン 1 回)。ターンが終わろうと
                 // する最初の応答で、「未実行なら実行を」「実行済みなら元の依頼と照合を」
@@ -1776,6 +1929,17 @@ const FINISH_NUDGE_VERIFY: &str = "[lodan] Before you finish: re-read the origin
     check that EVERY stated requirement is implemented and verified (run the verification \
     command if one was given, and confirm required files/outputs actually exist). If anything \
     is missing or unverified, continue working now; otherwise give your final answer.";
+
+/// #65: 未達の要件を示して続けさせる回数の上限 (1 ターンあたり)。
+const MAX_REQUIREMENTS_NUDGES: u32 = 2;
+
+/// #65: 未達の要件を残したまま終わろうとしたときに注入する指示 (一覧を挟む)。
+const REQUIREMENTS_NUDGE: &str = "[lodan] Requirements ledger check — these requirements are \
+    not marked done yet:";
+const REQUIREMENTS_NUDGE_TAIL: &str = "For each one: finish it and verify, then call the \
+    Requirements tool with action \"done\", its id and the evidence (e.g. the command you ran). \
+    If one is impossible or out of scope, call Requirements with action \"drop\" and the reason. \
+    Only then give your final answer.";
 
 /// #111: 空応答を答えとして書き直させる回数の上限。
 const MAX_EMPTY_REPLY_NUDGES: u32 = 1;
@@ -4571,6 +4735,128 @@ mod tests {
         let mut cfg = Config::default();
         cfg.agent.finish_nudge = true;
         Session::new(cfg, Arc::new(default_registry()))
+    }
+
+    /// 本文だけを順に返す LLM (尽きたら最後を繰り返す)。
+    struct RepliesLlm {
+        replies: Vec<String>,
+        idx: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RepliesLlm {
+        fn new(replies: &[&str]) -> Self {
+            Self {
+                replies: replies.iter().map(|s| s.to_string()).collect(),
+                idx: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for RepliesLlm {
+        async fn chat(
+            &self,
+            _history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _max_tokens: Option<u32>,
+        ) -> Result<ChatResponse> {
+            let i = self.idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = self.replies[i.min(self.replies.len() - 1)].clone();
+            Ok(ChatResponse {
+                content: Some(text),
+                tool_calls: vec![],
+                usage: None,
+                reasoning: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            history: &[Message],
+            tools: &[ToolSpec<'_>],
+            model: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let resp = self.chat(history, tools, model, None).await?;
+            let _ = sink.send(ChatEvent::Done(resp));
+            Ok(())
+        }
+    }
+
+    /// 要件台帳 (#65 B1/B2): 依頼から抽出して system prompt に固定し、未達のまま終わろうとしたら
+    /// 2 回まで促し、done になっていれば促さない。
+    #[tokio::test]
+    async fn requirements_ledger_extracts_pins_and_nudges_before_finishing() {
+        let mut cfg = Config::default();
+        cfg.agent.requirements = true;
+        let mut session = Session::new(cfg, Arc::new(default_registry()));
+        // テストでは cwd の `.lodan/` に書かない (永続化先の無い台帳に差し替える)。
+        session.ctx.requirements = Arc::new(std::sync::Mutex::new(
+            crate::agent::requirements::Ledger::default(),
+        ));
+        let gate = PermissionGate::new(true);
+        let llm = RepliesLlm::new(&[
+            r#"["Create hello.txt containing hi", "Add a test for it"]"#,
+            "I think that is done.",
+            "Still done.",
+            "Final answer.",
+        ]);
+        session
+            .run_turn(
+                "Create hello.txt containing hi, and add a test for it please",
+                &llm,
+                &gate,
+            )
+            .await
+            .unwrap();
+        {
+            let ledger = session.ctx.requirements.lock().unwrap();
+            assert_eq!(ledger.items().len(), 2);
+            assert_eq!(ledger.unmet().len(), 2);
+        }
+        // pinned block は system prompt にある (履歴には無い)。
+        assert!(
+            matches!(&session.history()[0], Message::System { content } if content.contains("Requirements ledger") && content.contains("1. [ ] Create hello.txt containing hi")),
+            "{:?}",
+            session.history()[0]
+        );
+        let nudges = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content.starts_with(REQUIREMENTS_NUDGE)))
+            .count();
+        assert_eq!(nudges, MAX_REQUIREMENTS_NUDGES as usize);
+        assert!(
+            matches!(session.history().last(), Some(Message::Assistant { content: Some(c), .. }) if c == "Final answer.")
+        );
+
+        // 全部 done なら促さない。短い依頼では抽出もしない。
+        session
+            .ctx
+            .requirements
+            .lock()
+            .unwrap()
+            .mark_done(1, "cat hello.txt")
+            .unwrap();
+        session
+            .ctx
+            .requirements
+            .lock()
+            .unwrap()
+            .mark_done(2, "pytest")
+            .unwrap();
+        let before = session.history().len();
+        let llm = RepliesLlm::new(&["thanks"]);
+        session.run_turn("thanks", &llm, &gate).await.unwrap();
+        assert_eq!(
+            session.history().len(),
+            before + 2,
+            "user + assistant, no nudge"
+        );
+        assert!(
+            matches!(&session.history()[0], Message::System { content } if content.contains("1. [x] Create hello.txt containing hi — cat hello.txt"))
+        );
     }
 
     /// 思考だけ返して本文の無い応答を、指定回数だけ続けてから本文を返す LLM (#111)。

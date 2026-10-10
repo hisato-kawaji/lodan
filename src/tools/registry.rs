@@ -25,7 +25,17 @@ pub struct ToolRegistry {
 /// `tool_profile = "core"` でモデルに見せるツール。
 /// TodoWrite を入れるのは、小型モデルが「計画だけ述べて実行しない」「要件を途中で落とす」のを、
 /// やることリストを書かせて抑えるため (#72 の判断。定義は約 +0.5 KB)。
-pub const CORE_TOOLS: &[&str] = &["Read", "Write", "Edit", "Bash", "Grep", "Glob", "TodoWrite"];
+pub const CORE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "TodoWrite",
+    // 要件台帳 (#65) が有効なときだけ登録されるので、無ければ無視される。
+    "Requirements",
+];
 
 /// 遅延ツールを読み込む擬似ツール (#72)。registry には登録せず、ループが横取りする。
 pub const TOOL_SEARCH: &str = "ToolSearch";
@@ -540,9 +550,20 @@ mod tests {
     fn core_profile_shows_exactly_the_core_tools() {
         let mut r = default_registry();
         r.apply_profile(crate::config::ToolProfile::Core, &[]);
-        let mut expected: Vec<String> = CORE_TOOLS.iter().map(|s| s.to_string()).collect();
+        // `Requirements` (#65) は有効なときだけ登録されるので、登録済みのものだけが期待値。
+        let mut expected: Vec<String> = CORE_TOOLS
+            .iter()
+            .filter(|n| r.get(n).is_some())
+            .map(|s| s.to_string())
+            .collect();
         expected.sort();
+        assert!(!expected.iter().any(|n| n == "Requirements"));
         assert_eq!(spec_names(&r), expected);
+        // 登録されていれば core に入る。
+        let mut with_req = default_registry();
+        with_req.register(Arc::new(crate::tools::requirements::RequirementsTool));
+        with_req.apply_profile(crate::config::ToolProfile::Core, &[]);
+        assert!(with_req.is_visible("Requirements"));
         assert_eq!(
             r.names(),
             expected.iter().map(String::as_str).collect::<Vec<_>>()
@@ -693,7 +714,7 @@ mod tests {
         assert!(!r.is_visible("NotebookEdit") && r.is_deferred("NotebookEdit"));
         assert_eq!(
             r.deferred_names().len(),
-            r.registered_len() - CORE_TOOLS.len()
+            r.registered_len() - CORE_TOOLS.iter().filter(|n| r.get(n).is_some()).count()
         );
         assert!(r.tool_search_spec().is_some());
     }

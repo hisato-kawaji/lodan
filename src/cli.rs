@@ -71,6 +71,11 @@ pub struct Cli {
     #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub finish_nudge: Option<bool>,
 
+    /// Keep a requirements ledger: extract checkable requirements from each request, pin them in
+    /// the system prompt, and nudge before finishing with items still open (#65)
+    #[arg(long, env = "LODAN_REQUIREMENTS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub requirements: Option<bool>,
+
     /// Ask the model to write its answer when a reply had no text and no tool call (#111)
     #[arg(long, env = "LODAN_EMPTY_REPLY_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub empty_reply_nudge: Option<bool>,
@@ -410,6 +415,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         show_reasoning: args.show_reasoning,
         auto_approve: args.yes,
         finish_nudge: args.finish_nudge,
+        requirements: args.requirements,
         empty_reply_nudge: args.empty_reply_nudge,
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,

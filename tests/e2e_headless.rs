@@ -1546,6 +1546,75 @@ fn an_mcp_elicitation_is_answered_from_the_repl_and_declined_headless() {
     );
 }
 
+/// 要件台帳 (#65): `--requirements` で依頼から要件を抜き出して `.lodan/requirements.json` に残し、
+/// 未達のまま終わろうとしたら 2 回促してから終える。
+#[test]
+fn requirements_are_extracted_persisted_and_nudged_headless() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // 1 回目の返事は抽出 (JSON 配列)、以降は本文だけ (ツールを呼ばないので未達のまま)。
+    let texts = serde_json::json!([
+        r#"["Create hello.txt containing hi"]"#,
+        "done",
+        "really done",
+        "final"
+    ])
+    .to_string();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_TEXTS", &texts)]);
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--requirements",
+            "-p",
+            "Create hello.txt containing hi, and nothing else please",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<serde_json::Value> = stdout(&out)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let count = |name: &str| events.iter().filter(|e| e["event"] == name).count();
+    assert_eq!(count("requirements_extracted"), 1, "{}", stdout(&out));
+    assert_eq!(count("requirements_nudge"), 2, "{}", stdout(&out));
+    assert_eq!(count("requirements_open_at_end"), 1, "{}", stdout(&out));
+    let result = events.iter().find(|e| e["event"] == "result").unwrap();
+    assert_eq!(result["result"], "final");
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(work.join(".lodan/requirements.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ledger["items"][0]["text"], "Create hello.txt containing hi");
+    assert_eq!(ledger["items"][0]["done"], false);
+    // 既定 (off) では抽出も台帳も無い。
+    let off = home.path().join("off");
+    std::fs::create_dir_all(&off).unwrap();
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "<harness:cwd=off>",
+            "-p",
+            "Create hello.txt containing hi, and nothing else please",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(out.status.success());
+    assert!(!stdout(&out).contains("requirements_extracted"));
+    assert!(!off.join(".lodan/requirements.json").exists());
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

@@ -273,9 +273,13 @@ fn write_json(path: &Path, root: &serde_json::Value) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(root)?;
-    std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
-    // `headers` / `env` に秘密が入る。transcript と同じく本人だけが読める形に (unix のみ)。
-    restrict_private(path);
+    // 途中で落ちても前の内容が残るよう、別名で書いてから差し替える (session.rs の goal.json と
+    // 同じ慣行。#83)。`headers` / `env` に秘密が入るので、差し替える前に本人だけが読める形に
+    // しておく (unix のみ)。
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text + "\n").with_context(|| format!("writing {}", tmp.display()))?;
+    restrict_private(&tmp);
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 

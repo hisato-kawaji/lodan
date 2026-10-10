@@ -125,11 +125,14 @@ pub async fn load_and_register(
                         // read_resource ツールとして登録する。
                         match client.list_resources().await {
                             Ok(resources) if !resources.is_empty() => {
-                                reg.register(Arc::new(McpResourceTool::new(
-                                    &server_name,
-                                    &resources,
-                                    Arc::clone(&client),
-                                )));
+                                reg.register(Arc::new(
+                                    McpResourceTool::new(
+                                        &server_name,
+                                        &resources,
+                                        Arc::clone(&client),
+                                    )
+                                    .with_limits(spec.tool_timeout(), spec.max_output_bytes()),
+                                ));
                                 outcome.resources += resources.len();
                             }
                             Ok(_) => {}

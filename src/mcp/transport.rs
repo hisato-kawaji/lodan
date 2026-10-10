@@ -66,6 +66,11 @@ pub trait Transport: Send + Sync {
     ) -> Result<JsonRpcIncoming>;
     /// 通知 (応答なし) を送る。
     async fn send_notification(&self, line: String) -> Result<()>;
+    /// サーバから `notifications/tools/list_changed` が届いていたら true を返し、印を消す (#83)。
+    /// 受信の口が無い transport (HTTP の POST だけ) は常に false。
+    fn take_tools_changed(&self) -> bool {
+        false
+    }
 }
 
 // ---------------- stdio ----------------
@@ -77,6 +82,8 @@ pub struct StdioTransport {
     outbound: mpsc::UnboundedSender<String>,
     pending: Pending,
     child: Mutex<Option<Child>>,
+    /// `notifications/tools/list_changed` を受けた印。次のターンの入口で読まれる (#83)。
+    tools_changed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StdioTransport {
@@ -133,6 +140,8 @@ impl StdioTransport {
         //         method のみ = 通知 (無視)。
         let pending_clone = Arc::clone(&pending);
         let label_for_reader = label.to_string();
+        let tools_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools_changed_for_reader = Arc::clone(&tools_changed);
         let reader_outbound = outbound_tx.clone();
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
@@ -174,7 +183,12 @@ impl StdioTransport {
                         });
                     }
                     (Some(method), None) => {
-                        tracing::debug!(server=%label_for_reader, method, "mcp: notification ignored");
+                        if method == "notifications/tools/list_changed" {
+                            tools_changed_for_reader
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        } else {
+                            tracing::debug!(server=%label_for_reader, method, "mcp: notification ignored");
+                        }
                     }
                     (None, Some(id)) => {
                         if let Some(tx) = pending_clone.lock().await.remove(&id) {
@@ -204,6 +218,7 @@ impl StdioTransport {
             outbound: outbound_tx,
             pending,
             child: Mutex::new(Some(child)),
+            tools_changed,
         })
     }
 }
@@ -242,6 +257,11 @@ impl Transport for StdioTransport {
         self.outbound
             .send(line)
             .map_err(|_| anyhow!("mcp[{}]: writer channel closed", self.label))
+    }
+
+    fn take_tools_changed(&self) -> bool {
+        self.tools_changed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 

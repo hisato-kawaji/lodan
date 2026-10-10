@@ -148,6 +148,11 @@ impl McpClient {
         Ok(all)
     }
 
+    /// サーバから `tools/list_changed` が届いていたか (読むと印は消える。#83)。
+    pub fn take_tools_changed(&self) -> bool {
+        self.transport.take_tools_changed()
+    }
+
     pub async fn read_resource(&self, uri: &str) -> Result<ResourcesReadResult> {
         self.read_resource_with_timeout(uri, transport::REQUEST_TIMEOUT)
             .await

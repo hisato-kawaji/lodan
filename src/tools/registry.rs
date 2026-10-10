@@ -5,6 +5,7 @@ use crate::agent::messages::{ToolSpec, ToolSpecFunction};
 use crate::tools::{Tool, bash, edit, glob, grep, multi_edit, read, todo_write, write};
 use crate::tools::{ask_user_question, kill_shell, monitor, notebook_edit, web_fetch, web_search};
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     /// モデルに見せるツール名。`None` は全部。隠したツールも登録は残すので、呼ばれたときに
@@ -14,6 +15,8 @@ pub struct ToolRegistry {
     deferred: BTreeSet<String>,
     /// `ToolSearch` の説明文。遅延ツールの名前と 1 行説明を載せるので、`apply_profile` で作る。
     tool_search_description: String,
+    /// `apply_profile_with_search` で遅延ロードを有効にしたか (後から足す MCP ツールも遅延にする)。
+    tool_search: bool,
 }
 
 /// `tool_profile = "core"` でモデルに見せるツール。
@@ -43,6 +46,7 @@ impl ToolRegistry {
             visible: None,
             deferred: BTreeSet::new(),
             tool_search_description: String::new(),
+            tool_search: false,
         }
     }
 
@@ -67,6 +71,7 @@ impl ToolRegistry {
     ) -> Vec<String> {
         let unknown = self.restrict(profile, explicit);
         self.deferred.clear();
+        self.tool_search = tool_search;
         if tool_search {
             // `readonly` が隠すのは破壊的だからで、読み込ませてよいものではない。遅延にもしない
             // (「readonly では破壊的ツールは実行されない」を tool_search が覆さない)。
@@ -234,6 +239,42 @@ impl ToolRegistry {
         self.tools.insert(t.name().to_string(), t);
     }
 
+    /// あるサーバの MCP ツール (`mcp__<server>__*`、`read_resource` は除く) を `tools` で入れ替える
+    /// (`notifications/tools/list_changed`、#83)。見せ方は前と同じ: 遅延ロード中なら新しいものも
+    /// 遅延に、プロファイルで隠されていた (`core` など) なら隠したまま、見えていたなら見せる。
+    pub fn replace_server_tools(&mut self, server: &str, tools: Vec<Arc<dyn Tool>>) {
+        let prefix = format!("{MCP_PREFIX}{server}__");
+        let keep = format!("{prefix}read_resource");
+        let old: Vec<String> = self
+            .tools
+            .keys()
+            .filter(|n| n.starts_with(&prefix) && **n != keep)
+            .cloned()
+            .collect();
+        // 見えていたか: 隠す集合が無い (full) か、前のツールのどれかが見えていた。
+        let shown = match &self.visible {
+            None => true,
+            Some(visible) => old.iter().any(|n| visible.contains(n)),
+        };
+        for n in &old {
+            self.tools.remove(n);
+            self.deferred.remove(n);
+            if let Some(visible) = &mut self.visible {
+                visible.remove(n);
+            }
+        }
+        for t in tools {
+            let name = t.name().to_string();
+            if self.tool_search {
+                self.deferred.insert(name.clone());
+            } else if shown && let Some(visible) = &mut self.visible {
+                visible.insert(name.clone());
+            }
+            self.tools.insert(name, t);
+        }
+        self.tool_search_description = self.build_tool_search_description();
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }
@@ -344,6 +385,68 @@ pub fn read_only_registry() -> ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tools/list_changed` の入れ替え (#83): そのサーバのツールだけ入れ替わり、`read_resource` は
+    /// 残り、遅延ロード中なら新しいものも遅延になる。他のサーバには触らない。
+    #[test]
+    fn replacing_a_servers_tools_keeps_its_resource_tool_and_follows_the_profile() {
+        struct Named(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "d"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn is_destructive(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &crate::tools::ToolCtx,
+            ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+                Ok(crate::tools::ToolOutput::ok(""))
+            }
+        }
+        let mut reg = default_registry();
+        for n in ["mcp__a__old", "mcp__a__read_resource", "mcp__b__keep"] {
+            reg.register(Arc::new(Named(n)));
+        }
+        // full + tool_search: MCP は遅延。
+        reg.apply_profile_with_search(crate::config::ToolProfile::Full, &[], true);
+        assert!(reg.is_deferred("mcp__a__old"));
+        reg.replace_server_tools("a", vec![Arc::new(Named("mcp__a__new"))]);
+        assert!(reg.get("mcp__a__old").is_none());
+        assert!(reg.get("mcp__a__new").is_some() && reg.is_deferred("mcp__a__new"));
+        assert!(reg.get("mcp__a__read_resource").is_some());
+        assert!(reg.get("mcp__b__keep").is_some() && reg.is_deferred("mcp__b__keep"));
+        assert!(
+            reg.tool_search_spec()
+                .unwrap()
+                .function
+                .description
+                .contains("mcp__a__new")
+        );
+
+        // core (MCP は隠れている) で tool_search 無し: 新しいものも隠れたまま。
+        let mut reg = default_registry();
+        reg.register(Arc::new(Named("mcp__a__old")));
+        reg.apply_profile(crate::config::ToolProfile::Core, &[]);
+        assert!(!reg.is_visible("mcp__a__old"));
+        reg.replace_server_tools("a", vec![Arc::new(Named("mcp__a__new"))]);
+        assert!(reg.get("mcp__a__new").is_some() && !reg.is_visible("mcp__a__new"));
+
+        // full で tool_search 無し: 見える。
+        let mut reg = default_registry();
+        reg.register(Arc::new(Named("mcp__a__old")));
+        reg.replace_server_tools("a", vec![Arc::new(Named("mcp__a__new"))]);
+        assert!(reg.is_visible("mcp__a__new"));
+    }
 
     fn spec_names(r: &ToolRegistry) -> Vec<String> {
         r.tool_specs()

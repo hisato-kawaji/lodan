@@ -47,8 +47,8 @@ async fn handshake_list_and_call_round_trip() {
     let tools = client.list_tools().await.expect("list_tools");
     assert_eq!(
         tools.len(),
-        4,
-        "expected echo + get_roots + get_sample + sleep, got {tools:?}"
+        5,
+        "expected echo + get_roots + get_sample + sleep + add_tool, got {tools:?}"
     );
     assert!(tools.iter().any(|t| t.name == "echo"));
 

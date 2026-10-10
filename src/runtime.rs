@@ -51,7 +51,9 @@ pub struct Runtime {
     /// MCP サーバが公開する prompt (`/mcp__<server>__<prompt>`)。
     pub mcp_prompts: BTreeMap<String, McpPrompt>,
     /// セッションの間 MCP クライアントを生かしておく (Drop でサブプロセスが kill される)。
-    _mcp_clients: Vec<Arc<mcp::client::McpClient>>,
+    /// 繋いだ MCP サーバ (持ち続けないと子プロセスが終わる)。セッションにも渡して
+    /// `tools/list_changed` に追従させる (#83)。
+    mcp_servers: Vec<mcp::registry::McpServer>,
 }
 
 /// 定義ファイル 1 つぶんの子エージェント設定を組み立てる。`tools:` が無ければ読み取り専用の
@@ -299,7 +301,7 @@ impl Runtime {
             goal_evaluator,
             registry: Arc::new(registry),
             mcp_prompts,
-            _mcp_clients: mcp_outcome.clients,
+            mcp_servers: mcp_outcome.clients,
         })
     }
 
@@ -316,6 +318,7 @@ impl Runtime {
         };
         // 予算が残り少なくなったことを、ループがモデルに伝えられるように。
         session.set_ledger(Arc::clone(&self.ledger));
+        session.set_mcp_servers(self.mcp_servers.clone());
         // 子エージェントが親のプランモードを見られるように (#77)。
         session.set_plan_flag(Arc::clone(&self.plan_flag));
         // hook の payload に載せる (`session_id` / `transcript_path`)。

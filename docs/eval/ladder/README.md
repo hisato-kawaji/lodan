@@ -34,6 +34,7 @@
 | `core` | `temp` + `--tool-profile core` | ツール定義を 7 個に絞る (#72。2026-10-04 に TodoWrite を追加、それ以前の `core` の実測は 6 個)。**`temp` と比べる** (既定の `CONFIGS` には含めない) |
 | `core-search` | `core` + `--tool-search` | 隠したツールを `ToolSearch` で読み込めるようにする (#72)。**`core` と比べる** |
 | `req` / `req-none` | `temp` / `think-none` + `--requirements` | 要件台帳 (#65 B1/B2): 依頼から要件を LLM で抜き出して system prompt に固定し、未達のまま終わろうとしたら促す。抽出で LLM 呼び出しが 1 回増え、未達があれば促しの往復も増えるので、**所要時間は `temp` / `think-none` と比べる**。thinking モデルは `req-none` を使う |
+| `split-none` | `think-none` + `--write-max-lines 80` | Write の行数上限 (#65 A2): 80 行を超える Write を拒否し、骨格 + Edit の手順を返す。L0 / L1 は 80 行に届かないので **L2 で `think-none` と比べる** |
 | `empty-nudge` | `temp` + `--empty-reply-nudge` | 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)。**`temp` と比べる**。`base` / `temp` / `core` / `core-search` / `think-*` はこれを off にしている (lodan の既定は on) |
 
 ## 使い方

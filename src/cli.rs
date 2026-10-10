@@ -133,6 +133,10 @@ pub struct Cli {
     #[arg(long, env = "LODAN_MAX_TURNS", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
     pub max_turns: Option<u64>,
 
+    /// Refuse a single Write longer than N lines and ask for a skeleton + Edit instead (#65). 0 = no limit
+    #[arg(long, env = "LODAN_WRITE_MAX_LINES", value_name = "N", value_parser = clap::value_parser!(u64))]
+    pub write_max_lines: Option<u64>,
+
     /// Extra instructions appended to the end of the system prompt (sub-agents do not see them)
     #[arg(long, env = "LODAN_APPEND_SYSTEM_PROMPT", value_name = "TEXT")]
     pub append_system_prompt: Option<String>,
@@ -424,6 +428,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         sandbox_network: args.sandbox_network,
         max_requests: args.max_requests,
         max_total_tokens: args.max_total_tokens,
+        write_max_lines: args.write_max_lines.map(|n| n as usize),
         max_iterations: args.max_turns.map(|n| n as usize),
         append_system_prompt: args.append_system_prompt,
         permission_mode: args.permission_mode,

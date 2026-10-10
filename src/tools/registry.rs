@@ -17,6 +17,9 @@ pub struct ToolRegistry {
     tool_search_description: String,
     /// `apply_profile_with_search` で遅延ロードを有効にしたか (後から足す MCP ツールも遅延にする)。
     tool_search: bool,
+    /// `readonly` プロファイル (明示リスト無し) か。破壊的ツールはツール単位で隠し、遅延にもしない —
+    /// 後から足す MCP ツールにも同じ判定を掛ける (#142 のレビュー)。
+    readonly: bool,
 }
 
 /// `tool_profile = "core"` でモデルに見せるツール。
@@ -47,6 +50,7 @@ impl ToolRegistry {
             deferred: BTreeSet::new(),
             tool_search_description: String::new(),
             tool_search: false,
+            readonly: false,
         }
     }
 
@@ -75,7 +79,7 @@ impl ToolRegistry {
         if tool_search {
             // `readonly` が隠すのは破壊的だからで、読み込ませてよいものではない。遅延にもしない
             // (「readonly では破壊的ツールは実行されない」を tool_search が覆さない)。
-            let readonly = profile == crate::config::ToolProfile::Readonly && explicit.is_empty();
+            let readonly = self.readonly;
             let hidden_or_mcp: Vec<String> = self
                 .tools
                 .iter()
@@ -110,6 +114,7 @@ impl ToolRegistry {
     ) -> Vec<String> {
         use crate::config::ToolProfile;
         let mut unknown = Vec::new();
+        self.readonly = profile == ToolProfile::Readonly && explicit.is_empty();
         self.visible = if !explicit.is_empty() {
             let (known, missing): (Vec<_>, Vec<_>) = explicit
                 .iter()
@@ -265,7 +270,12 @@ impl ToolRegistry {
         }
         for t in tools {
             let name = t.name().to_string();
-            if self.tool_search {
+            // readonly の判定はツール単位: 破壊的なものは見せず、遅延にもしない (初回ロードの
+            // `restrict` / `apply_profile_with_search` と同じ)。
+            let blocked = self.readonly && t.is_destructive();
+            if blocked {
+                // 登録は残す (呼ばれたら「このプロファイルでは無効」と答えられる)。
+            } else if self.tool_search {
                 self.deferred.insert(name.clone());
             } else if shown && let Some(visible) = &mut self.visible {
                 visible.insert(name.clone());
@@ -446,6 +456,51 @@ mod tests {
         reg.register(Arc::new(Named("mcp__a__old")));
         reg.replace_server_tools("a", vec![Arc::new(Named("mcp__a__new"))]);
         assert!(reg.is_visible("mcp__a__new"));
+
+        // readonly: 判定はツール単位。非破壊の古いツールが見えていても、新しく来た破壊的ツールは
+        // 見せず、tool_search 中でも遅延にしない (#142 のレビュー)。
+        struct Harmless(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for Harmless {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "d"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn is_destructive(&self) -> bool {
+                false
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &crate::tools::ToolCtx,
+            ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+                Ok(crate::tools::ToolOutput::ok(""))
+            }
+        }
+        for tool_search in [false, true] {
+            let mut reg = default_registry();
+            reg.register(Arc::new(Harmless("mcp__a__look")));
+            reg.apply_profile_with_search(crate::config::ToolProfile::Readonly, &[], tool_search);
+            reg.replace_server_tools(
+                "a",
+                vec![
+                    Arc::new(Harmless("mcp__a__peek")),
+                    Arc::new(Named("mcp__a__wipe")),
+                ],
+            );
+            assert!(reg.get("mcp__a__wipe").is_some(), "registered but hidden");
+            assert!(!reg.is_visible("mcp__a__wipe") && !reg.is_deferred("mcp__a__wipe"));
+            if tool_search {
+                assert!(reg.is_deferred("mcp__a__peek"));
+            } else {
+                assert!(reg.is_visible("mcp__a__peek"));
+            }
+        }
     }
 
     fn spec_names(r: &ToolRegistry) -> Vec<String> {

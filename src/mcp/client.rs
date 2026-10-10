@@ -149,8 +149,19 @@ impl McpClient {
     }
 
     pub async fn read_resource(&self, uri: &str) -> Result<ResourcesReadResult> {
+        self.read_resource_with_timeout(uri, transport::REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// `toolTimeoutSecs` つき (tools/call と同じ扱い。#83)。
+    pub async fn read_resource_with_timeout(
+        &self,
+        uri: &str,
+        timeout: std::time::Duration,
+    ) -> Result<ResourcesReadResult> {
         let params = ResourcesReadParams { uri };
-        self.request("resources/read", Some(&params)).await
+        self.request_with("resources/read", Some(&params), timeout)
+            .await
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {

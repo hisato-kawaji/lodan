@@ -94,19 +94,43 @@ impl Tool for McpTool {
             .call_tool_with_timeout(&self.upstream_name, args, self.timeout)
             .await
             .map_err(|e| ToolError::Other(format!("mcp call failed: {e}")))?;
-        if out.content.len() > self.max_output_bytes {
-            let total = out.content.len();
-            let cut = (0..=self.max_output_bytes)
-                .rev()
-                .find(|&i| out.content.is_char_boundary(i))
-                .unwrap_or(0);
-            out.content.truncate(cut);
-            out.content.push_str(&format!(
-                "\n… (truncated: {total} bytes, maxOutputBytes {})",
-                self.max_output_bytes
-            ));
-        }
+        cap_output(&mut out.content, self.max_output_bytes);
         Ok(out)
+    }
+}
+
+/// `maxOutputBytes` を超えた本文を文字境界で切り、切ったことを末尾に書く (tools/call と
+/// resources/read で共通)。
+pub(crate) fn cap_output(content: &mut String, max_output_bytes: usize) {
+    if content.len() <= max_output_bytes {
+        return;
+    }
+    let total = content.len();
+    let cut = (0..=max_output_bytes)
+        .rev()
+        .find(|&i| content.is_char_boundary(i))
+        .unwrap_or(0);
+    content.truncate(cut);
+    content.push_str(&format!(
+        "\n… (truncated: {total} bytes, maxOutputBytes {max_output_bytes})"
+    ));
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::cap_output;
+
+    #[test]
+    fn cap_output_cuts_at_a_char_boundary_and_says_so() {
+        let mut s = "あいうえお".to_string();
+        cap_output(&mut s, 7);
+        assert!(
+            s.starts_with("あい\n… (truncated: 15 bytes, maxOutputBytes 7)"),
+            "{s}"
+        );
+        let mut short = "ok".to_string();
+        cap_output(&mut short, 7);
+        assert_eq!(short, "ok");
     }
 }
 

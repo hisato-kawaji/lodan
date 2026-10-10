@@ -38,9 +38,11 @@ async fn handshake_list_and_call_round_trip() {
         max_output_bytes: None,
     };
 
-    let client = McpClient::connect("mock", &spec, None)
-        .await
-        .expect("connect MCP mock");
+    let client = Arc::new(
+        McpClient::connect("mock", &spec, None)
+            .await
+            .expect("connect MCP mock"),
+    );
 
     let tools = client.list_tools().await.expect("list_tools");
     assert_eq!(
@@ -89,6 +91,23 @@ async fn handshake_list_and_call_round_trip() {
         .await
         .expect("read_resource");
     assert_eq!(read.flatten_text(), "remember the milk");
+
+    // read_resource ツールにはサーバ別の maxOutputBytes / toolTimeoutSecs が効く (#83)。
+    let tool = lodan::mcp::resource::McpResourceTool::new("m", &resources, Arc::clone(&client))
+        .with_limits(std::time::Duration::from_secs(5), 8);
+    let out = lodan::tools::Tool::execute(
+        &tool,
+        serde_json::json!({ "uri": "mem://notes" }),
+        &lodan::tools::ToolCtx::new(std::env::temp_dir()),
+    )
+    .await
+    .expect("read_resource tool");
+    assert!(
+        out.content
+            .starts_with("remember\n… (truncated: 17 bytes, maxOutputBytes 8)"),
+        "{}",
+        out.content
+    );
 
     // server→client roots/list: the mock asked us for roots during initialize and
     // captured our reply; `get_roots` echoes it back. Assert it carries a file:// root.

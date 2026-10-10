@@ -20,6 +20,8 @@ pub const KIND_MAIN: &str = "main";
 pub const KIND_SUBAGENT: &str = "subagent";
 pub const KIND_GOAL_EVAL: &str = "goal_eval";
 pub const KIND_COMPACT: &str = "compact";
+/// 要件台帳の抽出 (#65)。
+pub const KIND_REQUIREMENTS: &str = "requirements";
 pub const KIND_MCP_SAMPLING: &str = "mcp_sampling";
 
 /// モデルへの注意書きの書き出し。

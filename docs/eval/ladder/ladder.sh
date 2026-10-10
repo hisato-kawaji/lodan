@@ -72,6 +72,8 @@ flags_for_config() {
     temp)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false" ;;
     mitig) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=false --empty-reply-nudge=true" ;;
     nudge) echo "--temperature 0.2 --malformed-retry=true --dup-suppress=true --finish-nudge=true --empty-reply-nudge=true" ;;
+    # temp と同条件で要件台帳 (#65 B1/B2) だけを足す。temp との差が台帳の寄与 (抽出で LLM 1 回増える)。
+    req)   echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --requirements" ;;
     # temp と同条件で空応答の促しだけを on にする (#111)。temp との差が促しの寄与。
     empty-nudge) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=true" ;;
     # temp と同条件でツール定義だけを 7 個 (core) に絞る (#72)。temp との差がプロファイルの寄与。

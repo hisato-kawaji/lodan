@@ -72,7 +72,15 @@ pub struct ClientCapabilities {
     /// opt-in したサーバにのみ広告する。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingCapability>,
+    /// elicitation (server→client の利用者への問い合わせ) を受け付けることを知らせる。
+    /// 尋ねる相手がいる REPL でだけ広告する (#83)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<ElicitationCapability>,
 }
+
+/// elicitation capability も中身を持たない。
+#[derive(Debug, Serialize)]
+pub struct ElicitationCapability {}
 
 #[derive(Debug, Serialize)]
 pub struct RootsCapability {
@@ -86,13 +94,14 @@ pub struct RootsCapability {
 pub struct SamplingCapability {}
 
 impl ClientCapabilities {
-    /// roots は常に提供する。sampling は opt-in 時のみ広告する。
-    pub fn new(sampling_enabled: bool) -> Self {
+    /// roots は常に提供する。sampling は opt-in 時のみ、elicitation は REPL でのみ広告する。
+    pub fn new(sampling_enabled: bool, elicitation_enabled: bool) -> Self {
         Self {
             roots: Some(RootsCapability {
                 list_changed: false,
             }),
             sampling: sampling_enabled.then_some(SamplingCapability {}),
+            elicitation: elicitation_enabled.then_some(ElicitationCapability {}),
         }
     }
 }
@@ -595,12 +604,14 @@ mod tests {
     }
 
     #[test]
-    fn sampling_capability_advertised_only_when_enabled() {
-        let off = serde_json::to_value(ClientCapabilities::new(false)).unwrap();
+    fn sampling_and_elicitation_capabilities_are_advertised_only_when_enabled() {
+        let off = serde_json::to_value(ClientCapabilities::new(false, false)).unwrap();
         assert!(off.get("sampling").is_none());
+        assert!(off.get("elicitation").is_none());
         assert!(off.get("roots").is_some());
-        let on = serde_json::to_value(ClientCapabilities::new(true)).unwrap();
+        let on = serde_json::to_value(ClientCapabilities::new(true, true)).unwrap();
         assert!(on.get("sampling").is_some());
+        assert_eq!(on["elicitation"], serde_json::json!({}));
     }
 
     #[test]

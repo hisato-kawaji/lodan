@@ -39,7 +39,7 @@ async fn handshake_list_and_call_round_trip() {
     };
 
     let client = Arc::new(
-        McpClient::connect("mock", &spec, None)
+        McpClient::connect("mock", &spec, None, None)
             .await
             .expect("connect MCP mock"),
     );
@@ -47,8 +47,8 @@ async fn handshake_list_and_call_round_trip() {
     let tools = client.list_tools().await.expect("list_tools");
     assert_eq!(
         tools.len(),
-        5,
-        "expected echo + get_roots + get_sample + sleep + add_tool, got {tools:?}"
+        7,
+        "expected echo + get_roots + get_sample + sleep + add_tool + ask_user + get_elicited, got {tools:?}"
     );
     assert!(tools.iter().any(|t| t.name == "echo"));
 
@@ -176,7 +176,7 @@ async fn sampling_round_trip_when_opted_in() {
         Arc::new(StubLlm),
         "stub-model".into(),
     ));
-    let client = McpClient::connect("mock", &spec, Some(sampling))
+    let client = McpClient::connect("mock", &spec, Some(sampling), None)
         .await
         .expect("connect MCP mock");
 
@@ -215,7 +215,7 @@ async fn annotations_filters_timeouts_and_output_caps_apply_per_server() {
         max_output_bytes: None,
     };
     let client = Arc::new(
-        McpClient::connect("mock", &base, None)
+        McpClient::connect("mock", &base, None, None)
             .await
             .expect("connect"),
     );

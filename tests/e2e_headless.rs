@@ -1466,7 +1466,7 @@ fn mcp_tools_are_refreshed_after_list_changed_on_the_next_turn() {
     );
     let shown = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
     assert!(
-        shown.contains("mcp[mock]: tools changed, now 6 tool(s)"),
+        shown.contains("mcp[mock]: tools changed, now 8 tool(s)"),
         "{shown}"
     );
     // `/tools` (2 ターン目の後) に新しいツールが載る。
@@ -1474,6 +1474,75 @@ fn mcp_tools_are_refreshed_after_list_changed_on_the_next_turn() {
         stdout(&out).contains("mcp__mock__added"),
         "{}",
         stdout(&out)
+    );
+}
+
+/// elicitation (#83): サーバの `elicitation/create` に、REPL なら stdin の答えを型に合わせて返し、
+/// `-p` では尋ねずに decline を返す。
+#[test]
+fn an_mcp_elicitation_is_answered_from_the_repl_and_declined_headless() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_mcp_server.py");
+    std::fs::write(
+        work.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "mock": { "command": "python3", "args": [fixture] } } })
+            .to_string(),
+    )
+    .unwrap();
+    let steps = serde_json::json!([["mcp__mock__ask_user", {}], ["mcp__mock__get_elicited", {}],])
+        .to_string();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_STEPS", &steps)]);
+
+    // REPL: 問いの後の 2 行 (name / age) が答え。
+    let out = lodan(
+        home.path(),
+        server.port,
+        &["--yes"],
+        Stdin::Piped("run the demo\nAda\n42\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = stdout(&out);
+    assert!(shown.contains("[mcp:mock] asks: Who are you?"), "{shown}");
+    assert!(
+        shown.contains(r#"{"action":"accept","content":{"age":42,"name":"Ada"}}"#),
+        "{shown}"
+    );
+
+    // -p: 尋ねる相手がいないので decline (stdin は読まない)。
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::Piped("Ada\n42\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // stream-json はツール結果の本文を出さないので transcript で見る。
+    let session_id = stdout(&out)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["event"] == "result")
+        .and_then(|v| v["session_id"].as_str().map(str::to_string))
+        .expect("result event with session_id");
+    let transcript = std::fs::read_to_string(find_transcript(home.path(), &session_id)).unwrap();
+    assert!(
+        transcript.contains(r#"{\"action\":\"decline\"}"#),
+        "{transcript}"
     );
 }
 

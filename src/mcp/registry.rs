@@ -63,9 +63,11 @@ pub fn wrap_tools(
 /// Load `.mcp.json` from CWD, connect each server, and register their tools.
 /// Returns the live clients so the caller can keep them alive (Drop on session end).
 /// `sampling` を渡すと、allowSampling=true のサーバに sampling/createMessage を許可する。
+/// `interactive` (REPL) なら elicitation (サーバからの利用者への問い合わせ) を受け付ける (#83)。
 pub async fn load_and_register(
     reg: &mut ToolRegistry,
     sampling: Option<SamplingContext>,
+    interactive: bool,
 ) -> Result<LoadOutcome> {
     let (cfg, _scopes) = McpServersConfig::load_effective()?;
     if cfg.mcp_servers.is_empty() {
@@ -82,7 +84,12 @@ pub async fn load_and_register(
             ))),
             _ => None,
         };
-        match McpClient::connect(&server_name, &spec, sampling_provider).await {
+        let elicitation = interactive.then(|| {
+            Arc::new(crate::mcp::elicitation::ElicitationProvider::new(
+                &server_name,
+            ))
+        });
+        match McpClient::connect(&server_name, &spec, sampling_provider, elicitation).await {
             Ok(client) => {
                 let client = Arc::new(client);
                 match client.list_tools().await {

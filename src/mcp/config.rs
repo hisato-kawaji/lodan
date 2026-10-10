@@ -326,6 +326,16 @@ mod tests {
         let err = McpServersConfig::load_from(&path).unwrap_err().to_string();
         assert!(err.contains("parsing") && err.contains("line 1"), "{err}");
 
+        // 引用符の無い値 (数値) が文字列の欄にあると serde_json はバッククォートで引用する
+        // (`invalid type: integer `123456789`, expected a string`)。それも伏せる (#140 のレビュー)。
+        std::fs::write(&path, r#"{ "mcpServers": { "a": { "url": 123456789 } } }"#).unwrap();
+        let err = McpServersConfig::load_from(&path).unwrap_err().to_string();
+        assert!(!err.contains("123456789"), "{err}");
+        assert!(
+            err.contains("invalid type") && err.contains("line 1"),
+            "{err}"
+        );
+
         // 構文エラー (引用の途中で切れている) でも、引用された断片は出さない。
         std::fs::write(
             &path,

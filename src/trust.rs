@@ -259,6 +259,11 @@ mod tests {
         let err = read_store(&path).unwrap_err().to_string();
         assert!(err.contains("parsing") && err.contains("line 1"), "{err}");
         assert!(!err.contains("private-project"), "{err}");
+        // 引用符の無い値は toml がバッククォートで引用する。それも伏せる。
+        std::fs::write(&path, "dirs = 424242\n").unwrap();
+        let err = read_store(&path).unwrap_err().to_string();
+        assert!(!err.contains("424242"), "{err}");
+        assert!(err.contains("invalid type"), "{err}");
     }
 
     #[cfg(unix)]

@@ -970,12 +970,31 @@ pub(crate) fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
     }
 }
 
-/// 二重引用符の中身を `…` にする。
+/// 引用された値を `…` にする。二重引用符は常に (文字列の値)。バッククォートは、値を引用する
+/// メッセージ (`invalid type: integer `42``、`unknown variant `x``) のときだけ — `unknown field `x``
+/// のバッククォートはキー名なので残す (#140 のレビュー: 数値や enum の値も漏れ得る)。
 pub(crate) fn redact_quoted(message: &str) -> String {
+    let quoted = redact_between(message, '"');
+    if [
+        "invalid type",
+        "invalid value",
+        "unknown variant",
+        "invalid length",
+    ]
+    .iter()
+    .any(|p| quoted.starts_with(p))
+    {
+        redact_between(&quoted, '`')
+    } else {
+        quoted
+    }
+}
+
+fn redact_between(message: &str, delimiter: char) -> String {
     let mut out = String::with_capacity(message.len());
     let mut inside = false;
     for c in message.chars() {
-        if c == '"' {
+        if c == delimiter {
             inside = !inside;
             out.push(c);
             if inside {
@@ -1111,6 +1130,19 @@ max_iterations = "sk-not-a-number""#,
         );
         assert_eq!(redact_quoted("no quotes"), "no quotes");
         assert_eq!(redact_quoted(r#"unterminated "abc"#), r#"unterminated "…"#);
+        // 値を引用するメッセージではバッククォートも伏せる。キー名のバッククォートは残す。
+        assert_eq!(
+            redact_quoted("invalid type: integer `4242`, expected a string"),
+            "invalid type: integer `…`, expected a string"
+        );
+        assert_eq!(
+            redact_quoted("unknown variant `sk-x`, expected `off` or `on`"),
+            "unknown variant `…`, expected `…` or `…`"
+        );
+        assert_eq!(
+            redact_quoted("unknown field `api_key`, expected `model`"),
+            "unknown field `api_key`, expected `model`"
+        );
     }
 
     fn layer(name: &str, toml_src: &str) -> (PathBuf, toml::Table) {

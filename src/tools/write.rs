@@ -63,10 +63,11 @@ impl Tool for Write {
             return Ok(ToolOutput::error(format!(
                 "Write refused: content is {lines} lines, but a single Write may have at most {} \
                  lines here. Nothing was written. Do it in steps: (1) Write a skeleton of at most {} \
-                 lines — imports, constants, type and function signatures, with placeholder bodies \
-                 (e.g. a `pass`, `...`, or a `TODO` comment) — then (2) fill each placeholder with \
-                 Edit (old_string = the placeholder), one part at a time, each part at most {} lines. \
-                 Read the file before each Edit if unsure of its current content.",
+                 lines — imports, constants, type and function signatures, with a distinct \
+                 placeholder body in each (e.g. `# TODO <name>` naming the function, so every \
+                 placeholder is unique) — then (2) fill each placeholder with Edit (old_string = \
+                 that placeholder), one part at a time, each part at most {} lines. Read the file \
+                 before each Edit if unsure of its current content.",
                 ctx.write_max_lines, ctx.write_max_lines, ctx.write_max_lines
             )));
         }

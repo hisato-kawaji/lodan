@@ -89,6 +89,8 @@ pub struct ToolCtx {
     pub sandbox: crate::sandbox::SandboxPolicy,
     /// 要件台帳 (#65 B1)。ループが抽出し、`Requirements` ツールが更新する。
     pub requirements: Arc<Mutex<crate::agent::requirements::Ledger>>,
+    /// `Write` 1 回の行数上限 (#65 A2)。0 は無制限。
+    pub write_max_lines: usize,
 }
 
 impl ToolCtx {
@@ -100,6 +102,7 @@ impl ToolCtx {
             bg: Arc::new(Mutex::new(background::BgStore::default())),
             sandbox: crate::sandbox::SandboxPolicy::off(),
             requirements: Arc::new(Mutex::new(crate::agent::requirements::Ledger::default())),
+            write_max_lines: 0,
         }
     }
 
@@ -111,6 +114,12 @@ impl ToolCtx {
 
     pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
         self.sandbox = policy;
+        self
+    }
+
+    /// `[agent] write_max_lines` (#65 A2)。
+    pub fn with_write_limit(mut self, lines: usize) -> Self {
+        self.write_max_lines = lines;
         self
     }
 

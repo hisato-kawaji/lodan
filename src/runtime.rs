@@ -211,6 +211,7 @@ impl Runtime {
         .with_plan_flag(Arc::clone(&plan_flag))
         .with_hook_env(Arc::clone(&hook_env), cfg.permissions.mode)
         .with_sandbox(crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd))
+        .with_write_limit(cfg.agent.write_max_lines)
         // `isolation: worktree` (#77) は git リポジトリの中でだけ。
         .with_git_root(agent::subagent::git_toplevel(&cwd))
         // バックグラウンド実行 (#77) は REPL だけ (`-p` では結果を知らせる次のターンが無い)。

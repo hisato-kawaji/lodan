@@ -169,7 +169,8 @@ impl Session {
         let sandbox = crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd);
         let ctx = ToolCtx::new(cwd)
             .with_sandbox(sandbox)
-            .with_requirements(ledger);
+            .with_requirements(ledger)
+            .with_write_limit(cfg.agent.write_max_lines);
         let active_hooks = hooks::effective(&cfg.hooks, &cfg.disabled_hooks);
         Self {
             cfg,

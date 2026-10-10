@@ -85,6 +85,8 @@ flags_for_config() {
     think-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none" ;;
     # think-none と同条件で要件台帳だけを足す (thinking モデルは think-none が基準。#65 B1/B2)。
     req-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --requirements" ;;
+    # think-none と同条件で Write の行数上限だけを足す (#65 A2)。
+    split-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --write-max-lines 80" ;;
     think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
     *) echo "unknown config: $1" >&2; return 1 ;;
   esac

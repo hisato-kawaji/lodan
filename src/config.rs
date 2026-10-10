@@ -318,6 +318,9 @@ pub struct AgentConfig {
     /// `.lodan/requirements.json` に持ち、system prompt に常に描画し、未達のまま終わろうとしたら
     /// 促す。既定 false (抽出に LLM 呼び出しが 1 回増える。ablation で寄与を測る)。
     pub requirements: bool,
+    /// `Write` 1 回の内容の行数上限 (#65 A2)。超えたら書かずに「骨格を書いてから Edit で埋める」手順を
+    /// 返す。0 (既定) は無制限。小型モデルは数百行を 1 引数で一貫して書けないので、要求しない。
+    pub write_max_lines: usize,
     /// ターン終了直前に 1 回だけ自己検証を促す (#63)。小型ローカルモデルの
     /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
     /// (良行儀なモデルに余計な LLM ラウンドトリップを課さない)。
@@ -478,6 +481,7 @@ impl Default for AgentConfig {
             auto_approve: false,
             finish_nudge: false,
             requirements: false,
+            write_max_lines: 0,
             empty_reply_nudge: true,
             malformed_retry: true,
             dup_suppress: true,
@@ -790,6 +794,10 @@ impl Config {
             self.agent.max_iterations = v;
             mark("agent.max_iterations".into());
         }
+        if let Some(v) = o.write_max_lines {
+            self.agent.write_max_lines = v;
+            mark("agent.write_max_lines".into());
+        }
         if let Some(v) = o.append_system_prompt {
             self.agent.append_system_prompt = Some(v);
             mark("agent.append_system_prompt".into());
@@ -843,6 +851,7 @@ pub struct Overrides {
     pub max_total_tokens: Option<u64>,
     /// `--max-turns`: `agent.max_iterations` を上書きする。
     pub max_iterations: Option<usize>,
+    pub write_max_lines: Option<usize>,
     pub append_system_prompt: Option<String>,
     pub permission_mode: Option<PermissionMode>,
     pub allowed_tools: Vec<String>,

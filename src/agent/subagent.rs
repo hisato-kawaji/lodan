@@ -287,6 +287,8 @@ pub struct SubAgentTool {
     permission_mode: crate::config::PermissionMode,
     /// cwd を含む git リポジトリのトップ。無ければ `isolation: worktree` は使えない (#77)。
     git_root: Option<PathBuf>,
+    /// 子の `Write` にも親と同じ行数上限を掛ける (#65 A2)。0 は無制限。
+    write_max_lines: usize,
     /// `run_in_background` を受け付けるか (REPL だけ。`-p` では知らせる次のターンが無い)。
     background: bool,
     /// 子の id (`agent_N`) の連番。
@@ -329,12 +331,19 @@ impl SubAgentTool {
             hook_env: None,
             permission_mode: crate::config::PermissionMode::default(),
             git_root: None,
+            write_max_lines: 0,
             background: false,
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             children: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         };
         tool.refresh_description();
         tool
+    }
+
+    /// `[agent] write_max_lines` を子にも掛ける (#65 A2)。
+    pub fn with_write_limit(mut self, lines: usize) -> Self {
+        self.write_max_lines = lines;
+        self
     }
 
     /// `run_in_background` を受け付ける (#77)。REPL なら true。
@@ -867,7 +876,7 @@ impl SubAgentTool {
                 ),
             });
         }
-        let mut ctx = ToolCtx::new(cwd.to_path_buf());
+        let mut ctx = ToolCtx::new(cwd.to_path_buf()).with_write_limit(self.write_max_lines);
         if let Some(policy) = &self.sandbox {
             // worktree の中で走る子には、そこを「書ける作業ディレクトリ」とする同じ方針。
             let mut policy = policy.clone();

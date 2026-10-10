@@ -33,6 +33,7 @@
 | `think-none` / `think-low` | `temp` + `--reasoning-effort none` / `low` | 推論の深さ (#78)。**`temp` (サーバ既定の effort) と比べる**。語彙はサーバ次第 (Ollama は `none` で thinking off、kimi / gpt-oss は `low`)。既定の `CONFIGS` には含めない。実測: [kimi-k3 の `low` vs 既定](kimi-k3-effort-2026-09.md)、[qwen3.5:9b の thinking off と `core`](qwen3.5-thinking-core-2026-09.md) |
 | `core` | `temp` + `--tool-profile core` | ツール定義を 7 個に絞る (#72。2026-10-04 に TodoWrite を追加、それ以前の `core` の実測は 6 個)。**`temp` と比べる** (既定の `CONFIGS` には含めない) |
 | `core-search` | `core` + `--tool-search` | 隠したツールを `ToolSearch` で読み込めるようにする (#72)。**`core` と比べる** |
+| `req` / `req-none` | `temp` / `think-none` + `--requirements` | 要件台帳 (#65 B1/B2): 依頼から要件を LLM で抜き出して system prompt に固定し、未達のまま終わろうとしたら促す。抽出で LLM 呼び出しが 1 回増え、未達があれば促しの往復も増えるので、**所要時間は `temp` / `think-none` と比べる**。thinking モデルは `req-none` を使う |
 | `empty-nudge` | `temp` + `--empty-reply-nudge` | 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)。**`temp` と比べる**。`base` / `temp` / `core` / `core-search` / `think-*` はこれを off にしている (lodan の既定は on) |
 
 ## 使い方

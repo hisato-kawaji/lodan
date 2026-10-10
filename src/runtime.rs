@@ -154,6 +154,10 @@ impl Runtime {
         let goal_evaluator = llm::build_goal_evaluator(cfg, &ledger)?;
 
         let mut registry = default_registry();
+        // 要件台帳 (#65) は opt-in。有効なときだけツールを見せる。
+        if cfg.agent.requirements {
+            registry.register(Arc::new(crate::tools::requirements::RequirementsTool));
+        }
         // sampling は opt-in サーバにのみ active モデルの LLM を貸す。
         let sampling_ctx = mcp::registry::SamplingContext {
             llm: Arc::clone(&llm),

@@ -21,8 +21,26 @@ use crate::slash::{self, SlashCommand};
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
-    "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop", "plan", "accept",
-    "undo", "memory", "model", "status", "context", "fork", "rename", "export",
+    "exit",
+    "quit",
+    "help",
+    "clear",
+    "tools",
+    "compact",
+    "cost",
+    "goal",
+    "loop",
+    "plan",
+    "accept",
+    "undo",
+    "memory",
+    "model",
+    "status",
+    "context",
+    "fork",
+    "rename",
+    "export",
+    "requirements",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
@@ -322,6 +340,22 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
                     }
                 }
                 persist(&mut recorder, &session);
+                continue;
+            }
+
+            // /requirements: 要件台帳 (#65) の表示と clear。session が持つのでここで処理する。
+            if head == "requirements" {
+                match session.requirements().lock() {
+                    Ok(mut ledger) => {
+                        if args == "clear" {
+                            ledger.clear();
+                            println!("requirements: cleared");
+                        } else {
+                            println!("{}", crate::term::sanitize(&ledger.describe()));
+                        }
+                    }
+                    Err(_) => println!("requirements: ledger unavailable"),
+                }
                 continue;
             }
 

@@ -314,6 +314,10 @@ pub struct AgentConfig {
     /// 本文もツール呼び出しも無い応答 (典型は thinking モデルの「思考だけ」) を、1 回だけ「答えを
     /// 書け」と促して続ける (#111)。既定 true。思考の有無は問わない (空の応答は答えではない)。
     pub empty_reply_nudge: bool,
+    /// 要件台帳 (#65 B1/B2)。利用者の依頼から検査可能な要件を LLM で抜き出して
+    /// `.lodan/requirements.json` に持ち、system prompt に常に描画し、未達のまま終わろうとしたら
+    /// 促す。既定 false (抽出に LLM 呼び出しが 1 回増える。ablation で寄与を測る)。
+    pub requirements: bool,
     /// ターン終了直前に 1 回だけ自己検証を促す (#63)。小型ローカルモデルの
     /// 「計画だけ述べて実行しない」「要件の実装漏れ」対策。既定 false
     /// (良行儀なモデルに余計な LLM ラウンドトリップを課さない)。
@@ -473,6 +477,7 @@ impl Default for AgentConfig {
             show_reasoning: false,
             auto_approve: false,
             finish_nudge: false,
+            requirements: false,
             empty_reply_nudge: true,
             malformed_retry: true,
             dup_suppress: true,
@@ -732,6 +737,10 @@ impl Config {
             self.agent.empty_reply_nudge = v;
             mark("agent.empty_reply_nudge".into());
         }
+        if let Some(v) = o.requirements {
+            self.agent.requirements = v;
+            mark("agent.requirements".into());
+        }
         if let Some(v) = o.malformed_retry {
             self.agent.malformed_retry = v;
             mark("agent.malformed_retry".into());
@@ -822,6 +831,7 @@ pub struct Overrides {
     /// `true` のときだけ有効化する (既存 `--yes` の意味を保つ)。
     pub auto_approve: bool,
     pub finish_nudge: Option<bool>,
+    pub requirements: Option<bool>,
     pub empty_reply_nudge: Option<bool>,
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,

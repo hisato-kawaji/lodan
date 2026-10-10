@@ -12,6 +12,7 @@ pub mod write;
 pub mod ask_user_question;
 pub mod multi_edit;
 pub mod notebook_edit;
+pub mod requirements;
 pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
@@ -86,6 +87,8 @@ pub struct ToolCtx {
     pub bg: Arc<Mutex<background::BgStore>>,
     /// Bash を包むサンドボックスの方針 (#75)。既定は off。
     pub sandbox: crate::sandbox::SandboxPolicy,
+    /// 要件台帳 (#65 B1)。ループが抽出し、`Requirements` ツールが更新する。
+    pub requirements: Arc<Mutex<crate::agent::requirements::Ledger>>,
 }
 
 impl ToolCtx {
@@ -96,7 +99,14 @@ impl ToolCtx {
             todos: Arc::new(Mutex::new(Vec::new())),
             bg: Arc::new(Mutex::new(background::BgStore::default())),
             sandbox: crate::sandbox::SandboxPolicy::off(),
+            requirements: Arc::new(Mutex::new(crate::agent::requirements::Ledger::default())),
         }
+    }
+
+    /// 要件台帳を差し替える (cwd の `.lodan/requirements.json` を読んだもの。#65)。
+    pub fn with_requirements(mut self, ledger: crate::agent::requirements::Ledger) -> Self {
+        self.requirements = Arc::new(Mutex::new(ledger));
+        self
     }
 
     pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {

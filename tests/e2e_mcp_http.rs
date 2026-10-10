@@ -75,7 +75,7 @@ async fn http_handshake_list_and_call_round_trip() {
         max_output_bytes: None,
     };
 
-    let client = McpClient::connect("mock-http", &spec, None)
+    let client = McpClient::connect("mock-http", &spec, None, None)
         .await
         .expect("connect HTTP MCP mock");
 

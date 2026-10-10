@@ -26,29 +26,48 @@ pub struct McpClient {
     server_label: String,
     transport: Box<dyn Transport>,
     sampling_enabled: bool,
+    elicitation_enabled: bool,
 }
 
 impl McpClient {
     /// `sampling` に `Some` を渡すと、このサーバの sampling/createMessage を許可し
     /// capability を広告する (config の allowSampling が真のサーバのみ)。
+    /// `elicitation` に `Some` を渡すと、このサーバの `elicitation/create` に利用者の答えを返し、
+    /// capability を広告する (REPL のみ。#83)。
     pub async fn connect(
         label: &str,
         spec: &McpServerSpec,
         sampling: Option<Arc<SamplingProvider>>,
+        elicitation: Option<Arc<crate::mcp::elicitation::ElicitationProvider>>,
     ) -> Result<Self> {
         // server→client リクエストのハンドラ (stdio のみ有効)。
         //   roots/list           → cwd を返す
         //   sampling/createMessage → opt-in 時のみ LLM を呼ぶ
+        //   elicitation/create   → REPL なら利用者に尋ねる
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let roots = crate::mcp::roots::RootsProvider::from_cwd(&cwd);
         let sampling_enabled = sampling.is_some();
+        let elicitation_enabled = elicitation.is_some();
         let handler: transport::ServerRequestHandler =
             Arc::new(move |method: String, params: Option<Value>| {
                 let roots = roots.clone();
                 let sampling = sampling.clone();
+                let elicitation = elicitation.clone();
                 Box::pin(async move {
                     if let Some(result) = roots.handle(&method) {
                         return HandlerOutcome::Result(result);
+                    }
+                    if method == "elicitation/create" {
+                        // 広告していないのに尋ねてきても、method-not-found ではなく decline を返す
+                        // (サーバがその応答を待ったまま固まらないように)。
+                        let Some(elicitation) = elicitation else {
+                            return HandlerOutcome::Result(
+                                crate::mcp::elicitation::ElicitationProvider::declined(),
+                            );
+                        };
+                        return HandlerOutcome::Result(
+                            elicitation.create(params.unwrap_or(Value::Null)).await,
+                        );
                     }
                     if method == "sampling/createMessage" {
                         let Some(sampling) = sampling else {
@@ -72,6 +91,7 @@ impl McpClient {
             server_label: label.to_string(),
             transport,
             sampling_enabled,
+            elicitation_enabled,
         };
         client.handshake().await?;
         Ok(client)
@@ -80,7 +100,7 @@ impl McpClient {
     async fn handshake(&self) -> Result<()> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ClientCapabilities::new(self.sampling_enabled),
+            capabilities: ClientCapabilities::new(self.sampling_enabled, self.elicitation_enabled),
             client_info: ClientInfo {
                 name: CLIENT_NAME,
                 version: CLIENT_VERSION,

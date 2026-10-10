@@ -518,6 +518,7 @@ network = false            # 既定 true。false でサンドボックス内か�
 
 - **transport**: **stdio** (`command`) と **Streamable HTTP** (`url`)。HTTP は POST で JSON-RPC を送り、`application/json` または `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぎ、`headers` で認証ヘッダを付与できる。HTTP の server→client GET ストリームは未対応
 - **`tools/list_changed`**: サーバが `notifications/tools/list_changed` を送ると、**次のターンの入口**で `tools/list` を取り直してそのサーバのツールを入れ替える（`mcp[<server>]: tools changed, now N tool(s)` と表示。`enabledTools` などの絞り込みと `tool_search` の遅延はそのまま効く。system prompt のツール一覧も作り直す）。ターンの途中では入れ替えない（進行中の呼び出しと定義が食い違うため）。受け取れるのは **stdio** だけ（HTTP は POST の応答しか読まないので、サーバからの通知は届かない）
+- **elicitation**（server→client の利用者への問い合わせ）: REPL では `[mcp:<server>] asks: <message>` と出して `requestedSchema` の各プロパティを 1 項目ずつ stdin で尋ね（string / integer / number / boolean / enum に合わせて変換。空行は「答えない」で、必須なら全体を decline）、`{ action: accept, content }` を返す。`-p` では尋ねずに decline（capability は広告しないが、尋ねてきたサーバにも decline を返す）。受け取れるのは stdio だけ
 - **capabilities**: tools / prompts / resources / roots、および opt-in の **sampling**。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストの受信は **stdio のみ**対応。⚠️ roots はサーバに **cwd の絶対パスを開示**します（`.mcp.json` のサーバを信頼する前提と同じ範囲）
 - **permission**: MCP 由来の **tools/call は常に destructive** 扱いで初回呼び出しに `y/n/a/e` 確認 (Claude Code 同様)。**resources は read-only なので非破壊** (ゲートを経ない)
 - **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in ツールのみで継続起動。`prompts/list` / `resources/list` 非対応サーバは warning で skip

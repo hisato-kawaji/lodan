@@ -159,12 +159,13 @@ impl Runtime {
             llm: Arc::clone(&llm),
             model: cfg.llm.active().model.clone(),
         };
-        let mcp_outcome = mcp::registry::load_and_register(&mut registry, Some(sampling_ctx))
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("{}", crate::term::sanitize(&format!("mcp: {e}")));
-                mcp::registry::LoadOutcome::default()
-            });
+        let mcp_outcome =
+            mcp::registry::load_and_register(&mut registry, Some(sampling_ctx), interactive)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("{}", crate::term::sanitize(&format!("mcp: {e}")));
+                    mcp::registry::LoadOutcome::default()
+                });
         if mcp_outcome.servers > 0 {
             notices.say(&format!(
                 "mcp: {} server(s), {} tool(s), {} prompt(s), {} resource(s) registered",

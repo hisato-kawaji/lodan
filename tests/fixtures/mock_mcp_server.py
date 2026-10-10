@@ -74,6 +74,19 @@ ADDED_TOOL = {
 }
 EXTRA_TOOLS: list = []
 
+# ask_user は elicitation/create を送り、get_elicited はその答えが届くまで待って返す (#83)。
+ASK_USER_TOOL = {
+    "name": "ask_user",
+    "description": "Ask the user for a name and an age via elicitation/create.",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+GET_ELICITED_TOOL = {
+    "name": "get_elicited",
+    "description": "Return the client's elicitation reply (waits for it).",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+CAPTURED_ELICIT: list = []
+
 # Captured from the client's response to our server-initiated roots/list request.
 CAPTURED_ROOTS: list = []
 # Captured from the client's response to our server-initiated sampling request.
@@ -94,7 +107,10 @@ def handle(msg: dict[str, Any]) -> None:
     if method is None and isinstance(msg.get("result"), dict):
         result = msg["result"]
         roots = result.get("roots")
-        if isinstance(roots, list):
+        if "action" in result:
+            CAPTURED_ELICIT.clear()
+            CAPTURED_ELICIT.append(result)
+        elif isinstance(roots, list):
             CAPTURED_ROOTS.clear()
             CAPTURED_ROOTS.extend(roots)
         elif isinstance(result.get("content"), dict):
@@ -142,7 +158,10 @@ def handle(msg: dict[str, Any]) -> None:
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {
-                    "tools": [ECHO_TOOL, GET_ROOTS_TOOL, GET_SAMPLE_TOOL, SLEEP_TOOL, ADD_TOOL]
+                    "tools": [
+                        ECHO_TOOL, GET_ROOTS_TOOL, GET_SAMPLE_TOOL, SLEEP_TOOL,
+                        ADD_TOOL, ASK_USER_TOOL, GET_ELICITED_TOOL,
+                    ]
                     + EXTRA_TOOLS
                 },
             }
@@ -182,6 +201,60 @@ def handle(msg: dict[str, Any]) -> None:
                 }
             )
             send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            return
+        if name == "ask_user":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9003,
+                    "method": "elicitation/create",
+                    "params": {
+                        "message": "Who are you?",
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "your name"},
+                                "age": {"type": "integer"},
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                }
+            )
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": "asked"}],
+                        "isError": False,
+                    },
+                }
+            )
+            return
+        if name == "get_elicited":
+            # 答えが届くまで stdin を読み進める (届いた応答は handle が CAPTURED_ELICIT に入れる)。
+            while not CAPTURED_ELICIT:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    try:
+                        handle(json.loads(line))
+                    except Exception:
+                        pass
+            text = json.dumps(CAPTURED_ELICIT[0] if CAPTURED_ELICIT else {}, separators=(",", ":"))
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": text}],
+                        "isError": False,
+                    },
+                }
+            )
             return
         if name == "echo":
             text = json.dumps(args, separators=(",", ":"))

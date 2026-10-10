@@ -957,7 +957,7 @@ fn parse_toml_table(path: &Path, text: &str) -> Result<toml::Table> {
 
 /// `toml::de::Error` を、ファイルの中身を引用せずに言い直す。メッセージ中の引用文字列
 /// (型エラーの `invalid type: string "sk-…"`) も伏せる。
-fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
+pub(crate) fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
     let message = redact_quoted(e.message());
     match e.span() {
         Some(span) => {
@@ -970,12 +970,31 @@ fn describe_toml_error(e: &toml::de::Error, text: &str) -> String {
     }
 }
 
-/// 二重引用符の中身を `…` にする。
-fn redact_quoted(message: &str) -> String {
+/// 引用された値を `…` にする。二重引用符は常に (文字列の値)。バッククォートは、値を引用する
+/// メッセージ (`invalid type: integer `42``、`unknown variant `x``) のときだけ — `unknown field `x``
+/// のバッククォートはキー名なので残す (#140 のレビュー: 数値や enum の値も漏れ得る)。
+pub(crate) fn redact_quoted(message: &str) -> String {
+    let quoted = redact_between(message, '"');
+    if [
+        "invalid type",
+        "invalid value",
+        "unknown variant",
+        "invalid length",
+    ]
+    .iter()
+    .any(|p| quoted.starts_with(p))
+    {
+        redact_between(&quoted, '`')
+    } else {
+        quoted
+    }
+}
+
+fn redact_between(message: &str, delimiter: char) -> String {
     let mut out = String::with_capacity(message.len());
     let mut inside = false;
     for c in message.chars() {
-        if c == '"' {
+        if c == delimiter {
             inside = !inside;
             out.push(c);
             if inside {
@@ -997,9 +1016,13 @@ fn from_layers(layers: Vec<(PathBuf, toml::Table)>) -> Result<(Config, Origins)>
     for (path, table) in layers {
         merge_table(&mut merged, table, "", &path, &mut origins);
     }
+    // 各レイヤーは単体で検証済みなのでここでは落ちないはずだが、落ちたときも値を引用しない
+    // (#123: 不変条件に頼らず、エラー表示の出口ごとに伏せる)。
     let cfg: Config = toml::Value::Table(merged)
         .try_into()
-        .context("merging config layers")?;
+        .map_err(|e: toml::de::Error| {
+            anyhow::anyhow!("merging config layers: {}", redact_quoted(e.message()))
+        })?;
     Ok((cfg, origins))
 }
 
@@ -1085,6 +1108,20 @@ mod tests {
         );
     }
 
+    /// レイヤーを重ねた後の型エラーも値を引用しない (#123)。
+    #[test]
+    fn a_type_error_after_merging_layers_hides_the_value() {
+        let err = from_layers(vec![layer(
+            "project",
+            r#"[agent]
+max_iterations = "sk-not-a-number""#,
+        )])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("merging config layers"), "{err}");
+        assert!(!err.contains("sk-not-a-number"), "{err}");
+    }
+
     #[test]
     fn redact_quoted_hides_every_quoted_segment() {
         assert_eq!(
@@ -1093,6 +1130,19 @@ mod tests {
         );
         assert_eq!(redact_quoted("no quotes"), "no quotes");
         assert_eq!(redact_quoted(r#"unterminated "abc"#), r#"unterminated "…"#);
+        // 値を引用するメッセージではバッククォートも伏せる。キー名のバッククォートは残す。
+        assert_eq!(
+            redact_quoted("invalid type: integer `4242`, expected a string"),
+            "invalid type: integer `…`, expected a string"
+        );
+        assert_eq!(
+            redact_quoted("unknown variant `sk-x`, expected `off` or `on`"),
+            "unknown variant `…`, expected `…` or `…`"
+        );
+        assert_eq!(
+            redact_quoted("unknown field `api_key`, expected `model`"),
+            "unknown field `api_key`, expected `model`"
+        );
     }
 
     fn layer(name: &str, toml_src: &str) -> (PathBuf, toml::Table) {

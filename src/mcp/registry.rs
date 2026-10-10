@@ -146,7 +146,11 @@ pub async fn load_and_register(
                             }
                         }
 
-                        outcome.clients.push(client);
+                        outcome.clients.push(McpServer {
+                            name: server_name.clone(),
+                            spec: spec.clone(),
+                            client,
+                        });
                     }
                     Err(e) => {
                         eprintln!(
@@ -177,6 +181,23 @@ pub struct LoadOutcome {
     pub resources: usize,
     /// MCP サーバが公開する prompt (slash として呼び出される)。
     pub prompts: Vec<McpPrompt>,
-    /// Kept alive by the caller; on Drop the subprocess is killed.
-    pub clients: Vec<Arc<McpClient>>,
+    /// 繋いだサーバ。呼び出し側が持ち続ける (Drop で子プロセスが終わる)。`tools/list_changed` の
+    /// 追従にも使う (#83)。
+    pub clients: Vec<McpServer>,
+}
+
+/// 繋いだ MCP サーバ 1 つ (名前・設定・クライアント)。
+#[derive(Clone)]
+pub struct McpServer {
+    pub name: String,
+    pub spec: crate::mcp::config::McpServerSpec,
+    pub client: Arc<McpClient>,
+}
+
+impl McpServer {
+    /// `tools/list` を取り直して lodan のツールに包む (`notifications/tools/list_changed` の後。#83)。
+    pub async fn refresh_tools(&self) -> anyhow::Result<Vec<McpTool>> {
+        let tools = self.client.list_tools().await?;
+        Ok(wrap_tools(&self.name, &self.spec, tools, &self.client))
+    }
 }

@@ -1436,6 +1436,47 @@ fn a_background_sub_agents_result_is_reported_on_the_next_turn() {
     );
 }
 
+/// MCP サーバが `notifications/tools/list_changed` を送ると、次のターンの入口で `tools/list` を
+/// 取り直してツールを入れ替える (#83)。stdio の mock サーバの `add_tool` が新しいツールを公開する。
+#[test]
+fn mcp_tools_are_refreshed_after_list_changed_on_the_next_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_mcp_server.py");
+    std::fs::write(
+        work.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "mock": { "command": "python3", "args": [fixture] } } })
+            .to_string(),
+    )
+    .unwrap();
+    // 親は 1 ターン目に add_tool を呼ぶ (demo の手順を差し替え)。2 ターン目は挨拶だけ。
+    let steps = serde_json::json!([["mcp__mock__add_tool", {}]]).to_string();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_STEPS", &steps)]);
+    let out = lodan(
+        home.path(),
+        server.port,
+        &["--yes"],
+        Stdin::Piped("run the demo\nnext\n/tools\n/exit\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        shown.contains("mcp[mock]: tools changed, now 6 tool(s)"),
+        "{shown}"
+    );
+    // `/tools` (2 ターン目の後) に新しいツールが載る。
+    assert!(
+        stdout(&out).contains("mcp__mock__added"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

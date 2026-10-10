@@ -50,6 +50,8 @@ pub struct Session {
     /// path-scoped ルール (`.lodan/rules/*.md`, #79) と、このセッションで注入済みの添字。
     rules: Vec<crate::memory::rules::Rule>,
     rules_injected: std::collections::BTreeSet<usize>,
+    /// 繋いだ MCP サーバ。`tools/list_changed` が届いていたら次のターンの入口で取り直す (#83)。
+    mcp_servers: Vec<crate::mcp::registry::McpServer>,
     /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。transcript のレコーダはこれが増えた分だけ
     /// 「書き込み済み」の位置を縮めて数え直す (履歴が短くなっても末尾を取りこぼさない)。
     compacted_away: usize,
@@ -172,6 +174,7 @@ impl Session {
             plan_flag: None,
             rules,
             rules_injected: std::collections::BTreeSet::new(),
+            mcp_servers: Vec::new(),
             compacted_away: 0,
         }
     }
@@ -221,6 +224,62 @@ impl Session {
             extra.push_str(&rule.injection());
         }
         (!extra.is_empty()).then_some(extra)
+    }
+
+    /// いま使っているツール一覧 (`tools/list_changed` で入れ替わる。#83)。`/tools` / `/status` 用。
+    pub fn registry(&self) -> &Arc<ToolRegistry> {
+        &self.registry
+    }
+
+    /// `tools/list_changed` の追従のために、繋いだ MCP サーバを持つ (#83)。
+    pub fn set_mcp_servers(&mut self, servers: Vec<crate::mcp::registry::McpServer>) {
+        self.mcp_servers = servers;
+    }
+
+    /// `notifications/tools/list_changed` を送ってきたサーバの `tools/list` を取り直し、そのサーバの
+    /// ツールを入れ替える (#83)。ターンの入口で呼ぶ: 途中で入れ替えると、進行中の tool_calls と
+    /// 定義が食い違う。registry は共有の `Arc` なので写しを作って差し替え、system prompt の
+    /// ツール一覧も作り直す。
+    async fn refresh_mcp_tools(&mut self) {
+        let changed: Vec<crate::mcp::registry::McpServer> = self
+            .mcp_servers
+            .iter()
+            .filter(|s| s.client.take_tools_changed())
+            .cloned()
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let mut registry = (*self.registry).clone();
+        for server in changed {
+            match server.refresh_tools().await {
+                Ok(tools) => {
+                    let n = tools.len();
+                    registry.replace_server_tools(
+                        &server.name,
+                        tools
+                            .into_iter()
+                            .map(|t| Arc::new(t) as Arc<dyn crate::tools::Tool>)
+                            .collect(),
+                    );
+                    crate::say!("mcp[{}]: tools changed, now {n} tool(s)", server.name);
+                }
+                Err(e) => crate::say!(
+                    "mcp[{}]: tools/list after list_changed failed: {}",
+                    server.name,
+                    crate::term::sanitize(&e.to_string())
+                ),
+            }
+        }
+        self.registry = Arc::new(registry);
+        // 消えたツールを読み込み済みのままにしない。
+        let registry = Arc::clone(&self.registry);
+        self.loaded_tools.retain(|n| registry.get(n).is_some());
+        let system = Self::system_prompt(&self.cfg, &self.ctx.cwd, self.registry.as_ref());
+        match self.history.first_mut() {
+            Some(Message::System { content }) => *content = system,
+            _ => self.history.insert(0, Message::System { content: system }),
+        }
     }
 
     pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
@@ -338,6 +397,7 @@ impl Session {
             return Ok(());
         }
         self.pending_context.extend(submitted.context);
+        self.refresh_mcp_tools().await;
         // 終わったバックグラウンドの子エージェント (#77) の結果を、この入力に添えて知らせる。
         let finished = self
             .ctx

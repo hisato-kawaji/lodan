@@ -186,7 +186,6 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
     let runtime = Runtime::build(&cfg, Notices::Stdout, true).await?;
     // `/model` で作り直す。サブエージェント (Task) と MCP sampling は起動時のクライアントのまま。
     let mut llm_client = Arc::clone(&runtime.llm);
-    let registry = Arc::clone(&runtime.registry);
     let mcp_prompts = &runtime.mcp_prompts;
 
     // 補完対象が出揃ったところで helper を装着する (#42 P7)。
@@ -469,6 +468,8 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
                     "session: {}",
                     recorder.as_ref().map_or("(not saved)", |r| r.id())
                 );
+                // MCP の `tools/list_changed` で入れ替わるので、セッションの現物を見る。
+                let registry = session.registry();
                 let deferred = registry.deferred_names().len();
                 println!(
                     "tools: {} of {} visible{}  hooks: {}  mcp prompts: {}",
@@ -636,7 +637,7 @@ pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
                 continue;
             }
 
-            match handle_slash(head, &registry, &user_commands, mcp_prompts) {
+            match handle_slash(head, session.registry(), &user_commands, mcp_prompts) {
                 SlashResult::Exit => break,
                 SlashResult::Handled => continue,
                 SlashResult::Unknown => {

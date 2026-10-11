@@ -37,6 +37,12 @@ pub struct Config {
     pub sandbox: crate::sandbox::SandboxConfig,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
+    /// 検証ループ (#65 D1)。ファイルを変えたターンの最終応答の直前に走らせ、失敗したら差し戻す。
+    #[serde(default)]
+    pub verify: Vec<crate::verify::VerifyConfig>,
+    /// 無効にする `[[verify]]` の `id` (hook と同じ規則でレイヤー間を連結する)。
+    #[serde(default)]
+    pub disabled_verify: Vec<String>,
     /// 無効にする hook の `id`。レイヤー間で連結される (プロジェクト側からユーザ設定の hook を
     /// 名指しで外せる。逆も同じ)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -324,6 +330,9 @@ pub struct AgentConfig {
     /// 本文もツール呼び出しも無い応答 (典型は thinking モデルの「思考だけ」) を、1 回だけ「答えを
     /// 書け」と促して続ける (#111)。既定 true。思考の有無は問わない (空の応答は答えではない)。
     pub empty_reply_nudge: bool,
+    /// 検証 (`[[verify]]`) が失敗したとき、モデルに差し戻して直させる回数の上限 (1 ターンあたり)。
+    /// 既定 2。0 で「走らせるが差し戻さない」(結果だけ知らせて終える)。
+    pub max_repairs: u32,
     /// 要件台帳 (#65 B1/B2)。利用者の依頼から検査可能な要件を LLM で抜き出して
     /// `.lodan/requirements.json` に持ち、system prompt に常に描画し、未達のまま終わろうとしたら
     /// 促す。既定 false (抽出に LLM 呼び出しが 1 回増える。ablation で寄与を測る)。
@@ -395,6 +404,9 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 32_768;
 pub const DEFAULT_MAX_RETRIES: u32 = 3;
 /// 再試行待ちの起点 (ミリ秒) の既定値。500 → 1000 → 2000ms と伸びる。
 pub const DEFAULT_RETRY_BASE_MS: u64 = 500;
+
+/// `[[verify]]` の失敗を差し戻す既定の回数 (#65 D1)。
+const DEFAULT_MAX_REPAIRS: u32 = 2;
 
 /// 自動圧縮を発火する既定のコンテキスト使用率 (%)。
 pub const DEFAULT_AUTO_COMPACT_PERCENT: u8 = 80;
@@ -495,6 +507,7 @@ impl Default for AgentConfig {
             auto_approve: false,
             finish_nudge: false,
             requirements: false,
+            max_repairs: DEFAULT_MAX_REPAIRS,
             write_max_lines: 0,
             empty_reply_nudge: true,
             malformed_retry: true,
@@ -763,6 +776,22 @@ impl Config {
             self.agent.requirements = v;
             mark("agent.requirements".into());
         }
+        if let Some(v) = o.max_repairs {
+            self.agent.max_repairs = v;
+            mark("agent.max_repairs".into());
+        }
+        if !o.verify.is_empty() {
+            // `--verify` は設定に書いた分へ**足す** (id 無しなので外す対象にはならない)。
+            for command in o.verify {
+                self.verify.push(crate::verify::VerifyConfig {
+                    id: None,
+                    command,
+                    paths: Vec::new(),
+                    timeout_secs: None,
+                });
+            }
+            mark("verify".into());
+        }
         if let Some(v) = o.malformed_retry {
             self.agent.malformed_retry = v;
             mark("agent.malformed_retry".into());
@@ -858,6 +887,9 @@ pub struct Overrides {
     pub auto_approve: bool,
     pub finish_nudge: Option<bool>,
     pub requirements: Option<bool>,
+    pub max_repairs: Option<u32>,
+    /// `--verify <CMD>` (繰り返し可)。設定の `[[verify]]` に足す。
+    pub verify: Vec<String>,
     pub empty_reply_nudge: Option<bool>,
     pub malformed_retry: Option<bool>,
     pub dup_suppress: Option<bool>,
@@ -958,6 +990,8 @@ impl std::fmt::Display for Origin {
 const CONCAT_ARRAY_KEYS: &[&str] = &[
     "hooks",
     "disabled_hooks",
+    "verify",
+    "disabled_verify",
     "permissions.allow",
     "permissions.deny",
     "permissions.ask",

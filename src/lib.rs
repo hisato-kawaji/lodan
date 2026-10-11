@@ -26,3 +26,4 @@ pub mod term;
 pub mod tools;
 pub mod trust;
 pub mod undo;
+pub mod verify;

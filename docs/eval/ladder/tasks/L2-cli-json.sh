@@ -11,6 +11,10 @@ setup() {
   printf '{"a": 1}\n' > sample/data.json
 }
 
+# #65 D1 (`verify-none`) で検証として強制するコマンド。プロンプトが明記している実行方法
+# だけを使う (checks の隠し条件は入れない — それはテストを教えることになる)。
+VERIFY="python3 scanner.py scan sample"
+
 PROMPT="Create scanner.py in the current directory, a Python 3 CLI using only the standard library. It must support: python3 scanner.py scan <dir> — which scans <dir> recursively and writes state/<basename of dir>.json containing exactly these fields: name (the directory basename, a string), files (integer count of files found, not directories), types (sorted list of distinct file extensions without the leading dot), has_readme (boolean, true if any file is named README.md). Create the state directory if it does not exist. It must work when run as: python3 scanner.py scan sample"
 
 checks() {

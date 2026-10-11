@@ -53,13 +53,18 @@ impl VerifyConfig {
         })
     }
 
-    /// `changed` のどれかが `paths` に当たるか。`paths` が空なら、何か変わっていれば当たる。
-    pub fn applies(&self, changed: &[PathBuf], cwd: &Path) -> bool {
+    /// `changed` のどれかが `paths` に当たるか。
+    ///
+    /// `paths` が空なら「このターンで何かを変えたら走る」。`ran_shell` は Bash が成功したこと —
+    /// lodan は Bash が**どのファイルを変えたか知らない**ので、`paths` 無しの検証はこれでも走らせる
+    /// (`sed -i` のような書き換えを取りこぼさないため)。`paths` つきの検証は、ファイル系ツールが
+    /// 触ったパスだけで判定する (#149 のレビュー)。
+    pub fn applies(&self, changed: &[PathBuf], ran_shell: bool, cwd: &Path) -> bool {
+        if self.paths.is_empty() {
+            return !changed.is_empty() || ran_shell;
+        }
         if changed.is_empty() {
             return false;
-        }
-        if self.paths.is_empty() {
-            return true;
         }
         let matchers: Vec<globset::GlobMatcher> =
             self.paths.iter().filter_map(|p| glob(p)).collect();
@@ -102,10 +107,14 @@ pub struct Outcome {
 pub async fn run_applicable(
     verifies: &[VerifyConfig],
     changed: &[PathBuf],
+    ran_shell: bool,
     cwd: &Path,
 ) -> Vec<Outcome> {
     let mut out = Vec::new();
-    for v in verifies.iter().filter(|v| v.applies(changed, cwd)) {
+    for v in verifies
+        .iter()
+        .filter(|v| v.applies(changed, ran_shell, cwd))
+    {
         out.push(run_one(v, cwd).await);
     }
     out
@@ -248,15 +257,18 @@ mod tests {
         let py = cfg(None, "pytest", &["**/*.py"]);
         let any = cfg(None, "make", &[]);
         let changed = |fs: &[&str]| fs.iter().map(|f| cwd.join(f)).collect::<Vec<_>>();
-        assert!(py.applies(&changed(&["src/a.py"]), cwd));
-        assert!(!py.applies(&changed(&["src/b.rs", "notes.md"]), cwd));
+        assert!(py.applies(&changed(&["src/a.py"]), false, cwd));
+        assert!(!py.applies(&changed(&["src/b.rs", "notes.md"]), false, cwd));
         // paths 無しは「何か変わったら走る」。何も変わっていなければ走らない。
-        assert!(any.applies(&changed(&["notes.md"]), cwd));
-        assert!(!any.applies(&[], cwd));
+        assert!(any.applies(&changed(&["notes.md"]), false, cwd));
+        assert!(!any.applies(&[], false, cwd));
+        // Bash が走ったターンは、どのファイルが変わったか分からないので paths 無しだけ走らせる。
+        assert!(any.applies(&[], true, cwd));
+        assert!(!py.applies(&[], true, cwd));
         // cwd の外のファイルは当たらない。
-        assert!(!py.applies(&[PathBuf::from("/tmp/outside.py")], cwd));
+        assert!(!py.applies(&[PathBuf::from("/tmp/outside.py")], false, cwd));
         // 拡張子だけのパターンはどの階層にも当たる。
-        assert!(cfg(None, "x", &["*.py"]).applies(&changed(&["src/a.py"]), cwd));
+        assert!(cfg(None, "x", &["*.py"]).applies(&changed(&["src/a.py"]), false, cwd));
     }
 
     #[test]
@@ -286,7 +298,7 @@ mod tests {
         let changed = vec![dir.path().join("a.py")];
         let ok = cfg(Some("ok"), "echo fine", &[]);
         let bad = cfg(None, "echo boom >&2; exit 3", &[]);
-        let outs = run_applicable(&[ok, bad], &changed, dir.path()).await;
+        let outs = run_applicable(&[ok, bad], &changed, false, dir.path()).await;
         assert_eq!(outs.len(), 2);
         assert!(outs[0].ok && outs[0].output == "fine" && outs[0].label == "ok");
         assert!(!outs[1].ok && outs[1].output == "boom");
@@ -297,13 +309,24 @@ mod tests {
         assert!(note.contains("$ echo boom >&2; exit 3") && note.contains("boom"));
     }
 
+    /// Bash が走ったターン: `paths` 無しの検証だけが走る (#149 のレビュー)。
+    #[tokio::test]
+    async fn a_shell_turn_runs_only_the_paths_less_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let any = cfg(Some("any"), "echo ran", &[]);
+        let py = cfg(Some("py"), "echo nope", &["**/*.py"]);
+        let outs = run_applicable(&[any, py], &[], true, dir.path()).await;
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].label, "any");
+    }
+
     #[tokio::test]
     async fn a_hung_command_fails_after_its_own_timeout() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"), "x").unwrap();
         let mut slow = cfg(None, "sleep 30", &[]);
         slow.timeout_secs = Some(1);
-        let outs = run_applicable(&[slow], &[dir.path().join("a.py")], dir.path()).await;
+        let outs = run_applicable(&[slow], &[dir.path().join("a.py")], false, dir.path()).await;
         assert!(!outs[0].ok && outs[0].output.contains("timed out after 1s"));
     }
 

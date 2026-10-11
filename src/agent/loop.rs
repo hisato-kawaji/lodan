@@ -58,6 +58,9 @@ pub struct Session {
     active_verify: Vec<crate::verify::VerifyConfig>,
     /// このターンでファイル系ツールが触ったパス。検証の `paths` 判定に使う。
     changed_files: Vec<std::path::PathBuf>,
+    /// このターンで Bash が成功したか。どのファイルを変えたかは分からないので、`paths` 無しの
+    /// 検証はこれでも走らせる (#149 のレビュー)。
+    ran_shell: bool,
     /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。transcript のレコーダはこれが増えた分だけ
     /// 「書き込み済み」の位置を縮めて数え直す (履歴が短くなっても末尾を取りこぼさない)。
     compacted_away: usize,
@@ -200,6 +203,7 @@ impl Session {
             requirements_version: 0,
             active_verify: crate::verify::effective(&cfg_verify, &cfg_disabled_verify),
             changed_files: Vec::new(),
+            ran_shell: false,
             compacted_away: 0,
         }
     }
@@ -501,6 +505,7 @@ impl Session {
         // ターンごとの値。hook にブロックされたターンでも前の値を残さない。
         self.last_reply_thought_chars = None;
         self.changed_files.clear();
+        self.ran_shell = false;
         if let Some(reason) = &submitted.block {
             crate::say!("prompt blocked by hook: {}", crate::term::sanitize(reason));
             return Ok(());
@@ -735,10 +740,13 @@ impl Session {
                 // #65 D1: ファイルを変えたターンなら、最終応答の前に検証を走らせる。失敗したら
                 // 出力を差し戻して直させる (上限 `max_repairs`)。要件台帳より先に見る — 検証が
                 // 通らないものを「要件は満たした」と記録させない。
-                if !self.active_verify.is_empty() && !self.changed_files.is_empty() {
+                if !self.active_verify.is_empty()
+                    && (!self.changed_files.is_empty() || self.ran_shell)
+                {
                     let outcomes = crate::verify::run_applicable(
                         &self.active_verify,
                         &self.changed_files,
+                        self.ran_shell,
                         &self.ctx.cwd,
                     )
                     .await;
@@ -1397,13 +1405,18 @@ impl Session {
             Decision::Allow => {
                 // 実行が確定してから変更前を退避する (/undo 用)。
                 self.snapshot_for_undo(tool.name(), args);
-                match tool.execute(args.clone(), &self.ctx).await {
+                let out = match tool.execute(args.clone(), &self.ctx).await {
                     Ok(o) => o,
                     Err(e) => {
                         *reason = "tool_error";
                         ToolOutput::error(format!("tool error: {e}"))
                     }
+                };
+                // Bash は何を変えたか分からない。検証 (#65 D1) の判断に使う。
+                if tool.name() == "Bash" && !out.is_error {
+                    self.ran_shell = true;
                 }
+                out
             }
         }
     }

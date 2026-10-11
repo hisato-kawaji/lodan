@@ -91,9 +91,10 @@ flags_for_config() {
     split-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --write-max-lines 80" ;;
     # 上限 40 行。ラダーの L2 が作るファイルは 51-77 行なので、80 では一度も発動しない (実測)。
     split40-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --write-max-lines 40" ;;
-    # think-none と同条件で、タスクが指定した実行方法 ($VERIFY) を検証として強制する (#65 D1)。
-    # タスク側が VERIFY を定義していなければ think-none と同じ (差は出ない)。
-    verify-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none${VERIFY:+ --verify }${VERIFY:-}" ;;
+    # think-none と同条件で、タスクが定義した実行方法 ($VERIFY) を検証として強制する (#65 D1)。
+    # `--verify` はフラグ列の単語分割で壊れる (コマンドに空白が入る) ので、実行ごとの
+    # `.lodan/config.toml` に `[[verify]]` として書く (下の run_one を参照)。
+    verify-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none" ;;
     think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
     *) echo "unknown config: $1" >&2; return 1 ;;
   esac
@@ -167,6 +168,13 @@ for task_file in $TASK_FILES; do
         mkdir -p "$work/.lodan"
         printf '[llm.local]\ntimeout_secs = 900\n\n[llm.sakana]\ntimeout_secs = 900\n' \
           > "$work/.lodan/config.toml"
+        # `verify-none` のときだけ、タスクが定義した検証コマンド ($VERIFY) を [[verify]] に書く
+        # (#65 D1)。空白を含むコマンドをフラグ列で渡すと単語分割で壊れるため、設定ファイル経由。
+        if [ "$config" = "verify-none" ] && [ -n "${VERIFY:-}" ]; then
+          printf '\n[[verify]]\nid = "task"\ncommand = %s\ntimeout_secs = 120\n' \
+            "$(printf '%s' "$VERIFY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+            >> "$work/.lodan/config.toml"
+        fi
 
         cd "$work" || exit 1
         setup

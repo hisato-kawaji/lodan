@@ -63,6 +63,10 @@ if __name__ == "__main__":
 PY
 }
 
+# #65 D1 (`verify-none`) で検証として強制するコマンド。プロンプトが明記している実行方法
+# だけを使う (checks の隠し条件は入れない — それはテストを教えることになる)。
+VERIFY="python3 -m py_compile server.py"
+
 PROMPT="Create server.py in the current directory: a JSON HTTP API using only the Python 3 standard library (http.server). It must accept a --port <port> command line option and serve two GET endpoints. GET /health returns {\"status\": \"ok\"}. GET /sum?a=<int>&b=<int> returns {\"result\": <a+b>}. Both responses must have Content-Type application/json. Start it with: python3 server.py --port 8000"
 
 checks() {

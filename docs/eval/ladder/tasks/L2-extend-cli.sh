@@ -47,6 +47,10 @@ if __name__ == "__main__":
 PY
 }
 
+# #65 D1 (`verify-none`) で検証として強制するコマンド。プロンプトが明記している実行方法
+# だけを使う (checks の隠し条件は入れない — それはテストを教えることになる)。
+VERIFY="python3 scanner.py scan sample && python3 scanner.py report sample"
+
 PROMPT="Read scanner.py in the current directory, then add a new subcommand to it: python3 scanner.py report <name> — it reads state/<name>.json and writes state/<name>.txt containing two lines: 'name: <name>' and 'files: <count>' taken from the JSON. It must fail with a non-zero exit status if state/<name>.json does not exist. Keep the existing scan subcommand working exactly as before."
 
 checks() {

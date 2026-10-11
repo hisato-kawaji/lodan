@@ -18,7 +18,7 @@ impl Tool for RequirementsTool {
         "Update the requirements ledger shown in the system prompt. action \"done\": mark a \
          requirements verified (give ids — one or several — and evidence such as the command you \
          ran; mark several at once when one verification covers them). action \"drop\": \
-         mark it out of scope (give id and reason). action \"add\": record a requirement you \
+         mark them out of scope (give ids and reason). action \"add\": record a requirement you \
          discovered (give text). The ledger is kept by lodan and survives context compaction."
     }
 
@@ -97,9 +97,13 @@ impl Tool for RequirementsTool {
                         "Requirements: `evidence` is required for done — say how you verified it",
                     ));
                 }
-                ids.iter()
-                    .try_for_each(|id| ledger.mark_done(*id, &note))
-                    .map(|_| format!("requirement(s) {} marked done", list(&ids)))
+                // 1 つでも無い id があれば何も変えない (途中まで done にして止めると、何が反映された
+                // か分からず、まとめて記録した意味が無くなる)。
+                ledger.check_ids(&ids).and_then(|_| {
+                    ids.iter()
+                        .try_for_each(|id| ledger.mark_done(*id, &note))
+                        .map(|_| format!("requirement(s) {} marked done", list(&ids)))
+                })
             }
             "drop" => {
                 let ids = ids()?;
@@ -108,9 +112,11 @@ impl Tool for RequirementsTool {
                         "Requirements: `evidence` (the reason) is required for drop",
                     ));
                 }
-                ids.iter()
-                    .try_for_each(|id| ledger.drop_item(*id, &note))
-                    .map(|_| format!("requirement(s) {} dropped", list(&ids)))
+                ledger.check_ids(&ids).and_then(|_| {
+                    ids.iter()
+                        .try_for_each(|id| ledger.drop_item(*id, &note))
+                        .map(|_| format!("requirement(s) {} dropped", list(&ids)))
+                })
             }
             "add" => {
                 let text = args
@@ -194,6 +200,21 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error && out.content.contains("no requirement with id 9"));
+        // 無い id が混ざったら何も変えない。
+        ctx.requirements.lock().unwrap().add(["f".to_string()]);
+        let out = run(serde_json::json!({ "action": "done", "ids": [6, 99], "evidence": "x" }))
+            .await
+            .unwrap();
+        assert!(
+            out.is_error && out.content.contains("99"),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            ctx.requirements.lock().unwrap().unmet().len(),
+            2,
+            "5 and 6 stay open"
+        );
         assert!(run(serde_json::json!({ "action": "nope" })).await.is_err());
     }
 }

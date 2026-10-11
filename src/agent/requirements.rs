@@ -123,6 +123,17 @@ impl Ledger {
         Ok(())
     }
 
+    /// 全部ある id か。無いものがあれば、その最初の id を言う。
+    pub fn check_ids(&self, ids: &[u32]) -> Result<(), String> {
+        match ids
+            .iter()
+            .find(|id| !self.items.iter().any(|r| r.id == **id))
+        {
+            Some(missing) => Err(format!("no requirement with id {missing}")),
+            None => Ok(()),
+        }
+    }
+
     pub fn clear(&mut self) {
         self.items.clear();
         self.touch();

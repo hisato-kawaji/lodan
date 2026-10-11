@@ -16,8 +16,9 @@ impl Tool for RequirementsTool {
 
     fn description(&self) -> &str {
         "Update the requirements ledger shown in the system prompt. action \"done\": mark a \
-         requirement verified (give id and evidence such as the command you ran). action \"drop\": \
-         mark it out of scope (give id and reason). action \"add\": record a requirement you \
+         requirements verified (give ids — one or several — and evidence such as the command you \
+         ran; mark several at once when one verification covers them). action \"drop\": \
+         mark them out of scope (give ids and reason). action \"add\": record a requirement you \
          discovered (give text). The ledger is kept by lodan and survives context compaction."
     }
 
@@ -26,7 +27,8 @@ impl Tool for RequirementsTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["done", "drop", "add"] },
-                "id": { "type": "integer", "description": "Requirement id (for done / drop)" },
+                "ids": { "type": "array", "items": { "type": "integer" }, "description": "Requirement ids (for done / drop); `id` with a single integer also works" },
+                "id": { "type": "integer", "description": "A single requirement id (for done / drop)" },
                 "evidence": { "type": "string", "description": "How it was verified (done) or why it is out of scope (drop)" },
                 "text": { "type": "string", "description": "The requirement (for add)" }
             },
@@ -47,13 +49,36 @@ impl Tool for RequirementsTool {
             .get("action")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("Requirements: missing `action`".into()))?;
-        let id = || {
-            args.get("id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .ok_or_else(|| {
-                    ToolError::InvalidArgs("Requirements: `id` (integer) required".into())
+        // `ids` (複数) か `id` (1 つ)。1 回の検証で複数を done にできるようにして往復を減らす
+        // (ラダー実測: 9B は 1 件ずつ呼ぶと 1 件あたり LLM 往復が 1 回増える)。
+        let ids = || -> Result<Vec<u32>, ToolError> {
+            let mut out: Vec<u32> = args
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|v| v as u32)
+                        .collect()
                 })
+                .unwrap_or_default();
+            if let Some(one) = args.get("id").and_then(|v| v.as_u64()) {
+                out.push(one as u32);
+            }
+            out.sort_unstable();
+            out.dedup();
+            if out.is_empty() {
+                return Err(ToolError::InvalidArgs(
+                    "Requirements: `ids` (array of integers) or `id` required".into(),
+                ));
+            }
+            Ok(out)
+        };
+        let list = |ids: &[u32]| {
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let note = args
             .get("evidence")
@@ -66,26 +91,32 @@ impl Tool for RequirementsTool {
             .map_err(|_| ToolError::Other("requirements ledger poisoned".into()))?;
         let result = match action {
             "done" => {
-                let id = id()?;
+                let ids = ids()?;
                 if note.trim().is_empty() {
                     return Ok(ToolOutput::error(
                         "Requirements: `evidence` is required for done — say how you verified it",
                     ));
                 }
-                ledger
-                    .mark_done(id, &note)
-                    .map(|_| format!("requirement {id} marked done"))
+                // 1 つでも無い id があれば何も変えない (途中まで done にして止めると、何が反映された
+                // か分からず、まとめて記録した意味が無くなる)。
+                ledger.check_ids(&ids).and_then(|_| {
+                    ids.iter()
+                        .try_for_each(|id| ledger.mark_done(*id, &note))
+                        .map(|_| format!("requirement(s) {} marked done", list(&ids)))
+                })
             }
             "drop" => {
-                let id = id()?;
+                let ids = ids()?;
                 if note.trim().is_empty() {
                     return Ok(ToolOutput::error(
                         "Requirements: `evidence` (the reason) is required for drop",
                     ));
                 }
-                ledger
-                    .drop_item(id, &note)
-                    .map(|_| format!("requirement {id} dropped"))
+                ledger.check_ids(&ids).and_then(|_| {
+                    ids.iter()
+                        .try_for_each(|id| ledger.drop_item(*id, &note))
+                        .map(|_| format!("requirement(s) {} dropped", list(&ids)))
+                })
             }
             "add" => {
                 let text = args
@@ -142,19 +173,48 @@ mod tests {
         let out = run(serde_json::json!({ "action": "done", "id": 1, "evidence": "ran it" }))
             .await
             .unwrap();
-        assert_eq!(out.content, "requirement 1 marked done; 1 still open");
+        assert_eq!(out.content, "requirement(s) 1 marked done; 1 still open");
         let out = run(serde_json::json!({ "action": "drop", "id": 2, "evidence": "not needed" }))
             .await
             .unwrap();
-        assert_eq!(out.content, "requirement 2 dropped; 0 still open");
+        assert_eq!(out.content, "requirement(s) 2 dropped; 0 still open");
+        // 複数を 1 回で。
+        ctx.requirements
+            .lock()
+            .unwrap()
+            .add(["d".to_string(), "e".to_string()]);
+        let out = run(serde_json::json!({ "action": "done", "ids": [3, 4], "evidence": "pytest" }))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "requirement(s) 3, 4 marked done; 0 still open");
+        assert!(
+            run(serde_json::json!({ "action": "done", "evidence": "x" }))
+                .await
+                .is_err()
+        );
         let out = run(serde_json::json!({ "action": "add", "text": "c" }))
             .await
             .unwrap();
-        assert_eq!(out.content, "requirement 3 added; 1 still open");
+        assert_eq!(out.content, "requirement 5 added; 1 still open");
         let out = run(serde_json::json!({ "action": "done", "id": 9, "evidence": "x" }))
             .await
             .unwrap();
         assert!(out.is_error && out.content.contains("no requirement with id 9"));
+        // 無い id が混ざったら何も変えない。
+        ctx.requirements.lock().unwrap().add(["f".to_string()]);
+        let out = run(serde_json::json!({ "action": "done", "ids": [6, 99], "evidence": "x" }))
+            .await
+            .unwrap();
+        assert!(
+            out.is_error && out.content.contains("99"),
+            "{}",
+            out.content
+        );
+        assert_eq!(
+            ctx.requirements.lock().unwrap().unmet().len(),
+            2,
+            "5 and 6 stay open"
+        );
         assert!(run(serde_json::json!({ "action": "nope" })).await.is_err());
     }
 }

@@ -1937,10 +1937,10 @@ const MAX_REQUIREMENTS_NUDGES: u32 = 2;
 /// #65: 未達の要件を残したまま終わろうとしたときに注入する指示 (一覧を挟む)。
 const REQUIREMENTS_NUDGE: &str = "[lodan] Requirements ledger check — these requirements are \
     not marked done yet:";
-const REQUIREMENTS_NUDGE_TAIL: &str = "For each one: finish it and verify, then call the \
-    Requirements tool with action \"done\", its id and the evidence (e.g. the command you ran). \
-    If one is impossible or out of scope, call Requirements with action \"drop\" and the reason. \
-    Only then give your final answer.";
+const REQUIREMENTS_NUDGE_TAIL: &str = "Finish and verify them, then call the Requirements tool \
+    once with action \"done\", the ids of everything that verification covered, and the evidence \
+    (e.g. the command you ran). If one is impossible or out of scope, call Requirements with \
+    action \"drop\", its ids and the reason. Only then give your final answer.";
 
 /// #111: 空応答を答えとして書き直させる回数の上限。
 const MAX_EMPTY_REPLY_NUDGES: u32 = 1;

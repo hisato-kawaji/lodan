@@ -1405,7 +1405,7 @@ impl Session {
             Decision::Allow => {
                 // 実行が確定してから変更前を退避する (/undo 用)。
                 self.snapshot_for_undo(tool.name(), args);
-                let out = match tool.execute(args.clone(), &self.ctx).await {
+                let mut out = match tool.execute(args.clone(), &self.ctx).await {
                     Ok(o) => o,
                     Err(e) => {
                         *reason = "tool_error";
@@ -1416,9 +1416,65 @@ impl Session {
                 if tool.name() == "Bash" && !out.is_error {
                     self.ran_shell = true;
                 }
+                // #65 D2: 書けたファイルの構文を即座に検査する。壊れていても書き込みは取り消さず、
+                // 注記を足してモデルに直させる。
+                if !out.is_error {
+                    self.append_syntax_note(tool.name(), args, &mut out).await;
+                }
                 out
             }
         }
+    }
+
+    /// 書けたファイルの構文を検査して、壊れていればツール結果の後ろに注記を足す (#65 D2)。
+    /// 対象は `snapshot_for_undo` と同じファイル系ツールと `path` 引数。
+    async fn append_syntax_note(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        out: &mut ToolOutput,
+    ) {
+        if !self.cfg.agent.syntax_check {
+            return;
+        }
+        let Some(abs) = Self::file_arg(&self.ctx.cwd, tool_name, args) else {
+            return;
+        };
+        let Some(outcome) = crate::tools::syntax::check(&abs, &self.cfg.agent.syntax_checks).await
+        else {
+            return;
+        };
+        crate::runlog::record(
+            "syntax_check",
+            serde_json::json!({
+                "turn": self.turn_seq,
+                "path": abs.display().to_string(),
+                "ok": outcome.ok,
+                "ms": outcome.ms,
+            }),
+        );
+        if !outcome.ok {
+            crate::say!("{}", crate::term::dim("[lodan] syntax check failed"));
+            out.content.push_str(&outcome.note());
+        }
+    }
+
+    /// ファイル系ツールの `path` 引数を絶対パスにしたもの (対象外のツールは None)。
+    fn file_arg(
+        cwd: &std::path::Path,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<std::path::PathBuf> {
+        if !UNDOABLE_FILE_TOOLS.contains(&tool_name) {
+            return None;
+        }
+        let path = args.get("path").and_then(|v| v.as_str())?;
+        let abs = std::path::PathBuf::from(path);
+        Some(if abs.is_absolute() {
+            abs
+        } else {
+            cwd.join(abs)
+        })
     }
 
     /// ファイル系ツールの実行直前に変更前スナップショットを取る (`/undo` 用)。
@@ -1426,17 +1482,8 @@ impl Session {
     /// 相対なら ctx.cwd 基準。実行が失敗してもスナップショットは台帳に残るが、
     /// 変更前と同じ内容を書き戻すだけなので undo しても無害。
     fn snapshot_for_undo(&mut self, tool_name: &str, args: &serde_json::Value) {
-        if !UNDOABLE_FILE_TOOLS.contains(&tool_name) {
+        let Some(abs) = Self::file_arg(&self.ctx.cwd, tool_name, args) else {
             return;
-        }
-        let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
-            return;
-        };
-        let abs = std::path::PathBuf::from(path);
-        let abs = if abs.is_absolute() {
-            abs
-        } else {
-            self.ctx.cwd.join(abs)
         };
         self.undo.record_before(self.turn_seq, &abs);
         // 検証 (#65 D1) の `paths` 判定に使う。同じファイルを何度も触っても 1 回だけ。

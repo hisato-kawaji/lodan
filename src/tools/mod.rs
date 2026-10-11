@@ -22,6 +22,8 @@ pub mod monitor;
 
 // バックグラウンドプロセスの共有ストア（Bash run_in_background ↔ Monitor / KillShell）
 pub mod background;
+/// 編集直後の構文チェック (#65 D2)。`Tool` ではなく、ループが書き込みの後に呼ぶ補助。
+pub mod syntax;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

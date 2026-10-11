@@ -337,6 +337,13 @@ pub struct AgentConfig {
     /// `.lodan/requirements.json` に持ち、system prompt に常に描画し、未達のまま終わろうとしたら
     /// 促す。既定 false (抽出に LLM 呼び出しが 1 回増える。ablation で寄与を測る)。
     pub requirements: bool,
+    /// 編集直後の構文チェック (#65 D2)。`Write` / `Edit` などが成功した直後に、拡張子ごとの
+    /// コマンドでそのファイルだけを検査し、壊れていたらツール結果の後ろに注記を足す (ブロックはしない)。
+    /// 既定 false (ablation で寄与を測る)。
+    pub syntax_check: bool,
+    /// `syntax_check` の拡張子 → コマンド。`{path}` が検査するファイルに置き換わる。
+    /// 既定 (`py` / `js` / `json` / `sh` …) を上書き・追加でき、空文字は「検査しない」。
+    pub syntax_checks: std::collections::BTreeMap<String, String>,
     /// `Write` 1 回の内容の行数上限 (#65 A2)。超えたら書かずに「骨格を書いてから Edit で埋める」手順を
     /// 返す。0 (既定) は無制限。小型モデルは数百行を 1 引数で一貫して書けないので、要求しない。
     pub write_max_lines: usize,
@@ -509,6 +516,8 @@ impl Default for AgentConfig {
             requirements: false,
             max_repairs: DEFAULT_MAX_REPAIRS,
             write_max_lines: 0,
+            syntax_check: false,
+            syntax_checks: std::collections::BTreeMap::new(),
             empty_reply_nudge: true,
             malformed_retry: true,
             dup_suppress: true,
@@ -845,6 +854,10 @@ impl Config {
             self.agent.write_max_lines = v;
             mark("agent.write_max_lines".into());
         }
+        if let Some(v) = o.syntax_check {
+            self.agent.syntax_check = v;
+            mark("agent.syntax_check".into());
+        }
         if let Some(v) = o.append_system_prompt {
             self.agent.append_system_prompt = Some(v);
             mark("agent.append_system_prompt".into());
@@ -902,6 +915,7 @@ pub struct Overrides {
     /// `--max-turns`: `agent.max_iterations` を上書きする。
     pub max_iterations: Option<usize>,
     pub write_max_lines: Option<usize>,
+    pub syntax_check: Option<bool>,
     pub append_system_prompt: Option<String>,
     pub permission_mode: Option<PermissionMode>,
     pub allowed_tools: Vec<String>,

@@ -83,6 +83,8 @@ flags_for_config() {
     # temp と同条件で推論の深さだけを変える (#78)。temp (サーバ既定) との差が effort の寄与。
     # 受け付ける語彙はサーバ次第: Ollama は none で thinking を切れる。kimi / gpt-oss は low。
     think-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none" ;;
+    # think-none と同条件で tool_choice=required (全応答をツール呼び出しに。最終回答は Finish) だけを足す (#65 A1)。
+    required-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --tool-choice required" ;;
     # think-none と同条件で要件台帳だけを足す (thinking モデルは think-none が基準。#65 B1/B2)。
     req-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --requirements" ;;
     # think-none と同条件で Write の行数上限だけを足す (#65 A2)。

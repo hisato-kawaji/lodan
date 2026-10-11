@@ -23,6 +23,8 @@ pub struct OpenAiClient {
     reasoning_effort: Option<String>,
     /// プランモードの間だけ `reasoning_effort` の代わりに使う値。
     plan_reasoning_effort: Option<String>,
+    /// `required` なら全リクエストをツール呼び出しで答えさせ、`Finish` を足して最終回答を受ける (#65 A1)。
+    require_tool_call: bool,
     /// body にそのまま足すサーバ固有のパラメータ。`new` で予約キーとの衝突を弾いてある。
     extra_body: serde_json::Map<String, serde_json::Value>,
     retry: RetryPolicy,
@@ -205,6 +207,13 @@ impl OpenAiClient {
                 .plan_reasoning_effort
                 .clone()
                 .filter(|e| !e.trim().is_empty()),
+            require_tool_call: match cfg.tool_choice.as_deref().map(str::trim) {
+                None | Some("") | Some("auto") => false,
+                Some("required") => true,
+                Some(other) => anyhow::bail!(
+                    "tool_choice `{other}` is not supported (use `auto` or `required`)"
+                ),
+            },
             extra_body: cfg.extra_body.clone(),
             retry: RetryPolicy {
                 max_retries: cfg.max_retries,
@@ -214,6 +223,63 @@ impl OpenAiClient {
                 .then(|| Duration::from_secs(cfg.stream_idle_timeout_secs)),
             http,
         })
+    }
+
+    /// このリクエストの `tool_choice`。ツールが無ければ送らない (`required` で tools 無しは
+    /// サーバがエラーにする)。
+    fn choice(&self, tools: &[ToolSpec<'_>]) -> Option<&'static str> {
+        if tools.is_empty() {
+            None
+        } else if self.require_tool_call {
+            Some("required")
+        } else {
+            Some("auto")
+        }
+    }
+
+    /// `required` のときは `Finish` 擬似ツールを足したツール一覧 (それ以外はそのまま)。
+    fn with_finish<'a>(&self, tools: &'a [ToolSpec<'a>]) -> std::borrow::Cow<'a, [ToolSpec<'a>]> {
+        if self.require_tool_call && !tools.is_empty() {
+            let mut v = tools.to_vec();
+            v.push(finish_spec());
+            std::borrow::Cow::Owned(v)
+        } else {
+            std::borrow::Cow::Borrowed(tools)
+        }
+    }
+
+    /// `Finish` だけを呼んだ応答を、本文 (最終回答) の応答に読み替える。**追加で画面に出す分**を
+    /// 返す (ストリームでは既に流れた本文との差分だけを送るため。何も足さないなら None)。
+    /// 他のツール呼び出しと一緒に来た `Finish` はそのまま (ループが unknown tool として返し、
+    /// モデルは次の応答で改めて Finish を呼ぶ)。
+    ///
+    /// 本文とツールコールの両方を返すモデルもある。その本文は既に画面へ流れているので、
+    /// **上書きせず**、`answer` がそこに含まれていなければ後ろに足す (捨てない・二重に出さない)。
+    fn absorb_finish(&self, resp: &mut ChatResponse) -> Option<String> {
+        if !self.require_tool_call || resp.tool_calls.len() != 1 {
+            return None;
+        }
+        let call = &resp.tool_calls[0];
+        if call.function.name != FINISH {
+            return None;
+        }
+        let answer = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            .ok()
+            .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(str::to_string))
+            .unwrap_or_else(|| call.function.arguments.clone());
+        resp.tool_calls.clear();
+        let said = resp.content.as_deref().unwrap_or("");
+        if said.trim().is_empty() {
+            resp.content = Some(answer.clone());
+            return Some(answer);
+        }
+        if said.contains(answer.trim()) || answer.trim().is_empty() {
+            // 既に同じことを言っている (本文に前置きして Finish に同じ答えを入れる挙動)。
+            return None;
+        }
+        let added = format!("\n{answer}");
+        resp.content = Some(format!("{said}{added}"));
+        Some(added)
     }
 
     /// このリクエストに付ける推論の深さ。プランモードの呼び出しで、専用の値があればそちら。
@@ -385,11 +451,12 @@ impl LlmClient for OpenAiClient {
         model: &str,
         max_tokens: Option<u32>,
     ) -> Result<ChatResponse> {
+        let tools = self.with_finish(tools);
         let req = ChatRequest {
             model,
             messages: history,
-            tools,
-            tool_choice: if tools.is_empty() { None } else { Some("auto") },
+            tools: &tools,
+            tool_choice: self.choice(&tools),
             max_tokens,
             temperature: self.temperature,
             reasoning_effort: self.effort(),
@@ -456,12 +523,14 @@ impl LlmClient for OpenAiClient {
             })
             .collect();
 
-        Ok(ChatResponse {
+        let mut out = ChatResponse {
             content,
             tool_calls,
             usage,
             reasoning,
-        })
+        };
+        self.absorb_finish(&mut out);
+        Ok(out)
     }
 
     async fn chat_stream(
@@ -471,11 +540,12 @@ impl LlmClient for OpenAiClient {
         model: &str,
         sink: mpsc::UnboundedSender<ChatEvent>,
     ) -> Result<()> {
+        let tools = self.with_finish(tools);
         let req = ChatRequest {
             model,
             messages: history,
-            tools,
-            tool_choice: if tools.is_empty() { None } else { Some("auto") },
+            tools: &tools,
+            tool_choice: self.choice(&tools),
             max_tokens: None,
             temperature: self.temperature,
             reasoning_effort: self.effort(),
@@ -534,7 +604,7 @@ impl LlmClient for OpenAiClient {
             })
             .collect::<Vec<_>>();
 
-        let resp = ChatResponse {
+        let mut resp = ChatResponse {
             content: if text_buf.is_empty() {
                 None
             } else {
@@ -544,6 +614,10 @@ impl LlmClient for OpenAiClient {
             usage,
             reasoning: (!reasoning_buf.is_empty()).then_some(reasoning_buf),
         };
+        // `Finish` を本文に読み替えたら、画面にも出す (本文のデルタは 1 つも流れていない)。
+        if let Some(answer) = self.absorb_finish(&mut resp) {
+            let _ = sink.send(ChatEvent::TextDelta(answer));
+        }
         let _ = sink.send(ChatEvent::Done(resp));
         Ok(())
     }
@@ -746,6 +820,166 @@ fn arguments_to_string(v: serde_json::Value) -> String {
         serde_json::Value::String(s) => s,
         serde_json::Value::Null => "{}".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// `tool_choice = "required"` のときに足す擬似ツール (#65 A1)。呼ばれたら lodan が本文に読み替える
+/// ので、registry には無く、ループにも見えない。
+pub const FINISH: &str = "Finish";
+
+fn finish_spec() -> ToolSpec<'static> {
+    ToolSpec {
+        kind: "function",
+        function: crate::agent::messages::ToolSpecFunction {
+            name: FINISH,
+            description: "Call this with your final answer when the task is complete (or when no \
+                          tool is needed to answer). The answer is shown to the user as your reply.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "answer": { "type": "string", "description": "The final reply to the user" }
+                },
+                "required": ["answer"]
+            }),
+        },
+    }
+}
+
+#[cfg(test)]
+mod required_tests {
+    use super::*;
+
+    fn client(tool_choice: Option<&str>) -> OpenAiClient {
+        let cfg = ProviderConfig {
+            tool_choice: tool_choice.map(str::to_string),
+            ..ProviderConfig::default()
+        };
+        OpenAiClient::new(&cfg).unwrap()
+    }
+
+    fn read_spec() -> ToolSpec<'static> {
+        ToolSpec {
+            kind: "function",
+            function: crate::agent::messages::ToolSpecFunction {
+                name: "Read",
+                description: "d",
+                parameters: serde_json::json!({}),
+            },
+        }
+    }
+
+    /// `required` では Finish が足され、tool_choice が required になる。ツール無しなら何も変えない。
+    #[test]
+    fn required_adds_finish_and_sets_tool_choice() {
+        let c = client(Some("required"));
+        let tools = [read_spec()];
+        let with = c.with_finish(&tools);
+        assert_eq!(with.len(), 2);
+        assert_eq!(with[1].function.name, FINISH);
+        assert_eq!(c.choice(&with), Some("required"));
+        assert_eq!(c.choice(&[]), None);
+        assert!(c.with_finish(&[]).is_empty());
+        let auto = client(None);
+        assert_eq!(auto.with_finish(&tools).len(), 1);
+        assert_eq!(auto.choice(&tools), Some("auto"));
+        assert!(
+            OpenAiClient::new(&ProviderConfig {
+                tool_choice: Some("none".into()),
+                ..ProviderConfig::default()
+            })
+            .is_err()
+        );
+    }
+
+    /// 本文とツールコールの両方を返すモデル: 本文は捨てず、answer が無ければ後ろに足す。
+    #[test]
+    fn text_alongside_a_finish_call_is_kept_not_overwritten() {
+        let c = client(Some("required"));
+        let with_text = |text: &str, answer: &str| ChatResponse {
+            content: Some(text.to_string()),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: ToolCallFunction {
+                    name: FINISH.into(),
+                    arguments: serde_json::json!({ "answer": answer }).to_string(),
+                },
+            }],
+            usage: None,
+            reasoning: None,
+        };
+        // 違うことを言っていれば後ろに足す (画面に出すのは足した分だけ)。
+        let mut resp = with_text("Let me check.", "all done");
+        assert_eq!(c.absorb_finish(&mut resp).as_deref(), Some("\nall done"));
+        assert_eq!(resp.content.as_deref(), Some("Let me check.\nall done"));
+        assert!(resp.tool_calls.is_empty());
+        // 既に同じことを言っていれば何も足さない (二重に出さない)。
+        let mut same = with_text("all done — wrote the file", "all done");
+        assert!(c.absorb_finish(&mut same).is_none());
+        assert_eq!(same.content.as_deref(), Some("all done — wrote the file"));
+        assert!(same.tool_calls.is_empty());
+        // 空の answer でも本文は消さない。
+        let mut empty = with_text("the answer", "  ");
+        assert!(c.absorb_finish(&mut empty).is_none());
+        assert_eq!(empty.content.as_deref(), Some("the answer"));
+    }
+
+    /// Finish だけの応答は本文に読み替える。他の呼び出しと一緒なら触らない。auto では触らない。
+    #[test]
+    fn a_lone_finish_call_becomes_the_final_text() {
+        let finish = |args: &str| ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: FINISH.into(),
+                arguments: args.into(),
+            },
+        };
+        let mut resp = ChatResponse {
+            content: None,
+            tool_calls: vec![finish(r#"{"answer": "all done"}"#)],
+            usage: None,
+            reasoning: None,
+        };
+        let c = client(Some("required"));
+        assert_eq!(c.absorb_finish(&mut resp).as_deref(), Some("all done"));
+        assert_eq!(resp.content.as_deref(), Some("all done"));
+        assert!(resp.tool_calls.is_empty());
+
+        let mut two = ChatResponse {
+            content: None,
+            tool_calls: vec![
+                finish(r#"{"answer": "x"}"#),
+                ToolCall {
+                    id: "c2".into(),
+                    kind: "function".into(),
+                    function: ToolCallFunction {
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            ],
+            usage: None,
+            reasoning: None,
+        };
+        assert!(c.absorb_finish(&mut two).is_none());
+        assert_eq!(two.tool_calls.len(), 2);
+
+        let mut auto_resp = ChatResponse {
+            content: None,
+            tool_calls: vec![finish(r#"{"answer": "x"}"#)],
+            usage: None,
+            reasoning: None,
+        };
+        assert!(client(None).absorb_finish(&mut auto_resp).is_none());
+        // 壊れた引数でも、引数そのものを本文にして止まらない。
+        let mut broken = ChatResponse {
+            content: None,
+            tool_calls: vec![finish("not json")],
+            usage: None,
+            reasoning: None,
+        };
+        assert_eq!(c.absorb_finish(&mut broken).as_deref(), Some("not json"));
     }
 }
 

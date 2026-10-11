@@ -157,6 +157,7 @@ struct ProviderOverlay {
     reasoning_effort: Option<String>,
     plan_reasoning_effort: Option<String>,
     reasoning_roundtrip: Option<bool>,
+    tool_choice: Option<String>,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     max_retries: Option<u32>,
     retry_base_ms: Option<u64>,
@@ -177,6 +178,7 @@ impl ProviderOverlay {
             reasoning_effort,
             plan_reasoning_effort,
             reasoning_roundtrip,
+            tool_choice,
             extra_body,
             max_retries,
             retry_base_ms,
@@ -192,6 +194,7 @@ impl ProviderOverlay {
             reasoning_effort: reasoning_effort.or(base.reasoning_effort),
             plan_reasoning_effort: plan_reasoning_effort.or(base.plan_reasoning_effort),
             reasoning_roundtrip: reasoning_roundtrip.unwrap_or(base.reasoning_roundtrip),
+            tool_choice: tool_choice.or(base.tool_choice),
             // レイヤー間の重ね合わせは `merge_table` がキー単位で済ませている (他のテーブルと同じ)。
             // 組み込みの既定値は常に空なので、ここは「書かれていればそれ」で足りる。
             extra_body: extra_body.unwrap_or_default(),
@@ -254,6 +257,13 @@ pub struct ProviderConfig {
     /// ツール往復の間、モデルの思考過程 (`reasoning_content`) を送り返す。既定 true。
     /// 送り返された思考を拒否するサーバでは false にする。ターンを跨いだ思考はどちらでも送らない。
     pub reasoning_roundtrip: bool,
+    /// リクエストの `tool_choice` (#65 A1)。None (既定) は `auto`。`required` にすると、ツールが
+    /// あるリクエストでは必ずツール呼び出しで答えさせる (制約デコードに対応したサーバではツール
+    /// コールが JSON Schema どおりに整形され、テキストに漏れない)。そのままでは最終回答が
+    /// 出せないので、lodan が `Finish` 擬似ツールを足し、その呼び出しを本文に読み替える。
+    /// **モデルごとに向き不向きがある** (qwen2.5-coder 7B は required でないと markdown で出す、
+    /// GLM-4.7-Flash は required だと返らない) ので provider 単位の opt-in。
+    pub tool_choice: Option<String>,
     /// リクエスト body にそのまま足すサーバ固有のパラメータ
     /// (例: vLLM / llama.cpp の `chat_template_kwargs = { enable_thinking = false }`)。
     /// lodan 自身が組み立てるキー (`model` / `messages` / `tools` …) は書けない。
@@ -404,6 +414,7 @@ impl ProviderConfig {
             reasoning_effort: None,
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
+            tool_choice: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -422,6 +433,7 @@ impl ProviderConfig {
             reasoning_effort: None,
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
+            tool_choice: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -442,6 +454,7 @@ impl ProviderConfig {
             reasoning_effort: None,
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
+            tool_choice: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -462,6 +475,7 @@ impl ProviderConfig {
             reasoning_effort: None,
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
+            tool_choice: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -729,6 +743,10 @@ impl Config {
             active.reasoning_effort = Some(v);
             mark(format!("llm.{provider}.reasoning_effort"));
         }
+        if let Some(v) = o.tool_choice {
+            active.tool_choice = Some(v);
+            mark(format!("llm.{provider}.tool_choice"));
+        }
         if o.auto_approve {
             self.agent.auto_approve = true;
             mark("agent.auto_approve".into());
@@ -859,6 +877,7 @@ pub struct Overrides {
     pub tool_profile: Option<ToolProfile>,
     pub tools: Option<Vec<String>>,
     pub tool_search: Option<bool>,
+    pub tool_choice: Option<String>,
 }
 
 fn user_config_path() -> Option<PathBuf> {

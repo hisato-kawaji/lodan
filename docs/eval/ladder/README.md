@@ -35,6 +35,7 @@
 | `core-search` | `core` + `--tool-search` | 隠したツールを `ToolSearch` で読み込めるようにする (#72)。**`core` と比べる** |
 | `req` / `req-none` | `temp` / `think-none` + `--requirements` | 要件台帳 (#65 B1/B2): 依頼から要件を LLM で抜き出して system prompt に固定し、未達のまま終わろうとしたら促す。抽出で LLM 呼び出しが 1 回増え、未達があれば促しの往復も増えるので、**所要時間は `temp` / `think-none` と比べる**。thinking モデルは `req-none` を使う |
 | `split-none` | `think-none` + `--write-max-lines 80` | Write の行数上限 (#65 A2): 80 行を超える Write を拒否し、骨格 + Edit の手順を返す。L0 / L1 は 80 行に届かないので **L2 で `think-none` と比べる** |
+| `split40-none` | `think-none` + `--write-max-lines 40` | A2 を**実際に発動させる**ための水準。L2 のファイルは 51-77 行なので `split-none` (80) では一度も発動しない（[phase1-2026-10](phase1-2026-10.md) の実測）。**`think-none` と比べる** |
 | `required-none` | `think-none` + `--tool-choice required` | 全応答をツール呼び出しにする (#65 A1)。最終回答は `Finish` 擬似ツール。テキストに漏れたツールコール (`malformed_retry` の対象) が構造的に起きなくなるかを見る。**`think-none` と比べる** |
 | `empty-nudge` | `temp` + `--empty-reply-nudge` | 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)。**`temp` と比べる**。`base` / `temp` / `core` / `core-search` / `think-*` はこれを off にしている (lodan の既定は on) |
 

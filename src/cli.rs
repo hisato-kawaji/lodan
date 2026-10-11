@@ -75,6 +75,15 @@ pub struct Cli {
     #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub finish_nudge: Option<bool>,
 
+    /// Run this command before finishing a turn that changed files; on failure the output is fed
+    /// back to the model to fix (repeatable, adds to [[verify]] in config) (#65)
+    #[arg(long, env = "LODAN_VERIFY", value_name = "CMD")]
+    pub verify: Vec<String>,
+
+    /// How many times a failing [[verify]] is fed back to the model in one turn (default 2, 0 = report only)
+    #[arg(long, env = "LODAN_MAX_REPAIRS", value_name = "N", value_parser = clap::value_parser!(u32))]
+    pub max_repairs: Option<u32>,
+
     /// Keep a requirements ledger: extract checkable requirements from each request, pin them in
     /// the system prompt, and nudge before finishing with items still open (#65)
     #[arg(long, env = "LODAN_REQUIREMENTS", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
@@ -425,6 +434,8 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         auto_approve: args.yes,
         finish_nudge: args.finish_nudge,
         requirements: args.requirements,
+        max_repairs: args.max_repairs,
+        verify: args.verify,
         empty_reply_nudge: args.empty_reply_nudge,
         malformed_retry: args.malformed_retry,
         dup_suppress: args.dup_suppress,

@@ -54,6 +54,10 @@ pub struct Session {
     mcp_servers: Vec<crate::mcp::registry::McpServer>,
     /// system prompt に描画済みの要件台帳の版 (#65)。台帳が変わったら描画し直す。
     requirements_version: u64,
+    /// 実際に発火させる検証 (`[[verify]]`、`disabled_verify` を外したもの。#65 D1)。
+    active_verify: Vec<crate::verify::VerifyConfig>,
+    /// このターンでファイル系ツールが触ったパス。検証の `paths` 判定に使う。
+    changed_files: Vec<std::path::PathBuf>,
     /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。transcript のレコーダはこれが増えた分だけ
     /// 「書き込み済み」の位置を縮めて数え直す (履歴が短くなっても末尾を取りこぼさない)。
     compacted_away: usize,
@@ -166,6 +170,8 @@ impl Session {
         let system = Self::system_prompt(&cfg, &cwd, registry.as_ref(), &ledger);
         let mut history = vec![Message::System { content: system }];
         history.extend(prior);
+        let cfg_verify = cfg.verify.clone();
+        let cfg_disabled_verify = cfg.disabled_verify.clone();
         let sandbox = crate::sandbox::SandboxPolicy::new(&cfg.sandbox, &cwd);
         let ctx = ToolCtx::new(cwd)
             .with_sandbox(sandbox)
@@ -192,6 +198,8 @@ impl Session {
             rules_injected: std::collections::BTreeSet::new(),
             mcp_servers: Vec::new(),
             requirements_version: 0,
+            active_verify: crate::verify::effective(&cfg_verify, &cfg_disabled_verify),
+            changed_files: Vec::new(),
             compacted_away: 0,
         }
     }
@@ -492,6 +500,7 @@ impl Session {
             .await?;
         // ターンごとの値。hook にブロックされたターンでも前の値を残さない。
         self.last_reply_thought_chars = None;
+        self.changed_files.clear();
         if let Some(reason) = &submitted.block {
             crate::say!("prompt blocked by hook: {}", crate::term::sanitize(reason));
             return Ok(());
@@ -548,6 +557,8 @@ impl Session {
         let mut empty_reply_nudges = 0u32;
         // #65: 未達の要件を残したまま終わろうとしたのを促した回数。
         let mut requirements_nudges = 0u32;
+        // #65 D1: 検証の失敗を差し戻した回数。
+        let mut repairs = 0u32;
 
         // 評価ハーネス向けの計測 (runlog 無効時はいずれも no-op)。
         end.arm(self.turn_seq);
@@ -720,6 +731,65 @@ impl Session {
                         content: MALFORMED_CALL_NOTE.to_string(),
                     });
                     continue;
+                }
+                // #65 D1: ファイルを変えたターンなら、最終応答の前に検証を走らせる。失敗したら
+                // 出力を差し戻して直させる (上限 `max_repairs`)。要件台帳より先に見る — 検証が
+                // 通らないものを「要件は満たした」と記録させない。
+                if !self.active_verify.is_empty() && !self.changed_files.is_empty() {
+                    let outcomes = crate::verify::run_applicable(
+                        &self.active_verify,
+                        &self.changed_files,
+                        &self.ctx.cwd,
+                    )
+                    .await;
+                    for o in &outcomes {
+                        crate::runlog::record(
+                            "verify_run",
+                            serde_json::json!({
+                                "turn": self.turn_seq, "iter": iterations,
+                                "label": o.label, "ok": o.ok, "ms": o.ms,
+                            }),
+                        );
+                    }
+                    let failed: Vec<&crate::verify::Outcome> =
+                        outcomes.iter().filter(|o| !o.ok).collect();
+                    if !failed.is_empty() {
+                        let labels: Vec<&str> = failed.iter().map(|f| f.label.as_str()).collect();
+                        if repairs < self.cfg.agent.max_repairs {
+                            repairs += 1;
+                            crate::say!(
+                                "{}",
+                                crate::term::dim(&format!(
+                                    "[lodan] verify failed ({}) — asking the model to fix it",
+                                    labels.join(", ")
+                                ))
+                            );
+                            crate::runlog::record(
+                                "verify_repair",
+                                serde_json::json!({
+                                    "turn": self.turn_seq, "iter": iterations, "n": repairs,
+                                    "labels": labels,
+                                }),
+                            );
+                            self.history.push(Message::User {
+                                content: crate::verify::repair_note(&failed),
+                            });
+                            continue;
+                        }
+                        crate::say!(
+                            "{}",
+                            crate::term::dim(&format!(
+                                "[lodan] finishing with verify still failing ({})",
+                                labels.join(", ")
+                            ))
+                        );
+                        crate::runlog::record(
+                            "verify_failed_at_end",
+                            serde_json::json!({
+                                "turn": self.turn_seq, "labels": labels,
+                            }),
+                        );
+                    }
                 }
                 // #65: 要件台帳に未達が残ったまま終わろうとしたら、一覧を示して続けさせる
                 // (最大 MAX_REQUIREMENTS_NUDGES 回。それでも残れば、残ったと知らせて終える)。
@@ -1356,6 +1426,10 @@ impl Session {
             self.ctx.cwd.join(abs)
         };
         self.undo.record_before(self.turn_seq, &abs);
+        // 検証 (#65 D1) の `paths` 判定に使う。同じファイルを何度も触っても 1 回だけ。
+        if !self.changed_files.contains(&abs) {
+            self.changed_files.push(abs);
+        }
     }
 
     /// 直近ターンのファイル変更を巻き戻す (`/undo`)。記録が無ければ None。
@@ -4767,6 +4841,124 @@ mod tests {
             Ok(ChatResponse {
                 content: Some(text),
                 tool_calls: vec![],
+                usage: None,
+                reasoning: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            history: &[Message],
+            tools: &[ToolSpec<'_>],
+            model: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let resp = self.chat(history, tools, model, None).await?;
+            let _ = sink.send(ChatEvent::Done(resp));
+            Ok(())
+        }
+    }
+
+    /// 検証ループ (#65 D1): ファイルを変えたターンの最終応答の前に `[[verify]]` を走らせ、
+    /// 失敗したら差し戻す。上限まで直らなければ、知らせて終える。変更が無いターンでは走らせない。
+    #[tokio::test]
+    async fn verify_runs_after_changes_and_feeds_failures_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag = dir.path().join("fixed");
+        // 1 回目は失敗、`fixed` が作られたら成功する検証。
+        let command = format!(
+            "test -f {} || {{ echo 'boom: not fixed yet' >&2; exit 1; }}",
+            flag.display()
+        );
+        let cfg = Config {
+            verify: vec![crate::verify::VerifyConfig {
+                id: Some("check".into()),
+                command,
+                paths: vec!["**/*.txt".into()],
+                timeout_secs: Some(10),
+            }],
+            ..Config::default()
+        };
+        let mut session = Session::new(cfg, Arc::new(default_registry()));
+        session.ctx = ToolCtx::new(dir.path().to_path_buf());
+        let gate = PermissionGate::new(true);
+
+        // 1 ターン目: .txt を書く → 検証が失敗 → 差し戻し → 2 回目も失敗 → 上限 (2) で終える。
+        let target = dir.path().join("a.txt");
+        let write = tool_call_with_args(
+            "w1",
+            "Write",
+            &format!(r#"{{"path": "{}", "content": "x"}}"#, target.display()),
+        );
+        let llm = ToolThenTextLlm {
+            calls: vec![write],
+            text: "done".into(),
+        };
+        session.run_turn("write a.txt", &llm, &gate).await.unwrap();
+        let repairs = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content.starts_with("[lodan] Verification failed")))
+            .count();
+        assert_eq!(repairs, 2, "差し戻しは max_repairs (2) 回まで");
+        assert!(
+            session.history().iter().any(|m| matches!(m, Message::User { content } if content.contains("boom: not fixed yet"))),
+            "失敗の出力が差し戻されている"
+        );
+
+        // 2 ターン目: 検証が通る状態にしてから書く → 差し戻しは増えない。
+        std::fs::write(&flag, "").unwrap();
+        session
+            .run_turn("write it again", &llm, &gate)
+            .await
+            .unwrap();
+        let repairs_after = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content.starts_with("[lodan] Verification failed")))
+            .count();
+        assert_eq!(repairs_after, 2, "通ったターンでは差し戻さない");
+
+        // 3 ターン目: ファイルを変えないターンでは走らせない (検証を失敗する状態に戻しても増えない)。
+        std::fs::remove_file(&flag).unwrap();
+        let text_only = FinalTextLlm {
+            text: "nothing to do".into(),
+            usage: None,
+        };
+        session
+            .run_turn("just say hi", &text_only, &gate)
+            .await
+            .unwrap();
+        let repairs_idle = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content.starts_with("[lodan] Verification failed")))
+            .count();
+        assert_eq!(repairs_idle, 2, "変更が無いターンでは検証を走らせない");
+    }
+
+    /// 1 回ツールを呼び、以降は本文を返す LLM。
+    struct ToolThenTextLlm {
+        calls: Vec<crate::agent::messages::ToolCall>,
+        text: String,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolThenTextLlm {
+        async fn chat(
+            &self,
+            history: &[Message],
+            _tools: &[ToolSpec<'_>],
+            _model: &str,
+            _max_tokens: Option<u32>,
+        ) -> Result<ChatResponse> {
+            // このターンで既にツールを呼んでいれば本文を返す (差し戻しの後も同じ)。
+            let called = history.iter().any(
+                |m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
+            );
+            Ok(ChatResponse {
+                content: called.then(|| self.text.clone()),
+                tool_calls: if called { vec![] } else { self.calls.clone() },
                 usage: None,
                 reasoning: None,
             })

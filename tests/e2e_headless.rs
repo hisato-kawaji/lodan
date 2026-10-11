@@ -1654,6 +1654,86 @@ fn a_lone_finish_call_is_the_final_answer_only_with_tool_choice_required() {
     );
 }
 
+/// 検証ループ (#65 D1): `--verify` が失敗したらモデルへ差し戻し、上限まで直らなければ
+/// 失敗したまま終える。変更の無いターンでは走らせない。
+#[test]
+fn a_failing_verify_is_fed_back_to_the_model_and_reported_at_the_end() {
+    let home = tempfile::tempdir().unwrap();
+    let demo = home.path().join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let server = start_mock(&demo);
+    // demo は Write から始まるので、ファイルを変えたターンになる。検証は必ず失敗する。
+    let out = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "--verify",
+            "echo 'verify says no' >&2; exit 1",
+            "--max-repairs",
+            "1",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<serde_json::Value> = stdout(&out)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let count = |name: &str| events.iter().filter(|e| e["event"] == name).count();
+    assert!(count("verify_run") >= 2, "{}", stdout(&out));
+    assert_eq!(
+        count("verify_repair"),
+        1,
+        "max-repairs = 1 なので 1 回だけ差し戻す"
+    );
+    assert_eq!(count("verify_failed_at_end"), 1, "{}", stdout(&out));
+
+    // 検証が通る場合は差し戻さない。
+    let ok = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--yes",
+            "--verify",
+            "true",
+            "-p",
+            "run the demo",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(ok.status.success());
+    assert!(stdout(&ok).contains("verify_run"), "{}", stdout(&ok));
+    assert!(!stdout(&ok).contains("verify_repair"), "{}", stdout(&ok));
+
+    // ファイルを変えないターン (挨拶) では走らせない。
+    let idle = lodan(
+        home.path(),
+        server.port,
+        &[
+            "--verify",
+            "exit 1",
+            "-p",
+            "hi",
+            "--output-format",
+            "stream-json",
+        ],
+        Stdin::OpenAndSilent,
+    );
+    assert!(idle.status.success());
+    assert!(!stdout(&idle).contains("verify_run"), "{}", stdout(&idle));
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

@@ -91,6 +91,9 @@ flags_for_config() {
     split-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --write-max-lines 80" ;;
     # 上限 40 行。ラダーの L2 が作るファイルは 51-77 行なので、80 では一度も発動しない (実測)。
     split40-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --write-max-lines 40" ;;
+    # think-none と同条件で、タスクが指定した実行方法 ($VERIFY) を検証として強制する (#65 D1)。
+    # タスク側が VERIFY を定義していなければ think-none と同じ (差は出ない)。
+    verify-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none${VERIFY:+ --verify }${VERIFY:-}" ;;
     think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
     *) echo "unknown config: $1" >&2; return 1 ;;
   esac

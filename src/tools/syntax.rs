@@ -80,8 +80,13 @@ impl Outcome {
     }
 }
 
-/// `file` を検査する。対象外の拡張子・設定が空・コマンドが起動できない場合は `None`
-/// (「検査できなかった」はモデルに言わない — 出力を増やすだけなので)。
+/// 検査する道具が無い (`sh` が 127 / 126 を返した) ことを表す。
+pub const UNAVAILABLE: &str = "unavailable";
+
+/// `file` を検査する。次の場合は `None` = 「検査しなかった」(モデルには何も言わない):
+/// 対象外の拡張子 / 設定が空 / `sh` が起動できない / 時間切れ /
+/// **検査コマンドが無い** (`python3` が入っていない環境で `.py` を書いても「壊れている」と
+/// 言わない。#150 のレビュー: `sh -c` は自身は起動できるので終了コードで見分ける)。
 pub async fn check(file: &Path, overrides: &BTreeMap<String, String>) -> Option<Outcome> {
     let command = command_for(file, overrides)?;
     let started = std::time::Instant::now();
@@ -103,6 +108,19 @@ pub async fn check(file: &Path, overrides: &BTreeMap<String, String>) -> Option<
     let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&output.stdout).into_owned();
+    }
+    // 127 = command not found / 126 = 実行できない。道具が無いだけなので「壊れている」と言わない。
+    // 利用者には runlog で知らせる (`reason: "unavailable"`)。
+    if !ok && matches!(output.status.code(), Some(126 | 127)) {
+        crate::runlog::record(
+            "syntax_check",
+            serde_json::json!({
+                "path": file.display().to_string(),
+                "reason": UNAVAILABLE,
+                "command": command,
+            }),
+        );
+        return None;
     }
     Some(Outcome {
         command,
@@ -195,10 +213,21 @@ mod tests {
         let other = dir.path().join("a.rs");
         std::fs::write(&other, "fn main() {").unwrap();
         assert!(check(&other, &none).await.is_none());
-        // 起動できないコマンドは「検査しなかった」扱い (ツール結果を汚さない)。
+        // 検査コマンドが無い環境では「検査しなかった」扱いにする (#150 のレビュー)。
+        // `sh -c` 自体は起動できてしまうので、終了コード 127 / 126 で見分ける。
         let missing = overrides(&[("py", "definitely-not-a-real-binary {path}")]);
-        let out = check(&good, &missing).await;
-        assert!(out.is_some_and(|o| !o.ok), "exit != 0 として扱う");
+        assert!(
+            check(&good, &missing).await.is_none(),
+            "道具が無いだけで「壊れている」と言わない"
+        );
+        let not_executable = overrides(&[("py", "/etc/hosts {path}")]);
+        assert!(
+            check(&good, &not_executable).await.is_none(),
+            "126 も同じ扱い"
+        );
+        // 一方、検査が走って落ちたときは報告する。
+        let fails = overrides(&[("py", "sh -c 'exit 1'")]);
+        assert!(check(&good, &fails).await.is_some_and(|o| !o.ok));
     }
 
     #[test]

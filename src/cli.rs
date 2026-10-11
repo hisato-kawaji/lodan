@@ -210,6 +210,8 @@ pub enum Command {
         #[arg(long)]
         show_secrets: bool,
     },
+    /// List the built-in model presets (#65 E)
+    Presets,
     /// Start the interactive REPL (default if omitted)
     Repl,
     /// List saved sessions (this directory's by default; --all for every directory)
@@ -493,6 +495,10 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::Presets => {
+            print!("{}", crate::presets::describe_all());
+            Ok(0)
+        }
         Command::Sessions { json } => list_sessions(args.all, json).map(|()| 0),
         Command::Trust { .. } | Command::Mcp { .. } => {
             unreachable!("handled before the config is loaded")
@@ -512,7 +518,12 @@ pub fn decide_project_trust(args: &Cli) {
     // 信頼の管理と、プロジェクトのファイルを使わないサブコマンドでは尋ねない。読みもしない。
     if matches!(
         args.cmd,
-        Some(Command::Trust { .. } | Command::Sessions { .. } | Command::Mcp { .. })
+        Some(
+            Command::Trust { .. }
+                | Command::Sessions { .. }
+                | Command::Mcp { .. }
+                | Command::Presets
+        )
     ) {
         crate::trust::set_project_trusted(false);
         return;

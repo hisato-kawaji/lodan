@@ -164,6 +164,7 @@ struct ProviderOverlay {
     plan_reasoning_effort: Option<String>,
     reasoning_roundtrip: Option<bool>,
     tool_choice: Option<String>,
+    preset: Option<String>,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     max_retries: Option<u32>,
     retry_base_ms: Option<u64>,
@@ -185,6 +186,7 @@ impl ProviderOverlay {
             plan_reasoning_effort,
             reasoning_roundtrip,
             tool_choice,
+            preset,
             extra_body,
             max_retries,
             retry_base_ms,
@@ -201,6 +203,7 @@ impl ProviderOverlay {
             plan_reasoning_effort: plan_reasoning_effort.or(base.plan_reasoning_effort),
             reasoning_roundtrip: reasoning_roundtrip.unwrap_or(base.reasoning_roundtrip),
             tool_choice: tool_choice.or(base.tool_choice),
+            preset: preset.or(base.preset),
             // レイヤー間の重ね合わせは `merge_table` がキー単位で済ませている (他のテーブルと同じ)。
             // 組み込みの既定値は常に空なので、ここは「書かれていればそれ」で足りる。
             extra_body: extra_body.unwrap_or_default(),
@@ -263,6 +266,10 @@ pub struct ProviderConfig {
     /// ツール往復の間、モデルの思考過程 (`reasoning_content`) を送り返す。既定 true。
     /// 送り返された思考を拒否するサーバでは false にする。ターンを跨いだ思考はどちらでも送らない。
     pub reasoning_roundtrip: bool,
+    /// 組み込みプリセットの名前 (#65 E)。`lodan presets` で一覧。**同じキーを自分で書けばそちらが
+    /// 勝つ**。未知の名前は起動時エラー (黙って無視しない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     /// リクエストの `tool_choice` (#65 A1)。None (既定) は `auto`。`required` にすると、ツールが
     /// あるリクエストでは必ずツール呼び出しで答えさせる (制約デコードに対応したサーバではツール
     /// コールが JSON Schema どおりに整形され、テキストに漏れない)。そのままでは最終回答が
@@ -434,6 +441,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -453,6 +461,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -474,6 +483,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -495,6 +505,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -1109,7 +1120,59 @@ fn from_layers(layers: Vec<(PathBuf, toml::Table)>) -> Result<(Config, Origins)>
         .map_err(|e: toml::de::Error| {
             anyhow::anyhow!("merging config layers: {}", redact_quoted(e.message()))
         })?;
+    let mut cfg = cfg;
+    apply_presets(&mut cfg, &origins)?;
     Ok((cfg, origins))
+}
+
+/// `preset = "<name>"` を書いた provider に、プリセットの値を**まだ書かれていないキーだけ**
+/// 埋める (#65 E)。利用者が同じキーを書いていればそちらが勝つ (`origins` に載っているキーは触らない)。
+/// 未知の名前は起動時エラー — 黙って無視すると「プリセットを当てたつもり」のまま走ってしまう。
+fn apply_presets(cfg: &mut Config, origins: &Origins) -> Result<()> {
+    use Provider::*;
+    for provider in [Local, Sakana, Sakura, Kimi] {
+        let Some(name) = cfg.llm.get(provider).preset.clone() else {
+            continue;
+        };
+        let preset = crate::presets::find(&name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown preset `{}` for [llm.{}] (see `lodan presets`)",
+                crate::term::sanitize(&name),
+                provider.as_str()
+            )
+        })?;
+        let set_by_user =
+            |key: &str| origins.contains_key(&format!("llm.{}.{key}", provider.as_str()));
+        let p = cfg.llm.get_mut(provider);
+        if let Some(t) = preset.temperature
+            && p.temperature.is_none()
+            && !set_by_user("temperature")
+        {
+            p.temperature = Some(t);
+        }
+        if let Some(e) = preset.reasoning_effort
+            && p.reasoning_effort.is_none()
+            && !set_by_user("reasoning_effort")
+        {
+            p.reasoning_effort = Some(e.to_string());
+        }
+        if let Some(c) = preset.tool_choice
+            && p.tool_choice.is_none()
+            && !set_by_user("tool_choice")
+        {
+            p.tool_choice = Some(c.to_string());
+        }
+        // ツールプロファイルは provider ではなく [agent] 側。provider ごとのプリセットから
+        // 当てるのは「いま使う provider のものだけ」にする (他の provider の設定で変わると驚く)。
+        if let Some(profile) = preset.tool_profile
+            && provider == cfg.llm.provider
+            && !origins.contains_key("agent.tool_profile")
+            && cfg.agent.tool_profile == ToolProfile::default()
+        {
+            cfg.agent.tool_profile = profile;
+        }
+    }
+    Ok(())
 }
 
 /// テーブルは再帰、`CONCAT_ARRAY_KEYS` は連結、それ以外の値は `over` で置き換える。
@@ -1206,6 +1269,54 @@ max_iterations = "sk-not-a-number""#,
         .to_string();
         assert!(err.contains("merging config layers"), "{err}");
         assert!(!err.contains("sk-not-a-number"), "{err}");
+    }
+
+    /// プリセット (#65 E): 書かれていないキーだけ埋め、利用者が書いたキーは勝つ。未知の名前はエラー。
+    #[test]
+    fn a_preset_fills_only_the_keys_the_user_did_not_set() {
+        let (cfg, _) = from_layers(vec![layer(
+            "project",
+            "[llm.local]\npreset = \"local-small\"\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.llm.local.temperature, Some(0.2));
+        assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("none"));
+
+        // 利用者が書いた値は上書きされない。
+        let (cfg, _) = from_layers(vec![layer(
+            "project",
+            "[llm.local]\npreset = \"local-small\"\ntemperature = 0.7\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.llm.local.temperature, Some(0.7));
+        assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("none"));
+
+        // tool_profile は「いま使う provider」のプリセットからだけ当てる。
+        let (cfg, _) = from_layers(vec![layer(
+            "project",
+            "[llm]\nprovider = \"local\"\n\n[llm.local]\npreset = \"local-small-core\"\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.agent.tool_profile, ToolProfile::Core);
+        let (cfg, _) = from_layers(vec![layer(
+            "project",
+            "[llm]\nprovider = \"kimi\"\n\n[llm.local]\npreset = \"local-small-core\"\n",
+        )])
+        .unwrap();
+        assert_eq!(
+            cfg.agent.tool_profile,
+            ToolProfile::Full,
+            "他 provider のプリセットでは変えない"
+        );
+
+        // 未知の名前は起動時エラー (黙って無視しない)。
+        let err = from_layers(vec![layer("project", "[llm.local]\npreset = \"nope\"\n")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown preset") && err.contains("lodan presets"),
+            "{err}"
+        );
     }
 
     #[test]

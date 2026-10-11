@@ -135,6 +135,22 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 小型モデルはツール呼び出しの XML/JSON を崩しがち(サーバ側でパース不能 → ただのテキストとして届く)なため、lodan は次の 3 つの対策を内蔵している:
 
 - **温度制御**: provider 設定の `temperature`(既定は未送信 = サーバ既定)。整形の破綻・綴りブレ・実行ごとの分散を抑えるには `0.1`〜`0.2` を推奨。
+- **モデル別プリセット**（provider 設定の `preset = "<name>"`、一覧は `lodan presets`、#65 E）: 「どのフラグを立てるか」で所要時間と正答が変わるが、効く組み合わせはモデルごとに違い推測は当たらない（`tool_choice` は単一方針が成立しないことを実測）。**実測が `docs/eval/` に残っているものだけ**を名前で呼べるようにしてある。
+
+  | preset | 設定するもの | 根拠 |
+  |---|---|---|
+  | `local-small` | `temperature 0.2`, `reasoning_effort "none"` | qwen3.5:9b で thinking off は正答同じ・28% 速い。thinking ありは 20 実行中 13 が「思考だけの応答」で終わった |
+  | `local-small-core` | 上記 + `tool_profile "core"` | MCP 多数構成で定義 20.6 KB → 12.9 KB、推定トークン -59% |
+  | `kimi-k3` | `reasoning_effort "low"` | 正答 10/10 のまま思考 -73%（サーバ既定は `max`） |
+  | `forced-tools` | `temperature 0.2`, `tool_choice "required"` | ツールコールをテキストで出すモデル（Qwen2.5-Coder 7B）向け。**GLM-4.7-Flash のように `required` だと返らないモデルもあるので、当てる前に 1 回試すこと** |
+
+  ```toml
+  [llm.local]
+  preset = "local-small"
+  temperature = 0.1   # 自分で書いたキーはプリセットより強い
+  ```
+
+  **モデル名から自動では当てない**（利用者の設定を黙って変えないため）。`preset` を書いた provider にだけ効き、**同じキーを設定ファイルや CLI で書いていればそちらが勝つ**。`tool_profile` は `[agent]` 側なので「いま使う provider のプリセット」からだけ当てる。未知の名前は**起動時エラー**（黙って無視すると当てたつもりで走ってしまう）
 - **推論の深さ**(provider 設定の `reasoning_effort`、`--reasoning-effort`、`LODAN_REASONING_EFFORT`。既定は未送信 = サーバ既定): thinking 系のモデルは、推論の深さで 1 応答の所要時間が大きく変わる(kimi-k3 のサーバ既定は `max`)。値は**検査せずそのまま** `reasoning_effort` として送る — 受け付ける語彙はサーバとモデルごとに違うため(`low` / `medium` / `high` が共通、Ollama は `none` で thinking を切れる、`max` / `minimal` を持つサーバもある)。未対応の値はサーバが 400 で返す。`reasoning_effort` を読まないサーバ固有の切り方は `extra_body` で渡す:
 
   ```toml
@@ -316,6 +332,8 @@ lodan> /exit
 cwd の中のファイルや単純な Bash コマンドでは、5 つ目の選択肢 `(p) always allow … in this project` も出る (この例は cwd の外の `/tmp` なので出ない。詳細は[権限ルールとモード](#権限ルールとモード))。
 
 承認プロンプトは **Enter だけで yes** だが、それは stdin が端末のときに限る。プロンプトをパイプで渡した実行 (`echo "..." | lodan`) では、空行は答えとして扱わず、誰も答えないまま入力が尽きた (EOF) 承認は `(no input — denied)` で**拒否**する。無人実行で破壊的ツールを通したいときは `--yes` を明示すること。
+
+サブコマンド: `lodan config` / `lodan presets`（プリセット一覧）/ `lodan sessions` / `lodan mcp` / `lodan trust` / `lodan repl`。
 
 組み込み slash: `/exit` `/quit` `/help` `/clear` `/tools` `/compact` `/cost` `/goal` `/loop` `/plan` `/accept` `/undo` `/model` `/status` `/context` `/memory` `/requirements`（ユーザー定義コマンドは後述）。`/help` は組み込み・ユーザー定義・MCP prompt を説明付きで、`/tools` は各ツールを説明付きで一覧する。
 - **`/model [provider[:model]]`**: セッション中に provider / model を切り替える（#81）。`/model kimi` は設定済みの kimi のモデルへ、`/model local:qwen3.5:9b` は provider とモデルを同時に、`/model qwen3.5:9b` はいまの provider のモデルだけを変える。引数なしで現在値と設定済み provider の一覧。会話履歴はそのまま引き継ぎ、system prompt の model 行だけ作り直す。トークンの台帳と予算も引き継ぐ（`/cost` にモデル別の内訳が出る）。`Task` のサブエージェントと MCP sampling は起動時のモデルのまま。クライアントを作れない指定（API キーが無い、など）は切り替えずに理由を表示する

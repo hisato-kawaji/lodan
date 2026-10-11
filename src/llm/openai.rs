@@ -248,9 +248,13 @@ impl OpenAiClient {
         }
     }
 
-    /// `Finish` だけを呼んだ応答を、本文 (最終回答) の応答に読み替える。読み替えたら本文を返す。
+    /// `Finish` だけを呼んだ応答を、本文 (最終回答) の応答に読み替える。**追加で画面に出す分**を
+    /// 返す (ストリームでは既に流れた本文との差分だけを送るため。何も足さないなら None)。
     /// 他のツール呼び出しと一緒に来た `Finish` はそのまま (ループが unknown tool として返し、
     /// モデルは次の応答で改めて Finish を呼ぶ)。
+    ///
+    /// 本文とツールコールの両方を返すモデルもある。その本文は既に画面へ流れているので、
+    /// **上書きせず**、`answer` がそこに含まれていなければ後ろに足す (捨てない・二重に出さない)。
     fn absorb_finish(&self, resp: &mut ChatResponse) -> Option<String> {
         if !self.require_tool_call || resp.tool_calls.len() != 1 {
             return None;
@@ -264,8 +268,18 @@ impl OpenAiClient {
             .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(str::to_string))
             .unwrap_or_else(|| call.function.arguments.clone());
         resp.tool_calls.clear();
-        resp.content = Some(answer.clone());
-        Some(answer)
+        let said = resp.content.as_deref().unwrap_or("");
+        if said.trim().is_empty() {
+            resp.content = Some(answer.clone());
+            return Some(answer);
+        }
+        if said.contains(answer.trim()) || answer.trim().is_empty() {
+            // 既に同じことを言っている (本文に前置きして Finish に同じ答えを入れる挙動)。
+            return None;
+        }
+        let added = format!("\n{answer}");
+        resp.content = Some(format!("{said}{added}"));
+        Some(added)
     }
 
     /// このリクエストに付ける推論の深さ。プランモードの呼び出しで、専用の値があればそちら。
@@ -875,6 +889,39 @@ mod required_tests {
             })
             .is_err()
         );
+    }
+
+    /// 本文とツールコールの両方を返すモデル: 本文は捨てず、answer が無ければ後ろに足す。
+    #[test]
+    fn text_alongside_a_finish_call_is_kept_not_overwritten() {
+        let c = client(Some("required"));
+        let with_text = |text: &str, answer: &str| ChatResponse {
+            content: Some(text.to_string()),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: ToolCallFunction {
+                    name: FINISH.into(),
+                    arguments: serde_json::json!({ "answer": answer }).to_string(),
+                },
+            }],
+            usage: None,
+            reasoning: None,
+        };
+        // 違うことを言っていれば後ろに足す (画面に出すのは足した分だけ)。
+        let mut resp = with_text("Let me check.", "all done");
+        assert_eq!(c.absorb_finish(&mut resp).as_deref(), Some("\nall done"));
+        assert_eq!(resp.content.as_deref(), Some("Let me check.\nall done"));
+        assert!(resp.tool_calls.is_empty());
+        // 既に同じことを言っていれば何も足さない (二重に出さない)。
+        let mut same = with_text("all done — wrote the file", "all done");
+        assert!(c.absorb_finish(&mut same).is_none());
+        assert_eq!(same.content.as_deref(), Some("all done — wrote the file"));
+        assert!(same.tool_calls.is_empty());
+        // 空の answer でも本文は消さない。
+        let mut empty = with_text("the answer", "  ");
+        assert!(c.absorb_finish(&mut empty).is_none());
+        assert_eq!(empty.content.as_deref(), Some("the answer"));
     }
 
     /// Finish だけの応答は本文に読み替える。他の呼び出しと一緒なら触らない。auto では触らない。

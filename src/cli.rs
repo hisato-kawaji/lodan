@@ -75,6 +75,10 @@ pub struct Cli {
     #[arg(long, env = "LODAN_FINISH_NUDGE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub finish_nudge: Option<bool>,
 
+    /// Check the syntax of each file right after Write / Edit and report (not block) if it is broken (#65)
+    #[arg(long, env = "LODAN_SYNTAX_CHECK", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    pub syntax_check: Option<bool>,
+
     /// Run this command before finishing a turn that changed files; on failure the output is fed
     /// back to the model to fix (repeatable, adds to [[verify]] in config) (#65)
     #[arg(long, env = "LODAN_VERIFY", value_name = "CMD")]
@@ -445,6 +449,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         max_requests: args.max_requests,
         max_total_tokens: args.max_total_tokens,
         write_max_lines: args.write_max_lines.map(|n| n as usize),
+        syntax_check: args.syntax_check,
         max_iterations: args.max_turns.map(|n| n as usize),
         append_system_prompt: args.append_system_prompt,
         permission_mode: args.permission_mode,

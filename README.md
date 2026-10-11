@@ -158,6 +158,18 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
 - **ツールプロファイル**(`[agent] tool_profile`、`--tool-profile`、`LODAN_TOOL_PROFILE`): ツール定義は**毎リクエスト全量が送られる**ので、小型モデルでは固定費がそのまま所要時間になる(ラダーのベースラインで 1.8k〜2.4k tok/呼び出し)。`core` は Read / Write / Edit / Bash / Grep / Glob / TodoWrite の 7 個だけを見せ、定義の JSON は 6,643 → 3,065 バイト(-54%。`--log-jsonl` の `tools` イベントの `spec_bytes`、Task 込みの 15 個が基準)。TodoWrite を入れているのは、小型モデルが「計画だけ述べて実行しない」「要件を途中で落とす」のを、やることリストを書かせて抑えるため。`readonly` は破壊的でないツールだけ。`tools = [...]`(`--tools Read,Grep,...`)で明示リストも指定できる。隠したツールは登録に残るので、モデルが名前を覚えていて呼んできても実行はされず「このプロファイルでは無効。使えるのは …」と返る(`--yes` でも通らない。ただし後述の `tool_search` が on なら、`readonly` が隠す破壊的ツール**以外**は `ToolSearch` で読み込めるようになる — `core` や `tools = [...]` は見せる範囲の指定であって権限の境界ではない)。Task / Skill / MCP のツールも `core` では隠れる点に注意。`agent.tools` は設定ファイルのレイヤー間で連結されず後勝ち。実行時の `--tool-profile` は設定ファイルの `tools = [...]` より優先される(リストを残すとプロファイル指定が黙って無視されるため)。リストがどのツールにも一致しなければ、LLM を呼ぶ前にエラーで止まる。`Task` の内側の調査エージェントは常に Read / Grep / Glob の 3 個を使い、プロファイルの影響を受けない。`readonly` は WebFetch / WebSearch を含むので、権限の境界としては使わないこと(それは承認ゲートの役割)。起動時の `tools` イベント(`--log-jsonl` / `stream-json`)に、見せているツールと定義のバイト数が残る
 - **遅延ロード**(`[agent] tool_search = true`、`--tool-search[=<bool>]`、`LODAN_TOOL_SEARCH`): プロファイルで隠したツールと **MCP のツール**(`full` でも)の定義を送らず、`ToolSearch` という擬似ツールの説明に**名前と 1 行説明だけ**を載せる。モデルが `ToolSearch` に `{"query": "select:TodoWrite"}`(名前の完全一致、カンマ区切り可)か `{"query": "notebook"}`(名前と説明の部分一致)で尋ねると、合ったツール(最大 5 個)の説明と引数スキーマが返り、**次のリクエストからそのツールの定義が tools に加わる**(同じ応答の後続の呼び出しでも使える)。読み込む前に直接呼ぶと、実行せずに「先に `ToolSearch` で読み込め」と返る(`tool_result` の `reason` は `deferred_unloaded`)。**`readonly` が隠す破壊的ツールは遅延にもならない**(読み込めない。「readonly では破壊的ツールは実行されない」は `tool_search` でも変わらない)。`ToolSearch` の定義自体が固定費で、遅延 8 個なら約 1.4 KB — `core` 単体(3.1 KB)より増えるが、`full`(6.6 KB)よりは小さい。`tools` イベントの `spec_bytes` はこの分を含み、`tool_search_bytes` に内訳が残る。Claude Code の deferred tools / Codex の `tool_search` に相当し、大量の MCP ツールを system prompt に常駐させないための仕組み。既定 off — `core` は 7 個だけ、`full` は全部を送る従来どおり。読み込んだツールはセッションの間だけ有効で、`--resume` では引き継がない。`--log-jsonl` の `tools` イベントに `deferred`、読み込みのたびに `tool_search` イベントが残る
 - **空応答の促し**(`[agent] empty_reply_nudge`、`--empty-reply-nudge[=<bool>]`、既定 **true**): 本文もツール呼び出しも無い応答(thinking モデルが思考だけ書いて閉じたもの。qwen3.5:9b の実測で 20 実行中 13)が来たら、1 回だけ「考えた内容を踏まえて答えを書くか次のツールを呼べ」と促して続ける。それでも空なら、そのまま終える(`-p` は終了コード `1` で、`error` に「思考は N 文字あったが答えを書かなかった」と出る)。思考の有無は問わない — 空の応答は答えではないので、思考を返さないモデルの空応答にも 1 回だけ促す。空応答の履歴は `content: ""` で保存する(`content` 無しの assistant メッセージは送り返すと Ollama が 400 で拒否するため。古いセッションの再開時にも揃える)(#111)
+- **編集直後の構文チェック**（`[agent] syntax_check = true`、`--syntax-check[=<bool>]`、`LODAN_SYNTAX_CHECK`、既定 false、#65 D2）: `Write` / `Edit` / `MultiEdit` / `NotebookEdit` が成功した直後に、拡張子ごとの短いコマンドで**そのファイルだけ**を検査し、壊れていたらツール結果の後ろに `[syntax] … failed:` と直し方を足す。**ブロックはしない**（ファイルは書かれたまま。拒否すると「書けない」ループに入る）。既定のコマンドは `py` = `python3 -m py_compile` / `js` `mjs` `cjs` = `node --check` / `json` = `python3 -m json.tool` / `sh` = `sh -n` / `bash` = `bash -n`。遅いもの（`tsc` / `cargo check`）と単ファイルで完結しないものは入れていない（そちらは `[[verify]]` の持ち場）。
+
+  ```toml
+  [agent]
+  syntax_check = true
+  [agent.syntax_checks]
+  py = "ruff check {path}"   # 既定を上書き
+  rs = "rustc --edition 2024 --emit=metadata --crate-type lib {path} -o /dev/null"  # 追加
+  json = ""                  # 空文字で無効化
+  ```
+
+  `{path}` は検査するファイルの絶対パス（shell quote 済み）に置き換わる。1 ファイル 5 秒で打ち切り、起動できないコマンドは「検査しなかった」として黙る。runlog に `syntax_check { path, ok, ms }`。
 - **検証ループ**（`[[verify]]`、`--verify <CMD>`、`LODAN_VERIFY`、`[agent] max_repairs`（既定 2）、#65 D1）: **そのターンがファイルを変えた**とき、最終応答を出す直前に検証コマンドを走らせ、**失敗したら出力をモデルへ差し戻して直させる**（同じターンで最大 `max_repairs` 回。それでも失敗なら「失敗したまま終える」と表示して終了）。ラダーの実測で「L2-http が満点になったのはモデルが自分で検証ループを回した 1 回だけ」だったので、回すかどうかをモデルに任せない（[phase1-2026-10](docs/eval/ladder/phase1-2026-10.md)）。
 
   ```toml
@@ -231,6 +243,7 @@ auto_approve    = false
 finish_nudge    = false   # 終了前自己検証ナッジ (#63)
 requirements    = false   # 要件台帳: 依頼から要件を抜き出して system prompt に固定し、未達なら終了前に促す (#65)
 max_repairs     = 2       # [[verify]] の失敗をモデルに差し戻す回数の上限 (1 ターンあたり。0 で報告だけ) (#65)
+syntax_check    = false   # Write / Edit の直後にそのファイルの構文を検査して注記する (#65)
 write_max_lines = 0       # Write 1 回の行数上限。超えたら骨格 + Edit の手順を返す。0 は無制限 (#65)
 empty_reply_nudge = true  # 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)
 malformed_retry = true    # テキストに漏れたツールコールの再要求 (#61)

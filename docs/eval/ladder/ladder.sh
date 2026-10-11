@@ -95,6 +95,8 @@ flags_for_config() {
     # `--verify` はフラグ列の単語分割で壊れる (コマンドに空白が入る) ので、実行ごとの
     # `.lodan/config.toml` に `[[verify]]` として書く (下の run_one を参照)。
     verify-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none" ;;
+    # think-none と同条件で、編集直後の構文チェックだけを足す (#65 D2)。
+    syntax-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --syntax-check" ;;
     think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
     *) echo "unknown config: $1" >&2; return 1 ;;
   esac

@@ -13,6 +13,7 @@ pub mod ask_user_question;
 pub mod multi_edit;
 pub mod notebook_edit;
 pub mod requirements;
+pub mod syntax;
 pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;

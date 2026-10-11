@@ -63,6 +63,10 @@ pub struct Cli {
     #[arg(long, env = "LODAN_REASONING_EFFORT", value_name = "LEVEL")]
     pub reasoning_effort: Option<String>,
 
+    /// tool_choice for the active provider: auto (default) or required (every reply is a tool call; lodan adds a Finish tool for the final answer) (#65)
+    #[arg(long, env = "LODAN_TOOL_CHOICE", value_name = "auto|required")]
+    pub tool_choice: Option<String>,
+
     /// Stream the model's reasoning (thinking) text in full instead of a one-line summary
     #[arg(long, env = "LODAN_SHOW_REASONING", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub show_reasoning: Option<bool>,
@@ -416,6 +420,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         api_key: args.api_key,
         temperature: args.temperature,
         reasoning_effort: args.reasoning_effort,
+        tool_choice: args.tool_choice,
         show_reasoning: args.show_reasoning,
         auto_approve: args.yes,
         finish_nudge: args.finish_nudge,

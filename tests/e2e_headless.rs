@@ -1615,6 +1615,45 @@ fn requirements_are_extracted_persisted_and_nudged_headless() {
     assert!(!off.join(".lodan/requirements.json").exists());
 }
 
+/// `--tool-choice required` (#65 A1): `Finish` だけを呼んだ応答は最終回答として扱われる。
+/// 既定 (`auto`) では `Finish` は登録に無いツールなので、そのまま unknown tool になる。
+#[test]
+fn a_lone_finish_call_is_the_final_answer_only_with_tool_choice_required() {
+    let home = tempfile::tempdir().unwrap();
+    let steps = serde_json::json!([["Finish", { "answer": "all done" }]]).to_string();
+    let server = start_mock_with(home.path(), &[("MOCK_LLM_STEPS", &steps)]);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["-p", "run the demo", "--output-format", "json"];
+        args.extend_from_slice(extra);
+        lodan(home.path(), server.port, &args, Stdin::OpenAndSilent)
+    };
+    let required = run(&["--tool-choice", "required"]);
+    assert!(
+        required.status.success(),
+        "{}",
+        String::from_utf8_lossy(&required.stderr)
+    );
+    let out: serde_json::Value = serde_json::from_str(&stdout(&required)).unwrap();
+    assert_eq!(out["result"], "all done", "{}", stdout(&required));
+
+    // 既定では擬似ツールを足さないので Finish は未知のツール。モデルは次の応答で本文を返す。
+    let auto = run(&[]);
+    assert!(auto.status.success());
+    let out: serde_json::Value = serde_json::from_str(&stdout(&auto)).unwrap();
+    assert_ne!(out["result"], "all done", "{}", stdout(&auto));
+
+    // auto / required 以外は起動時エラー。
+    let bad = run(&["--tool-choice", "none"]);
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("tool_choice")
+            || stdout(&bad).contains("tool_choice"),
+        "{}{}",
+        stdout(&bad),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
 #[test]
 fn headless_keeps_the_piped_result_verbatim_but_defuses_what_a_human_reads() {
     let home = tempfile::tempdir().unwrap();

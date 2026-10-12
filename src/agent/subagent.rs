@@ -297,7 +297,7 @@ pub struct SubAgentTool {
     children: Arc<std::sync::Mutex<std::collections::BTreeMap<String, ChildRecord>>>,
 }
 
-use crate::agent::agents::{DEFAULT_AGENT, Isolation};
+use crate::agent::agents::{DEFAULT_AGENT, Isolation, PLAN_STEP_AGENT};
 
 /// 説明の 1 行目 (Task の説明に載せる用)。
 fn first_line(text: &str) -> &str {
@@ -452,11 +452,12 @@ impl SubAgentTool {
         self
     }
 
-    /// 定義した種類の名前 (既定を除く)。
+    /// モデルに見せる種類の名前 (既定と、ハーネス専用の `plan-step` を除く)。
+    /// `plan-step` は書き込める子なので、モデルが自分で呼べる選択肢には出さない (#65 C1)。
     pub fn custom_names(&self) -> Vec<&str> {
         self.profiles
             .keys()
-            .filter(|n| n.as_str() != DEFAULT_AGENT)
+            .filter(|n| n.as_str() != DEFAULT_AGENT && n.as_str() != PLAN_STEP_AGENT)
             .map(String::as_str)
             .collect()
     }
@@ -1061,7 +1062,8 @@ impl Tool for SubAgentTool {
             schema["properties"]["subagent_type"] = serde_json::json!({
                 "type": "string",
                 "description": "Which sub-agent to run (see the tool description); omit for the default",
-                "enum": self.profiles.keys().collect::<Vec<_>>()
+                // ハーネス専用の種類は出さない (`custom_names` と同じ範囲 + 既定)。
+                "enum": std::iter::once(DEFAULT_AGENT).chain(self.custom_names()).collect::<Vec<_>>()
             });
         }
         // 走り終えた子がいるときだけ見せる (無いうちは選べるものが無い)。
@@ -2070,6 +2072,41 @@ mod tests {
             cwd,
             8,
         )
+    }
+
+    /// Plan→Execute (#65 C1) の `plan-step` は**書き込める**子なので、モデルに見せる一覧
+    /// (`Task` の説明と `subagent_type` の enum) には出さない。ハーネスは名指しで呼べる。
+    #[test]
+    fn the_plan_step_agent_is_usable_by_name_but_never_offered_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let writable = AgentProfile::new(
+            Arc::new(ScriptedLlm::new(vec![])),
+            "mock".into(),
+            Arc::new(crate::tools::registry::default_registry()),
+            4,
+        )
+        .with_instructions(String::new(), "runs one step of a plan".into());
+        let tool = subagent(vec![], dir.path().to_path_buf())
+            .with_profile(PLAN_STEP_AGENT.to_string(), writable)
+            .with_profile("digger".into(), {
+                AgentProfile::new(
+                    Arc::new(ScriptedLlm::new(vec![])),
+                    "mock".into(),
+                    Arc::new(read_only_registry()),
+                    4,
+                )
+                .with_instructions(String::new(), "digs".into())
+            });
+        // 利用者が定義した種類は見せる。plan-step は見せない。
+        assert_eq!(tool.custom_names(), vec!["digger"]);
+        assert!(!tool.description().contains(PLAN_STEP_AGENT));
+        let schema = tool.schema().to_string();
+        assert!(schema.contains("digger"), "{schema}");
+        assert!(!schema.contains(PLAN_STEP_AGENT), "{schema}");
+        // それでも名指しなら解決する (ハーネスが呼ぶ経路)。
+        let (_, profile) = tool.profile(Some(PLAN_STEP_AGENT)).expect("usable by name");
+        // 手順を実行するには書けないと意味が無い (既定の子は読み取り専用)。
+        assert!(SubAgentTool::profile_writes(profile));
     }
 
     /// 1 回目は指定のツールを呼び、2 回目は**受け取ったツール出力をそのまま最終応答にする** LLM。

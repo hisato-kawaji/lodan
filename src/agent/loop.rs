@@ -486,6 +486,9 @@ impl Session {
             let mut args = serde_json::json!({
                 "description": step.title,
                 "prompt": plan::step_prompt(user_input, &steps, i, &done),
+                // 既定の子は読み取り専用なので、手順の実行には書ける子を名指しする。
+                // 定義は runtime が入れる (モデルには見せない種類)。
+                "subagent_type": crate::agent::agents::PLAN_STEP_AGENT,
             });
             let started = std::time::Instant::now();
             let pre = self

@@ -223,6 +223,34 @@ impl Runtime {
         for w in warnings {
             eprintln!("agents: {}", crate::term::sanitize(&w));
         }
+        // Plan→Execute (#65 C1) の手順を実行する子。**書き込める**ので、モデルに見せる種類の
+        // 一覧には出さず (`custom_names` が除く)、ハーネスが名指しで呼ぶ。破壊的ツールは親と
+        // 同じ承認ゲート・サンドボックス・プランモードを通る (#77 / #134 と同じ扱い)。
+        // 定義ファイルより先に入れてあるので、`.lodan/agents/plan-step.md` があればそちらが勝つ。
+        if cfg.agent.plan_execute {
+            let mut tools = default_registry();
+            // 子は利用者と直接やり取りしない (`-p` では尋ねる相手もいない)。
+            let hide: Vec<String> = tools
+                .all_names()
+                .into_iter()
+                .filter(|n| *n != "AskUserQuestion")
+                .map(str::to_string)
+                .collect();
+            tools.apply_profile(crate::config::ToolProfile::Full, &hide);
+            task = task.with_profile(
+                agent::agents::PLAN_STEP_AGENT.to_string(),
+                agent::subagent::AgentProfile::new(
+                    Arc::clone(&llm),
+                    cfg.llm.active().model.clone(),
+                    Arc::new(tools),
+                    cfg.agent.max_iterations,
+                )
+                .with_instructions(
+                    String::new(),
+                    "runs one step of a plan made by the harness".to_string(),
+                ),
+            );
+        }
         let mut agent_names = Vec::new();
         for def in defs {
             match build_agent_profile(&def, cfg, &llm, &ledger) {

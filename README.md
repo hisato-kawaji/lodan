@@ -183,7 +183,9 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
   `paths` を省くと「何かファイルを変えたら走る」。変更が無いターン（質問に答えただけ、検索しただけ）では走らせない。**`paths` が見ているのは lodan のファイルツール（`Write` / `Edit` / `MultiEdit` / `NotebookEdit`）が触ったパスだけ**で、`Bash` が何を変えたか（`sed -i` など）は分からない。そのため **`paths` を省いた検証は、Bash が成功したターンでも走る**（取りこぼさないため）。逆に `paths` つきの検証は Bash の書き換えでは発火しないので、Bash で編集させる運用では `paths` を省くこと。出力はモデルに渡す前に末尾 2000 文字へ切る（失敗の理由は末尾に出るため）。runlog に `verify_run { label, ok, ms }` / `verify_repair { n, labels }` / `verify_failed_at_end`。`--verify` は設定の `[[verify]]` に**足す**（繰り返し可）。
   > ⚠️ **信頼前提**: 検証コマンドは hook と同じく `sh -c` でサンドボックス無しに走ります。`.lodan/config.toml` は未信頼ディレクトリでは読まれない（[workspace trust](#workspace-trust-と-bash-サンドボックス)）ので境界は hook と同じです。
 - **要件台帳**（`[agent] requirements = true`、`--requirements[=<bool>]`、`LODAN_REQUIREMENTS`、既定 false、#65 B1/B2）: 利用者の依頼（40 文字以上）ごとに LLM を 1 回呼んで「検査可能な要件」を JSON 配列で抜き出し、`<cwd>/.lodan/requirements.json` に持つ。台帳は **system prompt の末尾に常に描画**されるので、コンテキスト圧縮や `--resume` を挟んでも消えない（要件が文脈の中にしか無いと長い作業の途中で落ちる — mini-renovater ベンチの「33 分で要件が脱落」対策）。モデルは `Requirements` ツール（有効なときだけ登録。`core` にも入る）で `done`（`ids` + 根拠。1 回の検証で複数まとめて可）/ `drop`（`ids` + 理由）/ `add`（text）を記録する。最終応答を出そうとしたときに未達が残っていれば、未達一覧を `[lodan] Requirements ledger check` として注入して続けさせる（1 ターン最大 2 回。それでも残れば「残ったまま終える」と表示）。`/requirements` で一覧、`/requirements clear` で消す。runlog に `requirements_extracted` / `requirements_nudge` / `requirements_open_at_end`。抽出の呼び出しは台帳に `requirements` として計上される。**信頼前提**: 台帳の中身（抽出結果と `add` / `evidence` の文字列）はモデルが書いたもので、`.lodan/requirements.json` に残り、以後のセッションでも system prompt に入り続ける（`.lodan/skills` や `.lodan/commands` と同じく、cwd のファイルをプロンプトに注入する経路）。件数 30 / 1 件 300 字に切り詰め、端末表示は無害化するが、見覚えの無い項目が残っていたら `/requirements clear` で消すこと
-- **Write の行数上限**（`[agent] write_max_lines`、`--write-max-lines N`、`LODAN_WRITE_MAX_LINES`、既定 0 = 無制限、#65 A2）: 1 回の `Write` の内容が N 行を超えたら**書かずに**拒否し、「N 行以内の骨格（import・定数・型と関数のシグネチャ・プレースホルダの本体）を Write してから、各プレースホルダを Edit で N 行以内ずつ埋める」手順を返す。小型モデルが数百行を 1 引数で一貫して生成できない（mini-renovater の「800 行を 1 引数で書けない」）のに対し、**要求する粒度の方を落とす**。サブエージェントの Write にも掛かる。runlog に `write_split_refused`。目安は 80〜150
+- **Write の行数上限**（`[agent] write_max_lines`、`--write-max-lines N`、`LODAN_WRITE_MAX_LINES`、既定 0 = 無制限、#65 A2）: 1 回の `Write` の内容が N 行を超えたら**書かずに**拒否し、「まず N 行以内を Write し、続きを `Write { append: true }` で N 行以内ずつ**順に足す**」手順を返す。小型モデルが数百行を 1 引数で一貫して生成できない（mini-renovater の「800 行を 1 引数で書けない」）のに対し、**要求する粒度の方を落とす**。サブエージェントの Write にも掛かる。**追記の途中で上限に当たったとき**は「この塊を割って追記を続けろ（やり直すな）」に文面が変わる — 作りかけのファイルは上書きが通るので、先頭から書き直させるとそこまでの追記が消える。runlog に `write_split_refused`。目安は 80〜150
+  > 以前は「骨格を書いてプレースホルダを Edit で埋める」と誘導していたが、ラダーの実測（[phase1-2026-10](docs/eval/ladder/phase1-2026-10.md)）で 9B は自分が書いたプレースホルダを再現できず `old_string not found` を繰り返し、未完成のまま終わった。**追記なら文字列の一致が要らない**ので誘導を変えた
+- **`Write` の `append`**: `append: true` で末尾に足す（ファイルが無ければ作る）。**追記は既存の内容を壊さないので Read を要求しない**（上書きは従来どおり Read が必要）。行数上限は 1 回ごとに掛かる。結果は `appended N bytes to <path> (M bytes, L lines total)`（1 MiB を超えるファイルでは行数を数えず `(M bytes total)`）。**追記は「読んだ」ことにはならない**ので、一度も Read していない既存ファイルは追記したあとも上書きできない（追記で Read 必須ガードを外す経路を作らない）。runlog に `write_appended { path, bytes, lines, existed }`
 - **終了前自己検証ナッジ**(`[agent] finish_nudge = true`、既定 false): ターンが終わろうとする最初の応答で 1 回だけ、ツール未使用なら「計画を述べ直さず今実行せよ」、使用済みなら「元の依頼を読み直し全要件の実装・検証を確認せよ」と促して継続させる。「計画だけ述べて終了」「長い自己編集中の要件脱落」対策(#63)。良行儀なモデルには余計なラウンドトリップになるため opt-in。
 
 ## 設定
@@ -244,7 +246,7 @@ finish_nudge    = false   # 終了前自己検証ナッジ (#63)
 requirements    = false   # 要件台帳: 依頼から要件を抜き出して system prompt に固定し、未達なら終了前に促す (#65)
 max_repairs     = 2       # [[verify]] の失敗をモデルに差し戻す回数の上限 (1 ターンあたり。0 で報告だけ) (#65)
 syntax_check    = false   # Write / Edit の直後にそのファイルの構文を検査して注記する (#65)
-write_max_lines = 0       # Write 1 回の行数上限。超えたら骨格 + Edit の手順を返す。0 は無制限 (#65)
+write_max_lines = 0       # Write 1 回の行数上限。超えたら順に追記する手順を返す。0 は無制限 (#65)
 empty_reply_nudge = true  # 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)
 malformed_retry = true    # テキストに漏れたツールコールの再要求 (#61)
 dup_suppress    = true    # 直前と同一の read-only 呼び出しの抑止 (#61)

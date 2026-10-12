@@ -903,15 +903,11 @@ impl Config {
     /// 利用者の明示 (`--tool-profile` / 設定ファイルの `tool_profile` / `tools = [...]`) が勝つ。
     /// 起動時のアクティブ provider で決まる — `/model` で後から別の provider に切り替えても、
     /// ツール登録はセッションの間固定なので追従しない。
-    fn apply_preset_tool_profile(&mut self, origins: &Origins) {
-        let Some(profile) = self
-            .llm
-            .active()
-            .preset
-            .as_deref()
-            .and_then(crate::presets::find)
-            .and_then(|p| p.tool_profile)
-        else {
+    fn apply_preset_tool_profile(&mut self, origins: &mut Origins) {
+        let Some(name) = self.llm.active().preset.clone() else {
+            return;
+        };
+        let Some(profile) = crate::presets::find(&name).and_then(|p| p.tool_profile) else {
             return;
         };
         if !origins.contains_key("agent.tool_profile")
@@ -919,6 +915,7 @@ impl Config {
             && self.agent.tools.is_empty()
         {
             self.agent.tool_profile = profile;
+            origins.insert("agent.tool_profile".into(), Origin::Preset(name));
         }
     }
 }
@@ -1027,6 +1024,9 @@ pub enum Origin {
     File(PathBuf),
     /// env か CLI フラグ (`apply_overrides`)。ファイルの値より後に効く。
     Override,
+    /// プリセット (`[llm.<provider>] preset`) が埋めたキー (#65 E)。どこにも書かれて
+    /// いないキーだけが入るので、ファイルや CLI より弱い。
+    Preset(String),
 }
 
 impl std::fmt::Display for Origin {
@@ -1034,6 +1034,7 @@ impl std::fmt::Display for Origin {
         match self {
             Origin::File(p) => write!(f, "{}", p.display()),
             Origin::Override => f.write_str("env or CLI flag"),
+            Origin::Preset(name) => write!(f, "preset `{name}`"),
         }
     }
 }
@@ -1149,14 +1150,14 @@ fn from_layers(layers: Vec<(PathBuf, toml::Table)>) -> Result<(Config, Origins)>
             anyhow::anyhow!("merging config layers: {}", redact_quoted(e.message()))
         })?;
     let mut cfg = cfg;
-    apply_presets(&mut cfg, &origins)?;
+    apply_presets(&mut cfg, &mut origins)?;
     Ok((cfg, origins))
 }
 
 /// `preset = "<name>"` を書いた provider に、プリセットの値を**まだ書かれていないキーだけ**
 /// 埋める (#65 E)。利用者が同じキーを書いていればそちらが勝つ (`origins` に載っているキーは触らない)。
 /// 未知の名前は起動時エラー — 黙って無視すると「プリセットを当てたつもり」のまま走ってしまう。
-fn apply_presets(cfg: &mut Config, origins: &Origins) -> Result<()> {
+fn apply_presets(cfg: &mut Config, origins: &mut Origins) -> Result<()> {
     use Provider::*;
     for provider in [Local, Sakana, Sakura, Kimi] {
         let Some(name) = cfg.llm.get(provider).preset.clone() else {
@@ -1169,26 +1170,35 @@ fn apply_presets(cfg: &mut Config, origins: &Origins) -> Result<()> {
                 provider.as_str()
             )
         })?;
-        let set_by_user =
-            |key: &str| origins.contains_key(&format!("llm.{}.{key}", provider.as_str()));
+        let key_of = |key: &str| format!("llm.{}.{key}", provider.as_str());
+        let set_by_user = |key: &str| origins.contains_key(&key_of(key));
+        // 埋めたキーは origins に残す。残さないと `--show-origin` で「既定値」に見え、
+        // なぜ temperature が 0.2 なのかが追えない (#153 のレビュー)。
+        let mut filled: Vec<String> = Vec::new();
         let p = cfg.llm.get_mut(provider);
         if let Some(t) = preset.temperature
             && p.temperature.is_none()
             && !set_by_user("temperature")
         {
             p.temperature = Some(t);
+            filled.push(key_of("temperature"));
         }
         if let Some(e) = preset.reasoning_effort
             && p.reasoning_effort.is_none()
             && !set_by_user("reasoning_effort")
         {
             p.reasoning_effort = Some(e.to_string());
+            filled.push(key_of("reasoning_effort"));
         }
         if let Some(c) = preset.tool_choice
             && p.tool_choice.is_none()
             && !set_by_user("tool_choice")
         {
             p.tool_choice = Some(c.to_string());
+            filled.push(key_of("tool_choice"));
+        }
+        for key in filled {
+            origins.insert(key, Origin::Preset(name.clone()));
         }
     }
     Ok(())
@@ -1293,21 +1303,34 @@ max_iterations = "sk-not-a-number""#,
     /// プリセット (#65 E): 書かれていないキーだけ埋め、利用者が書いたキーは勝つ。未知の名前はエラー。
     #[test]
     fn a_preset_fills_only_the_keys_the_user_did_not_set() {
-        let (cfg, _) = from_layers(vec![layer(
+        let (cfg, origins) = from_layers(vec![layer(
             "project",
             "[llm.local]\npreset = \"local-small\"\n",
         )])
         .unwrap();
         assert_eq!(cfg.llm.local.temperature, Some(0.2));
         assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("none"));
+        // 埋めたキーは由来が分かる (`--show-origin` で既定値に見えない)。
+        assert_eq!(
+            origins["llm.local.temperature"],
+            Origin::Preset("local-small".into())
+        );
+        assert_eq!(
+            origins["llm.local.reasoning_effort"],
+            Origin::Preset("local-small".into())
+        );
 
-        // 利用者が書いた値は上書きされない。
-        let (cfg, _) = from_layers(vec![layer(
+        // 利用者が書いた値は上書きされない (由来もファイルのまま)。
+        let (cfg, origins) = from_layers(vec![layer(
             "project",
             "[llm.local]\npreset = \"local-small\"\ntemperature = 0.7\n",
         )])
         .unwrap();
         assert_eq!(cfg.llm.local.temperature, Some(0.7));
+        assert_eq!(
+            origins["llm.local.temperature"],
+            Origin::File(PathBuf::from("project"))
+        );
         assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("none"));
 
         // provider ごとの値は、どの provider がアクティブでも書いた先に入る。
@@ -1344,6 +1367,15 @@ max_iterations = "sk-not-a-number""#,
             load(core, Overrides::default()).agent.tool_profile,
             ToolProfile::Core
         );
+        // プリセットが決めたことが origins に残る。
+        {
+            let (mut cfg, mut origins) = from_layers(vec![layer("project", core)]).unwrap();
+            cfg.apply_overrides_tracked(Overrides::default(), &mut origins);
+            assert_eq!(
+                origins["agent.tool_profile"],
+                Origin::Preset("local-small-core".into())
+            );
+        }
         // --provider で別の provider に移ったら、そちらのプリセット (ここでは無し) に従う。
         let moved = load(
             core,

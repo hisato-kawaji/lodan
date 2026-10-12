@@ -103,25 +103,90 @@ pub fn describe_all() -> String {
 mod tests {
     use super::*;
 
+    /// `about` に書かれた `docs/…` のパス。
+    fn cited_paths(about: &str) -> Vec<&str> {
+        about
+            .split(|c: char| c.is_whitespace() || "()、。,".contains(c))
+            .filter(|w| w.starts_with("docs/") && w.ends_with(".md"))
+            .collect()
+    }
+
+    /// 出典 (パスと `#<issue>`) を除いた数字の個数 = 実際に測った値がいくつ書かれているか。
+    fn measured_numbers(about: &str, cited: &[&str]) -> usize {
+        let mut text = about.to_string();
+        for path in cited {
+            text = text.replace(path, " ");
+        }
+        let mut cleaned = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '#' {
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    chars.next();
+                }
+                continue;
+            }
+            cleaned.push(c);
+        }
+        cleaned
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .count()
+    }
+
+    /// 番人が実際に緩い `about` を落とすこと (#153 のレビュー: 以前の条件は `#` を含むだけで
+    /// 通った)。ここが通らなくなったら、上のテストはもう何も守っていない。
+    #[test]
+    fn the_guard_rejects_an_about_that_only_points_at_a_source() {
+        // 出典だけで数字が無い。
+        assert_eq!(measured_numbers("#72 の実測", &[]), 0);
+        assert_eq!(
+            measured_numbers(
+                "docs/eval/ladder/x-2026-09.md のとおり",
+                &["docs/eval/ladder/x-2026-09.md"]
+            ),
+            0
+        );
+        // 測った値が書いてあれば通る。
+        assert_eq!(measured_numbers("28% 速い (#72)", &[]), 1);
+        // パスの体裁だけの出典は拾えて、実在しないことを呼び出し側が落とせる。
+        assert_eq!(
+            cited_paths("docs/eval/nope.md より"),
+            vec!["docs/eval/nope.md"]
+        );
+        assert!(cited_paths("docs/eval より").is_empty());
+    }
+
     #[test]
     fn every_preset_has_a_measurement_in_its_about_and_sets_something() {
         for p in all() {
-            // 根拠は「どこで測ったか」まで辿れる形 (docs/eval のファイル名か issue 番号) で
-            // 書く。`実測` や `#` だけでは通さない (#153 のレビュー: 番人が緩いと出典の
-            // 無い / 取り違えた preset が入る)。
+            // 根拠は「どこで測ったか」まで辿れる形 (docs/eval の**実在する**ファイルか
+            // issue 番号) で書く。`実測` や `#` だけでは通さない (#153 のレビュー: 番人が
+            // 緩いと出典の無い / 取り違えた preset が入る)。
+            let cited_docs = cited_paths(p.about);
             let cites_issue = p
                 .about
                 .split('#')
                 .skip(1)
                 .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
             assert!(
-                p.about.contains("docs/eval/") || cites_issue,
+                !cited_docs.is_empty() || cites_issue,
                 "{}: about が実測の出典 (docs/eval/… か #<issue>) を示していない",
                 p.name
             );
+            // 書いたパスは実在すること (リネームや打ち間違いで辿れない出典を残さない)。
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            for path in &cited_docs {
+                assert!(
+                    root.join(path).is_file(),
+                    "{}: about が指す {path} が無い",
+                    p.name
+                );
+            }
+            // 出典の番号やファイル名とは別に、**測った値**が書かれていること。
             assert!(
-                p.about.chars().any(|c| c.is_ascii_digit()),
-                "{}: about に測った数字が無い",
+                measured_numbers(p.about, &cited_docs) > 0,
+                "{}: about に測った数字が無い (出典の番号だけ)",
                 p.name
             );
             assert!(

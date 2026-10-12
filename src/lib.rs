@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod memory;
 pub mod permission;
 pub mod permission_rules;
+pub mod presets;
 pub mod prompt;
 pub mod repl;
 pub mod runlog;

@@ -164,6 +164,7 @@ struct ProviderOverlay {
     plan_reasoning_effort: Option<String>,
     reasoning_roundtrip: Option<bool>,
     tool_choice: Option<String>,
+    preset: Option<String>,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     max_retries: Option<u32>,
     retry_base_ms: Option<u64>,
@@ -185,6 +186,7 @@ impl ProviderOverlay {
             plan_reasoning_effort,
             reasoning_roundtrip,
             tool_choice,
+            preset,
             extra_body,
             max_retries,
             retry_base_ms,
@@ -201,6 +203,7 @@ impl ProviderOverlay {
             plan_reasoning_effort: plan_reasoning_effort.or(base.plan_reasoning_effort),
             reasoning_roundtrip: reasoning_roundtrip.unwrap_or(base.reasoning_roundtrip),
             tool_choice: tool_choice.or(base.tool_choice),
+            preset: preset.or(base.preset),
             // レイヤー間の重ね合わせは `merge_table` がキー単位で済ませている (他のテーブルと同じ)。
             // 組み込みの既定値は常に空なので、ここは「書かれていればそれ」で足りる。
             extra_body: extra_body.unwrap_or_default(),
@@ -263,6 +266,10 @@ pub struct ProviderConfig {
     /// ツール往復の間、モデルの思考過程 (`reasoning_content`) を送り返す。既定 true。
     /// 送り返された思考を拒否するサーバでは false にする。ターンを跨いだ思考はどちらでも送らない。
     pub reasoning_roundtrip: bool,
+    /// 組み込みプリセットの名前 (#65 E)。`lodan presets` で一覧。**同じキーを自分で書けばそちらが
+    /// 勝つ**。未知の名前は起動時エラー (黙って無視しない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     /// リクエストの `tool_choice` (#65 A1)。None (既定) は `auto`。`required` にすると、ツールが
     /// あるリクエストでは必ずツール呼び出しで答えさせる (制約デコードに対応したサーバではツール
     /// コールが JSON Schema どおりに整形され、テキストに漏れない)。そのままでは最終回答が
@@ -434,6 +441,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -453,6 +461,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -474,6 +483,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -495,6 +505,7 @@ impl ProviderConfig {
             plan_reasoning_effort: None,
             reasoning_roundtrip: true,
             tool_choice: None,
+            preset: None,
             extra_body: serde_json::Map::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
@@ -881,6 +892,34 @@ impl Config {
             self.agent.tool_search = v;
             mark("agent.tool_search".into());
         }
+        // プリセットの `tool_profile` はここで当てる。provider ごとの値 (temperature …) と違い
+        // これは `[agent]` に 1 つしか無いので、**誰がアクティブか決まってから**でないと当てられない
+        // (#153 のレビュー: `--provider` / `LODAN_PROVIDER` が効くのはこの関数なので、設定の
+        // 読み込み時点ではファイルに書かれた provider しか見えていなかった)。
+        self.apply_preset_tool_profile(origins);
+    }
+
+    /// アクティブな provider のプリセットが `tool_profile` を持つなら、まだ決まっていないときだけ当てる。
+    /// 利用者の明示 (`--tool-profile` / 設定ファイルの `tool_profile` / `tools = [...]`) が勝つ。
+    /// 起動時のアクティブ provider で決まる — `/model` で後から別の provider に切り替えても、
+    /// ツール登録はセッションの間固定なので追従しない。
+    fn apply_preset_tool_profile(&mut self, origins: &Origins) {
+        let Some(profile) = self
+            .llm
+            .active()
+            .preset
+            .as_deref()
+            .and_then(crate::presets::find)
+            .and_then(|p| p.tool_profile)
+        else {
+            return;
+        };
+        if !origins.contains_key("agent.tool_profile")
+            && self.agent.tool_profile == ToolProfile::default()
+            && self.agent.tools.is_empty()
+        {
+            self.agent.tool_profile = profile;
+        }
     }
 }
 
@@ -1109,7 +1148,50 @@ fn from_layers(layers: Vec<(PathBuf, toml::Table)>) -> Result<(Config, Origins)>
         .map_err(|e: toml::de::Error| {
             anyhow::anyhow!("merging config layers: {}", redact_quoted(e.message()))
         })?;
+    let mut cfg = cfg;
+    apply_presets(&mut cfg, &origins)?;
     Ok((cfg, origins))
+}
+
+/// `preset = "<name>"` を書いた provider に、プリセットの値を**まだ書かれていないキーだけ**
+/// 埋める (#65 E)。利用者が同じキーを書いていればそちらが勝つ (`origins` に載っているキーは触らない)。
+/// 未知の名前は起動時エラー — 黙って無視すると「プリセットを当てたつもり」のまま走ってしまう。
+fn apply_presets(cfg: &mut Config, origins: &Origins) -> Result<()> {
+    use Provider::*;
+    for provider in [Local, Sakana, Sakura, Kimi] {
+        let Some(name) = cfg.llm.get(provider).preset.clone() else {
+            continue;
+        };
+        let preset = crate::presets::find(&name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown preset `{}` for [llm.{}] (see `lodan presets`)",
+                crate::term::sanitize(&name),
+                provider.as_str()
+            )
+        })?;
+        let set_by_user =
+            |key: &str| origins.contains_key(&format!("llm.{}.{key}", provider.as_str()));
+        let p = cfg.llm.get_mut(provider);
+        if let Some(t) = preset.temperature
+            && p.temperature.is_none()
+            && !set_by_user("temperature")
+        {
+            p.temperature = Some(t);
+        }
+        if let Some(e) = preset.reasoning_effort
+            && p.reasoning_effort.is_none()
+            && !set_by_user("reasoning_effort")
+        {
+            p.reasoning_effort = Some(e.to_string());
+        }
+        if let Some(c) = preset.tool_choice
+            && p.tool_choice.is_none()
+            && !set_by_user("tool_choice")
+        {
+            p.tool_choice = Some(c.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// テーブルは再帰、`CONCAT_ARRAY_KEYS` は連結、それ以外の値は `over` で置き換える。
@@ -1206,6 +1288,103 @@ max_iterations = "sk-not-a-number""#,
         .to_string();
         assert!(err.contains("merging config layers"), "{err}");
         assert!(!err.contains("sk-not-a-number"), "{err}");
+    }
+
+    /// プリセット (#65 E): 書かれていないキーだけ埋め、利用者が書いたキーは勝つ。未知の名前はエラー。
+    #[test]
+    fn a_preset_fills_only_the_keys_the_user_did_not_set() {
+        let (cfg, _) = from_layers(vec![layer(
+            "project",
+            "[llm.local]\npreset = \"local-small\"\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.llm.local.temperature, Some(0.2));
+        assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("none"));
+
+        // 利用者が書いた値は上書きされない。
+        let (cfg, _) = from_layers(vec![layer(
+            "project",
+            "[llm.local]\npreset = \"local-small\"\ntemperature = 0.7\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.llm.local.temperature, Some(0.7));
+        assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("none"));
+
+        // provider ごとの値は、どの provider がアクティブでも書いた先に入る。
+        let (cfg, _) = from_layers(vec![layer(
+            "project",
+            "[llm]\nprovider = \"kimi\"\n\n[llm.local]\npreset = \"local-small\"\n",
+        )])
+        .unwrap();
+        assert_eq!(cfg.llm.local.temperature, Some(0.2));
+
+        // 未知の名前は起動時エラー (黙って無視しない)。
+        let err = from_layers(vec![layer("project", "[llm.local]\npreset = \"nope\"\n")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown preset") && err.contains("lodan presets"),
+            "{err}"
+        );
+    }
+
+    /// `tool_profile` は `[agent]` に 1 つしか無いので、**上書きを反映した後のアクティブな
+    /// provider** のプリセットからだけ当てる。設定ファイルの provider で判定すると、
+    /// `--provider` で別のモデルを使う実行にツール非表示が漏れる (#153 のレビューで実測)。
+    #[test]
+    fn a_presets_tool_profile_follows_the_provider_that_is_actually_active() {
+        let load = |toml: &str, overrides: Overrides| {
+            let (mut cfg, mut origins) = from_layers(vec![layer("project", toml)]).unwrap();
+            cfg.apply_overrides_tracked(overrides, &mut origins);
+            cfg
+        };
+        let core = "[llm]\nprovider = \"local\"\n\n[llm.local]\npreset = \"local-small-core\"\n";
+        // 上書きが無ければファイルの provider がアクティブ。
+        assert_eq!(
+            load(core, Overrides::default()).agent.tool_profile,
+            ToolProfile::Core
+        );
+        // --provider で別の provider に移ったら、そちらのプリセット (ここでは無し) に従う。
+        let moved = load(
+            core,
+            Overrides {
+                provider: Some(Provider::Sakura),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            moved.agent.tool_profile,
+            ToolProfile::Full,
+            "他 provider のプリセットが漏れてはいけない"
+        );
+        // 逆向き: ファイルでは別 provider でも、--provider で指した先のプリセットは当たる。
+        let arrived = load(
+            "[llm]\nprovider = \"kimi\"\n\n[llm.local]\npreset = \"local-small-core\"\n",
+            Overrides {
+                provider: Some(Provider::Local),
+                ..Default::default()
+            },
+        );
+        assert_eq!(arrived.agent.tool_profile, ToolProfile::Core);
+        // 利用者の明示が勝つ: 設定ファイルの tool_profile / tools = [...] / --tool-profile。
+        let by_file = load(
+            "[llm]\nprovider = \"local\"\n[llm.local]\npreset = \"local-small-core\"\n\n[agent]\ntool_profile = \"readonly\"\n",
+            Overrides::default(),
+        );
+        assert_eq!(by_file.agent.tool_profile, ToolProfile::Readonly);
+        let by_list = load(
+            "[llm]\nprovider = \"local\"\n[llm.local]\npreset = \"local-small-core\"\n\n[agent]\ntools = [\"Read\"]\n",
+            Overrides::default(),
+        );
+        assert_eq!(by_list.agent.tool_profile, ToolProfile::Full);
+        let by_flag = load(
+            core,
+            Overrides {
+                tool_profile: Some(ToolProfile::Readonly),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_flag.agent.tool_profile, ToolProfile::Readonly);
     }
 
     #[test]

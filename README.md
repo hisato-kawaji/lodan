@@ -150,7 +150,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
   temperature = 0.1   # 自分で書いたキーはプリセットより強い
   ```
 
-  **モデル名から自動では当てない**（利用者の設定を黙って変えないため）。`preset` を書いた provider にだけ効き、**同じキーを設定ファイルや CLI で書いていればそちらが勝つ**。`tool_profile` は `[agent]` 側に 1 つしか無いので、**起動時にアクティブな provider**（`--provider` / `LODAN_PROVIDER` を反映した後）のプリセットからだけ当てる。`tools = [...]` を書いているときも当てない。`/model` で後から別の provider に切り替えてもツール登録はセッションの間固定なので追従しない。未知の名前は**起動時エラー**（黙って無視すると当てたつもりで走ってしまう）
+  **モデル名から自動では当てない**（利用者の設定を黙って変えないため）。`preset` を書いた provider にだけ効き、**同じキーを設定ファイルや CLI で書いていればそちらが勝つ**。`tool_profile` は `[agent]` 側に 1 つしか無いので、**起動時にアクティブな provider**（`--provider` / `LODAN_PROVIDER` を反映した後）のプリセットからだけ当てる。`tools = [...]` を書いているときも当てない。`/model` で後から別の provider に切り替えてもツール登録はセッションの間固定なので追従しない。未知の名前は**起動時エラー**（黙って無視すると当てたつもりで走ってしまう）。プリセットが埋めたキーは `lodan config --show-origin` に `<- preset \`<name>\`` として出る（「書いていないのにこの値」の理由が追える）
 - **推論の深さ**(provider 設定の `reasoning_effort`、`--reasoning-effort`、`LODAN_REASONING_EFFORT`。既定は未送信 = サーバ既定): thinking 系のモデルは、推論の深さで 1 応答の所要時間が大きく変わる(kimi-k3 のサーバ既定は `max`)。値は**検査せずそのまま** `reasoning_effort` として送る — 受け付ける語彙はサーバとモデルごとに違うため(`low` / `medium` / `high` が共通、Ollama は `none` で thinking を切れる、`max` / `minimal` を持つサーバもある)。未対応の値はサーバが 400 で返す。`reasoning_effort` を読まないサーバ固有の切り方は `extra_body` で渡す:
 
   ```toml

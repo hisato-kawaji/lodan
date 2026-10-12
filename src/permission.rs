@@ -600,6 +600,11 @@ fn preview(tool: &str, args: &serde_json::Value) -> Option<String> {
         "Write" => {
             let content = as_str("content")?;
             let mut out = String::new();
+            // 上書きと追記は同じ tool なので、どちらなのかを承認する側に見せる (#152 のレビュー)。
+            // 追記は既存の内容を消さないかわりに、設定ファイルの意味を壊すことがある。
+            if args.get("append").and_then(|v| v.as_bool()) == Some(true) {
+                out.push_str(&crate::term::dim("  (append to the end of the file)\n"));
+            }
             for (i, line) in content.lines().take(PREVIEW_MAX_LINES).enumerate() {
                 if i > 0 {
                     out.push('\n');

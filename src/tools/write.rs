@@ -5,6 +5,23 @@ use super::{Tool, ToolCtx, ToolError, ToolOutput};
 
 pub struct Write;
 
+/// 追記結果に付ける進捗。行数を数えるには全文を読むしかないので、分割生成で想定する大きさ
+/// (数百行) までに留める。これを超えるファイルへの追記を繰り返すと読み直しが O(n^2) になる
+/// (#152 のレビュー)。
+const MAX_LINE_COUNT_BYTES: u64 = 1 << 20;
+
+/// 追記後のファイルの大きさ。小さいうちは「何行目まで書けたか」も返す — 分割生成では
+/// モデルが続きを書く位置の目印になる。
+async fn append_progress(path: &std::path::Path, total: u64) -> String {
+    if total > MAX_LINE_COUNT_BYTES {
+        return format!(" ({total} bytes total)");
+    }
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => format!(" ({total} bytes, {} lines total)", text.lines().count()),
+        Err(_) => format!(" ({total} bytes total)"),
+    }
+}
+
 #[async_trait]
 impl Tool for Write {
     fn name(&self) -> &str {
@@ -57,7 +74,8 @@ impl Tool for Write {
             .get("append")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if !append && abs.exists() && !ctx.was_read(&abs) {
+        let existed = abs.exists();
+        if !append && existed && !ctx.was_read(&abs) {
             return Err(ToolError::NotReadYet(abs.display().to_string()));
         }
 
@@ -105,7 +123,12 @@ impl Tool for Write {
         } else {
             tokio::fs::write(&abs, content).await?;
         }
-        ctx.mark_read(&abs);
+        // 「読んだ」に数えるのは全文を把握しているときだけ。既存ファイルへの追記でこれを立てると、
+        // 一度も見ていないファイルに 1 行足してから全文上書きする、で Read 必須ガードを迂回できる
+        // (#152 のレビューで実証された)。新規作成の追記は中身がこの content そのものなので数える。
+        if !append || !existed {
+            ctx.mark_read(&abs);
+        }
 
         let total = tokio::fs::metadata(&abs)
             .await
@@ -113,13 +136,10 @@ impl Tool for Write {
             .unwrap_or(0);
         Ok(ToolOutput::ok(if append {
             format!(
-                "appended {} bytes to {} ({total} bytes, {} lines total)",
+                "appended {} bytes to {}{}",
                 content.len(),
                 abs.display(),
-                tokio::fs::read_to_string(&abs)
-                    .await
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0)
+                append_progress(&abs, total).await
             )
         } else {
             format!("wrote {} ({} bytes)", abs.display(), content.len())
@@ -177,6 +197,50 @@ mod split_tests {
                     serde_json::json!({ "path": path, "content": "x\n", "append": true }),
                     &fresh
                 )
+                .await
+                .unwrap()
+                .is_error
+        );
+    }
+
+    /// 既存ファイルへの追記は「読んだ」ことにしない。これを立てると、一度も見ていないファイルに
+    /// 1 行足して Read 必須ガードを外し、そのまま全文上書きできてしまう (#152 のレビュー)。
+    #[tokio::test]
+    async fn appending_to_an_unread_file_does_not_unlock_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        std::fs::write(&path, "KEY=original\n").unwrap();
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let put = |content: &str, append: bool| {
+            let args = serde_json::json!({ "path": path, "content": content, "append": append });
+            Write.execute(args, &ctx)
+        };
+        // 見ないままの追記は通る (中身は消えない)。
+        assert!(!put("# note\n", true).await.unwrap().is_error);
+        // その直後の全文上書きは、依然として Read を要求する。
+        assert!(matches!(
+            put("KEY=stolen\n", false).await,
+            Err(ToolError::NotReadYet(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "KEY=original\n# note\n"
+        );
+        // 自分が作ったファイルなら全文を把握しているので、追記のあとも上書きできる。
+        let made = dir.path().join("grown.py");
+        assert!(
+            !Write
+                .execute(
+                    serde_json::json!({ "path": made, "content": "a\n", "append": true }),
+                    &ctx
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !Write
+                .execute(serde_json::json!({ "path": made, "content": "b\n" }), &ctx)
                 .await
                 .unwrap()
                 .is_error

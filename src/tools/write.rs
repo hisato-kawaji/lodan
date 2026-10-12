@@ -97,15 +97,31 @@ impl Tool for Write {
                 }),
             );
             let limit = ctx.write_max_lines;
-            return Ok(ToolOutput::error(format!(
-                "Write refused: this is {lines} lines, but one Write may have at most {limit} lines \
-                 here. Nothing was written. Build the file in order instead: first Write the first \
-                 {limit} lines or fewer (imports and the first definitions, complete as far as they \
-                 go), then add each next piece with Write {{\"path\": …, \"append\": true, \
-                 \"content\": …}} — at most {limit} lines per call, continuing exactly where the \
-                 previous piece ended. Do not use placeholders and do not Edit; append in order \
-                 until the file is complete, then run it to check."
-            )));
+            // 追記の途中で上限に当たったときに「まず先頭を Write しろ」と言ってはいけない。
+            // 作りかけのファイルは自分で作ったぶん上書きが通る (Read 済みに数えている) ので、
+            // 文面どおりに従うとそこまでの追記が消える (#152 のレビューで実測)。
+            return Ok(ToolOutput::error(if append {
+                format!(
+                    "Write refused: this piece is {lines} lines, but one Write may have at most \
+                     {limit} lines here. Nothing was written and the file is unchanged. Split this \
+                     piece: append its first {limit} lines or fewer with Write {{\"path\": …, \
+                     \"append\": true, \"content\": …}}, then append the rest the same way, \
+                     continuing exactly where it ended. Do not start the file over (a Write \
+                     without append would replace everything you have added so far) and do not \
+                     use placeholders."
+                )
+            } else {
+                format!(
+                    "Write refused: this is {lines} lines, but one Write may have at most {limit} \
+                     lines here. Nothing was written. Build the file in order instead: first Write \
+                     the first {limit} lines or fewer (imports and the first definitions, complete \
+                     as far as they go), then add each next piece with Write {{\"path\": …, \
+                     \"append\": true, \"content\": …}} — at most {limit} lines per call, \
+                     continuing exactly where the previous piece ended. Do not use placeholders \
+                     and do not Edit; append in order until the file is complete, then run it to \
+                     check."
+                )
+            }));
         }
 
         if let Some(parent) = abs.parent() {
@@ -120,6 +136,17 @@ impl Tool for Write {
                 .await?;
             file.write_all(content.as_bytes()).await?;
             file.flush().await?;
+            // 追記は Read を要求しないぶん、何が足されたかは runlog でしか追えない
+            // (#152 のレビュー)。`existed` は既存ファイルに足したのかどうか。
+            crate::runlog::record(
+                "write_appended",
+                serde_json::json!({
+                    "path": abs.display().to_string(),
+                    "bytes": content.len(),
+                    "lines": lines,
+                    "existed": existed,
+                }),
+            );
         } else {
             tokio::fs::write(&abs, content).await?;
         }
@@ -175,12 +202,23 @@ mod split_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\nd\n");
         // 上限は追記にも掛かる。拒否されても中身は変わらない。
         let out = put("e\nf\ng\n", true).await.unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\nd\n");
+        // 追記が拒否されたときの誘導は「この塊を割れ」。「まず先頭を Write しろ」と言ってはいけない
+        // (作りかけのファイルは上書きが通るので、従うとそこまでの追記が消える)。
         assert!(
-            out.is_error && out.content.contains("append"),
+            out.content.contains("Split this piece")
+                && out.content.contains("Do not start the file over")
+                && !out.content.contains("first Write"),
             "{}",
             out.content
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\nd\n");
+        // 文面どおりに従えば消えない。
+        assert!(!put("e\nf\n", true).await.unwrap().is_error);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a\nb\nc\nd\ne\nf\n"
+        );
         // 既存ファイルの上書きは従来どおり Read が必要。
         let fresh = ToolCtx::new(dir.path().to_path_buf());
         let err = Write

@@ -243,14 +243,25 @@ pub fn outcome_note(outcomes: &[Outcome], total: usize) -> String {
     out
 }
 
+/// 子の結果に付く resume 用の id の案内 (#77) **だけ**を抜く。後ろには hook の追記
+/// (`[post-tool hook] …` や hook が寄せた文脈) が続くことがあるので、巻き込まない
+/// (#154 のレビュー: 一緒に切っていて親に届かなくなっていた)。
+fn without_resume_hint(output: &str) -> String {
+    let Some(start) = output.rfind("\n\n[sub-agent id: ") else {
+        return output.to_string();
+    };
+    let tail = &output[start..];
+    match tail.find(']') {
+        Some(end) => format!("{}{}", &output[..start], &tail[end + 1..]),
+        // 閉じ括弧が無い (切れている) ときは、そこから後ろを捨てる。
+        None => output[..start].to_string(),
+    }
+}
+
 /// 子の最終応答を 1 行ぶんに詰める。
 pub fn summarize(output: &str) -> String {
-    // 子の結果の末尾には resume 用の id が付く (#77)。親に積むのは要約だけでよく、
-    // 400 字の予算をこれに食わせない (#154 のレビュー)。
-    let text = match output.rfind("\n\n[sub-agent id: ") {
-        Some(cut) => &output[..cut],
-        None => output,
-    };
+    // 親に積むのは要約だけでよく、400 字の予算を resume の案内に食わせない。
+    let text = without_resume_hint(output);
     let one_line = text
         .trim()
         .lines()
@@ -384,6 +395,18 @@ mod tests {
             summarize(
                 "Added scanner.py.\n\n[sub-agent id: agent_1; pass resume: \"agent_1\" to continue it with its context]"
             ),
+            "Added scanner.py."
+        );
+        // 尾の**後ろ**に付く hook の追記は巻き込まない (#154 のレビュー)。
+        assert_eq!(
+            summarize(
+                "Added scanner.py.\n\n[sub-agent id: agent_1; pass resume: \"agent_1\"]\n                 [post-tool hook] lint is dirty"
+            ),
+            "Added scanner.py. [post-tool hook] lint is dirty"
+        );
+        // 閉じ括弧が無い (切れている) ときは、そこから後ろを捨てる。
+        assert_eq!(
+            summarize("Added scanner.py.\n\n[sub-agent id: agent_1"),
             "Added scanner.py."
         );
         assert_eq!(

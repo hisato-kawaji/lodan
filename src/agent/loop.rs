@@ -394,6 +394,199 @@ impl Session {
         }
     }
 
+    /// 依頼を手順へ割り、手順ごとに子エージェント (`Task`) で実行する (#65 C1)。
+    /// 返すのは親の履歴に足す注記。計画しなかったときは `None` で、ターンは普通に進む。
+    ///
+    /// 計画は LLM 1 回。**調べる前に割る** — 文脈を短く保つのが狙いなので、計画の段では
+    /// ツールを渡さない。手順の実行は `Task` をそのまま使うため、承認・hook・サンドボックス・
+    /// 書き込み可否は通常の呼び出しと同じ扱いになる。
+    async fn plan_and_execute(
+        &mut self,
+        user_input: &str,
+        llm: &dyn LlmClient,
+        gate: &PermissionGate,
+    ) -> Option<String> {
+        use crate::agent::plan;
+        if !self.cfg.agent.plan_execute
+            || self.mode == Mode::Plan
+            || user_input.chars().count() < plan::MIN_PROMPT_CHARS
+        {
+            return None;
+        }
+        // `Task` が無い構成 (プロファイルで隠した、子エージェント自身) では分解できない。
+        let Some(task) = self.registry.get(TASK).filter(|_| {
+            self.registry.is_usable(TASK, &self.loaded_tools) && !self.registry.is_deferred(TASK)
+        }) else {
+            crate::runlog::record(
+                "plan_skipped",
+                serde_json::json!({ "reason": "no_task_tool" }),
+            );
+            return None;
+        };
+        // 手順を実行する子に渡せるツールが残らない構成では、計画だけ立てても実行できない。
+        // 先に諦める — 計画の LLM 呼び出しを 1 回無駄にし、親に「失敗した手順」の注記を
+        // 残すのは誤解を招く (#154 のレビュー)。
+        if !plan::can_run_steps(&self.cfg) {
+            crate::runlog::record(
+                "plan_skipped",
+                serde_json::json!({ "reason": "no_step_tools" }),
+            );
+            return None;
+        }
+        let messages = [
+            Message::System {
+                content: plan::PLAN_SYSTEM.to_string(),
+            },
+            Message::User {
+                content: user_input.to_string(),
+            },
+        ];
+        let resp = crate::llm::metered::with_kind(
+            crate::llm::metered::KIND_PLAN,
+            llm.chat(&messages, &[], &self.cfg.llm.active().model, Some(1024)),
+        )
+        .await;
+        let steps = match resp {
+            Ok(r) => {
+                let (u, estimated) = resolve_usage(&r, &messages);
+                self.usage.record(u, estimated);
+                plan::parse_plan(r.content.as_deref().unwrap_or(""))
+            }
+            Err(e) => {
+                crate::say!(
+                    "{}",
+                    crate::term::dim(&format!(
+                        "[lodan] plan: planning call failed: {}",
+                        crate::term::sanitize(&e.to_string())
+                    ))
+                );
+                Vec::new()
+            }
+        };
+        // 手順が 1 つなら分解した意味がない (子の文脈も親と同じ長さになる)。普通に走らせる。
+        if steps.len() < 2 {
+            crate::runlog::record(
+                "plan_skipped",
+                serde_json::json!({ "turn": self.turn_seq, "reason": "no_plan", "steps": steps.len() }),
+            );
+            return None;
+        }
+        crate::runlog::record(
+            "plan_made",
+            serde_json::json!({ "turn": self.turn_seq, "steps": steps.len() }),
+        );
+        crate::say!(
+            "{}",
+            crate::term::dim(&format!(
+                "[lodan] plan: {} steps, each in its own context",
+                steps.len()
+            ))
+        );
+        let mut done: Vec<plan::Outcome> = Vec::new();
+        for (i, step) in steps.iter().enumerate() {
+            crate::say!(
+                "{}",
+                crate::term::dim(&format!(
+                    "[lodan] step {}/{}: {}",
+                    i + 1,
+                    steps.len(),
+                    crate::term::sanitize(&step.title)
+                ))
+            );
+            let mut args = serde_json::json!({
+                "description": step.title,
+                "prompt": plan::step_prompt(user_input, &steps, i, &done),
+                // 既定の子は読み取り専用なので、手順の実行には書ける子を名指しする。
+                // 定義は runtime が入れる (モデルには見せない種類)。
+                "subagent_type": crate::agent::agents::PLAN_STEP_AGENT,
+            });
+            let started = std::time::Instant::now();
+            let pre = self
+                .fire_hook(
+                    Lifecycle::PreToolUse,
+                    Some(TASK),
+                    serde_json::json!({ "tool_name": TASK, "tool_input": args }),
+                )
+                .await
+                .unwrap_or_default();
+            let mut reason: &'static str = TOOL_REASON_OK;
+            let mut hook_context = Vec::new();
+            let mut output = self
+                .run_after_pre_hook(&task, &mut args, pre, gate, &mut reason, &mut hook_context)
+                .await;
+            let executed = reason == TOOL_REASON_OK || reason == "tool_error";
+            let post_event = match (self.cfg.hooks_compat, executed, output.is_error) {
+                (hooks::HooksCompat::V1, _, _) | (_, true, false) => Some(Lifecycle::PostToolUse),
+                (_, true, true) => Some(Lifecycle::PostToolUseFailure),
+                (_, false, _) => None,
+            };
+            if let Some(event) = post_event {
+                let payload = serde_json::json!({
+                    "tool_name": TASK,
+                    "tool_input": args,
+                    "tool_output": output.content,
+                    "tool_response": output.content,
+                    "error": output.is_error.then_some(&output.content),
+                });
+                let post = self.fire_hook(event, Some(TASK), payload).await;
+                if let Ok(post) = post {
+                    if let Some(why) = &post.block {
+                        output.content = format!("{}\n[post-tool hook] {why}", output.content);
+                    }
+                    hook_context.extend(post.context);
+                }
+            }
+            if !hook_context.is_empty() {
+                output.content = format!(
+                    "{}\n{}",
+                    output.content,
+                    hook_context_block(&hook_context.join("\n"))
+                );
+            }
+            crate::runlog::record(
+                "plan_step",
+                serde_json::json!({
+                    "turn": self.turn_seq,
+                    "step": i + 1,
+                    "of": steps.len(),
+                    "outcome": if output.is_error { "error" } else { "ok" },
+                    "reason": reason,
+                    "ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+            let ok = !output.is_error;
+            // 子が何を変えたかは分からない (結果は要約だけ)。Bash と同じ扱いにして、パス指定の
+            // ない検証 (#65 D1) がターン末に走るようにする。
+            if ok {
+                self.ran_shell = true;
+            } else {
+                // 失敗は画面にも出す (注記だけだと、残りを飛ばした理由が見えない)。
+                crate::say!(
+                    "{}",
+                    crate::term::dim(&format!(
+                        "[lodan] step {}/{} failed: {}",
+                        i + 1,
+                        steps.len(),
+                        crate::term::sanitize(plan::summarize(&output.content).as_str())
+                    ))
+                );
+            }
+            done.push(plan::Outcome {
+                title: step.title.clone(),
+                summary: plan::summarize(&output.content),
+                ok,
+            });
+            // 失敗した手順の上に次を積まない。残りは親が引き継ぐ (注記で伝える)。
+            if !ok {
+                break;
+            }
+        }
+        Some(format!(
+            "{HARNESS_NOTE_PREFIX}{}",
+            plan::outcome_note(&done, steps.len())
+        ))
+    }
+
     pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
         self.ledger = Some(ledger);
     }
@@ -550,6 +743,13 @@ impl Session {
             context => format!("{content}\n\n{}", hook_context_block(&context.join("\n"))),
         };
         self.history.push(Message::User { content });
+
+        // #65 C1: 分解してから動く。手順ごとに子の文脈で実行し、親には結果の 1 行だけ残す。
+        // 普通のツール呼び出しと同じ経路を通るので、この後のループ (検証・要件・最終回答) は
+        // 「子がやった仕事」を前提に続く。
+        if let Some(note) = self.plan_and_execute(user_input, llm, gate).await {
+            self.history.push(Message::User { content: note });
+        }
 
         // #61: 小型ローカルモデル対策の状態 (いずれもターン内スコープ)。
         // 壊れツールコール再要求の回数と、直前のツール呼び出し (重複検知用)。
@@ -2039,6 +2239,9 @@ const PLAN_MODE_PREFIX: &str = "[plan mode] You are in plan mode: investigate wi
 /// Plan モード中のみ specs へ加える承認要求の擬似ツール名。registry には登録しない。
 pub(crate) const EXIT_PLAN_MODE: &str = "ExitPlanMode";
 
+/// 子エージェントのツール名。Plan→Execute (#65 C1) は手順ごとにこれを呼ぶ。
+const TASK: &str = "Task";
+
 /// `/undo` の巻き戻し対象 (args の `path` を変更前退避するファイル系ツール)。
 /// Bash 等の副作用は巻き戻せないため対象外。
 const UNDOABLE_FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
@@ -3089,6 +3292,228 @@ mod tests {
             injected,
             "a blocked Stop hook should inject its reason as a user turn"
         );
+    }
+
+    /// #65 C1: 計画の応答を返すモック。1 回目だけ計画、以後は最終テキスト。
+    struct PlanThenTextLlm {
+        plan: String,
+        calls: Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl PlanThenTextLlm {
+        fn reply(&self) -> ChatResponse {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let content = match *calls {
+                1 => self.plan.clone(),
+                _ => "done".to_string(),
+            };
+            ChatResponse {
+                content: Some(content),
+                tool_calls: vec![],
+                usage: None,
+                reasoning: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for PlanThenTextLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            Ok(self.reply())
+        }
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let _ = sink.send(ChatEvent::Done(self.reply()));
+            Ok(())
+        }
+    }
+
+    /// 手順ごとに受け取った依頼文を覚えておく偽の `Task`。
+    #[derive(Clone)]
+    struct RecordingTask {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        fail_at: Option<usize>,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for RecordingTask {
+        fn name(&self) -> &str {
+            "Task"
+        }
+        fn description(&self) -> &str {
+            "fake sub-agent"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &crate::tools::ToolCtx,
+        ) -> std::result::Result<ToolOutput, crate::tools::ToolError> {
+            let mut prompts = self.prompts.lock().unwrap();
+            prompts.push(
+                args.get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            let nth = prompts.len();
+            Ok(match self.fail_at {
+                Some(n) if n == nth => {
+                    ToolOutput::error("sub-agent failed: no python3".to_string())
+                }
+                _ => ToolOutput::ok(format!("step {nth} done: wrote file{nth}.py")),
+            })
+        }
+    }
+
+    fn plan_session(task: RecordingTask) -> Session {
+        let mut cfg = Config::default();
+        cfg.agent.plan_execute = true;
+        let mut registry = default_registry();
+        registry.register(Arc::new(task));
+        Session::new(cfg, Arc::new(registry))
+    }
+
+    const PLAN_REQUEST: &str = "Write a directory scanner with a scan subcommand that stores the \
+         sizes as JSON, and a report subcommand that prints the three biggest files.";
+
+    /// #65 C1: 計画が立てば、手順ごとに子を立てて実行し、親の履歴には注記だけが残る。
+    /// 子に渡す依頼文は元の依頼・その手順・前の手順の結果を含む。
+    #[tokio::test]
+    async fn a_plan_runs_each_step_in_its_own_sub_agent_and_leaves_one_note() {
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: None,
+        };
+        let prompts = Arc::clone(&task.prompts);
+        let mut session = plan_session(task);
+        let llm = PlanThenTextLlm {
+            plan: r#"{"steps": [{"title": "Write the scanner", "detail": "scanner.py with scan"},
+                                {"title": "Add report", "detail": "print the top three"}]}"#
+                .into(),
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2, "one sub-agent per step");
+        assert!(prompts[0].contains(PLAN_REQUEST), "{}", prompts[0]);
+        assert!(prompts[0].contains("step 1 of 2"), "{}", prompts[0]);
+        // 2 つ目は 1 つ目の結果を知っている。
+        assert!(
+            prompts[1].contains("Write the scanner — step 1 done: wrote file1.py"),
+            "{}",
+            prompts[1]
+        );
+        // 親の履歴に残るのは注記 1 つだけ (子の文脈は親に積まない)。
+        let notes: Vec<&String> = session
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } if is_harness_note(content) => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("2 of 2 steps"), "{}", notes[0]);
+        assert!(notes[0].contains("do not redo it"), "{}", notes[0]);
+    }
+
+    /// 手順が失敗したら、その上に次を積まずに親へ返す。
+    #[tokio::test]
+    async fn a_failed_step_stops_the_plan_and_hands_it_back_to_the_parent() {
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: Some(1),
+        };
+        let prompts = Arc::clone(&task.prompts);
+        let mut session = plan_session(task);
+        let llm = PlanThenTextLlm {
+            plan: "1. Write the scanner\n2. Add report\n3. Check it runs\n".into(),
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+
+        assert_eq!(prompts.lock().unwrap().len(), 1, "stops at the failed step");
+        let note = session
+            .history()
+            .iter()
+            .find_map(|m| match m {
+                Message::User { content } if is_harness_note(content) => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a note is left even when the plan broke");
+        assert!(
+            note.contains("1 of 3 steps") && note.contains("[failed]"),
+            "{note}"
+        );
+        assert!(note.contains("did not finish"), "{note}");
+    }
+
+    /// 計画が読めない / 手順が 1 つなら分解しない (普通のターンと同じ)。
+    #[tokio::test]
+    async fn an_unusable_plan_leaves_the_turn_alone() {
+        for plan in [
+            "let me look around first",
+            r#"{"steps": [{"title": "do it all"}]}"#,
+        ] {
+            let task = RecordingTask {
+                prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            };
+            let prompts = Arc::clone(&task.prompts);
+            let mut session = plan_session(task);
+            let llm = PlanThenTextLlm {
+                plan: plan.into(),
+                calls: Arc::new(std::sync::Mutex::new(0)),
+            };
+            let gate = PermissionGate::new(true);
+            session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+            assert!(prompts.lock().unwrap().is_empty(), "{plan}");
+            assert!(
+                !session
+                    .history()
+                    .iter()
+                    .any(|m| matches!(m, Message::User { content } if is_harness_note(content))),
+                "{plan}"
+            );
+        }
+    }
+
+    /// 既定 (plan_execute = false) では計画の呼び出しもしない。
+    #[tokio::test]
+    async fn without_the_flag_nothing_is_planned() {
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: None,
+        };
+        let prompts = Arc::clone(&task.prompts);
+        let mut registry = default_registry();
+        registry.register(Arc::new(task));
+        let mut session = Session::new(Config::default(), Arc::new(registry));
+        let llm = PlanThenTextLlm {
+            plan: r#"{"steps": [{"title": "a"}, {"title": "b"}]}"#.into(),
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+        assert!(prompts.lock().unwrap().is_empty());
     }
 
     /// lodan が注入した user メッセージ (ナッジ・stop hook の理由) は、圧縮の境界を決めるときに

@@ -26,6 +26,11 @@ use crate::config::Provider;
 /// 既定の子 (読み取り専用の調査エージェント) の名前。定義ファイルでは使えない。
 pub const DEFAULT_AGENT: &str = "general-purpose";
 
+/// Plan→Execute (#65 C1) の手順を実行する子の名前。**書き込める**ので、モデルには見せず
+/// ハーネスからだけ名指しする (`Task` の説明と schema には出さない)。
+/// `.lodan/agents/plan-step.md` を置けば、手順の実行をそちらの定義に差し替えられる。
+pub const PLAN_STEP_AGENT: &str = "plan-step";
+
 /// 子の作業場所 (`isolation:`, #77)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Isolation {

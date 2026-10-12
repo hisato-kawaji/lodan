@@ -344,6 +344,10 @@ pub struct AgentConfig {
     /// `.lodan/requirements.json` に持ち、system prompt に常に描画し、未達のまま終わろうとしたら
     /// 促す。既定 false (抽出に LLM 呼び出しが 1 回増える。ablation で寄与を測る)。
     pub requirements: bool,
+    /// Plan→Execute 分離 (#65 C1)。長めの依頼を最初に手順へ割り、手順ごとに子エージェントを
+    /// 立てて**新しい短い文脈で**実行する。親に残るのは手順の見出しと 1 行の結果だけ。
+    /// 既定 false (計画に LLM 1 回、手順ごとに子が増えるので、ablation で寄与を測る)。
+    pub plan_execute: bool,
     /// 編集直後の構文チェック (#65 D2)。`Write` / `Edit` などが成功した直後に、拡張子ごとの
     /// コマンドでそのファイルだけを検査し、壊れていたらツール結果の後ろに注記を足す (ブロックはしない)。
     /// 既定 false (ablation で寄与を測る)。
@@ -527,6 +531,7 @@ impl Default for AgentConfig {
             requirements: false,
             max_repairs: DEFAULT_MAX_REPAIRS,
             write_max_lines: 0,
+            plan_execute: false,
             syntax_check: false,
             syntax_checks: std::collections::BTreeMap::new(),
             empty_reply_nudge: true,
@@ -865,6 +870,10 @@ impl Config {
             self.agent.write_max_lines = v;
             mark("agent.write_max_lines".into());
         }
+        if let Some(v) = o.plan_execute {
+            self.agent.plan_execute = v;
+            mark("agent.plan_execute".into());
+        }
         if let Some(v) = o.syntax_check {
             self.agent.syntax_check = v;
             mark("agent.syntax_check".into());
@@ -951,6 +960,7 @@ pub struct Overrides {
     /// `--max-turns`: `agent.max_iterations` を上書きする。
     pub max_iterations: Option<usize>,
     pub write_max_lines: Option<usize>,
+    pub plan_execute: Option<bool>,
     pub syntax_check: Option<bool>,
     pub append_system_prompt: Option<String>,
     pub permission_mode: Option<PermissionMode>,

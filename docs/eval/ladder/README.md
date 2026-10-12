@@ -38,6 +38,7 @@
 | `split40-none` | `think-none` + `--write-max-lines 40` | A2 を**実際に発動させる**ための水準。L2 のファイルは 51-77 行なので `split-none` (80) では一度も発動しない（[phase1-2026-10](phase1-2026-10.md) の実測）。**`think-none` と比べる** |
 | `syntax-none` | `think-none` + `--syntax-check` | 編集直後の構文チェック (#65 D2。実測: [phase2-2026-10](phase2-2026-10.md) — 18 回走って毎回 ok、構文エラーの検出は 0 件): `Write` / `Edit` の直後にそのファイルの構文を検査し、壊れていればツール結果に注記する（ブロックしない）。**`think-none` と比べる** |
 | `verify-none` | `think-none` + タスクの `VERIFY` を `[[verify]]` に | 検証ループ (#65 D1。実測: [phase2-2026-10](phase2-2026-10.md) — 9 回走って毎回成功、差し戻しは 0 回。検証コマンドの副作用という交絡も記録): ファイルを変えたターンの最後に、**プロンプトが明記している実行方法**を走らせて失敗なら差し戻す。タスク側が `VERIFY` を定義していなければ `think-none` と同じ。**`think-none` と比べる** |
+| `plan-none` | `think-none` + `--plan-execute` | Plan→Execute 分離 (#65 C1): 依頼を最初に手順へ割り、手順ごとに子エージェントを立てて**新しい短い文脈で**実行する。親に残るのは手順の見出しと 1 行の結果だけ。計画に LLM 1 回、手順ごとに子の往復が増えるので、**所要時間も `think-none` と比べる**。L0 / L1 は依頼が短くて分解されない (80 文字未満は計画しない) ので **L2 で比べる** |
 | `required-none` | `think-none` + `--tool-choice required` | 全応答をツール呼び出しにする (#65 A1)。最終回答は `Finish` 擬似ツール。テキストに漏れたツールコール (`malformed_retry` の対象) が構造的に起きなくなるかを見る。**`think-none` と比べる** |
 | `empty-nudge` | `temp` + `--empty-reply-nudge` | 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)。**`temp` と比べる**。`base` / `temp` / `core` / `core-search` / `think-*` はこれを off にしている (lodan の既定は on) |
 

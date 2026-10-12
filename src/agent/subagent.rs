@@ -297,7 +297,7 @@ pub struct SubAgentTool {
     children: Arc<std::sync::Mutex<std::collections::BTreeMap<String, ChildRecord>>>,
 }
 
-use crate::agent::agents::{DEFAULT_AGENT, Isolation};
+use crate::agent::agents::{DEFAULT_AGENT, Isolation, PLAN_STEP_AGENT};
 
 /// 説明の 1 行目 (Task の説明に載せる用)。
 fn first_line(text: &str) -> &str {
@@ -438,7 +438,7 @@ impl SubAgentTool {
     }
 
     /// その種類が破壊的ツールを持つか (説明と `is_destructive` 用)。
-    fn profile_writes(p: &AgentProfile) -> bool {
+    pub(crate) fn profile_writes(p: &AgentProfile) -> bool {
         p.tools
             .names()
             .into_iter()
@@ -452,11 +452,12 @@ impl SubAgentTool {
         self
     }
 
-    /// 定義した種類の名前 (既定を除く)。
+    /// モデルに見せる種類の名前 (既定と、ハーネス専用の `plan-step` を除く)。
+    /// `plan-step` は書き込める子なので、モデルが自分で呼べる選択肢には出さない (#65 C1)。
     pub fn custom_names(&self) -> Vec<&str> {
         self.profiles
             .keys()
-            .filter(|n| n.as_str() != DEFAULT_AGENT)
+            .filter(|n| n.as_str() != DEFAULT_AGENT && n.as_str() != PLAN_STEP_AGENT)
             .map(String::as_str)
             .collect()
     }
@@ -491,6 +492,11 @@ impl SubAgentTool {
             }
         }
         self.description = text;
+    }
+
+    /// 種類 `name` の設定 (モデルに見せない種類も引ける)。起動時の配線を確かめるため。
+    pub(crate) fn profile_of(&self, name: &str) -> Option<&AgentProfile> {
+        self.profiles.get(name)
     }
 
     fn profile(&self, name: Option<&str>) -> Result<(&str, &AgentProfile), ToolError> {
@@ -1061,7 +1067,8 @@ impl Tool for SubAgentTool {
             schema["properties"]["subagent_type"] = serde_json::json!({
                 "type": "string",
                 "description": "Which sub-agent to run (see the tool description); omit for the default",
-                "enum": self.profiles.keys().collect::<Vec<_>>()
+                // ハーネス専用の種類は出さない (`custom_names` と同じ範囲 + 既定)。
+                "enum": std::iter::once(DEFAULT_AGENT).chain(self.custom_names()).collect::<Vec<_>>()
             });
         }
         // 走り終えた子がいるときだけ見せる (無いうちは選べるものが無い)。
@@ -1221,13 +1228,16 @@ mod tests {
             }))
         }
 
+        /// 台本をそのまま 1 つの Done として流す (親の `Session` は streaming を使う)。
         async fn chat_stream(
             &self,
-            _history: &[Message],
-            _tools: &[ToolSpec<'_>],
-            _model: &str,
-            _sink: mpsc::UnboundedSender<ChatEvent>,
+            history: &[Message],
+            tools: &[ToolSpec<'_>],
+            model: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
         ) -> Result<()> {
+            let resp = self.chat(history, tools, model, None).await?;
+            let _ = sink.send(ChatEvent::Done(resp));
             Ok(())
         }
     }
@@ -2070,6 +2080,125 @@ mod tests {
             cwd,
             8,
         )
+    }
+
+    /// Plan→Execute (#65 C1) を**本物の `Task` を通して**走らせる。偽の `Task` だけで試すと
+    /// 「子が読み取り専用で何も書けない」を見逃す (`30c1159` で実際に見逃した)。
+    #[tokio::test]
+    async fn a_plan_runs_its_steps_through_the_real_task_tool_and_they_can_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = |s: &str| ChatResponse {
+            content: Some(s.to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        };
+        let call = |name: &str, args: &str| ChatResponse {
+            content: None,
+            tool_calls: vec![tool_call(name, args)],
+            usage: None,
+            reasoning: None,
+        };
+        // 子 (手順の実行): 手順ごとに Write を 1 回呼んで要約を返す。
+        let child = Arc::new(ScriptedLlm::new(vec![
+            call("Write", r#"{"path": "step1.py", "content": "print(1)\n"}"#),
+            text("wrote step1.py"),
+            call("Write", r#"{"path": "step2.py", "content": "print(2)\n"}"#),
+            text("wrote step2.py"),
+        ]));
+        let gate = Arc::new(crate::permission::PermissionGate::new(true));
+        let task = SubAgentTool::new(
+            Arc::new(ScriptedLlm::new(vec![])),
+            "mock".into(),
+            Arc::new(read_only_registry()),
+            dir.path().to_path_buf(),
+            4,
+        )
+        .with_gate(Arc::clone(&gate))
+        .with_profile(
+            PLAN_STEP_AGENT.to_string(),
+            AgentProfile::new(
+                child,
+                "mock".into(),
+                Arc::new(crate::tools::registry::default_registry()),
+                4,
+            )
+            .with_instructions(String::new(), "runs one step".into()),
+        );
+        let mut registry = crate::tools::registry::default_registry();
+        registry.register(Arc::new(task));
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.plan_execute = true;
+        let mut session = crate::agent::Session::new(cfg, Arc::new(registry));
+        // 親: 1 回目が計画、2 回目が最終応答。
+        let parent = ScriptedLlm::new(vec![
+            text(
+                r#"{"steps": [{"title": "First", "detail": "write step1.py"},
+                              {"title": "Second", "detail": "write step2.py"}]}"#,
+            ),
+            text("both steps are done"),
+        ]);
+        session
+            .run_turn(
+                "Write two small python files, step1.py printing 1 and step2.py printing 2, \
+                 then tell me what you did.",
+                &parent,
+                &gate,
+            )
+            .await
+            .unwrap();
+
+        // 手順が本当にファイルを書けている (子が読み取り専用なら 0 件になる)。
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("step1.py")).unwrap(),
+            "print(1)\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("step2.py")).unwrap(),
+            "print(2)\n"
+        );
+        // 親の履歴には注記 1 つだけが残る。
+        let notes = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content.starts_with("[lodan] ")))
+            .count();
+        assert_eq!(notes, 1);
+    }
+
+    /// Plan→Execute (#65 C1) の `plan-step` は**書き込める**子なので、モデルに見せる一覧
+    /// (`Task` の説明と `subagent_type` の enum) には出さない。ハーネスは名指しで呼べる。
+    #[test]
+    fn the_plan_step_agent_is_usable_by_name_but_never_offered_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let writable = AgentProfile::new(
+            Arc::new(ScriptedLlm::new(vec![])),
+            "mock".into(),
+            Arc::new(crate::tools::registry::default_registry()),
+            4,
+        )
+        .with_instructions(String::new(), "runs one step of a plan".into());
+        let tool = subagent(vec![], dir.path().to_path_buf())
+            .with_profile(PLAN_STEP_AGENT.to_string(), writable)
+            .with_profile("digger".into(), {
+                AgentProfile::new(
+                    Arc::new(ScriptedLlm::new(vec![])),
+                    "mock".into(),
+                    Arc::new(read_only_registry()),
+                    4,
+                )
+                .with_instructions(String::new(), "digs".into())
+            });
+        // 利用者が定義した種類は見せる。plan-step は見せない。
+        assert_eq!(tool.custom_names(), vec!["digger"]);
+        assert!(!tool.description().contains(PLAN_STEP_AGENT));
+        let schema = tool.schema().to_string();
+        assert!(schema.contains("digger"), "{schema}");
+        assert!(!schema.contains(PLAN_STEP_AGENT), "{schema}");
+        // それでも名指しなら解決する (ハーネスが呼ぶ経路)。
+        let (_, profile) = tool.profile(Some(PLAN_STEP_AGENT)).expect("usable by name");
+        // 手順を実行するには書けないと意味が無い (既定の子は読み取り専用)。
+        assert!(SubAgentTool::profile_writes(profile));
     }
 
     /// 1 回目は指定のツールを呼び、2 回目は**受け取ったツール出力をそのまま最終応答にする** LLM。

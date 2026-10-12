@@ -22,6 +22,8 @@ pub const KIND_GOAL_EVAL: &str = "goal_eval";
 pub const KIND_COMPACT: &str = "compact";
 /// 要件台帳の抽出 (#65)。
 pub const KIND_REQUIREMENTS: &str = "requirements";
+/// 依頼を手順へ割る呼び出し (#65 C1)。手順の実行自体は `subagent` に入る。
+pub const KIND_PLAN: &str = "plan";
 pub const KIND_MCP_SAMPLING: &str = "mcp_sampling";
 
 /// モデルへの注意書きの書き出し。

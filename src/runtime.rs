@@ -18,27 +18,37 @@ use crate::mcp::prompt::McpPrompt;
 use crate::session::Recorder;
 use crate::tools::registry::{ToolRegistry, default_registry, read_only_registry};
 
-/// Plan→Execute (#65 C1) の手順を実行する子のツール。**親に見えている範囲と同じ**に絞る
-/// (`AskUserQuestion` だけ外す — 子は利用者と直接やり取りしない)。残るものが無ければ `None`。
+/// Plan→Execute (#65 C1) の手順を実行する子 (`plan-step`) を `Task` に足す。
+/// 手順を実行できないとき (機能が off、親に渡せるツールが残らない) は何も足さない。
 ///
-/// 親より広くしてはいけない: `subagent_type` の enum は助言でしかなく、モデルは種類を名指しで
-/// 呼べる (#154 のレビューで実証された)。親が `readonly` なのに子が書けると、
+/// ツールは `plan::step_tools` が親に合わせて絞る。親より広くしてはいけない:
+/// `subagent_type` の enum は助言でしかなく、モデルは種類を名指しで呼べる
+/// (#154 のレビューで実証された)。親が `readonly` なのに子が書けると、
 /// 「`readonly` では破壊的ツールは実行されない」が成り立たなくなる。
-fn plan_step_tools(cfg: &Config) -> Option<ToolRegistry> {
-    let mut tools = default_registry();
-    tools.apply_profile(cfg.agent.tool_profile, &cfg.agent.tools);
-    let keep: Vec<String> = tools
-        .names()
-        .into_iter()
-        .filter(|n| *n != "AskUserQuestion")
-        .map(str::to_string)
-        .collect();
-    if keep.is_empty() {
-        return None;
+fn with_plan_step_profile(
+    task: agent::subagent::SubAgentTool,
+    cfg: &Config,
+    llm: &Arc<dyn LlmClient>,
+) -> agent::subagent::SubAgentTool {
+    if !cfg.agent.plan_execute {
+        return task;
     }
-    // 空リストは「絞らない」の意味になるので、ここに来るのは keep が空でないときだけ。
-    tools.apply_profile(crate::config::ToolProfile::Full, &keep);
-    Some(tools)
+    let Some(tools) = agent::plan::step_tools(cfg) else {
+        return task;
+    };
+    task.with_profile(
+        agent::agents::PLAN_STEP_AGENT.to_string(),
+        agent::subagent::AgentProfile::new(
+            Arc::clone(llm),
+            cfg.llm.active().model.clone(),
+            Arc::new(tools),
+            cfg.agent.max_iterations,
+        )
+        .with_instructions(
+            String::new(),
+            "runs one step of a plan made by the harness".to_string(),
+        ),
+    )
 }
 
 /// 起動時の状況報告の行き先。
@@ -253,23 +263,7 @@ impl Runtime {
         // 読み取り専用のまま = `readonly` の意味を壊さない)。破壊的ツールは親と同じ承認ゲート・
         // サンドボックス・プランモードを通る (#77 / #134 と同じ扱い)。
         // 定義ファイルより先に入れてあるので、`.lodan/agents/plan-step.md` があればそちらが勝つ。
-        if cfg.agent.plan_execute
-            && let Some(tools) = plan_step_tools(cfg)
-        {
-            task = task.with_profile(
-                agent::agents::PLAN_STEP_AGENT.to_string(),
-                agent::subagent::AgentProfile::new(
-                    Arc::clone(&llm),
-                    cfg.llm.active().model.clone(),
-                    Arc::new(tools),
-                    cfg.agent.max_iterations,
-                )
-                .with_instructions(
-                    String::new(),
-                    "runs one step of a plan made by the harness".to_string(),
-                ),
-            );
-        }
+        task = with_plan_step_profile(task, cfg, &llm);
         let mut agent_names = Vec::new();
         for def in defs {
             match build_agent_profile(&def, cfg, &llm, &ledger) {
@@ -457,38 +451,93 @@ fn resume_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::agents::PLAN_STEP_AGENT;
+    use crate::agent::messages::ToolSpec;
+    use crate::agent::plan;
     use crate::config::ToolProfile;
+    use crate::llm::{ChatEvent, ChatResponse};
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    /// 呼ばれない LLM (プロファイルの組み立てだけを見るテスト用)。
+    struct UnusedLlm;
+
+    #[async_trait]
+    impl LlmClient for UnusedLlm {
+        async fn chat(
+            &self,
+            _h: &[crate::agent::messages::Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("not called")
+        }
+        async fn chat_stream(
+            &self,
+            _h: &[crate::agent::messages::Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not called")
+        }
+    }
+
+    fn task_for(cfg: &Config) -> agent::subagent::SubAgentTool {
+        let llm: Arc<dyn LlmClient> = Arc::new(UnusedLlm);
+        let task = agent::subagent::SubAgentTool::new(
+            Arc::clone(&llm),
+            "mock".into(),
+            Arc::new(read_only_registry()),
+            PathBuf::from("."),
+            cfg.agent.max_iterations,
+        );
+        with_plan_step_profile(task, cfg, &llm)
+    }
 
     /// 手順を実行する子は親より強くならない。`readonly` の親の下では子も読み取り専用
-    /// (#154 のレビュー: モデルは `subagent_type` を名指しで呼べるので、ここが権限の境界になる)。
+    /// (#154 のレビュー: モデルは `subagent_type` を名指しで呼べるので、ここが権限の境界)。
+    /// **`Task` に実際に載った**プロファイルを見る — 絞り方だけ正しくて配線が違うのが
+    /// `30c1159` の欠陥だった。
     #[test]
     fn the_plan_step_child_never_gets_more_tools_than_the_parent() {
-        let writes = |tools: &ToolRegistry| {
-            tools
-                .names()
-                .into_iter()
-                .any(|n| tools.get(n).is_some_and(|t| t.is_destructive()))
+        let tools_of = |cfg: &Config| -> Option<Vec<String>> {
+            let task = task_for(cfg);
+            let p = task.profile_of(PLAN_STEP_AGENT)?;
+            Some(p.tools.names().into_iter().map(str::to_string).collect())
+        };
+        let writes = |cfg: &Config| -> bool {
+            let task = task_for(cfg);
+            task.profile_of(PLAN_STEP_AGENT)
+                .is_some_and(agent::subagent::SubAgentTool::profile_writes)
         };
         let mut cfg = Config::default();
+        // 機能が off なら種類ごと登録しない。
+        assert!(tools_of(&cfg).is_none());
+
+        cfg.agent.plan_execute = true;
         // 既定 (full): 書ける。利用者と話すツールは渡さない。
-        let full = plan_step_tools(&cfg).expect("full has tools");
-        assert!(writes(&full));
-        assert!(!full.names().contains(&"AskUserQuestion"));
-        assert!(full.names().contains(&"Write"));
+        let full = tools_of(&cfg).expect("full has tools");
+        assert!(writes(&cfg));
+        assert!(full.contains(&"Write".to_string()));
+        assert!(!full.contains(&"AskUserQuestion".to_string()));
 
         // readonly: 子も読み取り専用。
         cfg.agent.tool_profile = ToolProfile::Readonly;
-        let readonly = plan_step_tools(&cfg).expect("readonly has tools");
-        assert!(!writes(&readonly), "{:?}", readonly.names());
+        assert!(!writes(&cfg), "{:?}", tools_of(&cfg));
 
         // 明示リスト: その範囲だけ。
         cfg.agent.tool_profile = ToolProfile::Full;
         cfg.agent.tools = vec!["Read".into(), "Grep".into()];
-        let listed = plan_step_tools(&cfg).expect("explicit list has tools");
-        assert_eq!(listed.names(), vec!["Grep", "Read"]);
+        assert_eq!(tools_of(&cfg).unwrap(), vec!["Grep", "Read"]);
 
         // 子に渡せるものが残らない構成では登録しない (空リスト = 絞らない、にしない)。
         cfg.agent.tools = vec!["AskUserQuestion".into()];
-        assert!(plan_step_tools(&cfg).is_none());
+        assert!(tools_of(&cfg).is_none());
+        // 分解の可否も同じ判定を見る (計画の LLM 呼び出しを無駄にしない)。
+        assert!(!plan::can_run_steps(&cfg));
+        cfg.agent.tools.clear();
+        assert!(plan::can_run_steps(&cfg));
     }
 }

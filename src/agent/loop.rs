@@ -423,6 +423,16 @@ impl Session {
             );
             return None;
         };
+        // 手順を実行する子に渡せるツールが残らない構成では、計画だけ立てても実行できない。
+        // 先に諦める — 計画の LLM 呼び出しを 1 回無駄にし、親に「失敗した手順」の注記を
+        // 残すのは誤解を招く (#154 のレビュー)。
+        if !plan::can_run_steps(&self.cfg) {
+            crate::runlog::record(
+                "plan_skipped",
+                serde_json::json!({ "reason": "no_step_tools" }),
+            );
+            return None;
+        }
         let messages = [
             Message::System {
                 content: plan::PLAN_SYSTEM.to_string(),
@@ -549,6 +559,17 @@ impl Session {
             // ない検証 (#65 D1) がターン末に走るようにする。
             if ok {
                 self.ran_shell = true;
+            } else {
+                // 失敗は画面にも出す (注記だけだと、残りを飛ばした理由が見えない)。
+                crate::say!(
+                    "{}",
+                    crate::term::dim(&format!(
+                        "[lodan] step {}/{} failed: {}",
+                        i + 1,
+                        steps.len(),
+                        crate::term::sanitize(plan::summarize(&output.content).as_str())
+                    ))
+                );
             }
             done.push(plan::Outcome {
                 title: step.title.clone(),

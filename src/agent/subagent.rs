@@ -438,7 +438,7 @@ impl SubAgentTool {
     }
 
     /// その種類が破壊的ツールを持つか (説明と `is_destructive` 用)。
-    fn profile_writes(p: &AgentProfile) -> bool {
+    pub(crate) fn profile_writes(p: &AgentProfile) -> bool {
         p.tools
             .names()
             .into_iter()
@@ -492,6 +492,11 @@ impl SubAgentTool {
             }
         }
         self.description = text;
+    }
+
+    /// 種類 `name` の設定 (モデルに見せない種類も引ける)。起動時の配線を確かめるため。
+    pub(crate) fn profile_of(&self, name: &str) -> Option<&AgentProfile> {
+        self.profiles.get(name)
     }
 
     fn profile(&self, name: Option<&str>) -> Result<(&str, &AgentProfile), ToolError> {

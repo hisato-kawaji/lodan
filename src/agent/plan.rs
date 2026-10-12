@@ -31,6 +31,31 @@ pub const PLAN_SYSTEM: &str = "You split a software task into steps that can eac
      documentation, tests or refactoring unless the task asks for them.\n\
      - No prose outside the JSON.";
 
+/// 手順を実行する子 (`plan-step`) に渡すツール。**親に見えている範囲と同じ**に絞る
+/// (`AskUserQuestion` だけ外す — 子は利用者と直接やり取りしない)。残るものが無ければ `None`
+/// で、そのときは手順を実行できない (呼び出し側は分解しない)。
+pub fn step_tools(cfg: &crate::config::Config) -> Option<crate::tools::registry::ToolRegistry> {
+    let mut tools = crate::tools::registry::default_registry();
+    tools.apply_profile(cfg.agent.tool_profile, &cfg.agent.tools);
+    let keep: Vec<String> = tools
+        .names()
+        .into_iter()
+        .filter(|n| *n != "AskUserQuestion")
+        .map(str::to_string)
+        .collect();
+    if keep.is_empty() {
+        return None;
+    }
+    // 空リストは「絞らない」の意味になるので、ここに来るのは keep が空でないときだけ。
+    tools.apply_profile(crate::config::ToolProfile::Full, &keep);
+    Some(tools)
+}
+
+/// 手順を実行できる構成か (`plan-step` が登録される条件と同じ)。
+pub fn can_run_steps(cfg: &crate::config::Config) -> bool {
+    step_tools(cfg).is_some()
+}
+
 /// 手順 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -220,9 +245,14 @@ pub fn outcome_note(outcomes: &[Outcome], total: usize) -> String {
 
 /// 子の最終応答を 1 行ぶんに詰める。
 pub fn summarize(output: &str) -> String {
-    let text = output.trim();
-    let text = text.strip_prefix("Sub-agent").unwrap_or(text).trim();
+    // 子の結果の末尾には resume 用の id が付く (#77)。親に積むのは要約だけでよく、
+    // 400 字の予算をこれに食わせない (#154 のレビュー)。
+    let text = match output.rfind("\n\n[sub-agent id: ") {
+        Some(cut) => &output[..cut],
+        None => output,
+    };
     let one_line = text
+        .trim()
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -349,6 +379,13 @@ mod tests {
             "Added scanner.py. It walks the tree."
         );
         assert_eq!(summarize("   "), "(no summary)");
+        // resume 用の id の尾は落とす (親に積む 400 字をこれに食わせない)。
+        assert_eq!(
+            summarize(
+                "Added scanner.py.\n\n[sub-agent id: agent_1; pass resume: \"agent_1\" to continue it with its context]"
+            ),
+            "Added scanner.py."
+        );
         assert_eq!(
             summarize(&"y".repeat(MAX_OUTCOME_CHARS + 10))
                 .chars()

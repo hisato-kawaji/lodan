@@ -37,8 +37,9 @@ pub fn all() -> Vec<Preset> {
         },
         Preset {
             name: "local-small-core",
-            about: "local-small に加えてツール定義を 7 個に絞る。MCP を多数つないだ構成では定義が \
-                    20.6 KB → 12.9 KB、推定トークン -59% (#72 の実測)",
+            about: "local-small に加えてツール定義を 7 個に絞る: 定義の JSON が \
+                    6,643 → 3,065 バイト (-54%)。ツール定義は毎リクエスト全量が送られるので、\
+                    小型モデルではこれがそのまま固定費になる (#72 の実測)",
             temperature: Some(0.2),
             reasoning_effort: Some("none"),
             tool_choice: None,
@@ -55,9 +56,11 @@ pub fn all() -> Vec<Preset> {
         },
         Preset {
             name: "forced-tools",
-            about: "ツールコールをテキストで出してしまうモデル (Qwen2.5-Coder 7B で実測) 向け: \
-                    tool_choice=required で必ずツール呼び出しにさせる。**GLM-4.7-Flash のように \
-                    required だと応答が返らないモデルもあるので、当てる前に 1 回試すこと**",
+            about: "ツールコールをテキストで出してしまうモデル向け: tool_choice=required で必ず \
+                    ツール呼び出しにさせる (最終回答は Finish 擬似ツール)。qwen3.5:9b のラダー \
+                    L0-L2 で 4 条件中もっとも高いチェック通過率 96%、所要は基準と同等 \
+                    (docs/eval/ladder/phase1-2026-10.md)。**required を受けないサーバもあるので、\
+                    当てる前に 1 回試すこと**",
             temperature: Some(0.2),
             reasoning_effort: None,
             tool_choice: Some("required"),
@@ -103,9 +106,22 @@ mod tests {
     #[test]
     fn every_preset_has_a_measurement_in_its_about_and_sets_something() {
         for p in all() {
+            // 根拠は「どこで測ったか」まで辿れる形 (docs/eval のファイル名か issue 番号) で
+            // 書く。`実測` や `#` だけでは通さない (#153 のレビュー: 番人が緩いと出典の
+            // 無い / 取り違えた preset が入る)。
+            let cites_issue = p
+                .about
+                .split('#')
+                .skip(1)
+                .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
             assert!(
-                p.about.contains("実測") || p.about.contains("docs/eval") || p.about.contains('#'),
-                "{}: about に根拠が無い",
+                p.about.contains("docs/eval/") || cites_issue,
+                "{}: about が実測の出典 (docs/eval/… か #<issue>) を示していない",
+                p.name
+            );
+            assert!(
+                p.about.chars().any(|c| c.is_ascii_digit()),
+                "{}: about に測った数字が無い",
                 p.name
             );
             assert!(

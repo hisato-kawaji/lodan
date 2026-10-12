@@ -140,9 +140,9 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
   | preset | 設定するもの | 根拠 |
   |---|---|---|
   | `local-small` | `temperature 0.2`, `reasoning_effort "none"` | qwen3.5:9b で thinking off は正答同じ・28% 速い。thinking ありは 20 実行中 13 が「思考だけの応答」で終わった |
-  | `local-small-core` | 上記 + `tool_profile "core"` | MCP 多数構成で定義 20.6 KB → 12.9 KB、推定トークン -59% |
+  | `local-small-core` | 上記 + `tool_profile "core"` | ツール定義の JSON が 6,643 → 3,065 バイト（-54%）。定義は毎リクエスト全量が送られる |
   | `kimi-k3` | `reasoning_effort "low"` | 正答 10/10 のまま思考 -73%（サーバ既定は `max`） |
-  | `forced-tools` | `temperature 0.2`, `tool_choice "required"` | ツールコールをテキストで出すモデル（Qwen2.5-Coder 7B）向け。**GLM-4.7-Flash のように `required` だと返らないモデルもあるので、当てる前に 1 回試すこと** |
+  | `forced-tools` | `temperature 0.2`, `tool_choice "required"` | qwen3.5:9b のラダー L0-L2 で 4 条件中もっとも高いチェック通過率 96%、所要は基準と同等（[phase1-2026-10](docs/eval/ladder/phase1-2026-10.md)）。**`required` を受けないサーバもあるので、当てる前に 1 回試すこと** |
 
   ```toml
   [llm.local]
@@ -150,7 +150,7 @@ lodan が「LLM が応答するだけでツールが起きない」場合は、�
   temperature = 0.1   # 自分で書いたキーはプリセットより強い
   ```
 
-  **モデル名から自動では当てない**（利用者の設定を黙って変えないため）。`preset` を書いた provider にだけ効き、**同じキーを設定ファイルや CLI で書いていればそちらが勝つ**。`tool_profile` は `[agent]` 側なので「いま使う provider のプリセット」からだけ当てる。未知の名前は**起動時エラー**（黙って無視すると当てたつもりで走ってしまう）
+  **モデル名から自動では当てない**（利用者の設定を黙って変えないため）。`preset` を書いた provider にだけ効き、**同じキーを設定ファイルや CLI で書いていればそちらが勝つ**。`tool_profile` は `[agent]` 側に 1 つしか無いので、**起動時にアクティブな provider**（`--provider` / `LODAN_PROVIDER` を反映した後）のプリセットからだけ当てる。`tools = [...]` を書いているときも当てない。`/model` で後から別の provider に切り替えてもツール登録はセッションの間固定なので追従しない。未知の名前は**起動時エラー**（黙って無視すると当てたつもりで走ってしまう）
 - **推論の深さ**(provider 設定の `reasoning_effort`、`--reasoning-effort`、`LODAN_REASONING_EFFORT`。既定は未送信 = サーバ既定): thinking 系のモデルは、推論の深さで 1 応答の所要時間が大きく変わる(kimi-k3 のサーバ既定は `max`)。値は**検査せずそのまま** `reasoning_effort` として送る — 受け付ける語彙はサーバとモデルごとに違うため(`low` / `medium` / `high` が共通、Ollama は `none` で thinking を切れる、`max` / `minimal` を持つサーバもある)。未対応の値はサーバが 400 で返す。`reasoning_effort` を読まないサーバ固有の切り方は `extra_body` で渡す:
 
   ```toml

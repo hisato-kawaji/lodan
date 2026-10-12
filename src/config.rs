@@ -892,6 +892,34 @@ impl Config {
             self.agent.tool_search = v;
             mark("agent.tool_search".into());
         }
+        // プリセットの `tool_profile` はここで当てる。provider ごとの値 (temperature …) と違い
+        // これは `[agent]` に 1 つしか無いので、**誰がアクティブか決まってから**でないと当てられない
+        // (#153 のレビュー: `--provider` / `LODAN_PROVIDER` が効くのはこの関数なので、設定の
+        // 読み込み時点ではファイルに書かれた provider しか見えていなかった)。
+        self.apply_preset_tool_profile(origins);
+    }
+
+    /// アクティブな provider のプリセットが `tool_profile` を持つなら、まだ決まっていないときだけ当てる。
+    /// 利用者の明示 (`--tool-profile` / 設定ファイルの `tool_profile` / `tools = [...]`) が勝つ。
+    /// 起動時のアクティブ provider で決まる — `/model` で後から別の provider に切り替えても、
+    /// ツール登録はセッションの間固定なので追従しない。
+    fn apply_preset_tool_profile(&mut self, origins: &Origins) {
+        let Some(profile) = self
+            .llm
+            .active()
+            .preset
+            .as_deref()
+            .and_then(crate::presets::find)
+            .and_then(|p| p.tool_profile)
+        else {
+            return;
+        };
+        if !origins.contains_key("agent.tool_profile")
+            && self.agent.tool_profile == ToolProfile::default()
+            && self.agent.tools.is_empty()
+        {
+            self.agent.tool_profile = profile;
+        }
     }
 }
 
@@ -1162,15 +1190,6 @@ fn apply_presets(cfg: &mut Config, origins: &Origins) -> Result<()> {
         {
             p.tool_choice = Some(c.to_string());
         }
-        // ツールプロファイルは provider ではなく [agent] 側。provider ごとのプリセットから
-        // 当てるのは「いま使う provider のものだけ」にする (他の provider の設定で変わると驚く)。
-        if let Some(profile) = preset.tool_profile
-            && provider == cfg.llm.provider
-            && !origins.contains_key("agent.tool_profile")
-            && cfg.agent.tool_profile == ToolProfile::default()
-        {
-            cfg.agent.tool_profile = profile;
-        }
     }
     Ok(())
 }
@@ -1291,23 +1310,13 @@ max_iterations = "sk-not-a-number""#,
         assert_eq!(cfg.llm.local.temperature, Some(0.7));
         assert_eq!(cfg.llm.local.reasoning_effort.as_deref(), Some("none"));
 
-        // tool_profile は「いま使う provider」のプリセットからだけ当てる。
+        // provider ごとの値は、どの provider がアクティブでも書いた先に入る。
         let (cfg, _) = from_layers(vec![layer(
             "project",
-            "[llm]\nprovider = \"local\"\n\n[llm.local]\npreset = \"local-small-core\"\n",
+            "[llm]\nprovider = \"kimi\"\n\n[llm.local]\npreset = \"local-small\"\n",
         )])
         .unwrap();
-        assert_eq!(cfg.agent.tool_profile, ToolProfile::Core);
-        let (cfg, _) = from_layers(vec![layer(
-            "project",
-            "[llm]\nprovider = \"kimi\"\n\n[llm.local]\npreset = \"local-small-core\"\n",
-        )])
-        .unwrap();
-        assert_eq!(
-            cfg.agent.tool_profile,
-            ToolProfile::Full,
-            "他 provider のプリセットでは変えない"
-        );
+        assert_eq!(cfg.llm.local.temperature, Some(0.2));
 
         // 未知の名前は起動時エラー (黙って無視しない)。
         let err = from_layers(vec![layer("project", "[llm.local]\npreset = \"nope\"\n")])
@@ -1317,6 +1326,65 @@ max_iterations = "sk-not-a-number""#,
             err.contains("unknown preset") && err.contains("lodan presets"),
             "{err}"
         );
+    }
+
+    /// `tool_profile` は `[agent]` に 1 つしか無いので、**上書きを反映した後のアクティブな
+    /// provider** のプリセットからだけ当てる。設定ファイルの provider で判定すると、
+    /// `--provider` で別のモデルを使う実行にツール非表示が漏れる (#153 のレビューで実測)。
+    #[test]
+    fn a_presets_tool_profile_follows_the_provider_that_is_actually_active() {
+        let load = |toml: &str, overrides: Overrides| {
+            let (mut cfg, mut origins) = from_layers(vec![layer("project", toml)]).unwrap();
+            cfg.apply_overrides_tracked(overrides, &mut origins);
+            cfg
+        };
+        let core = "[llm]\nprovider = \"local\"\n\n[llm.local]\npreset = \"local-small-core\"\n";
+        // 上書きが無ければファイルの provider がアクティブ。
+        assert_eq!(
+            load(core, Overrides::default()).agent.tool_profile,
+            ToolProfile::Core
+        );
+        // --provider で別の provider に移ったら、そちらのプリセット (ここでは無し) に従う。
+        let moved = load(
+            core,
+            Overrides {
+                provider: Some(Provider::Sakura),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            moved.agent.tool_profile,
+            ToolProfile::Full,
+            "他 provider のプリセットが漏れてはいけない"
+        );
+        // 逆向き: ファイルでは別 provider でも、--provider で指した先のプリセットは当たる。
+        let arrived = load(
+            "[llm]\nprovider = \"kimi\"\n\n[llm.local]\npreset = \"local-small-core\"\n",
+            Overrides {
+                provider: Some(Provider::Local),
+                ..Default::default()
+            },
+        );
+        assert_eq!(arrived.agent.tool_profile, ToolProfile::Core);
+        // 利用者の明示が勝つ: 設定ファイルの tool_profile / tools = [...] / --tool-profile。
+        let by_file = load(
+            "[llm]\nprovider = \"local\"\n[llm.local]\npreset = \"local-small-core\"\n\n[agent]\ntool_profile = \"readonly\"\n",
+            Overrides::default(),
+        );
+        assert_eq!(by_file.agent.tool_profile, ToolProfile::Readonly);
+        let by_list = load(
+            "[llm]\nprovider = \"local\"\n[llm.local]\npreset = \"local-small-core\"\n\n[agent]\ntools = [\"Read\"]\n",
+            Overrides::default(),
+        );
+        assert_eq!(by_list.agent.tool_profile, ToolProfile::Full);
+        let by_flag = load(
+            core,
+            Overrides {
+                tool_profile: Some(ToolProfile::Readonly),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_flag.agent.tool_profile, ToolProfile::Readonly);
     }
 
     #[test]

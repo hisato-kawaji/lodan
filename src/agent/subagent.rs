@@ -1223,13 +1223,16 @@ mod tests {
             }))
         }
 
+        /// 台本をそのまま 1 つの Done として流す (親の `Session` は streaming を使う)。
         async fn chat_stream(
             &self,
-            _history: &[Message],
-            _tools: &[ToolSpec<'_>],
-            _model: &str,
-            _sink: mpsc::UnboundedSender<ChatEvent>,
+            history: &[Message],
+            tools: &[ToolSpec<'_>],
+            model: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
         ) -> Result<()> {
+            let resp = self.chat(history, tools, model, None).await?;
+            let _ = sink.send(ChatEvent::Done(resp));
             Ok(())
         }
     }
@@ -2072,6 +2075,90 @@ mod tests {
             cwd,
             8,
         )
+    }
+
+    /// Plan→Execute (#65 C1) を**本物の `Task` を通して**走らせる。偽の `Task` だけで試すと
+    /// 「子が読み取り専用で何も書けない」を見逃す (`30c1159` で実際に見逃した)。
+    #[tokio::test]
+    async fn a_plan_runs_its_steps_through_the_real_task_tool_and_they_can_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = |s: &str| ChatResponse {
+            content: Some(s.to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning: None,
+        };
+        let call = |name: &str, args: &str| ChatResponse {
+            content: None,
+            tool_calls: vec![tool_call(name, args)],
+            usage: None,
+            reasoning: None,
+        };
+        // 子 (手順の実行): 手順ごとに Write を 1 回呼んで要約を返す。
+        let child = Arc::new(ScriptedLlm::new(vec![
+            call("Write", r#"{"path": "step1.py", "content": "print(1)\n"}"#),
+            text("wrote step1.py"),
+            call("Write", r#"{"path": "step2.py", "content": "print(2)\n"}"#),
+            text("wrote step2.py"),
+        ]));
+        let gate = Arc::new(crate::permission::PermissionGate::new(true));
+        let task = SubAgentTool::new(
+            Arc::new(ScriptedLlm::new(vec![])),
+            "mock".into(),
+            Arc::new(read_only_registry()),
+            dir.path().to_path_buf(),
+            4,
+        )
+        .with_gate(Arc::clone(&gate))
+        .with_profile(
+            PLAN_STEP_AGENT.to_string(),
+            AgentProfile::new(
+                child,
+                "mock".into(),
+                Arc::new(crate::tools::registry::default_registry()),
+                4,
+            )
+            .with_instructions(String::new(), "runs one step".into()),
+        );
+        let mut registry = crate::tools::registry::default_registry();
+        registry.register(Arc::new(task));
+        let mut cfg = crate::config::Config::default();
+        cfg.agent.plan_execute = true;
+        let mut session = crate::agent::Session::new(cfg, Arc::new(registry));
+        // 親: 1 回目が計画、2 回目が最終応答。
+        let parent = ScriptedLlm::new(vec![
+            text(
+                r#"{"steps": [{"title": "First", "detail": "write step1.py"},
+                              {"title": "Second", "detail": "write step2.py"}]}"#,
+            ),
+            text("both steps are done"),
+        ]);
+        session
+            .run_turn(
+                "Write two small python files, step1.py printing 1 and step2.py printing 2, \
+                 then tell me what you did.",
+                &parent,
+                &gate,
+            )
+            .await
+            .unwrap();
+
+        // 手順が本当にファイルを書けている (子が読み取り専用なら 0 件になる)。
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("step1.py")).unwrap(),
+            "print(1)\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("step2.py")).unwrap(),
+            "print(2)\n"
+        );
+        // 親の履歴には注記 1 つだけが残る。
+        let notes = session
+            .history()
+            .iter()
+            .filter(|m| matches!(m, Message::User { content } if content.starts_with("[lodan] ")))
+            .count();
+        assert_eq!(notes, 1);
     }
 
     /// Plan→Execute (#65 C1) の `plan-step` は**書き込める**子なので、モデルに見せる一覧

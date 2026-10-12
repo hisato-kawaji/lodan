@@ -18,6 +18,29 @@ use crate::mcp::prompt::McpPrompt;
 use crate::session::Recorder;
 use crate::tools::registry::{ToolRegistry, default_registry, read_only_registry};
 
+/// Plan→Execute (#65 C1) の手順を実行する子のツール。**親に見えている範囲と同じ**に絞る
+/// (`AskUserQuestion` だけ外す — 子は利用者と直接やり取りしない)。残るものが無ければ `None`。
+///
+/// 親より広くしてはいけない: `subagent_type` の enum は助言でしかなく、モデルは種類を名指しで
+/// 呼べる (#154 のレビューで実証された)。親が `readonly` なのに子が書けると、
+/// 「`readonly` では破壊的ツールは実行されない」が成り立たなくなる。
+fn plan_step_tools(cfg: &Config) -> Option<ToolRegistry> {
+    let mut tools = default_registry();
+    tools.apply_profile(cfg.agent.tool_profile, &cfg.agent.tools);
+    let keep: Vec<String> = tools
+        .names()
+        .into_iter()
+        .filter(|n| *n != "AskUserQuestion")
+        .map(str::to_string)
+        .collect();
+    if keep.is_empty() {
+        return None;
+    }
+    // 空リストは「絞らない」の意味になるので、ここに来るのは keep が空でないときだけ。
+    tools.apply_profile(crate::config::ToolProfile::Full, &keep);
+    Some(tools)
+}
+
 /// 起動時の状況報告の行き先。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notices {
@@ -223,20 +246,16 @@ impl Runtime {
         for w in warnings {
             eprintln!("agents: {}", crate::term::sanitize(&w));
         }
-        // Plan→Execute (#65 C1) の手順を実行する子。**書き込める**ので、モデルに見せる種類の
-        // 一覧には出さず (`custom_names` が除く)、ハーネスが名指しで呼ぶ。破壊的ツールは親と
-        // 同じ承認ゲート・サンドボックス・プランモードを通る (#77 / #134 と同じ扱い)。
+        // Plan→Execute (#65 C1) の手順を実行する子。モデルに見せる種類の一覧には出さないが
+        // (`custom_names` が除く)、**schema の enum は助言でしかなく、モデルは種類を名指しで
+        // 呼べる** (#154 のレビューで実証された)。だから「親より強い子」を作らない:
+        // ツールは**親に見えている範囲と同じ**に絞る (`--tool-profile readonly` なら子も
+        // 読み取り専用のまま = `readonly` の意味を壊さない)。破壊的ツールは親と同じ承認ゲート・
+        // サンドボックス・プランモードを通る (#77 / #134 と同じ扱い)。
         // 定義ファイルより先に入れてあるので、`.lodan/agents/plan-step.md` があればそちらが勝つ。
-        if cfg.agent.plan_execute {
-            let mut tools = default_registry();
-            // 子は利用者と直接やり取りしない (`-p` では尋ねる相手もいない)。
-            let hide: Vec<String> = tools
-                .all_names()
-                .into_iter()
-                .filter(|n| *n != "AskUserQuestion")
-                .map(str::to_string)
-                .collect();
-            tools.apply_profile(crate::config::ToolProfile::Full, &hide);
+        if cfg.agent.plan_execute
+            && let Some(tools) = plan_step_tools(cfg)
+        {
             task = task.with_profile(
                 agent::agents::PLAN_STEP_AGENT.to_string(),
                 agent::subagent::AgentProfile::new(
@@ -432,5 +451,44 @@ fn resume_session(
             eprintln!("session: cannot resume {id}: {e}");
             new_session(cwd, cfg, registry, notices)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ToolProfile;
+
+    /// 手順を実行する子は親より強くならない。`readonly` の親の下では子も読み取り専用
+    /// (#154 のレビュー: モデルは `subagent_type` を名指しで呼べるので、ここが権限の境界になる)。
+    #[test]
+    fn the_plan_step_child_never_gets_more_tools_than_the_parent() {
+        let writes = |tools: &ToolRegistry| {
+            tools
+                .names()
+                .into_iter()
+                .any(|n| tools.get(n).is_some_and(|t| t.is_destructive()))
+        };
+        let mut cfg = Config::default();
+        // 既定 (full): 書ける。利用者と話すツールは渡さない。
+        let full = plan_step_tools(&cfg).expect("full has tools");
+        assert!(writes(&full));
+        assert!(!full.names().contains(&"AskUserQuestion"));
+        assert!(full.names().contains(&"Write"));
+
+        // readonly: 子も読み取り専用。
+        cfg.agent.tool_profile = ToolProfile::Readonly;
+        let readonly = plan_step_tools(&cfg).expect("readonly has tools");
+        assert!(!writes(&readonly), "{:?}", readonly.names());
+
+        // 明示リスト: その範囲だけ。
+        cfg.agent.tool_profile = ToolProfile::Full;
+        cfg.agent.tools = vec!["Read".into(), "Grep".into()];
+        let listed = plan_step_tools(&cfg).expect("explicit list has tools");
+        assert_eq!(listed.names(), vec!["Grep", "Read"]);
+
+        // 子に渡せるものが残らない構成では登録しない (空リスト = 絞らない、にしない)。
+        cfg.agent.tools = vec!["AskUserQuestion".into()];
+        assert!(plan_step_tools(&cfg).is_none());
     }
 }

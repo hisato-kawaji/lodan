@@ -44,6 +44,9 @@ fn with_plan_step_profile(
             Arc::new(tools),
             cfg.agent.max_iterations,
         )
+        // 手順は「そのターンの仕事」なので、調査用の子の上限 (12) ではなく親と同じ予算で回す
+        // (#65 C1 の実測: 12 回では手順を落とす)。
+        .with_iteration_budget(cfg.agent.max_iterations)
         .with_instructions(
             String::new(),
             "runs one step of a plan made by the harness".to_string(),
@@ -517,6 +520,16 @@ mod tests {
         assert!(tools_of(&cfg).is_none());
 
         cfg.agent.plan_execute = true;
+        // 手順は親と同じ反復予算で回す (調査用の子の上限 12 では手順を落とす。#65 C1 の実測)。
+        {
+            let task = task_for(&cfg);
+            let p = task.profile_of(PLAN_STEP_AGENT).expect("registered");
+            assert_eq!(p.max_iterations, cfg.agent.max_iterations);
+            assert!(
+                cfg.agent.max_iterations > 12,
+                "既定が子の上限より大きい前提"
+            );
+        }
         // 既定 (full): 書ける。利用者と話すツールは渡さない。
         let full = tools_of(&cfg).expect("full has tools");
         assert!(writes(&cfg));

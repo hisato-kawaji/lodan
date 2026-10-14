@@ -22,7 +22,11 @@ pub const PLAN_SYSTEM: &str = "You split a software task into steps that can eac
      {\"steps\": [{\"title\": \"short imperative title\", \"detail\": \"what to do, which files, \
      what the result must look like\"}]}\n\n\
      Rules:\n\
-     - At most 6 steps. Fewer is better. One step if the task is small.\n\
+     - At most 6 steps. Fewer is better: one step for a task that touches one file and has \
+     one command or endpoint to get right.\n\
+     - Split when the task names more than one file, more than one subcommand or endpoint, or \
+     asks to keep existing behaviour working while adding new behaviour: then make one step per \
+     file / subcommand / endpoint.\n\
      - Each step must be verifiable on its own and must leave the code in a working state.\n\
      - Order them so that a step only needs what the earlier steps produced.\n\
      - `detail` is written for the worker, not for the user: name the files, the commands and the \

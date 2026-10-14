@@ -81,16 +81,27 @@ impl AgentProfile {
         self
     }
 
-    /// 反復上限を子専用の上限 ([`SUBAGENT_MAX_ITERATIONS`]) に縛らず、そのまま使う。
+    /// Plan→Execute (#65 C1) の手順を実行する子。反復上限を子専用の上限
+    /// ([`SUBAGENT_MAX_ITERATIONS`]) で切らず、渡された値をそのまま使う。
     ///
-    /// 使うのは Plan→Execute (#65 C1) の手順だけ。あの子は「静かに走る調査」ではなく
-    /// **そのターンの仕事そのもの**なので、調査用の 12 回では足りない — ラダーの実測で、
-    /// 分解された 4 実行のうち 3 が `hit max_iterations (12)` で手順を落とし、1 手順に
-    /// 380-475 秒使ってから親に戻っていた (`docs/eval/ladder/phase3-2026-10.md`)。
-    /// 回しすぎは引き続き全体の予算 (`max_requests` / `max_total_tokens`) と手順数の上限が守る。
-    pub fn with_iteration_budget(mut self, max_iterations: usize) -> Self {
-        self.max_iterations = max_iterations;
-        self
+    /// 手順は「静かに走る調査」ではなく**そのターンの仕事そのもの**なので、調査用の 12 回では
+    /// 足りない — ラダーの実測で、分解された 4 実行のうち 3 が `hit max_iterations (12)` で
+    /// 手順を落とし、1 手順に 380-475 秒使ってから親に戻っていた
+    /// (`docs/eval/ladder/phase3-2026-10.md`)。
+    ///
+    /// **1 ターンの最悪値はこれで `手順数の上限 (6) × max_iterations` まで伸びる。**
+    /// `max_requests` / `max_total_tokens` は既定では未設定 (無制限) なので、既定で効く歯止めは
+    /// 手順数の上限だけ (#156 のレビュー)。この機能自体が既定 off。
+    pub fn for_plan_step(
+        llm: Arc<dyn LlmClient>,
+        model: String,
+        tools: Arc<ToolRegistry>,
+        max_iterations: usize,
+    ) -> Self {
+        Self {
+            max_iterations,
+            ..Self::new(llm, model, tools, max_iterations)
+        }
     }
 
     pub fn with_isolation(mut self, isolation: Isolation) -> Self {

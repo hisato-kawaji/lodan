@@ -273,10 +273,15 @@ pub enum McpCommand {
         #[arg(long)]
         user: bool,
     },
+    /// Log in to a Streamable HTTP server that requires OAuth (opens the browser; set $BROWSER to choose it)
+    Login { name: String },
+    /// Forget the saved OAuth login for a server
+    Logout { name: String },
 }
 
-/// `lodan mcp …`。設定ファイルを読み書きするだけで、サーバには繋がない。
-fn manage_mcp(cmd: McpCommand) -> Result<()> {
+/// `lodan mcp …`。設定ファイルを読み書きするだけで、サーバには繋がない (`login` だけは、
+/// サーバと認可サーバに繋いでブラウザで承認してもらう)。
+async fn manage_mcp(cmd: McpCommand) -> Result<()> {
     use crate::mcp::config::{
         McpServersConfig, Scope, remove_server, upsert_server, user_mcp_path,
     };
@@ -334,6 +339,13 @@ fn manage_mcp(cmd: McpCommand) -> Result<()> {
                 }
                 if !spec.headers.is_empty() {
                     flags.push(format!("{} header(s)", spec.headers.len()));
+                }
+                if let Some(url) = &spec.url
+                    && crate::mcp::oauth::Store::default_location()
+                        .and_then(|store| store.load(url))
+                        .is_some()
+                {
+                    flags.push("oauth".to_string());
                 }
                 println!(
                     "{:<8} {}  {}{}",
@@ -393,7 +405,61 @@ fn manage_mcp(cmd: McpCommand) -> Result<()> {
             }
             Ok(())
         }
+        McpCommand::Login { name } => {
+            let (url, from) = http_server_url(&name)?;
+            let store = crate::mcp::oauth::Store::default_location()
+                .context("could not resolve the user config directory")?;
+            eprintln!(
+                "mcp: logging in to {} at {} (from {})",
+                crate::term::sanitize(&name),
+                crate::term::sanitize(&url),
+                from.display()
+            );
+            crate::mcp::oauth::login(&url, &store, crate::mcp::oauth::open_in_browser).await?;
+            println!(
+                "mcp: logged in to {} ({})",
+                crate::term::sanitize(&name),
+                crate::term::sanitize(&url)
+            );
+            Ok(())
+        }
+        McpCommand::Logout { name } => {
+            let (url, _) = http_server_url(&name)?;
+            let store = crate::mcp::oauth::Store::default_location()
+                .context("could not resolve the user config directory")?;
+            let name = crate::term::sanitize(&name);
+            if store.remove(&url)? {
+                println!("mcp: logged out of {name}");
+            } else {
+                println!("mcp: {name} has no saved login");
+            }
+            Ok(())
+        }
     }
+}
+
+/// `lodan mcp login / logout` の対象の URL と、それを書いた設定ファイル。`list` と同じく
+/// ファイルを読むだけ (プロセスは起動しない) なので、信頼の有無に関わらずプロジェクトの
+/// `.mcp.json` も見る。同名ならプロジェクトが勝つ (セッションでの合成と同じ)。
+fn http_server_url(name: &str) -> Result<(String, std::path::PathBuf)> {
+    use crate::mcp::config::{McpServersConfig, user_mcp_path};
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let shown = crate::term::sanitize(name);
+    let mut found = None;
+    for path in user_mcp_path().into_iter().chain([cwd.join(".mcp.json")]) {
+        if let Some(cfg) = McpServersConfig::load_from(&path)?
+            && let Some(spec) = cfg.mcp_servers.get(name)
+        {
+            found = Some((spec.clone(), path));
+        }
+    }
+    let Some((spec, path)) = found else {
+        anyhow::bail!("no MCP server named `{shown}` (see `lodan mcp list`)");
+    };
+    let Some(url) = spec.url else {
+        anyhow::bail!("`{shown}` is a stdio server; OAuth applies to servers added with --url");
+    };
+    Ok((url, path))
 }
 
 /// 戻り値はプロセスの終了コード。
@@ -402,7 +468,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         return manage_trust(*list, *remove).map(|()| 0);
     }
     if let Some(Command::Mcp { cmd }) = args.cmd {
-        return manage_mcp(cmd).map(|()| 0);
+        return manage_mcp(cmd).await.map(|()| 0);
     }
     // プロジェクトのファイルを読むかどうかは、設定を読む前に決める (設定そのものが対象なので)。
     // バイナリでは main が `.env` を読む前に済ませている。ここは、それ以外の呼び出し元のための保険

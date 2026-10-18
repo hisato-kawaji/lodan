@@ -42,5 +42,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 
+# MCP OAuth (#83): PKCE の SHA-256 と乱数、base64url、URL の組み立て。いずれも rustls / reqwest が
+# 既に引いている版を使う (新しいクレートは増えない)。
+ring = "0.17"
+base64 = "0.22"
+url = "2"
+
 [dev-dependencies]
 tempfile = "3"

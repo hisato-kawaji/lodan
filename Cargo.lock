@@ -869,6 +869,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
  "directories",
  "dotenvy",
@@ -880,6 +881,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "reqwest",
+ "ring",
  "rustyline",
  "serde",
  "serde_json",
@@ -889,6 +891,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

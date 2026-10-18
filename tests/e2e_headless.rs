@@ -83,6 +83,17 @@ enum Stdin {
 
 /// 隔離した HOME / cwd で lodan を走らせ、終了まで待つ。`RUN_LIMIT` を超えたら kill して panic。
 fn lodan(home: &Path, port: u16, args: &[&str], stdin: Stdin) -> Output {
+    lodan_with_env(home, port, args, stdin, &[])
+}
+
+/// `lodan` に環境変数を足して走らせる (`BROWSER` など)。
+fn lodan_with_env(
+    home: &Path,
+    port: u16,
+    args: &[&str],
+    stdin: Stdin,
+    envs: &[(&str, &str)],
+) -> Output {
     // 既定の cwd は `<home>/work`。`<harness:cwd=REL>` で `<home>/REL` に変えられる。
     let cwd = args
         .iter()
@@ -104,6 +115,7 @@ fn lodan(home: &Path, port: u16, args: &[&str], stdin: Stdin) -> Output {
         .env("LODAN_PROVIDER", "local")
         .env("LODAN_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .envs(envs.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2526,6 +2538,212 @@ fn plan_model_routes_only_the_planning_call_to_that_model() {
     let unplanned = run(&[]);
     assert_eq!(unplanned.len(), 1, "{unplanned:?}");
     assert_eq!(unplanned[0]["event"], "plan_skipped", "{unplanned:?}");
+}
+
+// ---- #83: リモート MCP の OAuth ----
+
+/// `tests/fixtures/mock_mcp_http_server.py` (Streamable HTTP の MCP サーバ兼、OAuth の認可サーバ)。
+struct McpMock {
+    child: Child,
+    port: u16,
+}
+
+impl Drop for McpMock {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_mcp_mock(envs: &[(&str, &str)]) -> McpMock {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_mcp_http_server.py");
+    let child = Command::new("python3")
+        .arg(script)
+        .arg(port.to_string())
+        .envs(envs.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn python3 mock_mcp_http_server.py");
+    let mock = McpMock { child, port };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the MCP mock did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    mock
+}
+
+/// 保存されたトークンのファイル (`<HOME>/.config/lodan/mcp-auth/*.json`)。
+fn saved_logins(home: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(home.join(".config/lodan/mcp-auth"))
+        .map(|d| {
+            d.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// login 前は「login しろ」と知らせる / `lodan mcp login` でブラウザ (ここでは curl) の承認を経て
+/// トークンを 0600 で保存する / セッションはそれを使い、拒まれたら refresh して送り直し、新しい
+/// トークンを保存し直す / logout で忘れる。
+#[test]
+fn mcp_oauth_login_uses_and_refreshes_the_token_and_logout_forgets_it() {
+    let home = tempfile::tempdir().unwrap();
+    let log = home.path().join("mcp.log");
+    let mcp = start_mcp_mock(&[
+        ("MOCK_MCP_OAUTH", "1"),
+        ("MOCK_MCP_LOG", log.to_str().unwrap()),
+    ]);
+    let url = format!("http://127.0.0.1:{}/mcp", mcp.port);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "srv": { "url": url } } }).to_string(),
+    )
+    .unwrap();
+    let steps = serde_json::json!([
+        ["mcp__srv__echo", { "msg": "a" }],
+        ["mcp__srv__expire_tokens", {}],
+        ["mcp__srv__echo", { "msg": "b" }],
+    ])
+    .to_string();
+    let llm = start_mock_with(home.path(), &[("MOCK_LLM_STEPS", &steps)]);
+    let session = || {
+        let out = lodan(
+            home.path(),
+            llm.port,
+            &[
+                "--yes",
+                "-p",
+                "run the demo",
+                "--output-format",
+                "stream-json",
+            ],
+            Stdin::OpenAndSilent,
+        );
+        let outcomes: Vec<String> = stdout(&out)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["event"] == "tool_result")
+            .map(|e| {
+                format!(
+                    "{} {}",
+                    e["name"].as_str().unwrap(),
+                    e["outcome"].as_str().unwrap()
+                )
+            })
+            .collect();
+        (out, outcomes)
+    };
+    let mcp_cmd = |args: &[&str]| {
+        lodan_with_env(
+            home.path(),
+            1,
+            args,
+            Stdin::OpenAndSilent,
+            &[("BROWSER", "curl -s -L -o /dev/null")],
+        )
+    };
+
+    // login 前: サーバに繋げず、直し方を知らせる。
+    let (before, _) = session();
+    let stderr = String::from_utf8_lossy(&before.stderr);
+    assert!(stderr.contains("run `lodan mcp login srv`"), "{stderr}");
+
+    let login = mcp_cmd(&["mcp", "login", "srv"]);
+    assert!(
+        login.status.success(),
+        "{}{}",
+        stdout(&login),
+        String::from_utf8_lossy(&login.stderr)
+    );
+    assert!(
+        stdout(&login).contains("logged in to srv"),
+        "{}",
+        stdout(&login)
+    );
+    let files = saved_logins(home.path());
+    assert_eq!(files.len(), 1, "{files:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert!(
+        std::fs::read_to_string(&files[0])
+            .unwrap()
+            .contains("\"at-1\"")
+    );
+    assert!(stdout(&mcp_cmd(&["mcp", "list"])).contains("oauth"));
+
+    // セッション: at-1 で呼び、失効させられたら refresh して at-2 で送り直す。
+    let (_, outcomes) = session();
+    assert_eq!(
+        outcomes,
+        [
+            "mcp__srv__echo ok",
+            "mcp__srv__expire_tokens ok",
+            "mcp__srv__echo ok"
+        ]
+    );
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(seen.contains("at-1 tools/call echo"), "{seen}");
+    assert!(seen.contains("at-2 tools/call echo"), "{seen}");
+    assert!(
+        std::fs::read_to_string(&files[0])
+            .unwrap()
+            .contains("\"at-2\""),
+        "the refreshed token is saved"
+    );
+
+    let logout = mcp_cmd(&["mcp", "logout", "srv"]);
+    assert!(
+        stdout(&logout).contains("logged out of srv"),
+        "{}",
+        stdout(&logout)
+    );
+    assert!(saved_logins(home.path()).is_empty());
+    assert!(!stdout(&mcp_cmd(&["mcp", "list"])).contains("oauth"));
+}
+
+/// 認証の要らないサーバに login しようとしたら、何もせずに理由を返す。
+#[test]
+fn mcp_login_to_a_server_without_oauth_says_so() {
+    let home = tempfile::tempdir().unwrap();
+    let mcp = start_mcp_mock(&[]);
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": { "open": {
+            "url": format!("http://127.0.0.1:{}/mcp", mcp.port)
+        } } })
+        .to_string(),
+    )
+    .unwrap();
+    let out = lodan(
+        home.path(),
+        1,
+        &["mcp", "login", "open"],
+        Stdin::OpenAndSilent,
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("did not ask for authorization"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(saved_logins(home.path()).is_empty());
 }
 
 // ---- #88: `lodan config` は秘密を伏せる ----

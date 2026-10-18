@@ -307,6 +307,15 @@ struct HttpShared {
     handler: ServerRequestHandler,
     /// `notifications/tools/list_changed` を受けた印 (stdio と同じ扱い)。
     tools_changed: std::sync::atomic::AtomicBool,
+    /// `lodan mcp login` で保存した OAuth のトークン (#83)。`headers` に `Authorization` を
+    /// 書いたサーバではそちらを使い、これは持たない。
+    oauth: Option<OAuth>,
+}
+
+struct OAuth {
+    store: crate::mcp::oauth::Store,
+    /// まだ login していなければ None。
+    creds: Mutex<Option<crate::mcp::oauth::Credentials>>,
 }
 
 impl HttpTransport {
@@ -331,11 +340,21 @@ impl HttpTransport {
             .connect_timeout(REQUEST_TIMEOUT)
             .build()
             .context("building HTTP client")?;
-        let headers = spec
+        let headers: Vec<(String, String)> = spec
             .headers
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let static_auth = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+        let oauth = (!static_auth)
+            .then(crate::mcp::oauth::Store::default_location)
+            .flatten()
+            .map(|store| OAuth {
+                creds: Mutex::new(store.load(url)),
+                store,
+            });
         Ok(Self {
             shared: Arc::new(HttpShared {
                 label: label.to_string(),
@@ -346,6 +365,7 @@ impl HttpTransport {
                 session_id: Mutex::new(None),
                 handler,
                 tools_changed: std::sync::atomic::AtomicBool::new(false),
+                oauth,
             }),
             listener: std::sync::Mutex::new(None),
         })
@@ -353,7 +373,32 @@ impl HttpTransport {
 }
 
 impl HttpShared {
+    /// POST する。OAuth のトークンがあれば付け、401 なら一度だけ更新して送り直す。
     async fn post(&self, line: String, limit: Duration) -> Result<reqwest::Response> {
+        let token = self.bearer().await;
+        let resp = self
+            .post_once(line.clone(), limit, token.as_deref())
+            .await?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED || self.oauth.is_none() {
+            return Ok(resp);
+        }
+        if !self.refresh_rejected(token.as_deref()).await {
+            return Err(self.unauthorized().await);
+        }
+        let token = self.bearer().await;
+        let resp = self.post_once(line, limit, token.as_deref()).await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(self.unauthorized().await);
+        }
+        Ok(resp)
+    }
+
+    async fn post_once(
+        &self,
+        line: String,
+        limit: Duration,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response> {
         let mut req = self
             .client
             .post(&self.url)
@@ -364,6 +409,9 @@ impl HttpShared {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
         if let Some(sid) = self.session_id.lock().await.as_ref() {
             req = req.header(SESSION_HEADER, sid);
         }
@@ -373,6 +421,73 @@ impl HttpShared {
             .with_context(|| format!("mcp[{}]: HTTP POST to {}", self.label, self.url))?;
         self.remember_session(&resp).await;
         Ok(resp)
+    }
+
+    /// いま送るべき OAuth のトークン。期限が近ければ先に更新する (失敗しても古いものを返す —
+    /// まだ通るかもしれないし、通らなければ 401 の経路で知らせる)。
+    async fn bearer(&self) -> Option<String> {
+        let oauth = self.oauth.as_ref()?;
+        let mut creds = oauth.creds.lock().await;
+        let current = creds.as_ref()?;
+        if current.expiring(crate::mcp::oauth::now_secs()) && current.refresh_token.is_some() {
+            match crate::mcp::oauth::refresh(current).await {
+                Ok(fresh) => {
+                    if let Err(e) = oauth.store.save(&fresh) {
+                        tracing::debug!(server=%self.label, %e, "mcp: could not save the refreshed token");
+                    }
+                    *creds = Some(fresh);
+                }
+                Err(e) => tracing::debug!(server=%self.label, %e, "mcp: token refresh failed"),
+            }
+        }
+        creds.as_ref().map(|c| c.access_token.clone())
+    }
+
+    /// `used` のトークンが 401 で拒まれた。更新できた (か、別の呼び出しが既に更新していた) なら true。
+    async fn refresh_rejected(&self, used: Option<&str>) -> bool {
+        let Some(oauth) = &self.oauth else {
+            return false;
+        };
+        let mut creds = oauth.creds.lock().await;
+        let Some(current) = creds.as_ref() else {
+            return false;
+        };
+        // 並んで 401 を受けた呼び出しが、同じ refresh token で二度更新しない。
+        if Some(current.access_token.as_str()) != used {
+            return true;
+        }
+        match crate::mcp::oauth::refresh(current).await {
+            Ok(fresh) => {
+                if let Err(e) = oauth.store.save(&fresh) {
+                    tracing::debug!(server=%self.label, %e, "mcp: could not save the refreshed token");
+                }
+                *creds = Some(fresh);
+                true
+            }
+            Err(e) => {
+                tracing::debug!(server=%self.label, %e, "mcp: token refresh failed");
+                false
+            }
+        }
+    }
+
+    /// 401 のまま進めないときのエラー。何をすればよいかを書く。
+    async fn unauthorized(&self) -> anyhow::Error {
+        let logged_in = match &self.oauth {
+            Some(oauth) => oauth.creds.lock().await.is_some(),
+            None => false,
+        };
+        let label = &self.label;
+        if logged_in {
+            anyhow!(
+                "mcp[{label}]: the server rejected the saved login and it could not be refreshed \
+                 — run `lodan mcp login {label}`"
+            )
+        } else {
+            anyhow!(
+                "mcp[{label}]: the server requires authorization — run `lodan mcp login {label}`"
+            )
+        }
     }
 
     /// サーバが割り当てたセッション ID を引き継ぐ。
@@ -387,20 +502,15 @@ impl HttpShared {
     /// サーバが自分から送るメッセージ用の GET ストリームを開く。サーバが提供しない (405 など)
     /// ときは `Ok(None)` — 再接続しない。
     async fn open_stream(&self) -> Result<Option<reqwest::Response>> {
-        let mut req = self
-            .stream_client
-            .get(&self.url)
-            .header("Accept", "text/event-stream");
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        if let Some(sid) = self.session_id.lock().await.as_ref() {
-            req = req.header(SESSION_HEADER, sid);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("mcp[{}]: HTTP GET to {}", self.label, self.url))?;
+        let token = self.bearer().await;
+        let resp = self.get_once(token.as_deref()).await?;
+        let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.refresh_rejected(token.as_deref()).await
+        {
+            self.get_once(self.bearer().await.as_deref()).await?
+        } else {
+            resp
+        };
         let is_sse = resp
             .headers()
             .get("content-type")
@@ -411,6 +521,25 @@ impl HttpShared {
             return Ok(None);
         }
         Ok(Some(resp))
+    }
+
+    async fn get_once(&self, token: Option<&str>) -> Result<reqwest::Response> {
+        let mut req = self
+            .stream_client
+            .get(&self.url)
+            .header("Accept", "text/event-stream");
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        if let Some(sid) = self.session_id.lock().await.as_ref() {
+            req = req.header(SESSION_HEADER, sid);
+        }
+        req.send()
+            .await
+            .with_context(|| format!("mcp[{}]: HTTP GET to {}", self.label, self.url))
     }
 
     /// SSE を順に読む。サーバからのリクエストと通知はその場で処理し、`want` の id に一致する

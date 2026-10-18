@@ -550,6 +550,7 @@ network = false            # 既定 true。false でサンドボックス内か�
 
 - **スコープ**（#83）: ユーザー全体の `<config_dir>/mcp.json`（`config.toml` と同じ場所。macOS なら `~/Library/Application Support/lodan/mcp.json`）と、プロジェクトの `$CWD/.mcp.json`（**信頼済みのときだけ**読む）を合成する。同名はプロジェクトが勝つ
 - **`lodan mcp list | add | remove`**: 設定ファイルの読み書きだけで、サーバには繋がない。`lodan mcp add fs --command npx -- -y @modelcontextprotocol/server-filesystem /path`、`lodan mcp add web --url https://…/mcp`。既定はプロジェクトの `.mcp.json`、`--user` でユーザー全体。`--trust-annotations` で下の `trustAnnotations` を付ける。`list` はヘッダの値（トークン）を出さない
+- **`lodan mcp login <name>` / `lodan mcp logout <name>`**（#83）: OAuth を要求するリモート（`--url`）サーバにログインする / 保存したログインを忘れる。下の「OAuth」を参照。`list` はログイン済みのサーバに `[oauth]` を付ける
 - **サーバ別の設定**（`.mcp.json` の各サーバに書く）:
   - `"trustAnnotations": true` — ツールの `annotations.readOnlyHint: true` を信じて、そのツールを**非破壊**（承認ゲートを通さず、plan モードでも使える）にする。ヒントはサーバの自己申告なので既定 false。信頼するサーバだけ
   - `"enabledTools": ["read_file"]` / `"disabledTools": ["delete"]` — 取り込むツールを絞る（`disabledTools` が優先）。使わないツールの定義でコンテキストを食わない
@@ -576,6 +577,7 @@ network = false            # 既定 true。false でサンドボックス内か�
 サンプルは `.mcp.json.example` を参照。`command` があれば stdio、`url` があれば HTTP（両方／どちらも無いはエラー）。
 
 - **transport**: **stdio** (`command`) と **Streamable HTTP** (`url`)。HTTP は POST で JSON-RPC を送り、`application/json` または `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぎ、`headers` で認証ヘッダを付与できる。初期化の後に **GET で server→client のストリーム**（SSE）を開き、サーバが自分から送る通知・リクエストを受ける（サーバが 405 などで断れば開かない。切れたら倍々の待ち時間・上限 30 秒で開き直す）。POST の SSE 応答の途中に来たリクエスト（`elicitation/create` など）もその場で処理し、応答は別の POST で返す（#83）
+- **OAuth**（#83。MCP の Authorization 仕様 2025-06-18）: `lodan mcp login <name>` で、サーバの 401 応答の `WWW-Authenticate` → Protected Resource Metadata（RFC 9728）→ 認可サーバの metadata（RFC 8414 / OpenID Discovery）と辿り、動的クライアント登録（RFC 7591）、認可コード + PKCE（S256）、`resource` 指定（RFC 8707）でトークンを得る。承認ページはブラウザで開く（`$BROWSER` があればそれ、無ければ `open` / `xdg-open`。開けなくても URL を表示する）。リダイレクト先は `127.0.0.1` の一時ポート（5 分待つ）。トークンは `<config_dir>/mcp-auth/` に **サーバの URL ごと**に `0600` で保存する（名前ではなく URL に紐づけるので、`.mcp.json` の名前を別のホストに付け替えても前のトークンは送らない）。セッション中は `Authorization: Bearer` を付け、期限が近ければ先に、401 なら一度だけ refresh して送り直し、新しいトークンを保存し直す。更新できなければ「`lodan mcp login <name>` を実行しろ」と知らせて、そのサーバを使わずに続ける（**セッション中にブラウザは開かない**）。`headers` に `Authorization` を書いたサーバでは OAuth を使わない。サーバ・認可サーバの URL は https（ループバックの http だけ例外）でなければ断る。動的クライアント登録に対応していない認可サーバにはログインできない
 - **`tools/list_changed`**: サーバが `notifications/tools/list_changed` を送ると、**次のターンの入口**で `tools/list` を取り直してそのサーバのツールを入れ替える（`mcp[<server>]: tools changed, now N tool(s)` と表示。`enabledTools` などの絞り込みと `tool_search` の遅延はそのまま効く。system prompt のツール一覧も作り直す）。ターンの途中では入れ替えない（進行中の呼び出しと定義が食い違うため）。stdio でも HTTP（GET ストリームか POST の SSE 応答で届いたもの）でも受け取る
 - **elicitation**（server→client の利用者への問い合わせ）: REPL では `[mcp:<server>] asks: <message>` と出して `requestedSchema` の各プロパティを 1 項目ずつ stdin で尋ね（string / integer / number / boolean / enum に合わせて変換。空行は「答えない」で、必須なら全体を decline）、`{ action: accept, content }` を返す。`-p` では尋ねずに decline（capability は広告しないが、尋ねてきたサーバにも decline を返す）。stdio でも HTTP でも受け取る
 - **capabilities**: tools / prompts / resources / roots、および opt-in の **sampling**。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストは stdio でも HTTP でも受け取る。⚠️ roots はサーバに **cwd の絶対パスを開示**します（`.mcp.json` のサーバを信頼する前提と同じ範囲）
@@ -1103,7 +1105,7 @@ cargo test
 - `repl.rs` — slash command 判定（絶対パス始まりは LLM に流す）
 - `llm/openai.rs` — usage パース（非ストリーム / ストリーム最終チャンク）・`total_tokens` 補完・`stream_options` の付与
 - `agent/loop.rs` — Stop hook 継続 / compact 境界・要約前置 / usage 累積・概算フォールバック
-- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` / `mcp/roots.rs` / `mcp/sampling.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing、roots 提供、sampling (server→client LLM 補完) の opt-in 橋渡し
+- `mcp/config.rs` / `mcp/protocol.rs` / `mcp/transport.rs` / `mcp/oauth.rs` / `mcp/client.rs` / `mcp/tool.rs` / `mcp/prompt.rs` / `mcp/resource.rs` / `mcp/roots.rs` / `mcp/sampling.rs` — `.mcp.json` パース、JSON-RPC + MCP 型、stdio/HTTP transport、transport 非依存クライアント、tool / prompt / resource の namespacing、roots 提供、sampling (server→client LLM 補完) の opt-in 橋渡し
 - `tests/e2e_mock.rs` — 6 ツールを順に走らせるエンドツーエンドのモック試験
 - `tests/e2e_mcp.rs` — mock MCP サーバとの handshake + tools/list + tools/call 一周
 

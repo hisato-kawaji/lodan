@@ -1,10 +1,11 @@
 // MCP (Model Context Protocol) クライアント。
-// transport: stdio / Streamable HTTP。
+// transport: stdio / Streamable HTTP (OAuth 対応)。
 // capability: tools / prompts / resources / roots、および opt-in の sampling。
 
 pub mod client;
 pub mod config;
 pub mod elicitation;
+pub mod oauth;
 pub mod prompt;
 pub mod protocol;
 pub mod registry;

@@ -59,6 +59,12 @@ def collect(path: Path) -> dict:
         "dup_suppressed": reasons.get("dup_readonly", 0),
         "denied": reasons.get("denied", 0),
         "compactions": by_event.get("compact", 0),
+        # Plan→Execute (#65 C1): 分解されたか、ハーネスの検算が何回走って何回落ちたか。
+        "plans_made": by_event.get("plan_made", 0),
+        "plan_verify_runs": by_event.get("plan_verify", 0),
+        "plan_verify_failed": sum(
+            1 for e in events if e.get("event") == "plan_verify" and not e.get("ok")
+        ),
         # ターン所要の合計。lodan 側は単調時計 (Rust Instant) で測っているため、
         # 実行中にマシンがスリープしても伸びない。壁時計の secs より信頼できる。
         "active_ms": sum(e.get("ms", 0) for e in turn_ends),

@@ -10,6 +10,8 @@
 #   MODEL=llama3.1:8b PROVIDER=local bash ladder.sh
 #   TASKS="L0-write L1-fix-bug" CONFIGS=mitig REPEAT=1 bash ladder.sh   # 速い反復
 #   MODEL=fugu PROVIDER=sakana CONFIGS=mitig bash ladder.sh             # 参照実装
+#   TASKS=L3 CONFIGS="think-none plan-none plan-verify-none" bash ladder.sh   # C1 の測定 (#65)
+#   TASKS=L3 CONFIGS=plan-model-none PLAN_MODEL=qwen3:32b bash ladder.sh     # 計画器だけ大きく
 #
 # 結果は results.jsonl へ 1 実行 1 行で追記され、同じ key の行があるものは
 # スキップされる (中断しても再開できる)。表にするには summarize.py。
@@ -28,6 +30,7 @@ RUNS_DIR="${RUNS_DIR:-$HERE/runs}"
 T_L0="${T_L0:-120}"
 T_L1="${T_L1:-240}"
 T_L2="${T_L2:-480}"
+T_L3="${T_L3:-960}"
 # 1 チェックあたりの上限 (サーバ起動を伴う L2 のため少し長め)。
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-60}"
 
@@ -98,6 +101,14 @@ flags_for_config() {
     # think-none と同条件で Plan→Execute 分離だけを足す (#65 C1)。手順ごとに子を立てるので
     # LLM の往復が増える。時間は think-none と比べる。
     plan-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --plan-execute" ;;
+    # plan-none と同条件で、タスクの $VERIFY を [[verify]] に書く (#65)。全手順が通った直後に
+    # ハーネスが 1 回だけ検算し、通れば親に確かめ直させない。plan-none との差が「検算の移管」の寄与。
+    plan-verify-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --plan-execute" ;;
+    # plan-none と同条件で、計画だけを $PLAN_MODEL で立てる (#65)。手順の実行は $MODEL のまま。
+    # plan-none との差が「計画器の大きさ」の寄与。
+    plan-model-none)
+      if [ -z "${PLAN_MODEL:-}" ]; then echo "plan-model-none needs PLAN_MODEL" >&2; return 1; fi
+      echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --plan-execute --plan-model $PLAN_MODEL" ;;
     # think-none と同条件で、編集直後の構文チェックだけを足す (#65 D2)。
     syntax-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --syntax-check" ;;
     think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
@@ -115,6 +126,7 @@ timeout_for_level() {
     L0) echo "$T_L0" ;;
     L1) echo "$T_L1" ;;
     L2) echo "$T_L2" ;;
+    L3) echo "$T_L3" ;;
     *)  echo 300 ;;
   esac
 }
@@ -173,9 +185,9 @@ for task_file in $TASK_FILES; do
         mkdir -p "$work/.lodan"
         printf '[llm.local]\ntimeout_secs = 900\n\n[llm.sakana]\ntimeout_secs = 900\n' \
           > "$work/.lodan/config.toml"
-        # `verify-none` のときだけ、タスクが定義した検証コマンド ($VERIFY) を [[verify]] に書く
-        # (#65 D1)。空白を含むコマンドをフラグ列で渡すと単語分割で壊れるため、設定ファイル経由。
-        if [ "$config" = "verify-none" ] && [ -n "${VERIFY:-}" ]; then
+        # `verify-none` / `plan-verify-none` のときだけ、タスクが定義した検証コマンド ($VERIFY) を
+        # [[verify]] に書く (#65 D1)。空白を含むコマンドをフラグ列で渡すと単語分割で壊れるため、設定ファイル経由。
+        if { [ "$config" = "verify-none" ] || [ "$config" = "plan-verify-none" ]; } && [ -n "${VERIFY:-}" ]; then
           printf '\n[[verify]]\nid = "task"\ncommand = %s\ntimeout_secs = 120\n' \
             "$(printf '%s' "$VERIFY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
             >> "$work/.lodan/config.toml"

@@ -18,7 +18,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-LEVELS = ["L0", "L1", "L2"]
+LEVELS = ["L0", "L1", "L2", "L3"]
 CONFIG_ORDER = ["base", "temp", "mitig", "nudge"]
 
 

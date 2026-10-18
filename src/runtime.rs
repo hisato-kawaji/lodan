@@ -38,7 +38,9 @@ fn with_plan_step_profile(
     };
     task.with_profile(
         agent::agents::PLAN_STEP_AGENT.to_string(),
-        agent::subagent::AgentProfile::new(
+        // 手順は「そのターンの仕事」なので、調査用の子の上限 (12) ではなく親と同じ予算で回す
+        // (#65 C1 の実測: 12 回では手順を落とす)。
+        agent::subagent::AgentProfile::for_plan_step(
             Arc::clone(llm),
             cfg.llm.active().model.clone(),
             Arc::new(tools),
@@ -135,14 +137,17 @@ fn build_agent_profile(
             (client, next.llm.active().model.clone())
         }
     };
-    Ok(agent::subagent::AgentProfile::new(
-        llm,
-        model,
-        Arc::new(tools),
-        def.max_turns.unwrap_or(cfg.agent.max_iterations),
-    )
-    .with_instructions(def.prompt.clone(), def.description.clone())
-    .with_isolation(def.isolation))
+    let budget = def.max_turns.unwrap_or(cfg.agent.max_iterations);
+    // `.lodan/agents/plan-step.md` で手順の実行を差し替えたときも、手順ぶんの予算で回す。
+    // 普通の子のコンストラクタを通すと調査用の上限 (12) に戻り、#156 で直した欠陥が再発する。
+    let profile = if def.name == agent::agents::PLAN_STEP_AGENT {
+        agent::subagent::AgentProfile::for_plan_step(llm, model, Arc::new(tools), budget)
+    } else {
+        agent::subagent::AgentProfile::new(llm, model, Arc::new(tools), budget)
+    };
+    Ok(profile
+        .with_instructions(def.prompt.clone(), def.description.clone())
+        .with_isolation(def.isolation))
 }
 
 impl Runtime {
@@ -517,6 +522,16 @@ mod tests {
         assert!(tools_of(&cfg).is_none());
 
         cfg.agent.plan_execute = true;
+        // 手順は親と同じ反復予算で回す (調査用の子の上限 12 では手順を落とす。#65 C1 の実測)。
+        {
+            let task = task_for(&cfg);
+            let p = task.profile_of(PLAN_STEP_AGENT).expect("registered");
+            assert_eq!(p.max_iterations, cfg.agent.max_iterations);
+            assert!(
+                cfg.agent.max_iterations > 12,
+                "既定が子の上限より大きい前提"
+            );
+        }
         // 既定 (full): 書ける。利用者と話すツールは渡さない。
         let full = tools_of(&cfg).expect("full has tools");
         assert!(writes(&cfg));
@@ -535,9 +550,34 @@ mod tests {
         // 子に渡せるものが残らない構成では登録しない (空リスト = 絞らない、にしない)。
         cfg.agent.tools = vec!["AskUserQuestion".into()];
         assert!(tools_of(&cfg).is_none());
+
         // 分解の可否も同じ判定を見る (計画の LLM 呼び出しを無駄にしない)。
         assert!(!plan::can_run_steps(&cfg));
         cfg.agent.tools.clear();
         assert!(plan::can_run_steps(&cfg));
+
+        // `.lodan/agents/plan-step.md` で差し替えたときも手順ぶんの予算で回す
+        // (普通の子のコンストラクタを通すと調査用の上限 12 に戻る。#156 のレビュー)。
+        let def = |name: &str| agent::agents::AgentDef {
+            name: name.to_string(),
+            description: "d".into(),
+            tools: vec!["Read".into(), "Write".into()],
+            provider: None,
+            model: None,
+            max_turns: None,
+            isolation: agent::agents::Isolation::None,
+            prompt: String::new(),
+            path: PathBuf::from("plan-step.md"),
+        };
+        let llm: Arc<dyn LlmClient> = Arc::new(UnusedLlm);
+        let ledger = Arc::new(llm::metered::Ledger::new(Default::default()));
+        let built = |name: &str| {
+            build_agent_profile(&def(name), &cfg, &llm, &ledger)
+                .unwrap()
+                .max_iterations
+        };
+        assert_eq!(built(PLAN_STEP_AGENT), cfg.agent.max_iterations);
+        // 普通の子は今までどおり子専用の上限で切る。
+        assert!(built("digger") < cfg.agent.max_iterations);
     }
 }

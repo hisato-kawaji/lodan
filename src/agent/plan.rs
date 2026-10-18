@@ -221,7 +221,14 @@ pub fn step_prompt(request: &str, steps: &[Step], index: usize, done: &[Outcome]
 }
 
 /// 手順の結果を親の履歴に残す注記。親はこの後、普通にターンを続けて利用者に答える。
-pub fn outcome_note(outcomes: &[Outcome], total: usize) -> String {
+///
+/// `checks` は計画を最後まで実行した後にハーネスが走らせた検算 (`[[verify]]`)。空なら検算は
+/// していないので、確かめるのは親に任せる。
+pub fn outcome_note(
+    outcomes: &[Outcome],
+    total: usize,
+    checks: &[crate::verify::Outcome],
+) -> String {
     let mut out = format!(
         "plan→execute: {} of {} steps ran in their own context.\n",
         outcomes.len(),
@@ -237,13 +244,45 @@ pub fn outcome_note(outcomes: &[Outcome], total: usize) -> String {
         ));
     }
     let stopped = outcomes.len() < total || outcomes.iter().any(|o| !o.ok);
-    out.push_str(if stopped {
-        "\nThe plan did not finish. Pick it up from the failed step yourself: read what is there \
-         now, fix it, then answer the user."
+    let failed: Vec<&crate::verify::Outcome> = checks.iter().filter(|c| !c.ok).collect();
+    if stopped {
+        out.push_str(
+            "\nThe plan did not finish. Pick it up from the failed step yourself: read what is \
+             there now, fix it, then answer the user.",
+        );
+    } else if checks.is_empty() {
+        out.push_str(
+            "\nThis work is already done — do not redo it. Check the result against what the user \
+             asked (read the files, run it), then answer the user.",
+        );
+    } else if failed.is_empty() {
+        // 通った検算をもう一度走らせない。親の仕事は利用者に答えることだけ。
+        out.push_str("\nThis work is already done and the harness checked it:\n");
+        for c in checks {
+            out.push_str(&format!(
+                "$ {} — passed\n",
+                crate::term::sanitize(&c.command)
+            ));
+        }
+        out.push_str(
+            "\nDo not redo the work or run these checks again. Answer the user with a short \
+             summary of what was done.",
+        );
     } else {
-        "\nThis work is already done — do not redo it. Check the result against what the user \
-         asked (read the files, run it), then answer the user."
-    });
+        // 失敗した検算だけを差し戻す (D1 の差し戻しと同じ形)。
+        out.push_str("\nAll steps ran, but the harness check failed:\n");
+        for c in &failed {
+            out.push_str(&format!(
+                "\n$ {}\n{}\n",
+                crate::term::sanitize(&c.command),
+                crate::term::sanitize(&c.output)
+            ));
+        }
+        out.push_str(
+            "\nRead the files involved, fix the cause, then answer the user. The same check runs \
+             again before you finish.",
+        );
+    }
     out
 }
 
@@ -371,7 +410,7 @@ mod tests {
                 ok: true,
             },
         ];
-        let note = outcome_note(&ok, 2);
+        let note = outcome_note(&ok, 2, &[]);
         assert!(note.contains("do not redo it"), "{note}");
         assert!(!note.contains("did not finish"), "{note}");
         // 途中で止まった計画は、親に引き継ぎを促す。
@@ -380,11 +419,39 @@ mod tests {
             summary: "python3: command not found".into(),
             ok: false,
         }];
-        let note = outcome_note(&broke, 2);
+        let note = outcome_note(&broke, 2, &[]);
         assert!(
             note.contains("did not finish") && note.contains("failed"),
             "{note}"
         );
+    }
+
+    #[test]
+    fn the_note_reports_the_harness_check_instead_of_asking_for_one() {
+        let ok = [Outcome {
+            title: "First".into(),
+            summary: "wrote a.py".into(),
+            ok: true,
+        }];
+        let check = |ok: bool| crate::verify::Outcome {
+            label: "task".into(),
+            command: "python3 a.py".into(),
+            ok,
+            output: if ok {
+                String::new()
+            } else {
+                "Traceback: boom".into()
+            },
+            ms: 1,
+        };
+        let passed = outcome_note(&ok, 1, &[check(true)]);
+        assert!(passed.contains("$ python3 a.py — passed"), "{passed}");
+        assert!(!passed.contains("read the files, run it"), "{passed}");
+        let failed = outcome_note(&ok, 1, &[check(true), check(false)]);
+        assert!(failed.contains("harness check failed"), "{failed}");
+        assert!(failed.contains("Traceback: boom"), "{failed}");
+        // 通った方は差し戻さない。
+        assert!(!failed.contains("— passed"), "{failed}");
     }
 
     #[test]

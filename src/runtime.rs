@@ -82,6 +82,8 @@ pub struct Runtime {
     pub ledger: Arc<llm::metered::Ledger>,
     /// `/goal` の評価器を別のモデルにする設定があるとき、そのクライアントとモデル名。
     pub goal_evaluator: Option<(Arc<dyn LlmClient>, String)>,
+    /// Plan→Execute の計画だけを別のモデルで立てる設定があるとき、そのクライアントとモデル名 (#65)。
+    planner: Option<(Arc<dyn LlmClient>, String)>,
     pub registry: Arc<ToolRegistry>,
     /// MCP サーバが公開する prompt (`/mcp__<server>__<prompt>`)。
     pub mcp_prompts: BTreeMap<String, McpPrompt>,
@@ -190,6 +192,7 @@ impl Runtime {
 
         let (llm, ledger) = llm::build_metered(cfg)?;
         let goal_evaluator = llm::build_goal_evaluator(cfg, &ledger)?;
+        let planner = llm::build_planner(cfg, &ledger)?;
 
         let mut registry = default_registry();
         // 要件台帳 (#65) は opt-in。有効なときだけツールを見せる。
@@ -351,6 +354,7 @@ impl Runtime {
             hook_env,
             ledger,
             goal_evaluator,
+            planner,
             registry: Arc::new(registry),
             mcp_prompts,
             mcp_servers: mcp_outcome.clients,
@@ -371,6 +375,9 @@ impl Runtime {
         // 予算が残り少なくなったことを、ループがモデルに伝えられるように。
         session.set_ledger(Arc::clone(&self.ledger));
         session.set_mcp_servers(self.mcp_servers.clone());
+        if let Some(planner) = &self.planner {
+            session.set_planner(planner.clone());
+        }
         // 子エージェントが親のプランモードを見られるように (#77)。
         session.set_plan_flag(Arc::clone(&self.plan_flag));
         // hook の payload に載せる (`session_id` / `transcript_path`)。

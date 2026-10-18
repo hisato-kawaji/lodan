@@ -2474,6 +2474,60 @@ fn the_configured_evaluator_model_is_the_one_that_is_asked() {
     assert!(unjudged.contains("evaluator failed"), "{unjudged}");
 }
 
+// ---- #65 C1: 計画だけを別のモデルで立てる ----
+
+/// `--plan-model` を渡すと、計画のリクエストだけがそのモデル名で飛ぶ。陽性対照: 渡さなければ
+/// 作業側のモデル (計画を返さない) に尋ねるので、分解されない。
+#[test]
+fn plan_model_routes_only_the_planning_call_to_that_model() {
+    let request = "Write a directory scanner with a scan subcommand that stores the sizes as \
+                   JSON, and a report subcommand that prints the three biggest files.";
+    let run = |extra: &[&str]| {
+        let home = tempfile::tempdir().unwrap();
+        let server = start_mock_with(
+            home.path(),
+            &[
+                ("MOCK_LLM_TEXT", "Step finished."),
+                ("MOCK_LLM_JUDGE_MODEL", "the-planner"),
+                (
+                    "MOCK_LLM_JUDGE_TEXT",
+                    r#"{"steps": [{"title": "Write the scanner"}, {"title": "Add report"}]}"#,
+                ),
+            ],
+        );
+        let log = home.path().join("run.jsonl");
+        let mut args = vec![
+            "-p",
+            request,
+            "--yes",
+            "--plan-execute",
+            "--log-jsonl",
+            log.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let out = lodan(home.path(), server.port, &args, Stdin::OpenAndSilent);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["event"] == "plan_made" || e["event"] == "plan_skipped")
+            .collect::<Vec<_>>()
+    };
+    let planned = run(&["--plan-model", "the-planner"]);
+    assert_eq!(planned.len(), 1, "{planned:?}");
+    assert_eq!(planned[0]["event"], "plan_made", "{planned:?}");
+    assert_eq!(planned[0]["model"], "the-planner", "{planned:?}");
+    assert_eq!(planned[0]["steps"], 2, "{planned:?}");
+    let unplanned = run(&[]);
+    assert_eq!(unplanned.len(), 1, "{unplanned:?}");
+    assert_eq!(unplanned[0]["event"], "plan_skipped", "{unplanned:?}");
+}
+
 // ---- #88: `lodan config` は秘密を伏せる ----
 
 #[test]

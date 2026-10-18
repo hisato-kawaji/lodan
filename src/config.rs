@@ -348,6 +348,13 @@ pub struct AgentConfig {
     /// 立てて**新しい短い文脈で**実行する。親に残るのは手順の見出しと 1 行の結果だけ。
     /// 既定 false (計画に LLM 1 回、手順ごとに子が増えるので、ablation で寄与を測る)。
     pub plan_execute: bool,
+    /// 計画 (`plan_execute`) だけを立てる provider。未設定なら作業している provider。
+    /// 手順の実行は作業側のモデルのまま (#65 C1 の実測: 9B の計画器はほとんど分解しない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_provider: Option<Provider>,
+    /// 計画だけを立てるモデル。未設定ならその provider の `model`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_model: Option<String>,
     /// 編集直後の構文チェック (#65 D2)。`Write` / `Edit` などが成功した直後に、拡張子ごとの
     /// コマンドでそのファイルだけを検査し、壊れていたらツール結果の後ろに注記を足す (ブロックはしない)。
     /// 既定 false (ablation で寄与を測る)。
@@ -532,6 +539,8 @@ impl Default for AgentConfig {
             max_repairs: DEFAULT_MAX_REPAIRS,
             write_max_lines: 0,
             plan_execute: false,
+            plan_provider: None,
+            plan_model: None,
             syntax_check: false,
             syntax_checks: std::collections::BTreeMap::new(),
             empty_reply_nudge: true,
@@ -874,6 +883,10 @@ impl Config {
             self.agent.plan_execute = v;
             mark("agent.plan_execute".into());
         }
+        if let Some(v) = o.plan_model {
+            self.agent.plan_model = Some(v);
+            mark("agent.plan_model".into());
+        }
         if let Some(v) = o.syntax_check {
             self.agent.syntax_check = v;
             mark("agent.syntax_check".into());
@@ -961,6 +974,8 @@ pub struct Overrides {
     pub max_iterations: Option<usize>,
     pub write_max_lines: Option<usize>,
     pub plan_execute: Option<bool>,
+    /// `--plan-model`: 計画だけを立てるモデル (provider は `agent.plan_provider` か作業側)。
+    pub plan_model: Option<String>,
     pub syntax_check: Option<bool>,
     pub append_system_prompt: Option<String>,
     pub permission_mode: Option<PermissionMode>,
@@ -1785,6 +1800,29 @@ max_iterations = "sk-not-a-number""#,
             origins["llm.local.extra_body.top_k"],
             Origin::File(PathBuf::from("project.toml"))
         );
+    }
+
+    #[test]
+    fn the_planner_can_be_pointed_at_another_model() {
+        let cfg: Config =
+            toml::from_str("[agent]\nplan_provider = \"kimi\"\nplan_model = \"kimi-k3\"\n")
+                .unwrap();
+        assert_eq!(cfg.agent.plan_provider, Some(Provider::Kimi));
+        assert_eq!(cfg.agent.plan_model.as_deref(), Some("kimi-k3"));
+        // `--plan-model` は設定を上書きし、出どころにも残る。
+        let mut cfg = Config::default();
+        let mut origins = Origins::default();
+        cfg.apply_overrides_tracked(
+            Overrides {
+                plan_model: Some("qwen3:32b".into()),
+                ..Overrides::default()
+            },
+            &mut origins,
+        );
+        assert_eq!(cfg.agent.plan_model.as_deref(), Some("qwen3:32b"));
+        // 未設定なら `lodan config` にも出ない。
+        let shown = toml::to_string(&Config::default()).unwrap();
+        assert!(!shown.contains("plan_model") && !shown.contains("plan_provider"));
     }
 
     #[test]

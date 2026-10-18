@@ -147,15 +147,46 @@ pub fn build_goal_evaluator(
     ledger: &Arc<metered::Ledger>,
 ) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
     let goal = &cfg.goal;
-    if goal.evaluator_provider.is_none() && goal.evaluator_model.is_none() {
+    build_side(
+        cfg,
+        ledger,
+        goal.evaluator_provider,
+        goal.evaluator_model.as_deref(),
+        "the /goal evaluator",
+    )
+}
+
+/// Plan→Execute (#65 C1) の計画だけを別のモデルで立てる設定があれば、そのクライアントとモデル名。
+/// 評価器と同じく同じ台帳に載せる。設定が無ければ None (作業側のクライアントで計画する)。
+pub fn build_planner(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
+    build_side(
+        cfg,
+        ledger,
+        cfg.agent.plan_provider,
+        cfg.agent.plan_model.as_deref(),
+        "the planner",
+    )
+}
+
+/// 作業側とは別の用途 (評価器・計画器) に使うクライアント。provider も model も未指定なら None。
+fn build_side(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+    provider: Option<Provider>,
+    model: Option<&str>,
+    what: &str,
+) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
+    if provider.is_none() && model.is_none() {
         return Ok(None);
     }
-    let provider = goal.evaluator_provider.unwrap_or(cfg.llm.provider);
+    let provider = provider.unwrap_or(cfg.llm.provider);
     let inner = build_for(provider, cfg)
-        .with_context(|| format!("building the /goal evaluator ({})", provider.as_str()))?;
-    let model = goal
-        .evaluator_model
-        .clone()
+        .with_context(|| format!("building {what} ({})", provider.as_str()))?;
+    let model = model
+        .map(str::to_string)
         .unwrap_or_else(|| cfg.llm.get(provider).model.clone());
     let client: Arc<dyn LlmClient> = Arc::new(metered::MeteredClient::new(inner, ledger.clone()));
     Ok(Some((client, model)))

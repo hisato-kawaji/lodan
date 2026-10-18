@@ -61,6 +61,8 @@ pub struct Session {
     /// このターンで Bash が成功したか。どのファイルを変えたかは分からないので、`paths` 無しの
     /// 検証はこれでも走らせる (#149 のレビュー)。
     ran_shell: bool,
+    /// Plan→Execute の計画だけに使うクライアントとモデル名 (#65 C1)。無ければ作業側で計画する。
+    planner: Option<(Arc<dyn LlmClient>, String)>,
     /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。transcript のレコーダはこれが増えた分だけ
     /// 「書き込み済み」の位置を縮めて数え直す (履歴が短くなっても末尾を取りこぼさない)。
     compacted_away: usize,
@@ -204,8 +206,14 @@ impl Session {
             active_verify: crate::verify::effective(&cfg_verify, &cfg_disabled_verify),
             changed_files: Vec::new(),
             ran_shell: false,
+            planner: None,
             compacted_away: 0,
         }
+    }
+
+    /// 計画 (#65 C1) だけを別のモデルで立てる。`/model` で作業側を切り替えても、こちらはそのまま。
+    pub fn set_planner(&mut self, planner: (Arc<dyn LlmClient>, String)) {
+        self.planner = Some(planner);
     }
 
     /// 子エージェント (Task) と共有するプランモードのフラグ (#77)。
@@ -441,9 +449,15 @@ impl Session {
                 content: user_input.to_string(),
             },
         ];
+        // 計画器を別に設定していればそちら (手順の実行は作業側のモデルのまま)。
+        let planner = self.planner.clone();
+        let (plan_llm, plan_model): (&dyn LlmClient, String) = match &planner {
+            Some((client, model)) => (client.as_ref(), model.clone()),
+            None => (llm, self.cfg.llm.active().model.clone()),
+        };
         let resp = crate::llm::metered::with_kind(
             crate::llm::metered::KIND_PLAN,
-            llm.chat(&messages, &[], &self.cfg.llm.active().model, Some(1024)),
+            plan_llm.chat(&messages, &[], &plan_model, Some(1024)),
         )
         .await;
         let steps = match resp {
@@ -473,7 +487,7 @@ impl Session {
         }
         crate::runlog::record(
             "plan_made",
-            serde_json::json!({ "turn": self.turn_seq, "steps": steps.len() }),
+            serde_json::json!({ "turn": self.turn_seq, "steps": steps.len(), "model": plan_model }),
         );
         crate::say!(
             "{}",
@@ -555,11 +569,7 @@ impl Session {
                 }),
             );
             let ok = !output.is_error;
-            // 子が何を変えたかは分からない (結果は要約だけ)。Bash と同じ扱いにして、パス指定の
-            // ない検証 (#65 D1) がターン末に走るようにする。
-            if ok {
-                self.ran_shell = true;
-            } else {
+            if !ok {
                 // 失敗は画面にも出す (注記だけだと、残りを飛ばした理由が見えない)。
                 crate::say!(
                     "{}",
@@ -581,10 +591,54 @@ impl Session {
                 break;
             }
         }
+        let finished = done.len() == steps.len() && done.iter().all(|o| o.ok);
+        // 計画が最後まで通ったら、検算はハーネスが 1 回だけやる (#65 D1)。親に「読んで走らせて
+        // 確かめろ」と頼むと、手順の子がやった確認をもう一度払う (Phase 3 の実測で時間増の主役)。
+        let checks = match finished && !self.active_verify.is_empty() {
+            true => self.verify_plan().await,
+            false => Vec::new(),
+        };
+        // 子が何を変えたかは分からない (結果は要約だけ)。Bash と同じ扱いにして、パス指定の
+        // ない検証がターン末に走るようにする。ただしハーネスの検算が通ったなら立てない —
+        // 親が何も変えずに答えるなら、同じ検証をもう一度走らせる意味がない。
+        let verified = !checks.is_empty() && checks.iter().all(|c| c.ok);
+        if done.iter().any(|o| o.ok) && !verified {
+            self.ran_shell = true;
+        }
         Some(format!(
             "{HARNESS_NOTE_PREFIX}{}",
-            plan::outcome_note(&done, steps.len())
+            plan::outcome_note(&done, steps.len(), &checks)
         ))
+    }
+
+    /// 計画を最後まで実行した直後の検算 (`[[verify]]` のうち `paths` の無いもの)。子がどの
+    /// ファイルを変えたかは分からないので、`paths` つきの検証は当てられない (Bash と同じ扱い)。
+    async fn verify_plan(&mut self) -> Vec<crate::verify::Outcome> {
+        let outcomes =
+            crate::verify::run_applicable(&self.active_verify, &[], true, &self.ctx.cwd).await;
+        for o in &outcomes {
+            crate::runlog::record(
+                "plan_verify",
+                serde_json::json!({
+                    "turn": self.turn_seq, "label": o.label, "ok": o.ok, "ms": o.ms,
+                }),
+            );
+        }
+        if !outcomes.is_empty() {
+            let failed: Vec<&str> = outcomes
+                .iter()
+                .filter(|o| !o.ok)
+                .map(|o| o.label.as_str())
+                .collect();
+            crate::say!(
+                "{}",
+                crate::term::dim(&match failed.is_empty() {
+                    true => "[lodan] plan: verify passed".to_string(),
+                    false => format!("[lodan] plan: verify failed ({})", failed.join(", ")),
+                })
+            );
+        }
+        outcomes
     }
 
     pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
@@ -3494,6 +3548,150 @@ mod tests {
                 "{plan}"
             );
         }
+    }
+
+    /// 計画を実行した後に走った検証の回数を、検証コマンド自身に数えさせるセッション。
+    fn plan_session_with_verify(
+        task: RecordingTask,
+        dir: &std::path::Path,
+        passes: bool,
+    ) -> (Session, std::path::PathBuf) {
+        let count = dir.join("count");
+        let command = format!(
+            "echo run >> {}; {}",
+            count.display(),
+            if passes {
+                "true"
+            } else {
+                "echo 'boom: report missing' >&2; exit 1"
+            }
+        );
+        let mut session = plan_session(task);
+        session.active_verify = vec![crate::verify::VerifyConfig {
+            id: Some("task".into()),
+            command,
+            paths: vec![],
+            timeout_secs: Some(10),
+        }];
+        session.ctx = ToolCtx::new(dir.to_path_buf());
+        (session, count)
+    }
+
+    fn the_note(session: &Session) -> String {
+        session
+            .history()
+            .iter()
+            .find_map(|m| match m {
+                Message::User { content } if is_harness_note(content) => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a plan note")
+    }
+
+    /// #65: 計画が最後まで通ったら、検算はハーネスが 1 回だけやる。通ったら親には「確かめ直すな」と
+    /// 伝え、親が何も変えずに答えるならターン末の検証も繰り返さない。
+    #[tokio::test]
+    async fn a_finished_plan_is_checked_once_by_the_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: None,
+        };
+        let (mut session, count) = plan_session_with_verify(task, dir.path(), true);
+        let llm = PlanThenTextLlm {
+            plan: r#"{"steps": [{"title": "a"}, {"title": "b"}]}"#.into(),
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+
+        let note = the_note(&session);
+        assert!(note.contains("the harness checked it"), "{note}");
+        assert!(note.contains("— passed"), "{note}");
+        assert!(note.contains("run these checks again"), "{note}");
+        // 親に「読んで走らせて確かめろ」とは頼まない。
+        assert!(!note.contains("read the files, run it"), "{note}");
+        let runs = std::fs::read_to_string(&count).unwrap();
+        assert_eq!(runs.lines().count(), 1, "検算は 1 回だけ: {runs}");
+    }
+
+    /// 検算が失敗したら、失敗の出力を親へ差し戻す。親が直した後に同じ検証がもう一度走る
+    /// (ターン末の検証ループに引き継ぐ)。
+    #[tokio::test]
+    async fn a_failed_harness_check_is_handed_back_with_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: None,
+        };
+        let (mut session, count) = plan_session_with_verify(task, dir.path(), false);
+        let llm = PlanThenTextLlm {
+            plan: r#"{"steps": [{"title": "a"}, {"title": "b"}]}"#.into(),
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+
+        let note = the_note(&session);
+        assert!(note.contains("harness check failed"), "{note}");
+        assert!(note.contains("boom: report missing"), "{note}");
+        let runs = std::fs::read_to_string(&count).unwrap();
+        assert!(
+            runs.lines().count() >= 2,
+            "検算の後、ターン末の検証も走る: {runs}"
+        );
+    }
+
+    /// 手順が失敗した計画は検算しない (親が引き継いで直すのが先)。
+    #[tokio::test]
+    async fn a_broken_plan_is_not_checked_by_the_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: Some(2),
+        };
+        let (mut session, _count) = plan_session_with_verify(task, dir.path(), true);
+        let llm = PlanThenTextLlm {
+            plan: r#"{"steps": [{"title": "a"}, {"title": "b"}, {"title": "c"}]}"#.into(),
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+        let note = the_note(&session);
+        assert!(note.contains("did not finish"), "{note}");
+        assert!(!note.contains("harness"), "{note}");
+    }
+
+    /// 計画器を別に設定したら、計画の呼び出しだけがそちらへ行き、手順の実行と最終回答は作業側。
+    #[tokio::test]
+    async fn the_plan_is_made_by_the_planner_model_when_one_is_set() {
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: None,
+        };
+        let prompts = Arc::clone(&task.prompts);
+        let mut session = plan_session(task);
+        // 作業側は計画を返せない (返すのは本文だけ) — 計画器が使われなければ分解されない。
+        let worker_calls = Arc::new(std::sync::Mutex::new(1usize));
+        let worker = PlanThenTextLlm {
+            plan: String::new(),
+            calls: Arc::clone(&worker_calls),
+        };
+        let planner_calls = Arc::new(std::sync::Mutex::new(0usize));
+        let planner = PlanThenTextLlm {
+            plan: r#"{"steps": [{"title": "a"}, {"title": "b"}]}"#.into(),
+            calls: Arc::clone(&planner_calls),
+        };
+        session.set_planner((Arc::new(planner), "big-planner".into()));
+        let gate = PermissionGate::new(true);
+        session
+            .run_turn(PLAN_REQUEST, &worker, &gate)
+            .await
+            .unwrap();
+
+        assert_eq!(*planner_calls.lock().unwrap(), 1, "計画は計画器で 1 回");
+        assert_eq!(prompts.lock().unwrap().len(), 2, "手順は実行された");
+        assert!(*worker_calls.lock().unwrap() > 1, "最終回答は作業側");
     }
 
     /// 既定 (plan_execute = false) では計画の呼び出しもしない。

@@ -4,3 +4,6 @@
 .fish_api
 .lodan/config.local.toml
 .lodan/.config.local.toml.*.tmp
+# ローカル検証用の LLM サーバ構築作業ディレクトリ (設定に API キーを含む)。リポジトリ管理外 (#69)。
+/llmapi
+.DS_Store

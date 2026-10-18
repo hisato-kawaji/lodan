@@ -63,6 +63,60 @@ pub struct SandboxPolicy {
     pub network: bool,
     /// 書き込みを許す作業ディレクトリ (symlink 解決済み)。
     pub cwd: PathBuf,
+    /// 作業ディレクトリが linked worktree のとき、git が書く作業ディレクトリの外の場所 (#139)。
+    /// workspace-write でだけ設定する。
+    pub worktree_git: Option<WorktreeGit>,
+}
+
+/// linked worktree (`git worktree add`) の git が書く場所。worktree の `.git` は
+/// `gitdir: <common>/worktrees/<name>` と書かれたファイルで、index・HEAD・reflog はその
+/// ディレクトリに、新しい object は共通ディレクトリの `objects/` に書かれる。どちらも作業
+/// ディレクトリの外なので、足さないと worktree の中で `git commit` ができない。
+///
+/// 共通ディレクトリそのもの (hooks・config・`modules/`) と `refs/` は足さない。commit は
+/// detached HEAD (lodan の worktree の既定) なら `refs/` に触らない。ブランチを作る・動かすのは
+/// サンドボックスの外で。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeGit {
+    /// worktree 専用の git ディレクトリ (`<common>/worktrees/<name>`、実パス)。
+    pub git_dir: PathBuf,
+    /// 共通ディレクトリの `objects/` (実パス)。
+    pub objects: PathBuf,
+}
+
+impl WorktreeGit {
+    /// `cwd` から上へ辿って最初に見つかった `.git` が linked worktree のファイルなら、その場所。
+    /// ディレクトリ (普通のリポジトリ) やサブモジュール (`commondir` が無い) なら None。
+    pub fn detect(cwd: &Path) -> Option<Self> {
+        let dot_git = cwd
+            .ancestors()
+            .map(|d| d.join(".git"))
+            .find(|p| std::fs::symlink_metadata(p).is_ok())?;
+        if !dot_git.is_file() {
+            return None;
+        }
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+        let git_dir = std::fs::canonicalize(dot_git.parent()?.join(target)).ok()?;
+        let common = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+        let common = std::fs::canonicalize(git_dir.join(common.trim())).ok()?;
+        // `<common>/worktrees/<name>` の形でなければ足さない (書ける場所を広げる根拠が崩れる)。
+        if git_dir.parent() != Some(common.join("worktrees").as_path()) {
+            return None;
+        }
+        let objects = common.join("objects");
+        objects.is_dir().then_some(Self { git_dir, objects })
+    }
+
+    /// `git_dir` の中でも書かせないもの。`commondir` を書き換えられると、hooks を仕込んだ偽の
+    /// 共通ディレクトリを指させられる (worktree の `.git` ファイルを読み取り専用にしたのと同じ理由)。
+    /// `config.worktree` は worktree 単位の設定 (`core.fsmonitor` などを書ける)。
+    fn protected(&self) -> Vec<PathBuf> {
+        ["commondir", "gitdir", "config.worktree"]
+            .iter()
+            .map(|f| self.git_dir.join(f))
+            .collect()
+    }
 }
 
 impl SandboxPolicy {
@@ -71,6 +125,7 @@ impl SandboxPolicy {
             mode: SandboxMode::Off,
             network: true,
             cwd: PathBuf::new(),
+            worktree_git: None,
         }
     }
 
@@ -78,8 +133,24 @@ impl SandboxPolicy {
         Self {
             mode: cfg.mode,
             network: cfg.network,
-            // プロファイルは実パスで照合される (macOS の /tmp → /private/tmp など)。
-            cwd: std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+            cwd: PathBuf::new(),
+            worktree_git: None,
+        }
+        .with_cwd(cwd)
+    }
+
+    /// 同じ方針で、作業ディレクトリだけを `cwd` に替えたもの (worktree で走る子エージェント用)。
+    pub fn with_cwd(&self, cwd: &Path) -> Self {
+        // プロファイルは実パスで照合される (macOS の /tmp → /private/tmp など)。
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let worktree_git = (self.mode == SandboxMode::WorkspaceWrite)
+            .then(|| WorktreeGit::detect(&cwd))
+            .flatten();
+        Self {
+            mode: self.mode,
+            network: self.network,
+            cwd,
+            worktree_git,
         }
     }
 
@@ -248,6 +319,14 @@ pub fn seatbelt_profile(policy: &SandboxPolicy, temp_dirs: &[PathBuf]) -> String
             "(allow file-write* (subpath {}))\n",
             sbpl_string(&policy.cwd)
         ));
+        if let Some(wg) = &policy.worktree_git {
+            for dir in [&wg.git_dir, &wg.objects] {
+                p.push_str(&format!(
+                    "(allow file-write* (subpath {}))\n",
+                    sbpl_string(dir)
+                ));
+            }
+        }
         for dir in temp_dirs {
             p.push_str(&format!(
                 "(allow file-write* (subpath {}))\n",
@@ -260,6 +339,12 @@ pub fn seatbelt_profile(policy: &SandboxPolicy, temp_dirs: &[PathBuf]) -> String
             let filter = if is_dir { "subpath" } else { "literal" };
             p.push_str(&format!(
                 "(deny file-write* ({filter} {}))\n",
+                sbpl_string(&path)
+            ));
+        }
+        for path in policy.worktree_git.iter().flat_map(WorktreeGit::protected) {
+            p.push_str(&format!(
+                "(deny file-write* (literal {}))\n",
                 sbpl_string(&path)
             ));
         }
@@ -300,6 +385,13 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
             }
             let cwd = policy.cwd.display().to_string();
             a.extend(["--bind".into(), cwd.clone(), cwd]);
+            // linked worktree の git が書く場所 (#139)。保護の bind より前に置く (後の bind が覆う)。
+            if let Some(wg) = &policy.worktree_git {
+                for dir in [&wg.git_dir, &wg.objects] {
+                    let dir = dir.display().to_string();
+                    a.extend(["--bind".into(), dir.clone(), dir]);
+                }
+            }
             // `.git` をそれ自身に bind して mount point にする。mount point は rename も削除も
             // できない (EBUSY) ので、`.git` ごと差し替えて hooks の保護を外す回り道が塞がる。
             let dot_git_path = policy.cwd.join(".git");
@@ -320,6 +412,10 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
                 if path.starts_with(&dot_git_path) && !dot_git_path.is_dir() {
                     continue;
                 }
+                let path = path.display().to_string();
+                a.extend(["--ro-bind-try".into(), path.clone(), path]);
+            }
+            for path in policy.worktree_git.iter().flat_map(WorktreeGit::protected) {
                 let path = path.display().to_string();
                 a.extend(["--ro-bind-try".into(), path.clone(), path]);
             }
@@ -373,6 +469,8 @@ pub fn unguarded(policy: &SandboxPolicy) -> Vec<PathBuf> {
     let gitfile = dot_git.is_file();
     paths.retain(|p| !(gitfile && p.starts_with(&dot_git)));
     paths.push(dot_git);
+    // worktree 専用の git ディレクトリは書けるので、まだ無い `config.worktree` は作られ得る。
+    paths.extend(policy.worktree_git.iter().flat_map(WorktreeGit::protected));
     paths.retain(|p| std::fs::symlink_metadata(p).is_err());
     paths
 }
@@ -447,6 +545,7 @@ mod tests {
             mode,
             network,
             cwd: PathBuf::from("/work/my \"proj\""),
+            worktree_git: None,
         }
     }
 
@@ -604,6 +703,7 @@ mod tests {
             mode: SandboxMode::ReadOnly,
             network: true,
             cwd: a.ws.clone(),
+            worktree_git: None,
         };
         match wrap_with(&probe, "true", &[], sandbox_tool().as_deref()) {
             Ok((exe, args)) => std::process::Command::new(exe)
@@ -621,6 +721,7 @@ mod tests {
             mode: SandboxMode::WorkspaceWrite,
             network,
             cwd: a.ws.clone(),
+            worktree_git: None,
         }
     }
 
@@ -678,6 +779,7 @@ mod tests {
             mode: SandboxMode::ReadOnly,
             network: true,
             cwd: a.ws.clone(),
+            worktree_git: None,
         };
         assert!(run(&p, "ls / > /dev/null && cat ../outside/victim"));
         assert!(!run(&p, "echo a > inside.txt"));
@@ -850,5 +952,113 @@ mod tests {
             run(&p, "echo x > realgit/index"),
             "git's own files stay writable"
         );
+    }
+
+    /// 本物の linked worktree (`git worktree add`) を作る。返すのは (メインの checkout, worktree)。
+    fn linked_worktree(a: &Arena) -> (PathBuf, PathBuf) {
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let main = a.outside.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("a.txt"), "a").unwrap();
+        git(&main, &["add", "a.txt"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        let wt = a.outside.join("wt");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-q",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        (main, std::fs::canonicalize(&wt).unwrap())
+    }
+
+    /// #139: worktree を作業ディレクトリにした workspace-write でも、`git add` / `git commit` が通る
+    /// (index は `<main>/.git/worktrees/<name>/`、新しい object は `<main>/.git/objects/` に書かれる)。
+    /// メインの git ディレクトリの hooks / config と、worktree を共通ディレクトリへ結ぶ `commondir` は
+    /// 引き続き書けない。
+    #[test]
+    fn a_linked_worktree_can_commit_but_not_reach_the_main_hooks_or_config() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        let (main, wt) = linked_worktree(&a);
+        let p = SandboxPolicy::new(
+            &SandboxConfig {
+                mode: SandboxMode::WorkspaceWrite,
+                network: true,
+            },
+            &wt,
+        );
+        let commit = "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1; \
+                      echo b > b.txt && git add b.txt && \
+                      git -c user.name=t -c user.email=t@t commit -qm two";
+        assert!(run(&p, commit), "commit inside the worktree must work");
+        let head = std::process::Command::new("git")
+            .args(["log", "--format=%s", "-1"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "two");
+
+        let git_dir = main.join(".git");
+        let _ = run(
+            &p,
+            &format!("echo pwn > {}/hooks/pre-commit", git_dir.display()),
+        );
+        let _ = run(
+            &p,
+            &format!("echo '[core]' >> {}/config", git_dir.display()),
+        );
+        let wt_git = git_dir.join("worktrees/wt");
+        let commondir = std::fs::read_to_string(wt_git.join("commondir")).unwrap();
+        let _ = run(
+            &p,
+            &format!("echo /tmp/fake > {}/commondir", wt_git.display()),
+        );
+        let _ = run(
+            &p,
+            &format!("echo x > {}/config.worktree", wt_git.display()),
+        );
+        assert!(!git_dir.join("hooks/pre-commit").exists());
+        assert!(
+            !std::fs::read_to_string(git_dir.join("config"))
+                .unwrap()
+                .ends_with("[core]\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt_git.join("commondir")).unwrap(),
+            commondir
+        );
+        // まだ無かった `config.worktree` は Linux では作成を止められない。止められないものは
+        // 実行後に検出して知らせる (`planted`)。
+        if cfg!(target_os = "macos") {
+            assert!(!wt_git.join("config.worktree").exists());
+        }
     }
 }

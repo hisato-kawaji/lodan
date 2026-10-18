@@ -908,10 +908,11 @@ impl SubAgentTool {
         let mut ctx = ToolCtx::new(cwd.to_path_buf()).with_write_limit(self.write_max_lines);
         if let Some(policy) = &self.sandbox {
             // worktree の中で走る子には、そこを「書ける作業ディレクトリ」とする同じ方針。
-            let mut policy = policy.clone();
-            if worktree.is_some() {
-                policy.cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-            }
+            // linked worktree の git が書く場所 (`<main>/.git/worktrees/<name>` と objects) も足す (#139)。
+            let policy = match worktree {
+                Some(_) => policy.with_cwd(cwd),
+                None => policy.clone(),
+            };
             ctx = ctx.with_sandbox(policy);
         }
         let in_plan = self
@@ -1583,7 +1584,10 @@ mod tests {
 
     /// 1 コミットある git リポジトリ (worktree のテスト用)。
     fn git_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        git_repo_in(tempfile::tempdir().unwrap())
+    }
+
+    fn git_repo_in(dir: tempfile::TempDir) -> tempfile::TempDir {
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -1837,6 +1841,77 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(log.path()).unwrap()).unwrap();
         assert_eq!(payload["worktree"], wt.display().to_string());
         assert_eq!(payload["agent_type"], "writer");
+    }
+
+    /// #139: workspace-write のサンドボックスでも、worktree の子は `git commit` でき、親には
+    /// 「commits a..b」と伝わる (子の方針に worktree の git ディレクトリと objects が足される)。
+    #[tokio::test]
+    async fn a_sandboxed_worktree_child_can_commit_and_the_parent_is_told() {
+        // 一時ディレクトリの外に置く。サンドボックスは一時ディレクトリを丸ごと書けるようにするので、
+        // /tmp の下だとメインの `.git` まで書けてしまい、足した許可を確かめられない。
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&base).unwrap();
+        let repo = git_repo_in(tempfile::tempdir_in(&base).unwrap());
+        let policy = crate::sandbox::SandboxPolicy::new(
+            &crate::sandbox::SandboxConfig {
+                mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+                network: true,
+            },
+            repo.path(),
+        );
+        let probe = crate::sandbox::SandboxPolicy {
+            mode: crate::sandbox::SandboxMode::ReadOnly,
+            ..policy.clone()
+        };
+        let usable = crate::sandbox::wrap(&probe, "true").is_ok_and(|(exe, args)| {
+            std::process::Command::new(exe)
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !usable {
+            // 飛ばしたことが `--nocapture` で分かるようにする (黙って green にしない)。
+            eprintln!(
+                "skipped: no usable OS sandbox here (bwrap missing or user namespaces blocked)"
+            );
+            return;
+        }
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(crate::config::ToolProfile::Full, &["Bash".to_string()]);
+        let commit = "echo x > new.txt && git add new.txt && \
+                      git -c user.name=t -c user.email=t@t commit -qm child && echo committed";
+        let tool = subagent(vec![], repo.path().to_path_buf())
+            .with_profile(
+                "writer".into(),
+                AgentProfile::new(
+                    Arc::new(EchoToolOutputLlm {
+                        call: tool_call(
+                            "Bash",
+                            &serde_json::json!({ "command": commit }).to_string(),
+                        ),
+                    }),
+                    "mock".into(),
+                    Arc::new(rw),
+                    3,
+                )
+                .with_isolation(Isolation::Worktree),
+            )
+            .with_git_root(Some(repo.path().to_path_buf()))
+            .with_gate(Arc::new(crate::permission::PermissionGate::new(true)))
+            .with_sandbox(policy);
+        let out = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "writer" }),
+                &ToolCtx::new(repo.path().to_path_buf()),
+            )
+            .await
+            .unwrap()
+            .content;
+        assert!(out.contains("committed"), "{out}");
+        assert!(
+            out.contains("[worktree]") && out.contains("commits "),
+            "{out}"
+        );
     }
 
     /// 履歴の user メッセージ数を本文にして返す LLM (続きが前の会話の上に積まれたかを見る)。

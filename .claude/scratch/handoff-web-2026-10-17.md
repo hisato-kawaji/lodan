@@ -1,0 +1,91 @@
+# lodan 引き継ぎ（Claude Code web 向け、2026-10-17 時点）
+
+新しいセッションの最初にこのファイルの中身を渡せば、続きから作業できる。
+web のセッションは GitHub から clone した checkout で動くので、**ローカルの memory・scratchpad・未コミットのファイル・Ollama は見えない**。必要なことはここに全部書いた。
+
+---
+
+## 0. 前提
+
+- リポジトリ: `hisato-kawaji/lodan`（**public**）。Rust edition 2024 製の Claude Code 風コーディングエージェント CLI。主な対象はローカル / 小型 LLM（OpenAI 互換 Chat Completions）
+- 応答は日本語で簡潔に。完了報告は「何を変えたか / なぜ / 未解決の懸念」を箇条書きで
+- 複数ファイルに及ぶ変更は、先に計画を箇条書きで出してから着手する。仕様が曖昧なら推測せずに質問する
+- 既存の命名・構造・コメントの書き方（日本語で「なぜ」を書く）に合わせる。無関係なリファクタはしない。TODO やデバッグ出力を残さない
+- コミットは conventional commits（`feat:` / `fix:` / `docs:` …）、本文は日本語、`refs #NN` / `closes #NN`
+- 作業の作法: `feat/*` / `fix/*` ブランチ → PR → pr-reviewer（`.claude/agents/pr-reviewer.md`、基準は `docs/policy/pr-review.md` §1）→ マージ。マージは squash で、題名の末尾に `(#PR)` が付く
+
+## 1. 現在地
+
+- **main = `8539dfe`**（#154 Plan→Execute 分離）
+- **open PR**
+  - **#156**（`fix/plan-step-budget`、head `3274cba`）: **再レビューで APPROVE 済み、CI pass、マージ待ち**。前セッションでは auto mode がマージを「レビューなしのマージ」として拒否したので、マージはユーザーの判断で行う。マージ後にリモートブランチ `fix/plan-step-budget` を消す（必ず `state=MERGED` を確かめてから。§4）
+  - **#69**（`.gitignore` に `llmapi/` を追加）: 以前からある小さな PR
+- **open issue**: #65（小型モデル向けハーネス、下記）/ #139 / #83 / #85（tracking）/ #38（低優先、着手は未承認）
+
+## 2. #65 小型ローカルモデル向けハーネス強化 — 結論と残り
+
+方針: 「ローカル 9B/12B がタスクを完遂できない」をモデルのせいにせず、**1 回あたりの要求を小型モデルが確実に成功する粒度まで落とし、累積・記憶・検証はハーネスが持つ**。Phase 0 = 評価基盤（F）/ 1 = A + B / 2 = D + E / 3 = C。
+
+**4 つの Phase を通して勝ったのは A1（`tool_choice = required`、provider 単位の opt-in）だけ。**
+
+| 施策 | PR | 結果（ラダー L0-L2、qwen3.5:9b） |
+|---|---|---|
+| A1 制約デコード | #147 | チェック通過率 96% で 4 条件中最良、時間は基準と同等 |
+| B1/B2 要件台帳 | #144 #146 | 正答は変わらず、時間が +37〜146%（促しの往復がそのまま費用になる） |
+| A2 Write の分割 | #145 → #152 | 「骨格 → Edit」は 9B を悪化させた → 「順に追記」（`append`）に変えて中立 |
+| D1 `[[verify]]` / D2 構文チェック | — | 動いたが仕事が無かった（差し戻し 0 / 検出 0）。9B の失敗は「構文は正しいが仕様が違う」形 |
+| E モデル別プリセット | #153 #155 | 機能追加のみ |
+| C1 Plan→Execute | #154 #156 | 便益は測れない（9B の計画器がほぼ分解しない）。費用は測れた（時間 1.5〜3.7 倍、親が検算を二重払い） |
+
+レポート: `docs/eval/ladder/baseline-2026-07.md` / `phase1-2026-10.md` / `phase2-2026-10.md` / `phase3-2026-10.md`（phase3 は #156 に入っている）
+
+**残り**（どれも優先度は中〜低。どれをやるかはユーザーに確認する）
+1. **L3 ラダーを作る**: 4〜6 ファイル・2〜3 段の積み上げ（先の段の成果物を後の段が使う）。先に**基準が文脈長で実際に劣化する**ことを確かめてから C1 を足す。タスク定義とチェックの作成は web でもできるが、実行は不可（§3）
+2. **検算を親からハーネスへ移す**: C1 の注記で「読んで走らせて確かめろ」と頼むのをやめ、D1 に 1 回だけやらせて、失敗だけを親に差し戻す
+3. **計画器だけ別モデルにする**
+4. `split40-none` の再実行（追記版の誘導で 9B が完走するか）、副作用の無い `VERIFY` での D1 再測定 — **ローカル専用**
+5. 既知の欠陥: `L2-cli-json` は、自己検証のために `sample/` へファイルを足したモデルが減点される（チェックが `files == 4` を固定で assert している）。2026-07 ベースラインと比較できなくなるので未修正。ラダーを較正し直すときに両方取り直す
+
+## 3. web でできること / できないこと
+
+- **できる**: コード・テスト・docs・PR・レビュー。CI と同じ `cargo fmt --all --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
+- **できない**: ラダーの実行（Ollama のローカルモデルが要る。ローカルの Mac で実行する）。sakura / kimi の有料 API も使わない
+- **見えないもの**: ローカルの working tree（`eval/difficulty-ladder`）にある未コミットの sakura / kimi のレポート類。eval docs の一部はリモートブランチ `eval/docs-stash-2026-10` に退避してある
+- **#139 は Linux 環境のほうが確かめやすいかもしれない**（bwrap サンドボックス。web のコンテナで bwrap が動くかは未確認）
+
+## 4. 守ること（過去に実際に踏んだもの）
+
+- **push / マージ / ブランチ削除は、前段の結果を見て分岐させる**。`cargo test | grep | awk` は失敗しても exit 0 を返し、`gh pr merge` の失敗も `;` でつないだ後続には伝わらない。#124 では壊れた head を 2 回 push し、#129 では未マージの PR のブランチを消して close させた
+  ```bash
+  out=$(cargo test -q 2>&1 | awk '/^test result/{p+=$4; f+=$6} END{print "passed=" p " failed=" f}')
+  case "$out" in *"failed=0"*) git push origin "$b:refs/heads/$b" ;; *) echo "NOT PUSHED: $out" ;; esac
+  state=$(gh pr view <n> --json state -q .state); [ "$state" = MERGED ] && git push origin --delete <b>
+  ```
+- テスト結果は**全バイナリの passed / failed を合計**して見る（`head` で切ると e2e の FAILED を見落とす）。2026-10-14 時点で 641 passed（lib 575 + e2e 66）
+- `push.default = tracking` の環境だと `git push -u origin <b>` が main へ push しようとする → `git push origin <b>:refs/heads/<b>` と明示する
+- **Rust のアイテムを挿入したら doc コメントが誤って付いていないか確かめる**（5 回指摘された）: `grep -n "fn <新しい名前>\|^impl <型> {" -B8 <file>`。置換の anchor は fn シグネチャではなく、直前のアイテムの閉じ `}` を含む 2〜3 行にする。fn だけでなく impl / struct / const でも起きる
+- **権限は「モデルに見せない」で絞らない。到達しても権限が増えない形にする**（#152 / #154）。enum や説明文は助言でしかない。「確認済み」フラグは、本当に全体を把握したときだけ立てる
+- **配線にも本物の依存を 1 本通すテストを入れる**。偽物の依存だけだと、登録側を差し替えても全テストが通った（#154）。レビュー依頼には「mutation で検出力を確かめて」と書く
+- mutation で確かめるときは: ファイルを戻したら `touch`（mtime が古いと cargo が再ビルドしない）。`cp` / `mv` は `-i` の alias があるかもしれないので `/bin/cp -f`。戻したら `git diff --stat` で確かめる
+- 「起動できない環境では skip」するテストは、skip したことを必ず表示させる（bwrap のテストが Linux で全部黙って skip され、green に見えていた）
+- `.env` の中身は表示しない（変数名だけ）
+- ラダーの数字は `results.jsonl` から読む（走行中の run.jsonl や Monitor の行を数字として報告しない）。ablation 中は cargo を動かさない。round をまたいで集計を比べない。施策が発火したかを runlog で確かめてから解釈する
+
+## 5. pr-reviewer への依頼の書き方
+
+- `model: sonnet` で短く頼む（opus は止まりがちだった）
+- 依頼文には必ず次を入れる（レビュアーが cwd を間違えて有料 API を叩いた事故があった）:
+  1. `git archive <sha>` で展開した pristine export だけで検証する
+  2. lodan を起動するのは `cd <作業用ディレクトリ> || exit 1` の後だけ。`env -i HOME=<作業用> PATH="$PATH" LODAN_TRUST=1 LODAN_PROVIDER=local LODAN_BASE_URL=http://127.0.0.1:<mock>/v1 …` で親の環境を継がせない
+  3. `--provider kimi|sakura|sakana` を渡さない
+- レビュー中の checkout を編集しない（直すなら別の worktree で）
+- セキュリティ境界の PR は「壊してみて」と頼み、攻撃入力を実際に流させる
+
+## 6. 再提案しないもの
+
+プラグイン / マーケットプレイス、クラウド・remote control・app-server、音声、Codex code mode、Responses API 専用化、full-screen TUI / vim / テーマ、OpenTelemetry、Windows サンドボックス、managed config。
+
+## 7. 最初にやること（提案）
+
+1. `git fetch && gh pr view 156 --json state` で #156 がマージされたか確かめる（されていなければユーザーに確認する）
+2. ユーザーに次の作業を選んでもらう: #65 の残り（§2）/ #139 / #83（OAuth と HTTP GET stream）/ #69

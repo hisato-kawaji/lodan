@@ -120,6 +120,10 @@ PY
   {"id": 2, "title": "buy milk", "done": true}
 ]
 JSON
+  # 採点の前に todo.json をこの状態へ戻すための写し。モデルが自分で add を試して
+  # todo.json を変えても、正しい実装が減点されないようにする (#158 のレビュー)。
+  mkdir -p .probe
+  cp todo.json .probe/todo.json
 }
 
 # #65 D1 (`verify-none`) で検証として強制するコマンド。プロンプトが明記している実行方法だけを使う。
@@ -129,6 +133,7 @@ VERIFY="python3 -m unittest discover -s tests -t . && python3 -m todo.cli list -
 PROMPT="The current directory contains a small Python 3 todo package: todo/model.py (Task dataclass), todo/store.py (JSON storage in todo.json), todo/cli.py (run as python3 -m todo.cli) and tests/test_todo.py. Read them first, then add a task priority through all three files, in this order. Step 1, todo/model.py: add a priority field whose value is one of 'low', 'normal', 'high', defaulting to 'normal'; to_dict must include it, and from_dict must accept dicts without a priority key (treat them as 'normal') so that the existing todo.json keeps loading. Step 2, todo/store.py: add() must take an optional priority argument (default 'normal') and persist it; it must raise ValueError for any value other than low, normal or high. Step 3, todo/cli.py: 'add' gets an optional --priority option (default normal), and 'list' gets an optional --sort priority option that orders tasks high first, then normal, then low, and by id within the same priority; without --sort the list order stays as it is now. Each list line must become '[<mark>] <id> <title> (<priority>)', for example '[ ] 1 write report (normal)'. 'add' with an invalid priority must exit with a non-zero status without changing todo.json. The existing tests must keep passing: python3 -m unittest discover -s tests -t ."
 
 checks() {
+  cp .probe/todo.json todo.json
   check tests_pass     'python3 -m unittest discover -s tests -t . >/dev/null 2>&1'
   # 旧形式の todo.json をそのまま読める (add の前に確かめる)
   check old_data_loads 'test "$(python3 -m todo.cli list)" = "$(printf "[ ] 1 write report (normal)\n[x] 2 buy milk (normal)")"'
@@ -150,5 +155,5 @@ assert len(store.load(p)) == 1
   check cli_add_priority 'python3 -m todo.cli add "call bob" --priority high >/dev/null && python3 -c "import json; d=json.load(open(\"todo.json\")); assert d[-1][\"title\"]==\"call bob\" and d[-1][\"priority\"]==\"high\", d"'
   check cli_sort       'python3 -m todo.cli add "nap" --priority low >/dev/null 2>&1; test "$(python3 -m todo.cli list --sort priority)" = "$(printf "[ ] 3 call bob (high)\n[ ] 1 write report (normal)\n[x] 2 buy milk (normal)\n[ ] 4 nap (low)")"'
   # 正しい priority の add が動くことを先に確かめてから、不正値の拒否を見る (未実装の argparse エラーで通さない)。
-  check cli_rejects    'cp todo.json .probe_before.json && python3 -m todo.cli add ok --priority low >/dev/null 2>&1 && cp todo.json .probe_before.json && ! python3 -m todo.cli add bad --priority urgent >/dev/null 2>&1 && cmp -s todo.json .probe_before.json'
+  check cli_rejects    'python3 -m todo.cli add ok --priority low >/dev/null 2>&1 && cp todo.json .probe/before.json && ! python3 -m todo.cli add bad --priority urgent >/dev/null 2>&1 && cmp -s todo.json .probe/before.json'
 }

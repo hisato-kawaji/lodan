@@ -17,14 +17,16 @@ order_id,customer,item,qty,unit_price,status
 CSV
 
   # 判定用の別データ。data/orders.csv の答えを直書きした実装を落とすため、モデルには見せない。
+  # hank と gina は同額で、ファイルでは hank が先に出る (名前順の同点処理を省いた実装を落とす)。
   mkdir -p .probe
   cat > .probe/other.csv <<'CSV'
 order_id,customer,item,qty,unit_price,status
 10,erin,cup,2,4.10,paid
 11,frank,cup,1,4.10,paid
-12,erin,lid,3,0.25,paid
-13,frank,mug,1,9.99,refunded
-14,gina,mug,1,4.85,paid
+12,hank,mug,1,4.85,paid
+13,erin,lid,3,0.25,paid
+14,frank,mug,1,9.99,refunded
+15,gina,mug,1,4.85,paid
 CSV
 }
 
@@ -39,8 +41,8 @@ checks() {
   check stage1_load   'python3 -c "from shop.orders import load_orders; o=load_orders(\"data/orders.csv\"); assert len(o)==6, o; r=o[0]; assert (r[\"order_id\"],r[\"customer\"],r[\"qty\"],r[\"unit_price\"],r[\"status\"])==(\"1\",\"alice\",3,1.5,\"paid\"), r"'
   # 段 2: 集計 (paid だけ・小数 2 桁)。別データでも確かめる。
   check stage2_totals 'python3 -c "from shop.orders import load_orders; from shop.stats import customer_totals; t=customer_totals(load_orders(\"data/orders.csv\")); assert t=={\"alice\":4.5,\"bob\":18.5,\"carol\":15.0}, t"'
-  check stage2_other  'python3 -c "from shop.orders import load_orders; from shop.stats import customer_totals; t=customer_totals(load_orders(\".probe/other.csv\")); assert t=={\"erin\":8.95,\"frank\":4.1,\"gina\":4.85}, t"'
-  check stage2_top    'python3 -c "from shop.orders import load_orders; from shop.stats import top_customers; t=top_customers(load_orders(\".probe/other.csv\"), 2); assert [tuple(x) for x in t]==[(\"erin\",8.95),(\"gina\",4.85)], t"'
+  check stage2_other  'python3 -c "from shop.orders import load_orders; from shop.stats import customer_totals; t=customer_totals(load_orders(\".probe/other.csv\")); assert t=={\"erin\":8.95,\"frank\":4.1,\"gina\":4.85,\"hank\":4.85}, t"'
+  check stage2_top    'python3 -c "from shop.orders import load_orders; from shop.stats import top_customers; t=top_customers(load_orders(\".probe/other.csv\"), 3); assert [tuple(x) for x in t]==[(\"erin\",8.95),(\"gina\",4.85),(\"hank\",4.85)], t"'
   # 段 3: CLI (前の 2 段の約束を運べているか)
   check stage3_report 'python3 cli.py report data/orders.csv out/report.json >/dev/null && python3 -c "import json; d=json.load(open(\"out/report.json\")); assert d=={\"customers\":{\"alice\":4.5,\"bob\":18.5,\"carol\":15.0},\"grand_total\":38.0,\"orders_counted\":4}, d"'
   check stage3_top    'test "$(python3 cli.py top data/orders.csv 2)" = "$(printf "bob: 18.50\ncarol: 15.00")"'

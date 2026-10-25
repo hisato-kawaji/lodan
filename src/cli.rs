@@ -79,6 +79,14 @@ pub struct Cli {
     #[arg(long, env = "LODAN_PLAN_EXECUTE", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub plan_execute: Option<bool>,
 
+    /// Provider for the planning call of --plan-execute only; the steps still run on the main model (#65)
+    #[arg(long, env = "LODAN_PLAN_PROVIDER", value_enum)]
+    pub plan_provider: Option<Provider>,
+
+    /// Model for the planning call of --plan-execute only (default: that provider's model) (#65)
+    #[arg(long, env = "LODAN_PLAN_MODEL")]
+    pub plan_model: Option<String>,
+
     /// Check the syntax of each file right after Write / Edit and report (not block) if it is broken (#65)
     #[arg(long, env = "LODAN_SYNTAX_CHECK", num_args = 0..=1, require_equals = true, default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub syntax_check: Option<bool>,
@@ -456,6 +464,8 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         max_total_tokens: args.max_total_tokens,
         write_max_lines: args.write_max_lines.map(|n| n as usize),
         plan_execute: args.plan_execute,
+        plan_provider: args.plan_provider,
+        plan_model: args.plan_model,
         syntax_check: args.syntax_check,
         max_iterations: args.max_turns.map(|n| n as usize),
         append_system_prompt: args.append_system_prompt,

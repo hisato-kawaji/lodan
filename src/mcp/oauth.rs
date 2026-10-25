@@ -95,25 +95,30 @@ impl TokenStore {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        // 別名で書いて 0600 にしてから差し替える (書きかけ・他人に読める瞬間を作らない)。
+        // 別名で書いてから差し替える (書きかけを残さない)。別名のファイルは作る時点で 0600 にする
+        // (書いてから chmod すると、umask 次第で他人に読める瞬間ができる)。
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(all)? + "\n")
+        let _ = std::fs::remove_file(&tmp);
+        write_private(&tmp, (serde_json::to_string_pretty(all)? + "\n").as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
-        restrict_private(&tmp);
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("replacing {}", self.path.display()))?;
         Ok(())
     }
 }
 
-#[cfg(unix)]
-fn restrict_private(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+/// 新しいファイルを本人だけが読める形で作って書く (既にあれば失敗する)。
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
-
-#[cfg(not(unix))]
-fn restrict_private(_path: &Path) {}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()

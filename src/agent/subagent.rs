@@ -226,6 +226,22 @@ impl Worktree {
         let _ = std::fs::write(&path, format!("{current}{sep}{line}\n"));
     }
 
+    /// サンドボックスで書けるようにする、この worktree の git の置き場所 (#139)。git ディレクトリは
+    /// worktree の外 (`<main>/.git/worktrees/<name>`) にあるので、作業ディレクトリだけを書けるように
+    /// すると `git commit` が `index.lock` を作れない。分からなければ None (書ける場所は増やさない)。
+    fn linked_git(&self) -> Option<crate::sandbox::LinkedGit> {
+        let out = git(&self.root, &["rev-parse", "--git-dir", "--git-common-dir"]).ok()?;
+        let mut lines = out.lines();
+        // 古い git は相対パスで返すことがある (`--path-format` は 2.31 から)。
+        let resolve = |p: &str| match Path::new(p) {
+            p if p.is_absolute() => p.to_path_buf(),
+            p => self.root.join(p),
+        };
+        let git_dir = resolve(lines.next()?);
+        let common_dir = resolve(lines.next()?);
+        crate::sandbox::LinkedGit::new(&git_dir, &common_dir)
+    }
+
     fn short(sha: &str) -> &str {
         &sha[..sha.len().min(12)]
     }
@@ -909,8 +925,9 @@ impl SubAgentTool {
         if let Some(policy) = &self.sandbox {
             // worktree の中で走る子には、そこを「書ける作業ディレクトリ」とする同じ方針。
             let mut policy = policy.clone();
-            if worktree.is_some() {
+            if let Some(w) = worktree {
                 policy.cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                policy.linked_git = w.linked_git();
             }
             ctx = ctx.with_sandbox(policy);
         }
@@ -1837,6 +1854,94 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(log.path()).unwrap()).unwrap();
         assert_eq!(payload["worktree"], wt.display().to_string());
         assert_eq!(payload["agent_type"], "writer");
+    }
+
+    /// サンドボックス (workspace-write) の中の worktree の子が `git commit` でき、親に「commits a..b」
+    /// として伝わる (#139: git ディレクトリが worktree の外にあり、index.lock を作れなかった)。
+    /// 一時ディレクトリは書けるので、リポジトリは target/ の下に置く (/tmp だと修正が無くても通る)。
+    #[tokio::test]
+    async fn a_sandboxed_worktree_child_can_commit() {
+        use crate::sandbox::{SandboxConfig, SandboxMode, SandboxPolicy};
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let root = tempfile::tempdir_in(&target).unwrap();
+        let probe = SandboxPolicy::new(
+            &SandboxConfig {
+                mode: SandboxMode::ReadOnly,
+                network: true,
+            },
+            root.path(),
+        );
+        let usable = crate::sandbox::wrap(&probe, "true").is_ok_and(|(exe, args)| {
+            std::process::Command::new(exe)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !usable {
+            eprintln!("skipped a_sandboxed_worktree_child_can_commit: no usable OS sandbox here");
+            return;
+        }
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("tracked.txt"), "tracked").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let mut rw = crate::tools::registry::default_registry();
+        rw.apply_profile(crate::config::ToolProfile::Full, &["Bash".to_string()]);
+        let commit = "echo x > n.txt && git add n.txt && git -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -q -m child";
+        let tool = subagent(vec![], repo.clone())
+            .with_profile(
+                "committer".into(),
+                AgentProfile::new(
+                    Arc::new(EchoToolOutputLlm {
+                        call: tool_call(
+                            "Bash",
+                            &serde_json::json!({ "command": commit }).to_string(),
+                        ),
+                    }),
+                    "mock".into(),
+                    Arc::new(rw),
+                    3,
+                )
+                .with_isolation(Isolation::Worktree),
+            )
+            .with_git_root(Some(repo.clone()))
+            .with_gate(Arc::new(crate::permission::PermissionGate::new(true)))
+            .with_sandbox(SandboxPolicy::new(
+                &SandboxConfig {
+                    mode: SandboxMode::WorkspaceWrite,
+                    network: true,
+                },
+                &repo,
+            ));
+        let out = tool
+            .execute(
+                serde_json::json!({ "description": "d", "prompt": "p", "subagent_type": "committer" }),
+                &ToolCtx::new(repo.clone()),
+            )
+            .await
+            .unwrap()
+            .content;
+        assert!(
+            out.contains("[worktree]") && out.contains("commits "),
+            "{out}"
+        );
+        // 本体の hooks / config は書かれていない。
+        assert!(!repo.join(".git/hooks/post-commit").exists());
     }
 
     /// 履歴の user メッセージ数を本文にして返す LLM (続きが前の会話の上に積まれたかを見る)。

@@ -63,6 +63,51 @@ pub struct SandboxPolicy {
     pub network: bool,
     /// 書き込みを許す作業ディレクトリ (symlink 解決済み)。
     pub cwd: PathBuf,
+    /// 作業ディレクトリが linked worktree (`isolation: worktree` の子) のとき、その git の置き場所。
+    /// 作業ディレクトリの外にあるので、無いと `git add` / `git commit` が書けない (#139)。
+    pub linked_git: Option<LinkedGit>,
+}
+
+/// linked worktree の git の置き場所 (#139)。`git commit` が書くのは、worktree 専用の git
+/// ディレクトリ (`HEAD` / `index` / `logs/`) と、本体と共有の `objects/` の 2 か所だけ
+/// (detached HEAD なので refs は書かない)。本体の hooks / config / refs は引き続き書かせない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedGit {
+    /// `<main>/.git/worktrees/<name>`。
+    pub git_dir: PathBuf,
+    /// `<main>/.git`。ここでは `objects/` にだけ書ける。
+    pub common_dir: PathBuf,
+}
+
+impl LinkedGit {
+    /// `git rev-parse --git-dir --git-common-dir` の結果から組む。git ディレクトリが
+    /// `<common>/worktrees/<name>` の形でなければ None (それ以外の場所を書けるようにはしない)。
+    pub fn new(git_dir: &Path, common_dir: &Path) -> Option<Self> {
+        let git_dir = std::fs::canonicalize(git_dir).ok()?;
+        let common_dir = std::fs::canonicalize(common_dir).ok()?;
+        (git_dir.parent()? == common_dir.join("worktrees")).then_some(Self {
+            git_dir,
+            common_dir,
+        })
+    }
+
+    /// 書けるようにするディレクトリ。
+    fn writable(&self) -> [PathBuf; 2] {
+        [self.git_dir.clone(), self.common_dir.join("objects")]
+    }
+
+    /// 書けるようにした中でも書かせない場所 (パス, ディレクトリごとか)。`commondir` を書き換えると
+    /// hooks を仕込んだ偽の共有ディレクトリを指させられ、`config.worktree` は git が config として
+    /// 読む (`core.hooksPath` / `core.fsmonitor`)。`gitdir` は worktree への戻り道。
+    /// `objects/info/alternates` は別の場所のオブジェクトを読ませる。
+    fn protected(&self) -> [(PathBuf, bool); 4] {
+        [
+            (self.git_dir.join("commondir"), false),
+            (self.git_dir.join("gitdir"), false),
+            (self.git_dir.join("config.worktree"), false),
+            (self.common_dir.join("objects").join("info"), true),
+        ]
+    }
 }
 
 impl SandboxPolicy {
@@ -71,6 +116,7 @@ impl SandboxPolicy {
             mode: SandboxMode::Off,
             network: true,
             cwd: PathBuf::new(),
+            linked_git: None,
         }
     }
 
@@ -80,6 +126,7 @@ impl SandboxPolicy {
             network: cfg.network,
             // プロファイルは実パスで照合される (macOS の /tmp → /private/tmp など)。
             cwd: std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+            linked_git: None,
         }
     }
 
@@ -221,6 +268,15 @@ fn protected_paths(cwd: &Path) -> Vec<(PathBuf, bool)> {
     paths
 }
 
+/// 作業ディレクトリの保護に、linked worktree の git の保護を足したもの。
+fn all_protected(policy: &SandboxPolicy) -> Vec<(PathBuf, bool)> {
+    let mut paths = protected_paths(&policy.cwd);
+    if let Some(linked) = &policy.linked_git {
+        paths.extend(linked.protected());
+    }
+    paths
+}
+
 /// SBPL の文字列リテラル。パスに `"` や `\` が入っていてもプロファイルを壊させない。
 fn sbpl_string(path: &Path) -> String {
     let mut out = String::from("\"");
@@ -254,9 +310,15 @@ pub fn seatbelt_profile(policy: &SandboxPolicy, temp_dirs: &[PathBuf]) -> String
                 sbpl_string(dir)
             ));
         }
+        for dir in policy.linked_git.iter().flat_map(LinkedGit::writable) {
+            p.push_str(&format!(
+                "(allow file-write* (subpath {}))\n",
+                sbpl_string(&dir)
+            ));
+        }
         // 許可より後ろに置く (後勝ち)。パスで照合されるので、まだ無いファイルの作成も、
         // ディレクトリごと rename して作り直す回り道も止まる。
-        for (path, is_dir) in protected_paths(&policy.cwd) {
+        for (path, is_dir) in all_protected(policy) {
             let filter = if is_dir { "subpath" } else { "literal" };
             p.push_str(&format!(
                 "(deny file-write* ({filter} {}))\n",
@@ -311,10 +373,15 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
                 // 読み取り専用にして、偽の git ディレクトリを指すように書き換えさせない。
                 a.extend(["--ro-bind-try".into(), dot_git.clone(), dot_git]);
             }
+            // linked worktree の git ディレクトリと共有の objects/ (#139)。保護の ro-bind より前に置く。
+            for dir in policy.linked_git.iter().flat_map(LinkedGit::writable) {
+                let dir = dir.display().to_string();
+                a.extend(["--bind-try".into(), dir.clone(), dir]);
+            }
             // bind し直せるのは既にあるパスだけ (`-try` は無ければ黙って飛ばす)。だからディレクトリは
             // `prepare_workspace` が先に作っておく。まだ無い**ファイル**は止められないので、
             // 実行後に `planted` で検出して知らせる。
-            for (path, _) in protected_paths(&policy.cwd) {
+            for (path, _) in all_protected(policy) {
                 // `.git` がファイルのとき、その「下」のパスは ENOTDIR になる。`-try` が見逃すのは
                 // ENOENT だけで、ENOTDIR では bwrap ごと起動に失敗する。
                 if path.starts_with(&dot_git_path) && !dot_git_path.is_dir() {
@@ -354,6 +421,10 @@ fn prepare_workspace(policy: &SandboxPolicy) {
         let _ = std::fs::create_dir_all(dot_git.join("hooks"));
         let _ = std::fs::create_dir_all(dot_git.join("modules"));
     }
+    // `git init` が作るディレクトリ。消されていても作り直して、ro-bind で守れるようにする。
+    if let Some(linked) = &policy.linked_git {
+        let _ = std::fs::create_dir_all(linked.common_dir.join("objects").join("info"));
+    }
 }
 
 /// 実行前に呼ぶ: 守りたいのに OS では守れない (= まだ存在しない) パス。macOS では seatbelt が
@@ -364,7 +435,7 @@ pub fn unguarded(policy: &SandboxPolicy) -> Vec<PathBuf> {
     }
     // 自分で作る分を先に済ませる (後から現れると、仕込まれたものと区別がつかない)。
     prepare_workspace(policy);
-    let mut paths: Vec<PathBuf> = protected_paths(&policy.cwd)
+    let mut paths: Vec<PathBuf> = all_protected(policy)
         .into_iter()
         .map(|(path, _)| path)
         .collect();
@@ -447,6 +518,7 @@ mod tests {
             mode,
             network,
             cwd: PathBuf::from("/work/my \"proj\""),
+            linked_git: None,
         }
     }
 
@@ -604,6 +676,7 @@ mod tests {
             mode: SandboxMode::ReadOnly,
             network: true,
             cwd: a.ws.clone(),
+            linked_git: None,
         };
         match wrap_with(&probe, "true", &[], sandbox_tool().as_deref()) {
             Ok((exe, args)) => std::process::Command::new(exe)
@@ -621,6 +694,7 @@ mod tests {
             mode: SandboxMode::WorkspaceWrite,
             network,
             cwd: a.ws.clone(),
+            linked_git: None,
         }
     }
 
@@ -678,6 +752,7 @@ mod tests {
             mode: SandboxMode::ReadOnly,
             network: true,
             cwd: a.ws.clone(),
+            linked_git: None,
         };
         assert!(run(&p, "ls / > /dev/null && cat ../outside/victim"));
         assert!(!run(&p, "echo a > inside.txt"));
@@ -849,6 +924,172 @@ mod tests {
         assert!(
             run(&p, "echo x > realgit/index"),
             "git's own files stay writable"
+        );
+    }
+
+    /// 1 コミットあるリポジトリと、その linked worktree (`.lodan/worktrees/t-1`) を `parent` の下に作る。
+    fn repo_with_worktree(parent: &Path) -> (PathBuf, PathBuf) {
+        let main = parent.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("a"), "a").unwrap();
+        git(&main, &["add", "a"]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                ".lodan/worktrees/t-1",
+                "HEAD",
+            ],
+        );
+        let main = std::fs::canonicalize(main).unwrap();
+        (main.clone(), main.join(".lodan/worktrees/t-1"))
+    }
+
+    /// git ディレクトリが `<common>/worktrees/<name>` の形のときだけ受ける (#139)。
+    #[test]
+    fn only_a_real_linked_worktree_git_dir_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, _) = repo_with_worktree(tmp.path());
+        let common = main.join(".git");
+        let linked = LinkedGit::new(&common.join("worktrees/t-1"), &common).expect("linked");
+        assert_eq!(linked.git_dir, common.join("worktrees/t-1"));
+        // 本体の .git そのもの、worktrees の外は書けるようにしない。
+        assert!(LinkedGit::new(&common, &common).is_none());
+        assert!(LinkedGit::new(&common.join("hooks"), &common).is_none());
+        assert!(LinkedGit::new(&common.join("worktrees/nosuch"), &common).is_none());
+    }
+
+    /// worktree の git ディレクトリと objects/ を書けるように bind し、その後ろで保護を ro-bind する
+    /// (後の bind が前を覆うので、順序が逆だと保護が消える)。seatbelt も同じ順 (後勝ち)。
+    #[test]
+    fn a_linked_worktree_gets_its_git_dir_and_objects_but_not_the_rest_of_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, wt) = repo_with_worktree(tmp.path());
+        let common = main.join(".git");
+        let mut p = SandboxPolicy::new(
+            &SandboxConfig {
+                mode: SandboxMode::WorkspaceWrite,
+                network: true,
+            },
+            &wt,
+        );
+        p.linked_git = LinkedGit::new(&common.join("worktrees/t-1"), &common);
+        let gd = common.join("worktrees/t-1").display().to_string();
+        let objects = common.join("objects").display().to_string();
+        let a = bwrap_args(&p, "true", &[]);
+        let pos = |flag: &str, path: &str| {
+            a.windows(3)
+                .position(|w| w[0] == flag && w[1] == path && w[2] == path)
+                .unwrap_or_else(|| panic!("{flag} {path} in {a:?}"))
+        };
+        let bind_gd = pos("--bind-try", &gd);
+        let bind_objects = pos("--bind-try", &objects);
+        for protected in [
+            format!("{gd}/commondir"),
+            format!("{gd}/gitdir"),
+            format!("{gd}/config.worktree"),
+            format!("{objects}/info"),
+        ] {
+            let ro = pos("--ro-bind-try", &protected);
+            assert!(ro > bind_gd && ro > bind_objects, "{protected}: {a:?}");
+        }
+        // 本体の hooks / config / refs は bind されない (ルートの ro-bind のまま)。
+        for untouched in ["hooks", "config", "refs"] {
+            let path = common.join(untouched).display().to_string();
+            assert!(
+                !a.windows(2).any(|w| w[0] == "--bind-try" && w[1] == path),
+                "{path}: {a:?}"
+            );
+        }
+
+        let sb = seatbelt_profile(&p, &[]);
+        let allow = sb
+            .find(&format!(
+                "(allow file-write* (subpath {}))",
+                sbpl_string(Path::new(&gd))
+            ))
+            .expect("allow git dir");
+        let deny = sb
+            .find(&format!(
+                "(deny file-write* (literal {}))",
+                sbpl_string(&common.join("worktrees/t-1/commondir"))
+            ))
+            .expect("deny commondir");
+        assert!(allow < deny, "{sb}");
+        assert!(sb.contains(&format!(
+            "(allow file-write* (subpath {}))",
+            sbpl_string(Path::new(&objects))
+        )));
+
+        // linked_git が無ければ従来どおり何も足さない。
+        p.linked_git = None;
+        assert!(!bwrap_args(&p, "true", &[]).contains(&gd));
+    }
+
+    /// 実際にサンドボックスの中で worktree の `git commit` が通り、保護した場所には書けない (#139)。
+    #[test]
+    fn a_sandboxed_worktree_can_commit_but_cannot_touch_git_internals() {
+        let Some(_probe) = usable_arena() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, wt) = repo_with_worktree(tmp.path());
+        let common = main.join(".git");
+        // 一時ディレクトリへの許可は外す (リポジトリも一時ディレクトリの下にあるので)。
+        let run = |linked: Option<LinkedGit>, command: &str| -> bool {
+            let mut p = SandboxPolicy::new(
+                &SandboxConfig {
+                    mode: SandboxMode::WorkspaceWrite,
+                    network: true,
+                },
+                &wt,
+            );
+            p.linked_git = linked;
+            run(&p, command)
+        };
+        let linked = || LinkedGit::new(&common.join("worktrees/t-1"), &common);
+        // 署名はしない (開発機の設定で署名すると、署名器が一時ディレクトリに書こうとして落ちる)。
+        let commit = "echo b > b && git add b && git -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -q -m b";
+        // 陽性対照: 従来の方針では index.lock を作れずに落ちる (= サンドボックスが効いている)。
+        assert!(
+            !run(None, commit),
+            "without linked_git the commit must fail"
+        );
+        assert!(run(linked(), commit), "the worktree child can commit");
+        for path in [
+            common.join("worktrees/t-1/commondir"),
+            common.join("hooks/post-commit"),
+            common.join("config"),
+            common.join("refs/heads/evil"),
+        ] {
+            let cmd = format!("echo x > '{}'", path.display());
+            assert!(!run(linked(), &cmd), "must not write {}", path.display());
+        }
+        // 保護した場所は変わっていない。
+        assert!(!common.join("hooks/post-commit").exists());
+        assert!(
+            std::fs::read_to_string(common.join("worktrees/t-1/commondir"))
+                .unwrap()
+                .starts_with("../..")
         );
     }
 }

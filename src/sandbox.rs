@@ -398,6 +398,12 @@ pub fn bwrap_args(policy: &SandboxPolicy, command: &str, temp_dirs: &[PathBuf]) 
     if !policy.network {
         a.push("--unshare-net".into());
     }
+    // worktree の子は、終わったあとに lodan が git ディレクトリを掃除してから外の git を走らせる。
+    // `setsid` で逃がしたプロセスが掃除の後に仕掛け直せないよう、コマンドが終われば中のプロセスも
+    // 全て終わるようにする (#161 のレビュー)。作業ディレクトリ側の挙動 (`&` で残すサーバなど) は変えない。
+    if policy.linked_git.is_some() {
+        a.push("--unshare-pid".into());
+    }
     a.extend(
         ["--die-with-parent", "--chdir"]
             .iter()
@@ -1047,9 +1053,14 @@ mod tests {
             sbpl_string(Path::new(&objects))
         )));
 
+        // worktree の子だけ PID 名前空間を分ける (逃がしたプロセスがコマンドの後まで残らない)。
+        assert!(a.contains(&"--unshare-pid".to_string()), "{a:?}");
+
         // linked_git が無ければ従来どおり何も足さない。
         p.linked_git = None;
-        assert!(!bwrap_args(&p, "true", &[]).contains(&gd));
+        let plain = bwrap_args(&p, "true", &[]);
+        assert!(!plain.contains(&gd));
+        assert!(!plain.contains(&"--unshare-pid".to_string()));
     }
 
     /// 実際にサンドボックスの中で worktree の `git commit` が通り、保護した場所には書けない (#139)。
@@ -1092,6 +1103,25 @@ mod tests {
         ] {
             let cmd = format!("echo x > '{}'", path.display());
             assert!(!run(linked(), &cmd), "must not write {}", path.display());
+        }
+        // `setsid` で逃がしたプロセスは、コマンドが終われば消える (Linux。#161 のレビュー)。
+        // 陽性対照: worktree でない方針では残って、後からファイルを書く。
+        if cfg!(target_os = "linux") {
+            let late = wt.join("late");
+            let escape = format!(
+                "setsid sh -c 'sleep 1; echo x > {}' >/dev/null 2>&1 &",
+                late.display()
+            );
+            assert!(run(None, &escape));
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            assert!(
+                late.exists(),
+                "positive control: the survivor runs without --unshare-pid"
+            );
+            std::fs::remove_file(&late).unwrap();
+            assert!(run(linked(), &escape));
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            assert!(!late.exists(), "a worktree child's survivor must be gone");
         }
         // 保護した場所は変わっていない。
         assert!(!common.join("hooks/post-commit").exists());

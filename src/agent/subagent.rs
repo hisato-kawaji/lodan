@@ -254,16 +254,23 @@ impl Worktree {
     /// サンドボックスで書けるようにする、この worktree の git の置き場所 (#139)。git ディレクトリは
     /// worktree の外 (`<main>/.git/worktrees/<name>`) にあるので、作業ディレクトリだけを書けるように
     /// すると `git commit` が `index.lock` を作れない。分からなければ None (書ける場所は増やさない)。
+    ///
+    /// git は走らせずに、worktree の `.git` ファイル (`gitdir: …`) と git ディレクトリの `commondir`
+    /// から読む。どちらもサンドボックスでは書けないので、子が `HEAD` を壊していても辿れる
+    /// (#161 のレビュー: `git rev-parse` だと壊れた `HEAD` で失敗し、掃除が飛ばされた)。
     fn linked_git(&self) -> Option<crate::sandbox::LinkedGit> {
-        let out = git(&self.root, &["rev-parse", "--git-dir", "--git-common-dir"]).ok()?;
-        let mut lines = out.lines();
-        // 古い git は相対パスで返すことがある (`--path-format` は 2.31 から)。
-        let resolve = |p: &str| match Path::new(p) {
-            p if p.is_absolute() => p.to_path_buf(),
-            p => self.root.join(p),
+        let dot_git = std::fs::read_to_string(self.root.join(".git")).ok()?;
+        let git_dir = PathBuf::from(dot_git.trim().strip_prefix("gitdir:")?.trim());
+        let git_dir = match git_dir.is_absolute() {
+            true => git_dir,
+            false => self.root.join(git_dir),
         };
-        let git_dir = resolve(lines.next()?);
-        let common_dir = resolve(lines.next()?);
+        let common = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+        let common = Path::new(common.trim());
+        let common_dir = match common.is_absolute() {
+            true => common.to_path_buf(),
+            false => git_dir.join(common),
+        };
         crate::sandbox::LinkedGit::new(&git_dir, &common_dir)
     }
 
@@ -289,12 +296,20 @@ impl Worktree {
     /// - 埋め込まれたリポジトリ (gitlink) を探す。git はその中を覗くときに中の `.git/config` を読み、
     ///   `core.fsmonitor` を実行する。ここでは覗かないが、利用者には知らせる
     ///
-    /// 返すのは (消した symlink, gitlink のパス)。
+    /// 返すのは (消したもの, gitlink のパス)。
     fn sanitize(&self) -> (Vec<PathBuf>, Vec<String>) {
-        let removed = self
-            .linked_git()
-            .map(|l| remove_symlinks(&l.git_dir))
-            .unwrap_or_default();
+        let mut removed = Vec::new();
+        if let Some(linked) = self.linked_git() {
+            removed = remove_symlinks(&linked.git_dir);
+            // FIFO などに差し替えられた index は、外の git を読み込みで止める。普通のファイルでなければ
+            // 消す (git は HEAD から作り直す。消した分の未コミットの add は失われる)。
+            let index = linked.git_dir.join("index");
+            if std::fs::symlink_metadata(&index).is_ok_and(|m| !m.is_file())
+                && std::fs::remove_file(&index).is_ok()
+            {
+                removed.push(index);
+            }
+        }
         let gitlinks = git(
             &self.root,
             &["-c", "core.fsmonitor=false", "ls-files", "-s"],
@@ -361,8 +376,9 @@ impl Worktree {
         if !removed.is_empty() {
             let list: Vec<String> = removed.iter().map(|p| p.display().to_string()).collect();
             note.push_str(&format!(
-                " WARNING: removed symlinks the sub-agent planted in the worktree's git directory \
-                 ({}); git outside the sandbox would have written through them.",
+                " WARNING: removed what the sub-agent planted in the worktree's git directory \
+                 ({}): symlinks git outside the sandbox would have written through, or an index \
+                 that is not a regular file.",
                 list.join(", ")
             ));
         }
@@ -1994,9 +2010,49 @@ mod tests {
             "{}",
             kept.note
         );
-        assert!(kept.note.contains("removed symlinks"), "{}", kept.note);
+        assert!(
+            kept.note.contains("removed what the sub-agent planted"),
+            "{}",
+            kept.note
+        );
         assert!(std::fs::symlink_metadata(git_dir.join("logs/HEAD")).is_err());
         assert_eq!(std::fs::read_to_string(&hook).unwrap(), "#!/bin/sh\n");
+    }
+
+    /// 子が `HEAD` を壊していても git ディレクトリの symlink は消え、FIFO に差し替えた index で
+    /// `finish` が止まらない (#161 のレビュー)。
+    #[test]
+    fn finishing_survives_a_broken_head_and_a_fifo_index() {
+        let repo = git_repo();
+        let wt = Worktree::create(repo.path(), repo.path(), "t").unwrap();
+        let git_dir = wt.linked_git().expect("linked worktree").git_dir;
+        let hook = repo.path().join(".git/hooks/post-commit");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::remove_file(git_dir.join("logs/HEAD")).unwrap();
+        std::os::unix::fs::symlink(&hook, git_dir.join("logs/HEAD")).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "garbage\n").unwrap();
+        // HEAD が壊れているので finish は失敗するが、symlink は先に消えている。
+        assert!(wt.finish().is_err());
+        assert!(std::fs::symlink_metadata(git_dir.join("logs/HEAD")).is_err());
+
+        let wt = Worktree::create(repo.path(), repo.path(), "u").unwrap();
+        let git_dir = wt.linked_git().expect("linked worktree").git_dir;
+        std::fs::remove_file(git_dir.join("index")).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(git_dir.join("index"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(wt.finish().map(|k| k.map(|k| k.note)));
+        });
+        let note = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("finish must not hang on a FIFO index")
+            .unwrap()
+            .expect("kept");
+        assert!(note.contains("index that is not a regular file"), "{note}");
     }
 
     /// サンドボックス (workspace-write) の中の worktree の子が `git commit` でき、親に「commits a..b」

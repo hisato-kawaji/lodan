@@ -22,8 +22,8 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// 期限のこれだけ前から、期限切れとみなして先に更新する。
 const EXPIRY_MARGIN_SECS: u64 = 30;
 
-/// 保存しているトークン 1 件 (サーバ URL ごと)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 保存しているトークン 1 件 (サーバ URL ごと)。`Debug` はトークンを伏せる。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredToken {
     pub access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +33,21 @@ pub struct StoredToken {
     pub expires_at: Option<u64>,
     pub token_endpoint: String,
     pub client_id: String,
+}
+
+impl std::fmt::Debug for StoredToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredToken")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
 }
 
 impl StoredToken {
@@ -139,19 +154,30 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 認可サーバのエンドポイントとして使ってよい URL か (https、または loopback の http)。
-fn check_endpoint(url: &str, what: &str) -> Result<reqwest::Url> {
-    let u = reqwest::Url::parse(url).with_context(|| format!("{what}: not a URL: {url}"))?;
+fn is_loopback(u: &reqwest::Url) -> bool {
     let host = u.host_str().unwrap_or("");
-    let loopback = host == "localhost"
+    host == "localhost"
         || host
             .trim_matches(['[', ']'])
             .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    if u.scheme() != "https" && !(u.scheme() == "http" && loopback) {
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// 使ってよい URL か: https、または `allow_loopback` のときだけ loopback の http。
+/// loopback の例外は MCP サーバ自身が loopback のとき (手元のテスト・開発) に限る — 遠くのサーバの
+/// メタデータが、こちらの機械の中の URL を叩かせられないように (#165 のレビュー)。
+fn check_endpoint(url: &str, what: &str, allow_loopback: bool) -> Result<reqwest::Url> {
+    let u = reqwest::Url::parse(url).with_context(|| format!("{what}: not a URL: {url}"))?;
+    if u.scheme() != "https" && !(u.scheme() == "http" && allow_loopback && is_loopback(&u)) {
         bail!("{what} must use https (got {url})");
     }
     Ok(u)
+}
+
+/// このサーバ URL にトークンを送ってよいか (https、または loopback の http)。平文で遠くへ
+/// Bearer を流さない (#165 のレビュー)。
+pub fn may_send_token(server_url: &str) -> bool {
+    check_endpoint(server_url, "MCP server", true).is_ok()
 }
 
 /// 認可に要るエンドポイント。
@@ -224,7 +250,8 @@ async fn get_json<T: for<'de> Deserialize<'de>>(http: &reqwest::Client, url: &st
 }
 
 async fn discover(http: &reqwest::Client, server_url: &str) -> Result<AuthServer> {
-    let server = reqwest::Url::parse(server_url).context("server url")?;
+    let server = check_endpoint(server_url, "the MCP server url", true)?;
+    let local = is_loopback(&server);
     // 未認証の initialize が 401 なら、そのヘッダが保護リソースのメタデータの場所を教える。
     let probe = http
         .post(server_url)
@@ -241,7 +268,7 @@ async fn discover(http: &reqwest::Client, server_url: &str) -> Result<AuthServer
         .and_then(resource_metadata_from);
     // ヘッダはサーバが言うことなので、取りに行く先も https (か loopback) に限る。
     let mut candidates: Vec<String> = hinted
-        .filter(|u| check_endpoint(u, "resource_metadata").is_ok())
+        .filter(|u| check_endpoint(u, "resource_metadata", local).is_ok())
         .into_iter()
         .collect();
     candidates.extend(well_known(&server, "oauth-protected-resource"));
@@ -267,7 +294,7 @@ async fn discover(http: &reqwest::Client, server_url: &str) -> Result<AuthServer
         .authorization_servers
         .first()
         .ok_or_else(|| anyhow!("protected-resource metadata names no authorization server"))?;
-    let issuer_url = check_endpoint(issuer, "authorization server")?;
+    let issuer_url = check_endpoint(issuer, "authorization server", local)?;
     let mut tried = well_known(&issuer_url, "oauth-authorization-server");
     tried.extend(well_known(&issuer_url, "openid-configuration"));
     tried.push(format!(
@@ -299,10 +326,14 @@ async fn discover(http: &reqwest::Client, server_url: &str) -> Result<AuthServer
     {
         bail!("the authorization server {issuer} does not advertise PKCE S256");
     }
-    check_endpoint(&meta.authorization_endpoint, "authorization_endpoint")?;
-    check_endpoint(&meta.token_endpoint, "token_endpoint")?;
+    check_endpoint(
+        &meta.authorization_endpoint,
+        "authorization_endpoint",
+        local,
+    )?;
+    check_endpoint(&meta.token_endpoint, "token_endpoint", local)?;
     if let Some(r) = &meta.registration_endpoint {
-        check_endpoint(r, "registration_endpoint")?;
+        check_endpoint(r, "registration_endpoint", local)?;
     }
     Ok(AuthServer {
         authorization_endpoint: meta.authorization_endpoint,
@@ -427,6 +458,8 @@ async fn wait_for_code(listener: tokio::net::TcpListener, state: &str) -> Result
 
 /// サインインする。`open` は認可 URL を受け取って利用者に開かせる (ブラウザを起動する / 表示する)。
 pub async fn login(server_url: &str, store: &TokenStore, open: &dyn Fn(&str)) -> Result<()> {
+    // 保存先が壊れていたら、ブラウザでの手順の前に止める (最後に保存できずに終わらない)。
+    store.load()?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -512,7 +545,8 @@ pub async fn refresh(
         .refresh_token
         .clone()
         .ok_or_else(|| anyhow!("the token for {server_url} cannot be refreshed"))?;
-    check_endpoint(&old.token_endpoint, "token_endpoint")?;
+    let local = reqwest::Url::parse(server_url).is_ok_and(|u| is_loopback(&u));
+    check_endpoint(&old.token_endpoint, "token_endpoint", local)?;
     // リダイレクトはたどらない: 307 は本文 (refresh_token) ごと転送先へ送り直すので、
     // https の確認を素通りして別の場所へ渡してしまう (#165 のレビュー)。
     let http = reqwest::Client::builder()
@@ -547,6 +581,9 @@ pub async fn refresh(
 
 /// 送る前に使うトークン。期限が近ければ先に更新する (更新に失敗したら古いものを返し、401 に任せる)。
 pub async fn current(server_url: &str, store: &TokenStore) -> Option<StoredToken> {
+    if !may_send_token(server_url) {
+        return None;
+    }
     let token = store.get(server_url)?;
     if token.expired(now_secs()) && token.refresh_token.is_some() {
         return Some(
@@ -607,13 +644,19 @@ mod tests {
 
     #[test]
     fn only_https_or_loopback_endpoints_are_used() {
-        assert!(check_endpoint("https://as.example.com/token", "t").is_ok());
-        assert!(check_endpoint("http://127.0.0.1:9/token", "t").is_ok());
-        assert!(check_endpoint("http://localhost:9/token", "t").is_ok());
-        assert!(check_endpoint("http://[::1]:9/token", "t").is_ok());
-        assert!(check_endpoint("http://127.0.0.1.evil.com/token", "t").is_err());
-        assert!(check_endpoint("http://as.example.com/token", "t").is_err());
-        assert!(check_endpoint("ftp://as.example.com/token", "t").is_err());
+        assert!(check_endpoint("https://as.example.com/token", "t", false).is_ok());
+        assert!(check_endpoint("http://127.0.0.1:9/token", "t", true).is_ok());
+        assert!(check_endpoint("http://localhost:9/token", "t", true).is_ok());
+        assert!(check_endpoint("http://[::1]:9/token", "t", true).is_ok());
+        // loopback の例外は、MCP サーバ自身が loopback のときだけ。
+        assert!(check_endpoint("http://127.0.0.1:9/token", "t", false).is_err());
+        assert!(check_endpoint("http://127.0.0.1.evil.com/token", "t", true).is_err());
+        assert!(check_endpoint("http://as.example.com/token", "t", true).is_err());
+        assert!(check_endpoint("ftp://as.example.com/token", "t", true).is_err());
+        // 平文の遠くのサーバには Bearer を送らない。
+        assert!(may_send_token("https://mcp.example.com/mcp"));
+        assert!(may_send_token("http://127.0.0.1:8080/mcp"));
+        assert!(!may_send_token("http://mcp.example.com/mcp"));
     }
 
     /// トークンは 0600 で保存し、URL ごとに分ける (別の URL のサーバには出さない)。
@@ -761,6 +804,27 @@ mod tests {
         let got = refresh("https://mcp/x", &store, Some("old")).await.unwrap();
         assert_eq!(got.access_token, "new");
         assert!(refresh("https://mcp/x", &store, Some("new")).await.is_err());
+    }
+
+    /// 平文 (http) の遠くのサーバには、保存してあってもトークンを出さない。`Debug` も伏せる。
+    #[tokio::test]
+    async fn a_token_is_not_handed_out_for_a_plain_http_remote_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::at(dir.path().join("t.json"));
+        let token = token_at("https://as/t".into(), "SECRET_AT");
+        store
+            .put("http://mcp.example.com/mcp", token.clone())
+            .unwrap();
+        assert!(
+            current("http://mcp.example.com/mcp", &store)
+                .await
+                .is_none()
+        );
+        let shown = format!("{token:?}");
+        assert!(
+            !shown.contains("SECRET_AT") && !shown.contains("SECRET_RT"),
+            "{shown}"
+        );
     }
 
     /// 読めない保存ファイルは上書きしない (他のサーバのトークンを消さない)。

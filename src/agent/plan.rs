@@ -223,7 +223,8 @@ pub fn step_prompt(request: &str, steps: &[Step], index: usize, done: &[Outcome]
 /// 全手順が終わったあとにハーネスが走らせた検証 (`[[verify]]`、#65 D1) の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
-    /// 検証が設定されていない (または計画が途中で止まった)。親に確かめてもらうしかない。
+    /// 確かめていない: 検証が設定されていない / `paths` が手順の変更に当たらない / 計画が途中で
+    /// 止まった。親に確かめてもらうしかない。
     None,
     /// 走らせた検証が全て通った。中身は走らせたコマンド。
     Passed(Vec<String>),

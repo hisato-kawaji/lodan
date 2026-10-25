@@ -3594,6 +3594,92 @@ mod tests {
         }
     }
 
+    /// 1 回目は計画、2 回目は与えたツール呼び出し、以降は本文を返す偽の LLM。
+    struct PlanThenCallLlm {
+        plan: String,
+        call: crate::agent::messages::ToolCall,
+        n: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for PlanThenCallLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            _m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: match n {
+                    0 => Some(self.plan.clone()),
+                    1 => None,
+                    _ => Some("done".into()),
+                },
+                tool_calls: if n == 1 {
+                    vec![self.call.clone()]
+                } else {
+                    vec![]
+                },
+                usage: None,
+                reasoning: None,
+            })
+        }
+        async fn chat_stream(
+            &self,
+            h: &[Message],
+            t: &[ToolSpec<'_>],
+            m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            let resp = self.chat(h, t, m, None).await?;
+            let _ = sink.send(ChatEvent::Done(resp));
+            Ok(())
+        }
+    }
+
+    /// 手順のあとの検証が通っても、親がその後ファイルを変えたらターン末に検証が走り直す
+    /// (通ったときに消した変更の記録は、親の編集で積み直される。#159 のレビュー)。
+    #[tokio::test]
+    async fn a_parent_edit_after_the_verified_plan_is_verified_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("runs.log");
+        let mut cfg = Config::default();
+        cfg.agent.plan_execute = true;
+        cfg.verify = vec![crate::verify::VerifyConfig {
+            id: Some("task".into()),
+            command: format!("echo run >> {}", log.display()),
+            paths: Vec::new(),
+            timeout_secs: Some(10),
+        }];
+        let mut registry = default_registry();
+        registry.register(Arc::new(RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: None,
+        }));
+        let mut session = Session::new(cfg, Arc::new(registry));
+        session.ctx = ToolCtx::new(dir.path().to_path_buf());
+        let target = dir.path().join("extra.txt");
+        let llm = PlanThenCallLlm {
+            plan: "1. Write the scanner\n2. Add report\n".into(),
+            call: tool_call_with_args(
+                "w1",
+                "Write",
+                &format!(r#"{{"path": "{}", "content": "x"}}"#, target.display()),
+            ),
+            n: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+        assert!(target.exists(), "the parent's Write ran");
+        let runs = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(
+            runs, 2,
+            "手順のあとの 1 回 + 親の編集のあとのターン末の 1 回"
+        );
+    }
+
     /// 計画が読めない / 手順が 1 つなら分解しない (普通のターンと同じ)。
     #[tokio::test]
     async fn an_unusable_plan_leaves_the_turn_alone() {

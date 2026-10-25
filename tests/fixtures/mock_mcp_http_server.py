@@ -8,7 +8,8 @@ tools/list → tools/call(echo), over a single HTTP endpoint.
 - initialize response carries an `Mcp-Session-Id` header; later requests echo it.
 - Notifications (no `id`) get 202 Accepted with no body.
 - GET with `Accept: text/event-stream` opens the server→client stream (#83): it sends a
-  `roots/list` request and `notifications/tools/list_changed`, then keeps the stream open.
+  `roots/list` request and `notifications/tools/list_changed`, then closes the first stream. The client reconnects with
+  `Last-Event-ID`; later streams stay open, and `tools/call last_event_id` returns that header.
   The client's answer comes back as a POSTed JSON-RPC response; `tools/call last_roots`
   returns it.
 - `tools/call ask` answers with SSE: first a `roots/list` request on the POST's own stream,
@@ -37,6 +38,7 @@ ECHO_TOOL = {
 # server→client リクエストへの、クライアントの答え (POST で届く)。id → response。
 ANSWERS: dict = {}
 ANSWERED = threading.Condition()
+GETS = {"count": 0, "last_event_id": None}
 
 
 def wait_answer(req_id: str, timeout: float = 10.0):
@@ -58,6 +60,9 @@ def result_for(msg: dict) -> dict | None:
         return {"tools": [ECHO_TOOL]}
     if method == "tools/call":
         params = msg.get("params") or {}
+        if params.get("name") == "last_event_id":
+            text = GETS["last_event_id"] or "none"
+            return {"content": [{"type": "text", "text": text}], "isError": False}
         if params.get("name") == "last_roots":
             ans = ANSWERS.get("get-1")
             text = json.dumps(ans, separators=(",", ":")) if ans else "none"
@@ -142,12 +147,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(400)
             self.end_headers()
             return
+        GETS["count"] += 1
+        first = GETS["count"] == 1
+        if not first:
+            GETS["last_event_id"] = self.headers.get("Last-Event-ID")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
         try:
-            self.sse({"jsonrpc": "2.0", "id": "get-1", "method": "roots/list"}, "e1")
-            self.sse({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}, "e2")
+            if first:
+                self.sse({"jsonrpc": "2.0", "id": "get-1", "method": "roots/list"}, "e1")
+                self.sse({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}, "e2")
+                return  # 最初のストリームは閉じる (張り直しを確かめる)
             # 開いたままにする (クライアントが閉じるまで)。
             while True:
                 time.sleep(0.5)

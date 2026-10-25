@@ -316,7 +316,7 @@ impl Drop for StdioTransport {
 // ---------------- Streamable HTTP ----------------
 
 const SESSION_HEADER: &str = "Mcp-Session-Id";
-/// GET のストリームが続けて失敗したら諦める回数 (間隔は 1, 2, 4, 8 … 秒)。
+/// GET のストリームが続けて失敗したら諦める回数 (間隔は 1, 2, 4, 8, 16 秒)。
 const STREAM_MAX_FAILURES: u32 = 5;
 
 pub struct HttpTransport {
@@ -442,6 +442,8 @@ impl HttpInner {
     async fn listen(self: Arc<Self>) {
         let mut last_event_id: Option<String> = None;
         let mut failures = 0u32;
+        // サーバが `retry:` で指定した待ち時間 (無ければ 1 秒)。
+        let mut retry = Duration::from_secs(1);
         loop {
             let mut req = self
                 .stream_client
@@ -472,6 +474,13 @@ impl HttpInner {
                             last_event_id = sse.last_event_id.clone();
                         }
                     }
+                    if let Some(frame) = sse.finish().and_then(|e| classify(&e)) {
+                        delivered = true;
+                        let _ = self.handle(frame);
+                    }
+                    if let Some(ms) = sse.retry_ms {
+                        retry = Duration::from_millis(ms.max(1000));
+                    }
                     // 何も届かずに閉じたストリームは失敗に数える (すぐ閉じるサーバに毎秒張り直さない)。
                     failures = if delivered { 0 } else { failures + 1 };
                 }
@@ -492,7 +501,13 @@ impl HttpInner {
                 tracing::debug!(server=%self.label, "mcp: giving up on the server→client stream");
                 return;
             }
-            tokio::time::sleep(Duration::from_secs(1 << failures.min(4))).await;
+            // 届いたあとで閉じたストリームは、サーバの `retry:` (無ければ 1 秒) で張り直す。
+            // 失敗が続けば 1, 2, 4, 8, 16 秒と延ばす。
+            let wait = match failures {
+                0 => retry,
+                n => Duration::from_secs(1 << (n - 1).min(4)),
+            };
+            tokio::time::sleep(wait).await;
         }
     }
 }
@@ -554,6 +569,15 @@ impl Transport for HttpTransport {
                 }
             }
         }
+        // 空行で閉じずに終わった最後のイベント (以前の「本文を全部読む」実装は受け取っていた)。
+        if let Some(inc) = sse
+            .finish()
+            .and_then(|e| classify(&e))
+            .and_then(|f| inner.handle(f))
+            && (inc.id == Some(id) || fallback.is_none())
+        {
+            return Ok(inc);
+        }
         fallback.ok_or_else(|| anyhow!("mcp[{}]: no JSON-RPC response in SSE stream", inner.label))
     }
 
@@ -588,20 +612,38 @@ impl Drop for HttpTransport {
     }
 }
 
+/// SSE の 1 行・1 イベントの上限。改行の来ないストリームで際限なく溜め込まない
+/// (GET のストリームには全体のタイムアウトが無い)。超えたら、そこまでを捨てる。
+const SSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// SSE を少しずつ読んで、イベントごとの `data` を返す。`data:` 行は改行でつなぎ、空行で 1 イベント。
 /// チャンクの境目は行の途中 (UTF-8 の途中) でもよい。
 #[derive(Default)]
 struct SseParser {
     buf: Vec<u8>,
     data: Vec<String>,
+    data_bytes: usize,
     /// 最後に見た `id:` (張り直すときの `Last-Event-ID`)。
     last_event_id: Option<String>,
+    /// サーバが `retry:` で指定した、張り直すまでの待ち時間 (ミリ秒)。
+    retry_ms: Option<u64>,
 }
 
 impl SseParser {
+    /// ストリームが終わったとき、空行で閉じられていない最後のイベントを返す。
+    fn finish(&mut self) -> Option<String> {
+        let mut events = self.feed(b"\n\n");
+        events.pop()
+    }
+
     fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(chunk);
         let mut events = Vec::new();
+        if self.buf.len() > SSE_MAX_BYTES && !self.buf.contains(&b'\n') {
+            tracing::debug!("mcp: dropping an over-long SSE line");
+            self.buf.clear();
+            return events;
+        }
         while let Some(nl) = self.buf.iter().position(|b| *b == b'\n') {
             let raw: Vec<u8> = self.buf.drain(..=nl).collect();
             let line = String::from_utf8_lossy(&raw);
@@ -609,6 +651,7 @@ impl SseParser {
             if line.is_empty() {
                 if !self.data.is_empty() {
                     events.push(std::mem::take(&mut self.data).join("\n"));
+                    self.data_bytes = 0;
                 }
                 continue;
             }
@@ -617,9 +660,19 @@ impl SseParser {
                 None => (line, ""),
             };
             match field {
-                "data" => self.data.push(value.to_string()),
+                "data" => {
+                    self.data_bytes += value.len();
+                    if self.data_bytes > SSE_MAX_BYTES {
+                        tracing::debug!("mcp: dropping an over-long SSE event");
+                        self.data.clear();
+                        self.data_bytes = 0;
+                    } else {
+                        self.data.push(value.to_string());
+                    }
+                }
                 "id" => self.last_event_id = Some(value.to_string()),
-                // コメント (`: keep-alive`)、`event:`、`retry:` は使わない。
+                "retry" => self.retry_ms = value.trim().parse().ok(),
+                // コメント (`: keep-alive`) と `event:` は使わない。
                 _ => {}
             }
         }
@@ -667,8 +720,29 @@ mod tests {
         events.extend(p.feed(b"1}\r\n\r\n: keep-alive\n\ndata: x\ndata: y\n\n"));
         assert_eq!(events, vec!["{\"a\":1}".to_string(), "x\ny".to_string()]);
         assert_eq!(p.last_event_id.as_deref(), Some("e1"));
-        // 終わっていないイベントは出さない。
+        // 終わっていないイベントは出さない。ストリームが終われば出す。
         assert!(p.feed(b"data: z\n").is_empty());
+        assert_eq!(p.finish().as_deref(), Some("z"));
+        // 1 バイトずつでも多バイト文字が壊れない。retry も読む。
+        let mut q = SseParser::default();
+        let mut got = Vec::new();
+        for b in "retry: 2500\ndata: 日本語\n\n".as_bytes() {
+            got.extend(q.feed(std::slice::from_ref(b)));
+        }
+        assert_eq!(got, vec!["日本語".to_string()]);
+        assert_eq!(q.retry_ms, Some(2500));
+    }
+
+    #[test]
+    fn an_endless_sse_line_is_dropped_instead_of_buffered() {
+        let mut p = SseParser::default();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..9 {
+            assert!(p.feed(&chunk).is_empty());
+        }
+        assert!(p.buf.len() <= SSE_MAX_BYTES);
+        // その後のイベントは普通に読める。
+        assert_eq!(p.feed(b"\ndata: ok\n\n"), vec!["ok".to_string()]);
     }
 
     #[test]

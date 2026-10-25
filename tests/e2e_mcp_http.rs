@@ -146,6 +146,30 @@ async fn the_get_stream_carries_server_requests_and_notifications() {
     );
 }
 
+/// #83: GET のストリームが切れたら、最後に見たイベントの id を `Last-Event-ID` に付けて張り直す。
+#[tokio::test]
+async fn a_closed_get_stream_is_reopened_with_the_last_event_id() {
+    let port = pick_port();
+    let _server = start(port);
+    let client = McpClient::connect("mock-http", &spec_for(port), None, None)
+        .await
+        .expect("connect HTTP MCP mock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        seen = client
+            .call_tool("last_event_id", serde_json::json!({}))
+            .await
+            .expect("call_tool")
+            .content;
+        if seen != "none" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(seen, "e2", "the reconnect must carry Last-Event-ID");
+}
+
 /// #83: POST の応答が SSE のとき、応答より前に来た server→client リクエストに答えてから
 /// 応答を受け取る (本文を全部読んでから探すと、サーバが答えを待ったまま固まる)。
 #[tokio::test]

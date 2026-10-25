@@ -40,7 +40,7 @@ impl McpClient {
         sampling: Option<Arc<SamplingProvider>>,
         elicitation: Option<Arc<crate::mcp::elicitation::ElicitationProvider>>,
     ) -> Result<Self> {
-        // server→client リクエストのハンドラ (stdio のみ有効)。
+        // server→client リクエストのハンドラ (stdio と HTTP で共通)。
         //   roots/list           → cwd を返す
         //   sampling/createMessage → opt-in 時のみ LLM を呼ぶ
         //   elicitation/create   → REPL なら利用者に尋ねる

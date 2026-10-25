@@ -572,10 +572,10 @@ network = false            # 既定 true。false でサンドボックス内か�
 
 サンプルは `.mcp.json.example` を参照。`command` があれば stdio、`url` があれば HTTP（両方／どちらも無いはエラー）。
 
-- **transport**: **stdio** (`command`) と **Streamable HTTP** (`url`)。HTTP は POST で JSON-RPC を送り、`application/json` または `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぎ、`headers` で認証ヘッダを付与できる。HTTP の server→client GET ストリームは未対応
-- **`tools/list_changed`**: サーバが `notifications/tools/list_changed` を送ると、**次のターンの入口**で `tools/list` を取り直してそのサーバのツールを入れ替える（`mcp[<server>]: tools changed, now N tool(s)` と表示。`enabledTools` などの絞り込みと `tool_search` の遅延はそのまま効く。system prompt のツール一覧も作り直す）。ターンの途中では入れ替えない（進行中の呼び出しと定義が食い違うため）。受け取れるのは **stdio** だけ（HTTP は POST の応答しか読まないので、サーバからの通知は届かない）
-- **elicitation**（server→client の利用者への問い合わせ）: REPL では `[mcp:<server>] asks: <message>` と出して `requestedSchema` の各プロパティを 1 項目ずつ stdin で尋ね（string / integer / number / boolean / enum に合わせて変換。空行は「答えない」で、必須なら全体を decline）、`{ action: accept, content }` を返す。`-p` では尋ねずに decline（capability は広告しないが、尋ねてきたサーバにも decline を返す）。受け取れるのは stdio だけ
-- **capabilities**: tools / prompts / resources / roots、および opt-in の **sampling**。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストの受信は **stdio のみ**対応。⚠️ roots はサーバに **cwd の絶対パスを開示**します（`.mcp.json` のサーバを信頼する前提と同じ範囲）
+- **transport**: **stdio** (`command`) と **Streamable HTTP** (`url`)。HTTP は POST で JSON-RPC を送り、`application/json` または `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぎ、`headers` で認証ヘッダを付与できる。server→client の通知・リクエストは、POST の応答の SSE（応答より前に来るものも、届いた順に処理してから応答を受け取る）と、初期化のあとに開く **GET の SSE ストリーム**の両方から受け、リクエストへの答えは POST で返す（#83）。GET はサーバが `405` などで断れば開かず、切れたら `Last-Event-ID` を付けて張り直す（続けて 5 回失敗したら諦める）。server→client リクエストの `id` は文字列でも受ける
+- **`tools/list_changed`**: サーバが `notifications/tools/list_changed` を送ると、**次のターンの入口**で `tools/list` を取り直してそのサーバのツールを入れ替える（`mcp[<server>]: tools changed, now N tool(s)` と表示。`enabledTools` などの絞り込みと `tool_search` の遅延はそのまま効く。system prompt のツール一覧も作り直す）。ターンの途中では入れ替えない（進行中の呼び出しと定義が食い違うため）。stdio と HTTP（GET のストリーム / POST の応答の SSE）の両方で受け取れる
+- **elicitation**（server→client の利用者への問い合わせ）: REPL では `[mcp:<server>] asks: <message>` と出して `requestedSchema` の各プロパティを 1 項目ずつ stdin で尋ね（string / integer / number / boolean / enum に合わせて変換。空行は「答えない」で、必須なら全体を decline）、`{ action: accept, content }` を返す。`-p` では尋ねずに decline（capability は広告しないが、尋ねてきたサーバにも decline を返す）。stdio と HTTP の両方で受け取れる
+- **capabilities**: tools / prompts / resources / roots、および opt-in の **sampling**。**roots** はクライアントが作業ディレクトリ (cwd) を `file://` root としてサーバへ公開する（initialize で capability 宣言 → サーバの `roots/list` リクエストに応答）。server→client リクエストは stdio と HTTP の両方で受ける。⚠️ roots はサーバに **cwd の絶対パスを開示**します（`.mcp.json` のサーバを信頼する前提と同じ範囲）
 - **permission**: MCP 由来の **tools/call は常に destructive** 扱いで初回呼び出しに `y/n/a/e` 確認 (Claude Code 同様)。**resources は read-only なので非破壊** (ゲートを経ない)
 - **起動失敗の扱い**: サーバ起動 / `tools/list` 失敗は warning に留め、REPL は built-in ツールのみで継続起動。`prompts/list` / `resources/list` 非対応サーバは warning で skip
 - **プロトコル**: MCP `2025-06-18`、JSON-RPC 2.0（stdio は newline-delimited、HTTP は POST 1 リクエスト/レスポンス）
@@ -602,7 +602,7 @@ network = false            # 既定 true。false でサンドボックス内か�
 サーバが `sampling/createMessage` でクライアント側の LLM 補完を要求できます。サーバが
 こちらの**モデル・トークンを駆動**するため、既定では無効。`.mcp.json` の各サーバに
 **`"allowSampling": true`** を付けたサーバにのみ許可し、initialize で sampling capability を
-広告します（stdio のみ）。許可サーバの要求は、現在 active な provider/model の LLM へ
+広告します（stdio / HTTP とも。HTTP は #83 で受けられるようになった）。許可サーバの要求は、現在 active な provider/model の LLM へ
 そのまま渡され、結果を assistant テキストとして返します。サーバ指定の `maxTokens` は
 生成上限として LLM に渡され、無制限生成を防ぎます。
 

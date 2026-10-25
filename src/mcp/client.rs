@@ -109,6 +109,8 @@ impl McpClient {
         let _: InitializeResult = self.request("initialize", Some(&params)).await?;
         // notifications/initialized — no response expected.
         self.notify::<()>("notifications/initialized", None).await?;
+        // HTTP はここで server→client のストリーム (GET) を開く (#83)。
+        self.transport.on_initialized();
         Ok(())
     }
 

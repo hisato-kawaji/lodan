@@ -101,6 +101,13 @@ flags_for_config() {
     # think-none と同条件で、編集直後の構文チェックだけを足す (#65 D2)。
     syntax-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --syntax-check" ;;
     think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
+    # plan-none の計画だけを別のモデル ($PLAN_MODEL、任意で $PLAN_PROVIDER) に投げる (#65 C1)。
+    # 手順の実行は $MODEL のまま。plan-none との差が「計画器の性能」の寄与。
+    plan-ext-none)
+      if [ -z "${PLAN_MODEL:-}" ] && [ -z "${PLAN_PROVIDER:-}" ]; then
+        echo "plan-ext-none needs PLAN_MODEL (and optionally PLAN_PROVIDER)" >&2; return 1
+      fi
+      echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --plan-execute${PLAN_MODEL:+ --plan-model $PLAN_MODEL}${PLAN_PROVIDER:+ --plan-provider $PLAN_PROVIDER}" ;;
     *) echo "unknown config: $1" >&2; return 1 ;;
   esac
 }

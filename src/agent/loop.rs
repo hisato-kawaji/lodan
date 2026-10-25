@@ -64,6 +64,9 @@ pub struct Session {
     /// 圧縮で履歴から消えたメッセージ数の累計 (#131)。transcript のレコーダはこれが増えた分だけ
     /// 「書き込み済み」の位置を縮めて数え直す (履歴が短くなっても末尾を取りこぼさない)。
     compacted_away: usize,
+    /// `plan_execute` の計画だけに使うクライアントとモデル (`[agent] plan_provider` / `plan_model`、
+    /// #65 C1)。None なら作業しているクライアントが計画する。
+    planner: Option<(Arc<dyn LlmClient>, String)>,
 }
 
 /// hook の payload の共通フィールドのうち、セッションの外から与えるもの。
@@ -205,6 +208,7 @@ impl Session {
             changed_files: Vec::new(),
             ran_shell: false,
             compacted_away: 0,
+            planner: None,
         }
     }
 
@@ -441,9 +445,14 @@ impl Session {
                 content: user_input.to_string(),
             },
         ];
+        // 計画器だけを別のモデルにする設定があればそちらへ (9B の計画器はほとんど分解しない)。
+        let (plan_llm, plan_model): (&dyn LlmClient, String) = match &self.planner {
+            Some((client, model)) => (client.as_ref(), model.clone()),
+            None => (llm, self.cfg.llm.active().model.clone()),
+        };
         let resp = crate::llm::metered::with_kind(
             crate::llm::metered::KIND_PLAN,
-            llm.chat(&messages, &[], &self.cfg.llm.active().model, Some(1024)),
+            plan_llm.chat(&messages, &[], &plan_model, Some(1024)),
         )
         .await;
         let steps = match resp {
@@ -467,13 +476,16 @@ impl Session {
         if steps.len() < 2 {
             crate::runlog::record(
                 "plan_skipped",
-                serde_json::json!({ "turn": self.turn_seq, "reason": "no_plan", "steps": steps.len() }),
+                serde_json::json!({
+                    "turn": self.turn_seq, "reason": "no_plan", "steps": steps.len(),
+                    "model": plan_model,
+                }),
             );
             return None;
         }
         crate::runlog::record(
             "plan_made",
-            serde_json::json!({ "turn": self.turn_seq, "steps": steps.len() }),
+            serde_json::json!({ "turn": self.turn_seq, "steps": steps.len(), "model": plan_model }),
         );
         crate::say!(
             "{}",
@@ -593,6 +605,11 @@ impl Session {
 
     pub fn set_hook_env(&mut self, env: HookEnv) {
         self.hook_env = env;
+    }
+
+    /// 計画だけを別のモデルに投げる (#65 C1)。手順の実行は作業しているモデルのまま。
+    pub fn set_planner(&mut self, planner: (Arc<dyn LlmClient>, String)) {
+        self.planner = Some(planner);
     }
 
     /// 次のユーザ入力と一緒にモデルへ渡す文脈を預ける (SessionStart hook の `additionalContext` など)。
@@ -3432,6 +3449,82 @@ mod tests {
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("2 of 2 steps"), "{}", notes[0]);
         assert!(notes[0].contains("do not redo it"), "{}", notes[0]);
+    }
+
+    /// 受け取ったモデル名を覚えておき、1 回目だけ計画を返す偽の LLM。
+    struct ModelRecordingLlm {
+        inner: PlanThenTextLlm,
+        models: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ModelRecordingLlm {
+        async fn chat(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            m: &str,
+            _mt: Option<u32>,
+        ) -> Result<ChatResponse> {
+            self.models.lock().unwrap().push(m.to_string());
+            Ok(self.inner.reply())
+        }
+        async fn chat_stream(
+            &self,
+            _h: &[Message],
+            _t: &[ToolSpec<'_>],
+            m: &str,
+            sink: mpsc::UnboundedSender<ChatEvent>,
+        ) -> Result<()> {
+            self.models.lock().unwrap().push(m.to_string());
+            let _ = sink.send(ChatEvent::Done(self.inner.reply()));
+            Ok(())
+        }
+    }
+
+    /// #65 C1: 計画器を別のモデルにしたら、計画の 1 回だけがそちらへ行き、手順の実行と
+    /// 親のターンは作業しているモデルのまま。
+    #[tokio::test]
+    async fn a_separate_planner_makes_the_plan_and_nothing_else() {
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: None,
+        };
+        let prompts = Arc::clone(&task.prompts);
+        let mut session = plan_session(task);
+        let planner_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let planner = ModelRecordingLlm {
+            inner: PlanThenTextLlm {
+                plan: "1. Write the scanner\n2. Add report\n".into(),
+                calls: Arc::new(std::sync::Mutex::new(0)),
+            },
+            models: Arc::clone(&planner_models),
+        };
+        session.set_planner((Arc::new(planner), "big-planner".into()));
+        // 作業側のモデルが計画を頼まれたら、分解しない答えを返す (= 計画器が使われなければ手順は 0)。
+        let main_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let main = ModelRecordingLlm {
+            inner: PlanThenTextLlm {
+                plan: "let me look around first".into(),
+                calls: Arc::new(std::sync::Mutex::new(0)),
+            },
+            models: Arc::clone(&main_models),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &main, &gate).await.unwrap();
+
+        assert_eq!(prompts.lock().unwrap().len(), 2, "the planner's plan ran");
+        assert_eq!(
+            *planner_models.lock().unwrap(),
+            vec!["big-planner".to_string()],
+            "the planner is asked once, with its own model"
+        );
+        let main_models = main_models.lock().unwrap();
+        assert!(!main_models.is_empty(), "the parent turn still runs");
+        assert!(
+            main_models.iter().all(|m| m != "big-planner"),
+            "{main_models:?}"
+        );
     }
 
     /// 手順が失敗したら、その上に次を積まずに親へ返す。

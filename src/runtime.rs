@@ -82,6 +82,8 @@ pub struct Runtime {
     pub ledger: Arc<llm::metered::Ledger>,
     /// `/goal` の評価器を別のモデルにする設定があるとき、そのクライアントとモデル名。
     pub goal_evaluator: Option<(Arc<dyn LlmClient>, String)>,
+    /// `plan_execute` の計画だけを別のモデルにする設定があるとき、そのクライアントとモデル名 (#65 C1)。
+    planner: Option<(Arc<dyn LlmClient>, String)>,
     pub registry: Arc<ToolRegistry>,
     /// MCP サーバが公開する prompt (`/mcp__<server>__<prompt>`)。
     pub mcp_prompts: BTreeMap<String, McpPrompt>,
@@ -190,6 +192,7 @@ impl Runtime {
 
         let (llm, ledger) = llm::build_metered(cfg)?;
         let goal_evaluator = llm::build_goal_evaluator(cfg, &ledger)?;
+        let planner = llm::build_planner(cfg, &ledger)?;
 
         let mut registry = default_registry();
         // 要件台帳 (#65) は opt-in。有効なときだけツールを見せる。
@@ -351,6 +354,7 @@ impl Runtime {
             hook_env,
             ledger,
             goal_evaluator,
+            planner,
             registry: Arc::new(registry),
             mcp_prompts,
             mcp_servers: mcp_outcome.clients,
@@ -370,6 +374,9 @@ impl Runtime {
         };
         // 予算が残り少なくなったことを、ループがモデルに伝えられるように。
         session.set_ledger(Arc::clone(&self.ledger));
+        if let Some(planner) = &self.planner {
+            session.set_planner(planner.clone());
+        }
         session.set_mcp_servers(self.mcp_servers.clone());
         // 子エージェントが親のプランモードを見られるように (#77)。
         session.set_plan_flag(Arc::clone(&self.plan_flag));
@@ -499,6 +506,31 @@ mod tests {
             cfg.agent.max_iterations,
         );
         with_plan_step_profile(task, cfg, &llm)
+    }
+
+    /// 計画器を別のモデルにしても (#65 C1)、手順を実行する子は作業しているクライアントとモデルのまま
+    /// (#160 のレビュー: 子を計画器のモデルに替えても、どのテストも落ちなかった)。
+    #[test]
+    fn plan_steps_run_on_the_working_model_even_with_a_separate_planner() {
+        let mut cfg = Config::default();
+        cfg.agent.plan_execute = true;
+        cfg.agent.plan_model = Some("big-planner".into());
+        let llm: Arc<dyn LlmClient> = Arc::new(UnusedLlm);
+        let task = with_plan_step_profile(
+            agent::subagent::SubAgentTool::new(
+                Arc::clone(&llm),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                PathBuf::from("."),
+                cfg.agent.max_iterations,
+            ),
+            &cfg,
+            &llm,
+        );
+        let step = task.profile_of(PLAN_STEP_AGENT).expect("registered");
+        assert_eq!(step.model, cfg.llm.active().model);
+        assert_ne!(step.model, "big-planner");
+        assert!(Arc::ptr_eq(&step.llm, &llm), "the working client");
     }
 
     /// 手順を実行する子は親より強くならない。`readonly` の親の下では子も読み取り専用

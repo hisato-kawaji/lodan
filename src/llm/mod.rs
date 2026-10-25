@@ -147,15 +147,49 @@ pub fn build_goal_evaluator(
     ledger: &Arc<metered::Ledger>,
 ) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
     let goal = &cfg.goal;
-    if goal.evaluator_provider.is_none() && goal.evaluator_model.is_none() {
+    build_side(
+        cfg,
+        ledger,
+        goal.evaluator_provider,
+        goal.evaluator_model.as_deref(),
+        "the /goal evaluator",
+    )
+}
+
+/// `plan_execute` の計画だけを別のモデルにする設定があれば、そのクライアントとモデル名 (#65 C1)。
+/// 評価器と同じく同じ台帳に載せる。設定が無いか `plan_execute` が off なら None。
+pub fn build_planner(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
+    if !cfg.agent.plan_execute {
         return Ok(None);
     }
-    let provider = goal.evaluator_provider.unwrap_or(cfg.llm.provider);
+    build_side(
+        cfg,
+        ledger,
+        cfg.agent.plan_provider,
+        cfg.agent.plan_model.as_deref(),
+        "the planner",
+    )
+}
+
+/// 本体とは別の用途 (評価器・計画器) に使うクライアント。provider もモデルも未指定なら None。
+fn build_side(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+    provider: Option<crate::config::Provider>,
+    model: Option<&str>,
+    what: &str,
+) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
+    if provider.is_none() && model.is_none() {
+        return Ok(None);
+    }
+    let provider = provider.unwrap_or(cfg.llm.provider);
     let inner = build_for(provider, cfg)
-        .with_context(|| format!("building the /goal evaluator ({})", provider.as_str()))?;
-    let model = goal
-        .evaluator_model
-        .clone()
+        .with_context(|| format!("building {what} ({})", provider.as_str()))?;
+    let model = model
+        .map(str::to_string)
         .unwrap_or_else(|| cfg.llm.get(provider).model.clone());
     let client: Arc<dyn LlmClient> = Arc::new(metered::MeteredClient::new(inner, ledger.clone()));
     Ok(Some((client, model)))
@@ -208,4 +242,33 @@ fn build_for(provider: Provider, cfg: &Config) -> Result<Arc<dyn LlmClient>> {
         Provider::Sakura => Arc::new(sakura::SakuraClient::new(&cfg.llm.sakura)?),
         Provider::Kimi => Arc::new(kimi::KimiClient::new(&cfg.llm.kimi)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 計画器 (#65 C1) は `plan_execute` が on で、provider かモデルが指定されたときだけ作る。
+    /// モデルだけの指定は作業中の provider に投げる。
+    #[test]
+    fn a_planner_is_built_only_when_asked_for() {
+        let ledger = Arc::new(metered::Ledger::new(metered::Budget::default()));
+        let mut cfg = Config::default();
+        cfg.agent.plan_model = Some("big".into());
+        assert!(
+            build_planner(&cfg, &ledger).unwrap().is_none(),
+            "plan_execute off"
+        );
+        cfg.agent.plan_execute = true;
+        let (_, model) = build_planner(&cfg, &ledger).unwrap().expect("a planner");
+        assert_eq!(model, "big");
+        cfg.agent.plan_model = None;
+        assert!(
+            build_planner(&cfg, &ledger).unwrap().is_none(),
+            "nothing set"
+        );
+        cfg.agent.plan_provider = Some(crate::config::Provider::Local);
+        let (_, model) = build_planner(&cfg, &ledger).unwrap().expect("a planner");
+        assert_eq!(model, cfg.llm.local.model, "the provider's own model");
+    }
 }

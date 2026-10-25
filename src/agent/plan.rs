@@ -220,8 +220,24 @@ pub fn step_prompt(request: &str, steps: &[Step], index: usize, done: &[Outcome]
     out
 }
 
+/// 全手順が終わったあとにハーネスが走らせた検証 (`[[verify]]`、#65 D1) の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    /// 確かめていない: 検証が設定されていない / `paths` が手順の変更に当たらない / 計画が途中で
+    /// 止まった。親に確かめてもらうしかない。
+    None,
+    /// 走らせた検証が全て通った。中身は走らせたコマンド。
+    Passed(Vec<String>),
+    /// 失敗した検証がある。中身はモデルへ見せる差し戻しの本文 ([`crate::verify::repair_note`])。
+    Failed(String),
+}
+
 /// 手順の結果を親の履歴に残す注記。親はこの後、普通にターンを続けて利用者に答える。
-pub fn outcome_note(outcomes: &[Outcome], total: usize) -> String {
+///
+/// 検算は親に頼まない — phase3 の実測で、手順のあとに親が走らせる検算 (基準 4 回に対し 7〜14 回の
+/// LLM 呼び出し) が増えた時間の大半だった。検証が設定されていればハーネスが 1 回だけ走らせ、
+/// 通れば「確かめ済み」、落ちたときだけ出力を添えて親に直させる。
+pub fn outcome_note(outcomes: &[Outcome], total: usize, check: &Check) -> String {
     let mut out = format!(
         "plan→execute: {} of {} steps ran in their own context.\n",
         outcomes.len(),
@@ -237,13 +253,36 @@ pub fn outcome_note(outcomes: &[Outcome], total: usize) -> String {
         ));
     }
     let stopped = outcomes.len() < total || outcomes.iter().any(|o| !o.ok);
-    out.push_str(if stopped {
-        "\nThe plan did not finish. Pick it up from the failed step yourself: read what is there \
-         now, fix it, then answer the user."
-    } else {
-        "\nThis work is already done — do not redo it. Check the result against what the user \
-         asked (read the files, run it), then answer the user."
-    });
+    if stopped {
+        out.push_str(
+            "\nThe plan did not finish. Pick it up from the failed step yourself: read what is there \
+             now, fix it, then answer the user.",
+        );
+        return out;
+    }
+    match check {
+        Check::None => out.push_str(
+            "\nThis work is already done — do not redo it. Check the result against what the user \
+             asked (read the files, run it), then answer the user.",
+        ),
+        Check::Passed(commands) => {
+            out.push_str("\nThis work is already done and the harness verified it:\n");
+            for c in commands {
+                out.push_str(&format!("$ {c} — passed\n"));
+            }
+            out.push_str(
+                "Do not redo it and do not re-check it. Answer the user now: say briefly what was \
+                 built, based on the steps above.",
+            );
+        }
+        Check::Failed(repair) => {
+            out.push_str(
+                "\nThe steps finished, but the harness ran the verification and it failed. Fix only \
+                 what the output below points at — do not redo the steps.\n\n",
+            );
+            out.push_str(repair);
+        }
+    }
     out
 }
 
@@ -371,7 +410,7 @@ mod tests {
                 ok: true,
             },
         ];
-        let note = outcome_note(&ok, 2);
+        let note = outcome_note(&ok, 2, &Check::None);
         assert!(note.contains("do not redo it"), "{note}");
         assert!(!note.contains("did not finish"), "{note}");
         // 途中で止まった計画は、親に引き継ぎを促す。
@@ -380,9 +419,42 @@ mod tests {
             summary: "python3: command not found".into(),
             ok: false,
         }];
-        let note = outcome_note(&broke, 2);
+        let note = outcome_note(&broke, 2, &Check::None);
         assert!(
             note.contains("did not finish") && note.contains("failed"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn the_note_reports_the_harness_check_instead_of_asking_the_parent_to_check() {
+        let ok = [Outcome {
+            title: "First".into(),
+            summary: "wrote a.py".into(),
+            ok: true,
+        }];
+        let passed = outcome_note(&ok, 1, &Check::Passed(vec!["python3 a.py".into()]));
+        assert!(
+            passed.contains("$ python3 a.py — passed") && passed.contains("do not re-check"),
+            "{passed}"
+        );
+        assert!(!passed.contains("run it"), "{passed}");
+        let failed = outcome_note(&ok, 1, &Check::Failed("$ python3 a.py\nboom".into()));
+        assert!(
+            failed.contains("it failed")
+                && failed.contains("boom")
+                && failed.contains("do not redo"),
+            "{failed}"
+        );
+        // 計画が途中で止まったら、検証の結果より引き継ぎの案内が優先する。
+        let broke = [Outcome {
+            title: "First".into(),
+            summary: "error".into(),
+            ok: false,
+        }];
+        let note = outcome_note(&broke, 2, &Check::Passed(vec!["x".into()]));
+        assert!(
+            note.contains("did not finish") && !note.contains("passed"),
             "{note}"
         );
     }

@@ -28,6 +28,8 @@ RUNS_DIR="${RUNS_DIR:-$HERE/runs}"
 T_L0="${T_L0:-120}"
 T_L1="${T_L1:-240}"
 T_L2="${T_L2:-480}"
+# L3 は複数ファイル・複数段なので L2 の 2 倍を既定にする。
+T_L3="${T_L3:-960}"
 # 1 チェックあたりの上限 (サーバ起動を伴う L2 のため少し長め)。
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-60}"
 
@@ -115,6 +117,7 @@ timeout_for_level() {
     L0) echo "$T_L0" ;;
     L1) echo "$T_L1" ;;
     L2) echo "$T_L2" ;;
+    L3) echo "$T_L3" ;;
     *)  echo 300 ;;
   esac
 }

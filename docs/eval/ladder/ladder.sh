@@ -98,6 +98,9 @@ flags_for_config() {
     # think-none と同条件で Plan→Execute 分離だけを足す (#65 C1)。手順ごとに子を立てるので
     # LLM の往復が増える。時間は think-none と比べる。
     plan-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --plan-execute" ;;
+    # plan-none に、タスクの $VERIFY を [[verify]] として足す。全手順のあとの検算を親ではなく
+    # ハーネスが 1 回だけ行う形 (#65 C1 + D1)。plan-none との差が「親の検算」を外した寄与。
+    plan-verify-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --plan-execute" ;;
     # think-none と同条件で、編集直後の構文チェックだけを足す (#65 D2)。
     syntax-none) echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort none --syntax-check" ;;
     think-low)  echo "--temperature 0.2 --malformed-retry=false --dup-suppress=false --finish-nudge=false --empty-reply-nudge=false --reasoning-effort low" ;;
@@ -173,9 +176,9 @@ for task_file in $TASK_FILES; do
         mkdir -p "$work/.lodan"
         printf '[llm.local]\ntimeout_secs = 900\n\n[llm.sakana]\ntimeout_secs = 900\n' \
           > "$work/.lodan/config.toml"
-        # `verify-none` のときだけ、タスクが定義した検証コマンド ($VERIFY) を [[verify]] に書く
-        # (#65 D1)。空白を含むコマンドをフラグ列で渡すと単語分割で壊れるため、設定ファイル経由。
-        if [ "$config" = "verify-none" ] && [ -n "${VERIFY:-}" ]; then
+        # `verify-none` / `plan-verify-none` のときだけ、タスクが定義した検証コマンド ($VERIFY) を
+        # [[verify]] に書く (#65 D1)。空白を含むコマンドをフラグ列で渡すと単語分割で壊れるため、設定ファイル経由。
+        if { [ "$config" = "verify-none" ] || [ "$config" = "plan-verify-none" ]; } && [ -n "${VERIFY:-}" ]; then
           printf '\n[[verify]]\nid = "task"\ncommand = %s\ntimeout_secs = 120\n' \
             "$(printf '%s' "$VERIFY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
             >> "$work/.lodan/config.toml"

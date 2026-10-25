@@ -581,10 +581,71 @@ impl Session {
                 break;
             }
         }
+        let check = self.verify_plan(&done, steps.len()).await;
         Some(format!(
             "{HARNESS_NOTE_PREFIX}{}",
-            plan::outcome_note(&done, steps.len())
+            plan::outcome_note(&done, steps.len(), &check)
         ))
+    }
+
+    /// 全手順が通ったあとに `[[verify]]` を 1 回だけ走らせる (#65 C1 + D1)。検算を親の LLM に
+    /// 頼むと往復が増える (phase3 の実測で増えた時間の大半) ので、ハーネスが代わりに確かめる。
+    ///
+    /// 通ったら、このターンの変更の記録を消す — ターン末の検証は、親がこの後さらに何かを
+    /// 変えたときだけ走り直す。落ちたら記録を残し、ターン末に同じ検証がもう一度走る。
+    async fn verify_plan(
+        &mut self,
+        done: &[crate::agent::plan::Outcome],
+        total: usize,
+    ) -> crate::agent::plan::Check {
+        use crate::agent::plan::Check;
+        let finished = done.len() == total && done.iter().all(|o| o.ok);
+        if !finished || self.active_verify.is_empty() {
+            return Check::None;
+        }
+        let outcomes = crate::verify::run_applicable(
+            &self.active_verify,
+            &self.changed_files,
+            self.ran_shell,
+            &self.ctx.cwd,
+        )
+        .await;
+        for o in &outcomes {
+            crate::runlog::record(
+                "plan_verify",
+                serde_json::json!({
+                    "turn": self.turn_seq, "label": o.label, "ok": o.ok, "ms": o.ms,
+                }),
+            );
+        }
+        // 当てはまる検証が無かった (`paths` が手順の変更に当たらない) なら、確かめていない。
+        if outcomes.is_empty() {
+            return Check::None;
+        }
+        let failed: Vec<&crate::verify::Outcome> = outcomes.iter().filter(|o| !o.ok).collect();
+        if failed.is_empty() {
+            crate::say!(
+                "{}",
+                crate::term::dim("[lodan] plan: verify passed after the steps")
+            );
+            self.changed_files.clear();
+            self.ran_shell = false;
+            return Check::Passed(
+                outcomes
+                    .iter()
+                    .map(|o| crate::term::sanitize(&o.command).into_owned())
+                    .collect(),
+            );
+        }
+        let labels: Vec<&str> = failed.iter().map(|f| f.label.as_str()).collect();
+        crate::say!(
+            "{}",
+            crate::term::dim(&format!(
+                "[lodan] plan: verify failed after the steps ({}) — handing it to the model",
+                labels.join(", ")
+            ))
+        );
+        Check::Failed(crate::verify::repair_note(&failed))
     }
 
     pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
@@ -3464,6 +3525,73 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("did not finish"), "{note}");
+    }
+
+    /// #65 C1 + D1: 全手順が通ったら `[[verify]]` をハーネスが 1 回だけ走らせ、親には検算を頼まない。
+    /// 通れば「確かめ済み」の注記で、親がこの後ファイルを変えなければターン末に走り直さない。
+    /// 落ちたら出力を注記に添え、ターン末に同じ検証がもう一度走る。
+    #[tokio::test]
+    async fn after_the_steps_the_harness_verifies_once_instead_of_the_parent() {
+        for passing in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("runs.log");
+            let command = if passing {
+                format!("echo run >> {}", log.display())
+            } else {
+                format!(
+                    "echo run >> {}; echo 'boom: report missing' >&2; exit 1",
+                    log.display()
+                )
+            };
+            let mut cfg = Config::default();
+            cfg.agent.plan_execute = true;
+            cfg.verify = vec![crate::verify::VerifyConfig {
+                id: Some("task".into()),
+                command,
+                paths: Vec::new(),
+                timeout_secs: Some(10),
+            }];
+            let mut registry = default_registry();
+            registry.register(Arc::new(RecordingTask {
+                prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            }));
+            let mut session = Session::new(cfg, Arc::new(registry));
+            session.ctx = ToolCtx::new(dir.path().to_path_buf());
+            let llm = PlanThenTextLlm {
+                plan: "1. Write the scanner\n2. Add report\n".into(),
+                calls: Arc::new(std::sync::Mutex::new(0)),
+            };
+            let gate = PermissionGate::new(true);
+            session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+
+            let note = session
+                .history()
+                .iter()
+                .find_map(|m| match m {
+                    Message::User { content } if content.contains("plan→execute") => {
+                        Some(content.clone())
+                    }
+                    _ => None,
+                })
+                .expect("a plan note");
+            let runs = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count();
+            // 親に「読んで走らせて確かめろ」とは頼まない。
+            assert!(!note.contains("run it"), "{note}");
+            if passing {
+                assert!(note.contains("the harness verified it"), "{note}");
+                assert!(note.contains("do not re-check"), "{note}");
+                assert_eq!(runs, 1, "親が何も変えなければターン末に走り直さない");
+            } else {
+                assert!(note.contains("verification and it failed"), "{note}");
+                assert!(note.contains("boom: report missing"), "{note}");
+                // 手順のあとの 1 回 + ターン末の検証 (差し戻し max_repairs = 2 回ぶん走り直す)。
+                assert_eq!(runs, 4, "落ちたときはターン末にも走る");
+            }
+        }
     }
 
     /// 計画が読めない / 手順が 1 つなら分解しない (普通のターンと同じ)。

@@ -599,17 +599,17 @@ impl Session {
         ))
     }
 
-    /// 計画だけを別のモデルに投げる (#65 C1)。手順の実行は作業しているモデルのまま。
-    pub fn set_planner(&mut self, planner: (Arc<dyn LlmClient>, String)) {
-        self.planner = Some(planner);
-    }
-
     pub fn set_ledger(&mut self, ledger: Arc<crate::llm::metered::Ledger>) {
         self.ledger = Some(ledger);
     }
 
     pub fn set_hook_env(&mut self, env: HookEnv) {
         self.hook_env = env;
+    }
+
+    /// 計画だけを別のモデルに投げる (#65 C1)。手順の実行は作業しているモデルのまま。
+    pub fn set_planner(&mut self, planner: (Arc<dyn LlmClient>, String)) {
+        self.planner = Some(planner);
     }
 
     /// 次のユーザ入力と一緒にモデルへ渡す文脈を預ける (SessionStart hook の `additionalContext` など)。
@@ -3451,38 +3451,6 @@ mod tests {
         assert!(notes[0].contains("do not redo it"), "{}", notes[0]);
     }
 
-    /// 手順が失敗したら、その上に次を積まずに親へ返す。
-    #[tokio::test]
-    async fn a_failed_step_stops_the_plan_and_hands_it_back_to_the_parent() {
-        let task = RecordingTask {
-            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
-            fail_at: Some(1),
-        };
-        let prompts = Arc::clone(&task.prompts);
-        let mut session = plan_session(task);
-        let llm = PlanThenTextLlm {
-            plan: "1. Write the scanner\n2. Add report\n3. Check it runs\n".into(),
-            calls: Arc::new(std::sync::Mutex::new(0)),
-        };
-        let gate = PermissionGate::new(true);
-        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
-
-        assert_eq!(prompts.lock().unwrap().len(), 1, "stops at the failed step");
-        let note = session
-            .history()
-            .iter()
-            .find_map(|m| match m {
-                Message::User { content } if is_harness_note(content) => Some(content.clone()),
-                _ => None,
-            })
-            .expect("a note is left even when the plan broke");
-        assert!(
-            note.contains("1 of 3 steps") && note.contains("[failed]"),
-            "{note}"
-        );
-        assert!(note.contains("did not finish"), "{note}");
-    }
-
     /// 受け取ったモデル名を覚えておき、1 回目だけ計画を返す偽の LLM。
     struct ModelRecordingLlm {
         inner: PlanThenTextLlm,
@@ -3557,6 +3525,38 @@ mod tests {
             main_models.iter().all(|m| m != "big-planner"),
             "{main_models:?}"
         );
+    }
+
+    /// 手順が失敗したら、その上に次を積まずに親へ返す。
+    #[tokio::test]
+    async fn a_failed_step_stops_the_plan_and_hands_it_back_to_the_parent() {
+        let task = RecordingTask {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at: Some(1),
+        };
+        let prompts = Arc::clone(&task.prompts);
+        let mut session = plan_session(task);
+        let llm = PlanThenTextLlm {
+            plan: "1. Write the scanner\n2. Add report\n3. Check it runs\n".into(),
+            calls: Arc::new(std::sync::Mutex::new(0)),
+        };
+        let gate = PermissionGate::new(true);
+        session.run_turn(PLAN_REQUEST, &llm, &gate).await.unwrap();
+
+        assert_eq!(prompts.lock().unwrap().len(), 1, "stops at the failed step");
+        let note = session
+            .history()
+            .iter()
+            .find_map(|m| match m {
+                Message::User { content } if is_harness_note(content) => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a note is left even when the plan broke");
+        assert!(
+            note.contains("1 of 3 steps") && note.contains("[failed]"),
+            "{note}"
+        );
+        assert!(note.contains("did not finish"), "{note}");
     }
 
     /// 計画が読めない / 手順が 1 つなら分解しない (普通のターンと同じ)。

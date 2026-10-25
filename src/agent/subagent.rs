@@ -157,6 +157,31 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// `dir` の下の symlink を消して、消したパスを返す (symlink はたどらない)。
+fn remove_symlinks(dir: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_symlink() => {
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed.push(path);
+                    }
+                }
+                Ok(t) if t.is_dir() => stack.push(path),
+                _ => {}
+            }
+        }
+    }
+    removed.sort();
+    removed
+}
+
 /// `cwd` を含む git リポジトリのトップ。リポジトリでなければ (git が無くても) None。
 pub fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
     git(cwd, &["rev-parse", "--show-toplevel"])
@@ -258,14 +283,48 @@ impl Worktree {
     }
 
     /// 変更が無ければ worktree を消して None。あれば残して、その説明を返す。
+    /// 子が終わったあと、外 (サンドボックスの外) で git を走らせる前の後始末と確認 (#161 のレビュー)。
+    ///
+    /// - worktree の git ディレクトリに置かれた symlink を消す。`logs/HEAD` を本体の hook への
+    ///   symlink にされると、外の git が reflog の 1 行をその hook に追記してしまう
+    /// - 埋め込まれたリポジトリ (gitlink) を探す。git はその中を覗くときに中の `.git/config` を読み、
+    ///   `core.fsmonitor` を実行する。ここでは覗かないが、利用者には知らせる
+    ///
+    /// 返すのは (消した symlink, gitlink のパス)。
+    fn sanitize(&self) -> (Vec<PathBuf>, Vec<String>) {
+        let removed = self
+            .linked_git()
+            .map(|l| remove_symlinks(&l.git_dir))
+            .unwrap_or_default();
+        let gitlinks = git(
+            &self.root,
+            &["-c", "core.fsmonitor=false", "ls-files", "-s"],
+        )
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("160000 "))
+        .filter_map(|l| l.split_once('\t').map(|(_, path)| path.to_string()))
+        .collect();
+        (removed, gitlinks)
+    }
+
     fn finish(&self) -> Result<Option<KeptWorktree>, String> {
+        let (removed, gitlinks) = self.sanitize();
+        // 子が書いた設定や埋め込みリポジトリの設定で、外の git にコマンドを走らせない。
         let status = git(
             &self.root,
-            &["status", "--porcelain", "--untracked-files=all"],
+            &[
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
         )?;
         let head = git(&self.root, &["rev-parse", "HEAD"])?;
         let changed = status.lines().filter(|l| !l.trim().is_empty()).count();
-        if changed == 0 && head == self.base {
+        if changed == 0 && head == self.base && gitlinks.is_empty() && removed.is_empty() {
             let root = self.root.to_string_lossy().into_owned();
             git(&self.git_root, &["worktree", "remove", "--force", &root])?;
             return Ok(None);
@@ -281,7 +340,7 @@ impl Worktree {
         if changed > 0 {
             what.push(format!("{changed} uncommitted change(s)"));
         }
-        let note = format!(
+        let mut note = format!(
             "[worktree] The sub-agent worked in an isolated git worktree at {} ({}). The main \
              checkout is untouched. Review it there (e.g. `git -C {} diff`), merge or cherry-pick \
              what you want, then remove it with `git worktree remove {}`.",
@@ -290,6 +349,23 @@ impl Worktree {
             self.root.display(),
             self.root.display()
         );
+        if !gitlinks.is_empty() {
+            note.push_str(&format!(
+                " WARNING: it contains embedded git repositories ({}). git reads their own \
+                 .git/config (e.g. core.fsmonitor runs a command) when it looks inside them, so \
+                 inspect them before running git in this worktree, or pass \
+                 `-c core.fsmonitor=false --ignore-submodules=all`.",
+                gitlinks.join(", ")
+            ));
+        }
+        if !removed.is_empty() {
+            let list: Vec<String> = removed.iter().map(|p| p.display().to_string()).collect();
+            note.push_str(&format!(
+                " WARNING: removed symlinks the sub-agent planted in the worktree's git directory \
+                 ({}); git outside the sandbox would have written through them.",
+                list.join(", ")
+            ));
+        }
         Ok(Some(KeptWorktree {
             path: self.root.clone(),
             note,
@@ -1854,6 +1930,73 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(log.path()).unwrap()).unwrap();
         assert_eq!(payload["worktree"], wt.display().to_string());
         assert_eq!(payload["agent_type"], "writer");
+    }
+
+    /// 子が残したものに仕掛けがあっても、`finish` の git はサンドボックスの外でコマンドを走らせない
+    /// (#161 のレビュー)。埋め込みリポジトリの `core.fsmonitor` は走らず、git ディレクトリの symlink は
+    /// 消され、どちらも結果の注記で知らせる。
+    #[test]
+    fn finishing_a_worktree_does_not_run_what_the_child_planted() {
+        let repo = git_repo();
+        let wt = Worktree::create(repo.path(), repo.path(), "t").unwrap();
+        let marker = repo.path().join("PWNED");
+        let git_in = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // 埋め込みリポジトリ + gitlink。中の config は fsmonitor でマーカーを作る。
+        let nested = wt.root.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        git_in(&nested, &["init", "-q"]);
+        git_in(&nested, &["commit", "-q", "--allow-empty", "-m", "s"]);
+        git_in(
+            &nested,
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("touch '{}'; false", marker.display()),
+            ],
+        );
+        git_in(&wt.root, &["add", "sub"]);
+        git_in(&wt.root, &["commit", "-q", "-m", "gitlink"]);
+        // 陽性対照: 素の `git status` ならマーカーができる (= 仕掛けが本物)。
+        std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt.root)
+            .output()
+            .unwrap();
+        assert!(marker.exists(), "the planted fsmonitor must be real");
+        std::fs::remove_file(&marker).unwrap();
+        // reflog を本体の hook への symlink にする。
+        let git_dir = wt.linked_git().expect("linked worktree").git_dir;
+        let hook = repo.path().join(".git/hooks/post-commit");
+        std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+        std::fs::remove_file(git_dir.join("logs/HEAD")).unwrap();
+        std::os::unix::fs::symlink(&hook, git_dir.join("logs/HEAD")).unwrap();
+
+        let kept = wt.finish().unwrap().expect("kept");
+        assert!(
+            !marker.exists(),
+            "finish must not run the nested repo's fsmonitor"
+        );
+        assert!(
+            kept.note.contains("embedded git repositories (sub)"),
+            "{}",
+            kept.note
+        );
+        assert!(kept.note.contains("removed symlinks"), "{}", kept.note);
+        assert!(std::fs::symlink_metadata(git_dir.join("logs/HEAD")).is_err());
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), "#!/bin/sh\n");
     }
 
     /// サンドボックス (workspace-write) の中の worktree の子が `git commit` でき、親に「commits a..b」

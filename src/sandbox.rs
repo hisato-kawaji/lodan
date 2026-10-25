@@ -422,8 +422,15 @@ fn prepare_workspace(policy: &SandboxPolicy) {
         let _ = std::fs::create_dir_all(dot_git.join("modules"));
     }
     // `git init` が作るディレクトリ。消されていても作り直して、ro-bind で守れるようにする。
+    // `config.worktree` も空で先に置く: 無いままだと bwrap は作成を止められず、本体で
+    // `extensions.worktreeConfig` が立っていると (`git sparse-checkout init` が立てる) 子が書いた
+    // `core.fsmonitor` が外の git で走る (#161 のレビュー)。空のファイルは git の挙動を変えない。
     if let Some(linked) = &policy.linked_git {
         let _ = std::fs::create_dir_all(linked.common_dir.join("objects").join("info"));
+        let config = linked.git_dir.join("config.worktree");
+        if std::fs::symlink_metadata(&config).is_err() {
+            let _ = std::fs::write(&config, "");
+        }
     }
 }
 
@@ -1077,6 +1084,8 @@ mod tests {
         assert!(run(linked(), commit), "the worktree child can commit");
         for path in [
             common.join("worktrees/t-1/commondir"),
+            // 無かったファイルも、実行前に空で置いて守る (#161 のレビュー)。
+            common.join("worktrees/t-1/config.worktree"),
             common.join("hooks/post-commit"),
             common.join("config"),
             common.join("refs/heads/evil"),

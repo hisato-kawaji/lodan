@@ -282,7 +282,6 @@ impl Worktree {
         )
     }
 
-    /// 変更が無ければ worktree を消して None。あれば残して、その説明を返す。
     /// 子が終わったあと、外 (サンドボックスの外) で git を走らせる前の後始末と確認 (#161 のレビュー)。
     ///
     /// - worktree の git ディレクトリに置かれた symlink を消す。`logs/HEAD` を本体の hook への
@@ -308,6 +307,7 @@ impl Worktree {
         (removed, gitlinks)
     }
 
+    /// 変更が無ければ worktree を消して None。あれば残して、その説明を返す。
     fn finish(&self) -> Result<Option<KeptWorktree>, String> {
         let (removed, gitlinks) = self.sanitize();
         // 子が書いた設定や埋め込みリポジトリの設定で、外の git にコマンドを走らせない。

@@ -547,6 +547,7 @@ network = false            # 既定 true。false でサンドボックス内か�
 
 - **スコープ**（#83）: ユーザー全体の `<config_dir>/mcp.json`（`config.toml` と同じ場所。macOS なら `~/Library/Application Support/lodan/mcp.json`）と、プロジェクトの `$CWD/.mcp.json`（**信頼済みのときだけ**読む）を合成する。同名はプロジェクトが勝つ
 - **`lodan mcp list | add | remove`**: 設定ファイルの読み書きだけで、サーバには繋がない。`lodan mcp add fs --command npx -- -y @modelcontextprotocol/server-filesystem /path`、`lodan mcp add web --url https://…/mcp`。既定はプロジェクトの `.mcp.json`、`--user` でユーザー全体。`--trust-annotations` で下の `trustAnnotations` を付ける。`list` はヘッダの値（トークン）を出さない
+- **`lodan mcp login | logout <name>`**（HTTP のサーバの OAuth 2.1、#164）: `login` はサーバの `401` の `WWW-Authenticate`（無ければ `/.well-known/oauth-protected-resource`）から認可サーバを探し、動的クライアント登録をして、PKCE（S256）+ `state` + `resource` 付きの認可 URL を表示する（ブラウザも開けば開く）。`127.0.0.1` の空きポートで戻りを待ち、トークンを `<設定ディレクトリ>/mcp-tokens.json` に `0600` で保存する。**トークンは発行先のサーバ URL ごとに持ち、その URL のサーバにだけ送る**。以後の接続では `Authorization: Bearer` を付け、期限が近い・`401` が返ったときは refresh_token で 1 回だけ更新して送り直す（だめなら「`lodan mcp login <name>` を」と出す）。`headers` に `Authorization` を明示したサーバではトークンを使わない。認可サーバのエンドポイントは https のみ（loopback だけ例外）。PKCE S256 を広告しない認可サーバ・動的クライアント登録の無い認可サーバには対応しない。`logout` は保存したトークンを消す
 - **サーバ別の設定**（`.mcp.json` の各サーバに書く）:
   - `"trustAnnotations": true` — ツールの `annotations.readOnlyHint: true` を信じて、そのツールを**非破壊**（承認ゲートを通さず、plan モードでも使える）にする。ヒントはサーバの自己申告なので既定 false。信頼するサーバだけ
   - `"enabledTools": ["read_file"]` / `"disabledTools": ["delete"]` — 取り込むツールを絞る（`disabledTools` が優先）。使わないツールの定義でコンテキストを食わない

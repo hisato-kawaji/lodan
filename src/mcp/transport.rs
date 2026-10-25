@@ -458,10 +458,11 @@ impl HttpInner {
             }
             match req.send().await {
                 Ok(mut resp) if resp.status().is_success() && is_event_stream(&resp) => {
-                    failures = 0;
                     let mut sse = SseParser::default();
+                    let mut delivered = false;
                     while let Ok(Some(chunk)) = resp.chunk().await {
                         for event in sse.feed(&chunk) {
+                            delivered = true;
                             if let Some(frame) = classify(&event) {
                                 // GET のストリームに応答は来ない (来ても待っている人がいない)。
                                 let _ = self.handle(frame);
@@ -471,6 +472,8 @@ impl HttpInner {
                             last_event_id = sse.last_event_id.clone();
                         }
                     }
+                    // 何も届かずに閉じたストリームは失敗に数える (すぐ閉じるサーバに毎秒張り直さない)。
+                    failures = if delivered { 0 } else { failures + 1 };
                 }
                 Ok(resp) if resp.status().is_client_error() => {
                     tracing::debug!(server=%self.label, status=%resp.status(), "mcp: no server→client stream");

@@ -1,0 +1,139 @@
+# 難易度ラダー — 小型モデルが「どの粒度で壊れるか」を測る
+
+## なぜ作ったか
+
+先行の [mini-renovater ベンチ](https://github.com/hisato-kawaji/lodan/pull/60) (PR #60、未マージ) は、ローカル 9B/12B が
+**0/5** という結果で止まった。この数字には 3 つの問題がある。
+
+1. **二値なので改善が見えない** — 「サブ要件 1 個の不足」も「ステージ丸ごとの崩壊」も同じ 0 になる
+2. **指標が stdout の grep 依存** — 表示形式を変えると壊れ、ツール呼び出しの成否や所要時間は取れない
+3. **緩和策の寄与を分離できない** — 温度・整形再要求・重複抑止・ナッジをまとめて入れたので、何が効いたか言えない
+
+その結果、結論が「モデルが軽量すぎる」で止まってしまい、次に直す場所が分からない。
+ラダーはこの 3 点を潰すために、**難易度を刻み・部分点を出し・機能フラグ別に走らせる**。
+
+## 設計
+
+| 軸 | 内容 |
+|---|---|
+| **レベル** | L0 (ツール 1-2 回) → L1 (数ツールの連鎖) → L2 (要件 4-7 個を 1 ファイルで満たす) |
+| **判定** | 全てファイルシステムの状態と実際の実行で判定する。チェック項目単位で数え、`checks_passed/checks_total` を部分点として記録 |
+| **反復** | 同一条件を `REPEAT` 回 (既定 3)。先行ベンチで確認された PASS/FAIL の揺れを分散として見る |
+| **ablation** | `CONFIGS` で緩和策の組み合わせを切り替える。`base` は全て切った素の状態 |
+| **計測** | lodan の `--log-jsonl` を各実行で取り、LLM 呼び出し数・ツール呼び出し数・緩和策の発火回数・トークンを機械的に集計 |
+
+`CONFIGS` の各水準は先行ベンチの履歴に対応する。
+
+| config | フラグ | 対応 |
+|---|---|---|
+| `base` | 緩和策すべて off | v1 (温度未指定・対策なし) |
+| `temp` | `--temperature 0.2` | 温度固定だけ |
+| `mitig` | `+ --malformed-retry --dup-suppress --empty-reply-nudge` | v2 (#61)。2026-09-26 以降は空応答の促し (#111) も含むので、[baseline-2026-07](baseline-2026-07.md) の `mitig` とは条件が違う |
+| `nudge` | `+ --finish-nudge` | v4 (#63) |
+| `think-none` / `think-low` | `temp` + `--reasoning-effort none` / `low` | 推論の深さ (#78)。**`temp` (サーバ既定の effort) と比べる**。語彙はサーバ次第 (Ollama は `none` で thinking off、kimi / gpt-oss は `low`)。既定の `CONFIGS` には含めない。実測: [kimi-k3 の `low` vs 既定](kimi-k3-effort-2026-09.md)、[qwen3.5:9b の thinking off と `core`](qwen3.5-thinking-core-2026-09.md) |
+| `core` | `temp` + `--tool-profile core` | ツール定義を 7 個に絞る (#72。2026-10-04 に TodoWrite を追加、それ以前の `core` の実測は 6 個)。**`temp` と比べる** (既定の `CONFIGS` には含めない) |
+| `core-search` | `core` + `--tool-search` | 隠したツールを `ToolSearch` で読み込めるようにする (#72)。**`core` と比べる** |
+| `req` / `req-none` | `temp` / `think-none` + `--requirements` | 要件台帳 (#65 B1/B2): 依頼から要件を LLM で抜き出して system prompt に固定し、未達のまま終わろうとしたら促す。抽出で LLM 呼び出しが 1 回増え、未達があれば促しの往復も増えるので、**所要時間は `temp` / `think-none` と比べる**。thinking モデルは `req-none` を使う |
+| `split-none` | `think-none` + `--write-max-lines 80` | Write の行数上限 (#65 A2): 80 行を超える Write を拒否し、骨格 + Edit の手順を返す。L0 / L1 は 80 行に届かないので **L2 で `think-none` と比べる** |
+| `split40-none` | `think-none` + `--write-max-lines 40` | A2 を**実際に発動させる**ための水準。L2 のファイルは 51-77 行なので `split-none` (80) では一度も発動しない（[phase1-2026-10](phase1-2026-10.md) の実測）。**`think-none` と比べる** |
+| `syntax-none` | `think-none` + `--syntax-check` | 編集直後の構文チェック (#65 D2。実測: [phase2-2026-10](phase2-2026-10.md) — 18 回走って毎回 ok、構文エラーの検出は 0 件): `Write` / `Edit` の直後にそのファイルの構文を検査し、壊れていればツール結果に注記する（ブロックしない）。**`think-none` と比べる** |
+| `verify-none` | `think-none` + タスクの `VERIFY` を `[[verify]]` に | 検証ループ (#65 D1。実測: [phase2-2026-10](phase2-2026-10.md) — 9 回走って毎回成功、差し戻しは 0 回。検証コマンドの副作用という交絡も記録): ファイルを変えたターンの最後に、**プロンプトが明記している実行方法**を走らせて失敗なら差し戻す。タスク側が `VERIFY` を定義していなければ `think-none` と同じ。**`think-none` と比べる** |
+| `plan-none` | `think-none` + `--plan-execute` | Plan→Execute 分離 (#65 C1。実測: [phase3-2026-10](phase3-2026-10.md) — 9B の計画器は 9 実行中 3〜4 回しか分解せず、分解した実行では正答は基準と同じで時間 1.5〜3.7 倍。増えたぶんの主役は手順のあとに親が走る検算): 依頼を最初に手順へ割り、手順ごとに子エージェントを立てて**新しい短い文脈で**実行する。親に残るのは手順の見出しと 1 行の結果だけ。計画に LLM 1 回、手順ごとに子の往復が増えるので、**所要時間も `think-none` と比べる**。L0 / L1 は依頼が短くて分解されない (80 文字未満は計画しない) ので **L2 で比べる** |
+| `required-none` | `think-none` + `--tool-choice required` | 全応答をツール呼び出しにする (#65 A1)。最終回答は `Finish` 擬似ツール。テキストに漏れたツールコール (`malformed_retry` の対象) が構造的に起きなくなるかを見る。**`think-none` と比べる** |
+| `empty-nudge` | `temp` + `--empty-reply-nudge` | 本文もツール呼び出しも無い応答に 1 回だけ「答えを書け」と促す (#111)。**`temp` と比べる**。`base` / `temp` / `core` / `core-search` / `think-*` はこれを off にしている (lodan の既定は on) |
+
+## 使い方
+
+```bash
+cargo build --release
+
+# 一式 (10 タスク × 4 config × 3 反復)
+MODEL=llama3.1:8b PROVIDER=local bash docs/eval/ladder/ladder.sh
+
+# 速い反復: 特定タスク・単一 config・1 回だけ
+TASKS="L0 L1-fix-bug" CONFIGS=mitig REPEAT=1 MODEL=llama3.1:8b bash docs/eval/ladder/ladder.sh
+
+# 参照実装 (API 級) と比較する
+MODEL=fugu PROVIDER=sakana CONFIGS=mitig bash docs/eval/ladder/ladder.sh
+
+python3 docs/eval/ladder/summarize.py docs/eval/ladder/results.jsonl
+```
+
+主な環境変数: `MODEL` / `PROVIDER` / `LABEL` / `REPEAT` / `CONFIGS` / `TASKS` /
+`T_L0` `T_L1` `T_L2` (レベル別の実行上限秒) / `RESULTS` / `RUNS_DIR` / `LODAN`。
+
+結果は `results.jsonl` へ 1 実行 1 行で追記され、同じ `key`
+(`label/config/task/run`) の行があるものはスキップされる。長時間の実行が
+中断しても、そのまま再実行すれば続きから進む。
+
+lodan はヘッドレス (`-p "<prompt>" --output-format json`) で起動する。実行ごとの
+ディレクトリ (`RUNS_DIR/<label>/<config>/<task>/<run>/`) に、結果オブジェクトが
+`result.json`、進行の表示 (stderr) が `stdout.log`、イベント列が `run.jsonl` として残る。
+`results.jsonl` の `exit_code` は lodan の終了コード (`0` 成功 / `1` エラー /
+`3` max_iterations / `4` 予算切れ / `124` は `timeout` による打ち切り)。
+**`status=pass` なのに `exit_code=1` なら、ツールで仕事を終えたあと本文を返さずに
+ターンを閉じた実行** (#111 のパターン。`result.json` の `error` が
+"the turn ended without a final answer")。合否は checks で決めているので集計には影響しない。
+
+## タスク一覧
+
+| task | level | 測っているもの |
+|---|---|---|
+| `L0-write` | L0 | ツールコールが成立するか (最小) |
+| `L0-read-report` | L0 | Read の結果を次の呼び出しへ運べるか |
+| `L0-bash` | L0 | コマンド実行と出力の保存 |
+| `L0-grep` | L0 | 検索結果を取り違えずに書き出せるか |
+| `L1-fix-bug` | L1 | 既存コードへの最小介入・無関係箇所を壊さない |
+| `L1-add-func` | L1 | 既存を維持したまま足す (累積の最小単位) |
+| `L1-script-run` | L1 | Write → Bash の連鎖 |
+| `L2-cli-json` | L2 | 要件 7 個を 1 ファイルで満たす (mini-renovater S1 の縮小版) |
+| `L2-extend-cli` | L2 | 動いている既存 CLI へ 1 段積む (S2 以降の縮小版) |
+| `L2-http` | L2 | 実際に起動して応答するものを作る (S5 の縮小版) |
+
+## タスクの足し方
+
+`tasks/<name>.sh` を置くだけで拾われる。契約は 4 つ。
+
+```bash
+LEVEL=L1                  # L0 / L1 / L2 (実行時間上限の選択に使う)
+DESC="一行の説明"
+setup() { ... }           # 作業ディレクトリ (cwd) に fixture を用意する
+PROMPT="モデルへ渡す 1 行の指示"
+checks() {                # check <名前> <シェルコマンド>; exit 0 で合格
+  check exists 'test -f out.txt'
+}
+```
+
+**チェックを書くときの注意**: 否定条件は「対象が存在しないだけ」で通ってしまう。
+`! grep -q x out.txt` ではなく `test -f out.txt && ! grep -q x out.txt` と書く。
+部分点が水増しされると break point がぼやける。
+
+## 運用メモ
+
+先行ベンチで得た教訓はそのまま当てはまる。
+
+- ローカルモデルの cold start は lodan の `timeout_secs` を超えるため、ハーネスは
+  作業 cwd の `.lodan/config.toml` で 900s に上げ、実行前に `keep_alive` でプリウォームする
+- ollama 既定の `num_ctx` 4096 では system prompt + ツール定義が溢れる。
+  Modelfile 派生 (`FROM x` + `PARAMETER num_ctx 8192`) で固定してから測る
+- 長時間の実行は `nohup` + `caffeinate -is -w <pid>` で切り離す。中断しても
+  `results.jsonl` から再開できる
+- **実行時間上限はモデルごとに較正する**。`T_L0`/`T_L1`/`T_L2` を全モデル共通に
+  すると、遅いモデルでは能力ではなく上限の短さで timeout が量産される。
+  疑わしいときは `metrics.llm_calls` を見る — **`status=timeout` かつ
+  `llm_calls=0` は「最初の応答すら返っていない」**ので、能力の判定材料にはならない
+- 固定オーバーヘッドは 1 呼び出しあたり **1.8k-2.4k トークン**ある (system prompt +
+  14 ツール定義)。L0 の依頼本文は 20 トークン程度なので、短いタスクほど
+  prefill が支配的になる。遅いモデルの上限はこれを見込んで決める
+- **秒数は単調時計を見る**。`results.jsonl` の `secs` は壁時計なので、実行中に
+  マシンがスリープすると実作業と無関係に膨らむ (実測で 372s の作業が 35,793s と
+  記録された)。`summarize.py` は `metrics.active_ms` (lodan の `Instant` 由来) を
+  優先し、乖離した実行を末尾に列挙する
+- **ハーネスを途中で kill すると同じ key の行が二重に出ることがある**
+  (生き残った子シェルと再開後の実行が両方書く)。`summarize.py` は後勝ちで
+  畳むが、行を直接数えるときは注意する
+
+## workspace trust
+
+`ladder.sh` は作業ディレクトリに `.lodan/config.toml` (タイムアウト設定) を書いてから lodan を起動する。
+lodan は未信頼のディレクトリのプロジェクト設定を読まないので、ハーネスは `--trust` を付けて起動している。

@@ -1,54 +1,422 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use crate::permission_rules::{RuleSet, Verdict};
 
 #[derive(Debug, Default)]
 pub struct SessionPolicy {
     pub always_tools: HashSet<String>,
     pub always_commands: HashSet<String>,
+    /// このセッション中に `(p)` で保存した allow ルール。次回以降は設定ファイルから読まれる。
+    pub saved_rules: Vec<crate::permission_rules::Rule>,
 }
 
 pub struct PermissionGate {
     auto_approve: bool,
+    /// 尋ねる相手がいない (ヘッドレス実行) か、`dont-ask` モード。承認が要る呼び出しは尋ねずに拒否する。
+    non_interactive: bool,
+    /// `dont-ask` モード。利用者が「承認が要るものは通すな」と書いたもので、hook の allow でも覆らない
+    /// (単に尋ねる相手がいない `-p` とは区別する)。
+    dont_ask: bool,
+    /// `accept-edits` モード: ファイル編集ツールは尋ねずに通す。
+    accept_edits: bool,
+    rules: RuleSet,
+    /// 相対パターンのルールを解決する基準。
+    cwd: PathBuf,
     policy: Mutex<SessionPolicy>,
 }
+
+/// [`PermissionGate::assess`] の結果。
+#[derive(Debug, Clone)]
+pub struct Assessment {
+    /// ask ルールに当たった (hook の allow でも尋ねる)。
+    asked_by_rule: bool,
+    /// 尋ねずに決まるならその結論。
+    quiet: Option<Decision>,
+}
+
+/// ゲートの結論。尋ねる必要があれば `decide` の中で尋ね終えている。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    /// モデルへ返す理由つき。
+    Deny(String),
+}
+
+/// 検索範囲が広すぎて deny ルールに当たるか確かめきれなかったときの文面。
+/// 「やり直すな」ではなく「範囲を狭めてやり直せ」— 狭めれば通り得る。
+pub fn unverifiable_message(rule: &str) -> String {
+    format!(
+        "this search covers too much to verify against permission rule `{rule}`. \
+         Retry with `path` set to a smaller directory."
+    )
+}
+
+/// `accept-edits` モードで尋ねずに通すツール。
+const EDIT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+const DENIED_BY_USER: &str = "user denied execution";
+const DENIED_NON_INTERACTIVE: &str = "denied: this is a non-interactive run and nobody can approve \
+    this action. Do not retry it. Finish with the tools that are allowed, or report what is blocked \
+    (the operator can re-run with --yes to allow destructive tools).";
 
 impl PermissionGate {
     pub fn new(auto_approve: bool) -> Self {
         Self {
             auto_approve,
+            non_interactive: false,
+            dont_ask: false,
+            accept_edits: false,
+            rules: RuleSet::default(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             policy: Mutex::new(SessionPolicy::default()),
         }
     }
 
+    /// 設定からゲートを組む。`interactive` は尋ねる相手がいるか (REPL = true、`-p` = false)。
+    /// ルールが 1 つでも解釈できなければエラー — 権限の設定を黙って読み飛ばさない。
+    pub fn from_config(
+        cfg: &crate::config::Config,
+        cwd: &Path,
+        interactive: bool,
+    ) -> anyhow::Result<Self> {
+        use crate::config::PermissionMode;
+        let p = &cfg.permissions;
+        let mode = p.mode;
+        Ok(Self {
+            auto_approve: cfg.agent.auto_approve || mode == PermissionMode::Bypass,
+            non_interactive: !interactive || mode == PermissionMode::DontAsk,
+            dont_ask: mode == PermissionMode::DontAsk,
+            accept_edits: mode == PermissionMode::AcceptEdits,
+            rules: RuleSet::parse(&p.allow, &p.deny, &p.ask)?,
+            cwd: cwd.to_path_buf(),
+            policy: Mutex::new(SessionPolicy::default()),
+        })
+    }
+
+    /// プロンプトを出さないゲート。stdin はプロンプト本文に使われ得るので、承認待ちで
+    /// 読みに行くとハングするか、入力の続きを承認の答えと取り違える。
+    pub fn non_interactive(auto_approve: bool) -> Self {
+        Self {
+            non_interactive: true,
+            dont_ask: false,
+            ..Self::new(auto_approve)
+        }
+    }
+
+    /// 破壊的な呼び出しとして承認を求める (ExitPlanMode など、ツール以外の承認用)。
     pub fn allow(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        self.decide(tool_name, args, true) == Decision::Allow
+    }
+
+    /// 呼び出しを通すか決める。必要なら尋ねる。
+    pub fn decide(&self, tool_name: &str, args: &serde_json::Value, destructive: bool) -> Decision {
+        if let Some(decision) = self.decide_quietly(tool_name, args, destructive) {
+            return decision;
+        }
+        self.ask_user(tool_name, args, false)
+    }
+
+    /// PreToolUse hook の希望を踏まえて決める。
+    ///
+    /// - `Ask`: 他の条件で通る呼び出しでも尋ねる (`--yes` でも)。deny は deny のまま。ここで出す
+    ///   プロンプトは yes / no だけ — 「常に許可」を選ばせても、次回また hook が尋ねさせるので効かない。
+    /// - `Allow`: 既定なら尋ねるところを省く。**deny ルール・ask ルール・`dont-ask` モードには
+    ///   勝てない** — hook はプロジェクトの設定からも足せるので、利用者が書いた「禁止」「必ず尋ねる」
+    ///   「承認が要るものは通すな」を覆させない。尋ねる相手がいないだけの `-p` では、hook が承認役になる。
+    pub fn decide_hinted(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> Decision {
+        let assessed = self.assess(tool_name, args, destructive);
+        self.decide_assessed(assessed, tool_name, args, hint)
+    }
+
+    /// ルールとモードだけで分かるところまでを調べる。ルールの評価はファイルツリーを歩くことが
+    /// あるので、1 回の呼び出しにつき 1 度だけ行い、結果を [`Self::needs_approval`] と
+    /// [`Self::decide_assessed`] で使い回す。
+    pub fn assess(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+    ) -> Assessment {
+        self.assess_in(tool_name, args, destructive, &self.cwd)
+    }
+
+    /// [`Self::assess`] を、別の作業ディレクトリを基準に。worktree の中で走る子エージェントの
+    /// 呼び出しは、その cwd で相対パターンを照合しないと deny をすり抜ける (#137 のレビュー)。
+    pub fn assess_in(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        cwd: &Path,
+    ) -> Assessment {
+        let verdict = self.rules.evaluate(tool_name, args, cwd);
+        Assessment {
+            asked_by_rule: verdict == Some(Verdict::Ask),
+            quiet: self.quiet_decision(verdict, tool_name, args, destructive, cwd),
+        }
+    }
+
+    /// hook の希望がこの hint だったとして、誰かの承認が無いと通らないか (尋ねる相手がいるか
+    /// どうかは問わない)。PermissionRequest hook を発火するかどうかの判断に使う。
+    pub fn needs_approval(
+        &self,
+        assessed: &Assessment,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> bool {
+        use crate::hooks::PermissionHint;
+        match &assessed.quiet {
+            Some(Decision::Deny(_)) => false,
+            Some(Decision::Allow) => hint == Some(PermissionHint::Ask),
+            None => hint != Some(PermissionHint::Allow) || assessed.asked_by_rule || self.dont_ask,
+        }
+    }
+
+    /// [`Self::assess`] の結果と hook の希望から結論を出す。必要ならここで尋ねる。
+    pub fn decide_assessed(
+        &self,
+        assessed: Assessment,
+        tool_name: &str,
+        args: &serde_json::Value,
+        hint: Option<crate::hooks::PermissionHint>,
+    ) -> Decision {
+        use crate::hooks::PermissionHint;
+        let Assessment {
+            asked_by_rule,
+            quiet,
+        } = assessed;
+        match (hint, quiet) {
+            (_, Some(Decision::Deny(why))) => Decision::Deny(why),
+            (Some(PermissionHint::Allow), None) if !asked_by_rule && !self.dont_ask => {
+                Decision::Allow
+            }
+            (Some(PermissionHint::Ask), Some(Decision::Allow)) => {
+                self.ask_user(tool_name, args, true)
+            }
+            (_, Some(Decision::Allow)) => Decision::Allow,
+            // もともと尋ねる呼び出しでも、hook が確認を求めているなら yes / no だけ
+            // (「常に許可」を保存しても、次回また hook が尋ねさせる)。
+            (hint, None) => self.ask_user(tool_name, args, hint == Some(PermissionHint::Ask)),
+        }
+    }
+
+    /// サブエージェントの中からの呼び出し (#77)。ルール・モード・hook の希望の扱いは親と同じだが、
+    /// 尋ねるときは **yes / no だけ** — 子の要求で「常に許可」を保存すると、親の後続の呼び出しまで
+    /// 無確認で通ってしまう。プロンプトには子の名前を出し、親自身の要求と区別できるようにする。
+    pub fn decide_for_subagent(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        agent: &str,
+        hint: Option<crate::hooks::PermissionHint>,
+        cwd: &Path,
+    ) -> Decision {
+        use crate::hooks::PermissionHint;
+        let Assessment {
+            asked_by_rule,
+            quiet,
+        } = self.assess_in(tool_name, args, destructive, cwd);
+        match (hint, quiet) {
+            (_, Some(Decision::Deny(why))) => Decision::Deny(why),
+            (Some(PermissionHint::Allow), None) if !asked_by_rule && !self.dont_ask => {
+                Decision::Allow
+            }
+            (Some(PermissionHint::Ask), Some(Decision::Allow)) | (_, None) => {
+                self.ask_user_as(tool_name, args, agent)
+            }
+            (_, Some(Decision::Allow)) => Decision::Allow,
+        }
+    }
+
+    fn ask_user_as(&self, tool_name: &str, args: &serde_json::Value, agent: &str) -> Decision {
+        if self.non_interactive {
+            return Decision::Deny(DENIED_NON_INTERACTIVE.to_string());
+        }
+        use std::io::IsTerminal;
+        let stdin = io::stdin();
+        let enter_means_yes = stdin.is_terminal();
+        let label = format!("sub-agent {}", crate::term::sanitize(agent));
+        if self.prompt_full(
+            tool_name,
+            args,
+            &mut stdin.lock(),
+            &mut io::stdout().lock(),
+            enter_means_yes,
+            true,
+            Some(&label),
+        ) {
+            Decision::Allow
+        } else {
+            Decision::Deny(DENIED_BY_USER.to_string())
+        }
+    }
+
+    /// 承認プロンプトを実際に出せるか (REPL で、`dont-ask` でもない)。
+    pub fn can_prompt(&self) -> bool {
+        !self.non_interactive
+    }
+
+    /// 尋ねて決める。尋ねる相手がいなければ拒否。
+    fn ask_user(&self, tool_name: &str, args: &serde_json::Value, once_only: bool) -> Decision {
+        if self.non_interactive {
+            return Decision::Deny(DENIED_NON_INTERACTIVE.to_string());
+        }
+        if self.prompt(tool_name, args, once_only) {
+            Decision::Allow
+        } else {
+            Decision::Deny(DENIED_BY_USER.to_string())
+        }
+    }
+
+    /// 尋ねずに決まるならその結論、尋ねる必要があるなら `None`。
+    /// 並列の先行実行はこれが `Allow` の呼び出しだけを対象にする (尋ねながら並列にはできないし、
+    /// deny ルールに当たる Read を先に読んでしまってもいけない)。
+    ///
+    /// 順序: **deny ルール** → bypass → ask ルール → allow ルール → セッション中の「常に許可」→
+    /// 既定 (read-only は通す / accept-edits の編集は通す / それ以外は尋ねる)。
+    pub fn decide_quietly(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+    ) -> Option<Decision> {
+        self.decide_quietly_in(tool_name, args, destructive, &self.cwd)
+    }
+
+    /// [`Self::decide_quietly`] を、別の作業ディレクトリを基準に (worktree の中の子エージェント)。
+    pub fn decide_quietly_in(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        cwd: &Path,
+    ) -> Option<Decision> {
+        let verdict = self.rules.evaluate(tool_name, args, cwd);
+        self.quiet_decision(verdict, tool_name, args, destructive, cwd)
+    }
+
+    /// `decide_quietly` の本体。ルールの評価結果を受け取る (呼び出し側が使い回せるように)。
+    /// `cwd` は保存済みルールの照合基準。
+    fn quiet_decision(
+        &self,
+        verdict: Option<Verdict>,
+        tool_name: &str,
+        args: &serde_json::Value,
+        destructive: bool,
+        cwd: &Path,
+    ) -> Option<Decision> {
+        // deny は `--yes` にも勝つ。「全部通す」と「これだけは絶対に通さない」を両立させるため。
+        if let Some(Verdict::Deny(rule)) = &verdict {
+            return Some(Decision::Deny(format!(
+                "denied by permission rule `{rule}`. Do not retry this call or work around it; \
+                 use another approach or report that it is blocked."
+            )));
+        }
+        if let Some(Verdict::Unverifiable(rule)) = &verdict {
+            return Some(Decision::Deny(unverifiable_message(rule)));
+        }
         if self.auto_approve {
-            return true;
+            return Some(Decision::Allow);
+        }
+        match verdict {
+            Some(Verdict::Ask) => return None,
+            Some(Verdict::Allow) => return Some(Decision::Allow),
+            Some(Verdict::Deny(_) | Verdict::Unverifiable(_)) | None => {}
         }
         if let Ok(p) = self.policy.lock() {
-            if p.always_tools.contains(tool_name) {
-                return true;
+            if p.always_tools.contains(tool_name)
+                || p.saved_rules.iter().any(|r| r.allows(tool_name, args, cwd))
+            {
+                return Some(Decision::Allow);
             }
             if tool_name == "Bash"
                 && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
                 && p.always_commands.contains(cmd)
             {
-                return true;
+                return Some(Decision::Allow);
             }
         }
-        self.prompt(tool_name, args)
+        if !destructive || (self.accept_edits && EDIT_TOOLS.contains(&tool_name)) {
+            return Some(Decision::Allow);
+        }
+        None
     }
 
-    fn prompt(&self, tool_name: &str, args: &serde_json::Value) -> bool {
-        let summary = summarize(tool_name, args);
+    fn prompt(&self, tool_name: &str, args: &serde_json::Value, once_only: bool) -> bool {
+        use std::io::IsTerminal;
         let stdin = io::stdin();
-        let mut stdout = io::stdout().lock();
+        // Enter だけで yes になるのは、人が端末で答えているときだけ。パイプされた入力の
+        // 空行は答えではない (`printf 'do it\n\n' | lodan` が無承認で通ってしまう)。
+        let enter_means_yes = stdin.is_terminal();
+        self.prompt_full(
+            tool_name,
+            args,
+            &mut stdin.lock(),
+            &mut io::stdout().lock(),
+            enter_means_yes,
+            once_only,
+            None,
+        )
+    }
+
+    /// 通常の承認プロンプト。入出力を差し替えられるようにしてある (テスト用)。
+    #[cfg(test)]
+    fn prompt_with(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        input: &mut dyn BufRead,
+        stdout: &mut dyn Write,
+        enter_means_yes: bool,
+    ) -> bool {
+        self.prompt_full(tool_name, args, input, stdout, enter_means_yes, false, None)
+    }
+
+    /// `prompt` の本体。`once_only` は hook が確認を求めた場合 (とサブエージェントからの要求):
+    /// 選べるのは yes / no だけ。`origin` は誰の要求かの注記 (`sub-agent builder`)。
+    #[allow(clippy::too_many_arguments)]
+    fn prompt_full(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        input: &mut dyn BufRead,
+        stdout: &mut dyn Write,
+        enter_means_yes: bool,
+        once_only: bool,
+        origin: Option<&str>,
+    ) -> bool {
+        let summary = summarize(tool_name, args);
+        // MCP ツールの名前はサーバが決める。プロンプトに出すのは無害化した形。
+        let shown_name = visible(tool_name);
+        let shown_name = match origin {
+            Some(o) => format!("{shown_name} ({o})"),
+            None => shown_name,
+        };
+        let tool_label = shown_name.as_str();
+        // 保存しても意図どおりに効かない呼び出しには (p) を出さない。
+        // ask ルールに当たる呼び出しは、allow を保存しても毎回尋ねられる (ask が優先)。
+        // 「保存した」と言って効かないものは出さない。
+        let asked_by_rule = self.rules.evaluate(tool_name, args, &self.cwd) == Some(Verdict::Ask);
+        // 信頼していないディレクトリでは `.lodan/config.local.toml` を読まないので、保存しても
+        // 次回から効かない。効かない選択肢は出さない。
+        let persistable = (!asked_by_rule && crate::trust::project_trusted())
+            .then(|| crate::permission_rules::persistable_allow_rule(tool_name, args, &self.cwd))
+            .flatten();
         loop {
             let _ = writeln!(
                 stdout,
                 "{} Allow {}: {summary}",
                 crate::term::yellow("[lodan]"),
-                crate::term::bold(tool_name),
+                crate::term::bold(tool_label),
             );
             if let Some(p) = preview(tool_name, args) {
                 let _ = writeln!(stdout, "{p}");
@@ -56,27 +424,70 @@ impl PermissionGate {
             let _ = writeln!(
                 stdout,
                 "{}",
-                crate::term::dim(&format!(
-                    "  (y) yes once  (n) no  (a) always allow {tool_name}  (e) always allow this exact"
-                ))
+                crate::term::dim(&match &persistable {
+                    _ if once_only && origin.is_some() =>
+                        "  asked by a sub-agent:  (y) yes once  (n) no".to_string(),
+                    _ if once_only =>
+                        "  a hook asked for confirmation:  (y) yes once  (n) no".to_string(),
+                    Some(rule) => format!(
+                        "  (y) yes once  (n) no  (a) always allow {tool_label}  (e) always allow this exact  \
+                         (p) always allow `{rule}` in this project"
+                    ),
+                    None => format!(
+                        "  (y) yes once  (n) no  (a) always allow {tool_label}  (e) always allow this exact"
+                    ),
+                })
             );
             let _ = write!(stdout, "{} ", crate::term::yellow(">"));
             let _ = stdout.flush();
 
             let mut line = String::new();
-            if stdin.lock().read_line(&mut line).is_err() {
+            if nobody_answered(&input.read_line(&mut line)) {
+                let _ = writeln!(stdout, "(no input — denied)");
                 return false;
             }
             match line.trim() {
+                "" if !enter_means_yes => continue,
                 "y" | "Y" | "" => return true,
                 "n" | "N" => return false,
-                "a" | "A" => {
+                "a" | "A" if !once_only => {
                     if let Ok(mut p) = self.policy.lock() {
                         p.always_tools.insert(tool_name.to_string());
                     }
                     return true;
                 }
-                "e" | "E" => {
+                "p" | "P" if persistable.is_some() && !once_only => {
+                    let rule = persistable.as_deref().unwrap_or_default();
+                    match crate::config::append_local_allow_rule(&self.cwd, rule) {
+                        Ok(path) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                crate::term::dim(&format!(
+                                    "  saved `{rule}` to {} (keep this file out of version control)",
+                                    path.display()
+                                ))
+                            );
+                        }
+                        // 保存できなくても今回の承認は有効。次回また尋ねることになるだけ。
+                        Err(e) => {
+                            let _ = writeln!(
+                                stdout,
+                                "  could not save the rule: {}",
+                                visible(&format!("{e:#}"))
+                            );
+                        }
+                    }
+                    // このセッションでも以後は尋ねない。保存したのと**同じ広さ**で効かせる
+                    // (`Edit(src/**)` を保存したのに、セッション中は Edit 全体が通る、にしない)。
+                    if let Ok(mut p) = self.policy.lock()
+                        && let Ok(parsed) = crate::permission_rules::Rule::parse(rule)
+                    {
+                        p.saved_rules.push(parsed);
+                    }
+                    return true;
+                }
+                "e" | "E" if !once_only => {
                     if tool_name == "Bash"
                         && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
                     {
@@ -96,22 +507,50 @@ impl PermissionGate {
     }
 }
 
+/// 読み取りが「答えなし」だったか。EOF は 0 バイトの成功として返るので、エラーだけを
+/// 見ていると空行 (= Enter = yes) と区別できず、プロンプトをパイプで渡した実行で
+/// 破壊的ツールが無承認で通ってしまう。
+fn nobody_answered(read: &io::Result<usize>) -> bool {
+    matches!(read, Ok(0) | Err(_))
+}
+
 fn summarize(tool: &str, args: &serde_json::Value) -> String {
     match tool {
         "Bash" => args
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|s| format!("`{s}`"))
+            .map(|s| format!("`{}`", visible(s)))
             .unwrap_or_else(|| args.to_string()),
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => args
             .get("path")
             .and_then(|v| v.as_str())
-            .map(rel_path)
+            .map(|p| visible(&rel_path(p)))
             .unwrap_or_else(|| args.to_string()),
         // 計画本文は直前に表示済みなので、プロンプトには要旨だけ出す。
         "ExitPlanMode" => "approve the plan above and exit plan mode".to_string(),
-        _ => args.to_string(),
+        // serde は C0 の制御文字はエスケープするが、U+202E のような書式文字は素通しする。
+        _ => visible(&args.to_string()),
     }
+}
+
+/// 制御文字を `\u{1b}` のような見える形にする。承認プロンプトに出すのはモデルが渡した文字列で、
+/// ANSI エスケープや CR をそのまま端末へ流すと、行を消したり上書きしたりして「承認しようと
+/// しているもの」を偽れる。
+fn visible(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if crate::term::is_invisible(c) {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// プレビュー用。コードにはタブが普通にあるので、タブだけはそのまま出す。
+fn visible_line(line: &str) -> String {
+    line.split('\t').map(visible).collect::<Vec<_>>().join("\t")
 }
 
 /// cwd 配下のパスは相対表示にする (#42 P5)。cwd 外・取得失敗時はそのまま。
@@ -161,11 +600,16 @@ fn preview(tool: &str, args: &serde_json::Value) -> Option<String> {
         "Write" => {
             let content = as_str("content")?;
             let mut out = String::new();
+            // 上書きと追記は同じ tool なので、どちらなのかを承認する側に見せる (#152 のレビュー)。
+            // 追記は既存の内容を消さないかわりに、設定ファイルの意味を壊すことがある。
+            if args.get("append").and_then(|v| v.as_bool()) == Some(true) {
+                out.push_str(&crate::term::dim("  (append to the end of the file)\n"));
+            }
             for (i, line) in content.lines().take(PREVIEW_MAX_LINES).enumerate() {
                 if i > 0 {
                     out.push('\n');
                 }
-                out.push_str(&crate::term::green(&format!("  + {line}")));
+                out.push_str(&crate::term::green(&format!("  + {}", visible_line(line))));
             }
             let total = content.lines().count();
             if total > PREVIEW_MAX_LINES {
@@ -190,7 +634,7 @@ fn diff_block(old: &str, new: &str) -> String {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(&color(&format!("  {sign} {line}")));
+            out.push_str(&color(&format!("  {sign} {}", visible_line(line))));
         }
         if total > PREVIEW_MAX_LINES {
             out.push_str(&crate::term::dim(&format!(
@@ -207,6 +651,503 @@ fn diff_block(old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate_with(
+        mode: crate::config::PermissionMode,
+        allow: &[&str],
+        deny: &[&str],
+        ask: &[&str],
+    ) -> PermissionGate {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.mode = mode;
+        cfg.permissions.allow = allow.iter().map(|s| s.to_string()).collect();
+        cfg.permissions.deny = deny.iter().map(|s| s.to_string()).collect();
+        cfg.permissions.ask = ask.iter().map(|s| s.to_string()).collect();
+        PermissionGate::from_config(&cfg, Path::new("/work"), true).unwrap()
+    }
+
+    fn bash(cmd: &str) -> serde_json::Value {
+        serde_json::json!({ "command": cmd })
+    }
+
+    /// サブエージェントからの要求は、子の名前つきで yes / no だけ (「常に許可」を親へ波及させない)。
+    #[test]
+    fn a_sub_agents_prompt_is_labelled_and_offers_only_yes_or_no() {
+        let gate = gate_in(Path::new("/work"));
+        let mut shown = Vec::new();
+        let allowed = gate.prompt_full(
+            "Write",
+            &serde_json::json!({ "path": "/work/a.txt", "content": "x" }),
+            &mut "a\ny\n".as_bytes(),
+            &mut shown,
+            false,
+            true,
+            Some("sub-agent builder"),
+        );
+        let text = String::from_utf8(shown).unwrap();
+        assert!(allowed, "the `y` after the ignored `a` wins: {text}");
+        assert!(text.contains("Write (sub-agent builder)"), "{text}");
+        assert!(
+            text.contains("asked by a sub-agent") && !text.contains("(a) always"),
+            "{text}"
+        );
+        // `a` は選べないので保存されない。
+        assert!(
+            gate.decide_quietly("Write", &serde_json::json!({ "path": "/work/b.txt" }), true)
+                .is_none(),
+            "nothing was persisted as always-allow"
+        );
+    }
+
+    fn gate_in(cwd: &Path) -> PermissionGate {
+        PermissionGate::from_config(&crate::config::Config::default(), cwd, true).unwrap()
+    }
+
+    #[test]
+    fn a_non_interactive_gate_denies_instead_of_asking() {
+        let gate = PermissionGate::non_interactive(false);
+        assert!(!gate.can_prompt());
+        // 尋ねる相手がいないので拒否。理由はモデルに「再試行するな」と伝える固定文。
+        assert_eq!(
+            gate.decide("Bash", &bash("rm -rf build"), true),
+            Decision::Deny(DENIED_NON_INTERACTIVE.to_string())
+        );
+        // read-only は尋ねる必要がないので、そのまま通る。
+        assert_eq!(
+            gate.decide("Read", &serde_json::json!({ "path": "/work/a" }), false),
+            Decision::Allow
+        );
+        // `--yes` 相当なら破壊的な呼び出しも通る (ハングもしない)。
+        let yes = PermissionGate::non_interactive(true);
+        assert!(!yes.can_prompt());
+        assert_eq!(
+            yes.decide("Bash", &bash("rm -rf build"), true),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn p_saves_a_project_rule_and_stops_asking_for_the_rest_of_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let args = bash("cargo test --lib");
+        let mut out = Vec::new();
+        assert!(gate.prompt_with("Bash", &args, &mut "p\n".as_bytes(), &mut out, true));
+        let shown = String::from_utf8(out).unwrap();
+        assert!(
+            shown.contains("(p) always allow `Bash(cargo test --lib)` in this project"),
+            "{shown}"
+        );
+
+        let saved = std::fs::read_to_string(dir.path().join(".lodan/config.local.toml")).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&saved).unwrap();
+        assert_eq!(cfg.permissions.allow, ["Bash(cargo test --lib)"]);
+        // このセッションではもう尋ねない。
+        assert_eq!(
+            gate.decide_quietly("Bash", &args, true),
+            Some(Decision::Allow)
+        );
+        // 次のセッション (設定から組み直したゲート) でも尋ねない。
+        let next = PermissionGate::from_config(&cfg, dir.path(), true).unwrap();
+        assert_eq!(
+            next.decide_quietly("Bash", &args, true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            next.decide_quietly("Bash", &bash("cargo publish"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn p_on_a_file_edit_is_scoped_to_its_directory_now_and_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let edit = |p: &str| serde_json::json!({ "path": p, "old_string": "a", "new_string": "b" });
+        let mut out = Vec::new();
+        assert!(gate.prompt_with(
+            "Edit",
+            &edit("src/agent/loop.rs"),
+            &mut "p\n".as_bytes(),
+            &mut out,
+            true
+        ));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("`Edit(src/agent/**)`")
+        );
+        // セッション中も、保存したのと同じ広さでしか通らない。
+        assert_eq!(
+            gate.decide_quietly("Edit", &edit("src/agent/subagent.rs"), true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(gate.decide_quietly("Edit", &edit("Cargo.toml"), true), None);
+        assert_eq!(
+            gate.decide_quietly("Write", &edit("src/agent/x.rs"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn p_is_not_offered_for_a_call_an_ask_rule_will_keep_asking_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.ask = vec!["Bash(cargo *)".into()];
+        let gate = PermissionGate::from_config(&cfg, dir.path(), true).unwrap();
+        let mut out = Vec::new();
+        assert!(gate.prompt_with(
+            "Bash",
+            &bash("cargo test --lib"),
+            &mut "p\ny\n".as_bytes(),
+            &mut out,
+            true
+        ));
+        assert!(!String::from_utf8(out).unwrap().contains("(p)"));
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
+    }
+
+    #[test]
+    fn p_is_not_offered_when_the_saved_rule_would_not_mean_the_same_thing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let mut out = Vec::new();
+        // (p) は無視されて再プロンプト、次の n で拒否。
+        let allowed = gate.prompt_with(
+            "Bash",
+            &bash("ls && rm -rf build"),
+            &mut "p\nn\n".as_bytes(),
+            &mut out,
+            true,
+        );
+        assert!(!allowed);
+        assert!(!String::from_utf8(out).unwrap().contains("(p)"));
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
+    }
+
+    #[test]
+    fn paths_and_previews_are_escaped_too() {
+        let esc = "\x1b[2K\x1b[1G";
+        let edit = serde_json::json!({
+            "path": format!("src/{esc}harmless.rs"),
+            "old_string": format!("a{esc}b"),
+            "new_string": "fn x() {\n\tlet y = 1;\n}",
+        });
+        let write =
+            serde_json::json!({ "path": "x", "content": format!("\x1b[2A{esc}looks fine") });
+        for shown in [
+            summarize("Edit", &edit),
+            preview("Edit", &edit).unwrap(),
+            preview("Write", &write).unwrap(),
+        ] {
+            // 着色のための SGR (`\x1b[..m`) 以外のエスケープが端末へ出てはいけない。
+            let stripped = shown.replace("\x1b[0m", "");
+            let raw_escapes = stripped.matches('\x1b').filter(|_| true).count();
+            let sgr = stripped.matches("\x1b[3").count() + stripped.matches("\x1b[2m").count();
+            assert_eq!(raw_escapes, sgr, "unescaped control sequence in {shown:?}");
+        }
+        // タブはコードに普通にあるので、プレビューではそのまま。
+        assert!(preview("Edit", &edit).unwrap().contains("\tlet y = 1;"));
+        // 不可視文字入りのパスには (p) を出さない。
+        assert_eq!(
+            crate::permission_rules::persistable_allow_rule("Edit", &edit, Path::new("/work")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_prompt_shows_control_characters_instead_of_obeying_them() {
+        let sneaky = "rm -rf ~\x1b[2K\x1b[1Gls";
+        let shown = summarize("Bash", &bash(sneaky));
+        assert!(
+            !shown.contains('\x1b'),
+            "raw escape reached the terminal: {shown:?}"
+        );
+        assert!(
+            shown.contains("rm -rf ~") && shown.contains("\\u{1b}"),
+            "{shown}"
+        );
+        // そして、そういうコマンドには (p) を出さない。
+        assert_eq!(
+            crate::permission_rules::persistable_allow_rule("Bash", &bash(sneaky), Path::new("/")),
+            None
+        );
+    }
+
+    #[test]
+    fn defaults_let_read_only_through_and_ask_about_the_rest() {
+        use crate::config::PermissionMode::Default;
+        let gate = gate_with(Default, &[], &[], &[]);
+        let read = serde_json::json!({ "path": "src/lib.rs" });
+        assert_eq!(
+            gate.decide_quietly("Read", &read, false),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("ls"), true),
+            None,
+            "would prompt"
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_beats_everything_including_bypass_and_read_only() {
+        use crate::config::PermissionMode::Bypass;
+        let gate = gate_with(
+            Bypass,
+            &["Bash(*)"],
+            &["Bash(git push *)", "Read(.env)"],
+            &[],
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("ls"), true),
+            Some(Decision::Allow)
+        );
+        let pushed = gate.decide_quietly("Bash", &bash("git push origin main"), true);
+        assert!(
+            matches!(&pushed, Some(Decision::Deny(why)) if why.contains("Bash(git push *)")),
+            "{pushed:?}"
+        );
+        let env = gate.decide_quietly("Read", &serde_json::json!({ "path": "config/.env" }), false);
+        assert!(
+            matches!(env, Some(Decision::Deny(_))),
+            "deny applies to read-only tools too"
+        );
+    }
+
+    #[test]
+    fn allow_rules_skip_the_prompt_and_ask_rules_force_it() {
+        use crate::config::PermissionMode::Default;
+        let gate = gate_with(
+            Default,
+            &["Bash(cargo *)", "Read"],
+            &[],
+            &["Bash(cargo publish*)", "Read(secrets/**)"],
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("cargo test"), true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("cargo publish"), true),
+            None
+        );
+        assert_eq!(
+            gate.decide_quietly("Bash", &bash("cargo test && rm -rf target"), true),
+            None
+        );
+        // ask は read-only にも効く。
+        let secret = serde_json::json!({ "path": "secrets/key.pem" });
+        assert_eq!(gate.decide_quietly("Read", &secret, false), None);
+    }
+
+    #[test]
+    fn accept_edits_covers_file_edits_but_not_bash() {
+        use crate::config::PermissionMode::AcceptEdits;
+        let gate = gate_with(AcceptEdits, &[], &["Edit(Cargo.lock)"], &[]);
+        let edit = |p: &str| serde_json::json!({ "path": p });
+        assert_eq!(
+            gate.decide_quietly("Edit", &edit("src/lib.rs"), true),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            gate.decide_quietly("Write", &edit("notes.md"), true),
+            Some(Decision::Allow)
+        );
+        assert!(matches!(
+            gate.decide_quietly("Edit", &edit("Cargo.lock"), true),
+            Some(Decision::Deny(_))
+        ));
+        assert_eq!(gate.decide_quietly("Bash", &bash("ls"), true), None);
+    }
+
+    #[test]
+    fn dont_ask_denies_what_would_have_prompted_but_honours_allow_rules() {
+        use crate::config::PermissionMode::DontAsk;
+        let gate = gate_with(DontAsk, &["Bash(git status)"], &[], &[]);
+        assert_eq!(
+            gate.decide("Bash", &bash("git status"), true),
+            Decision::Allow
+        );
+        let denied = gate.decide("Bash", &bash("rm -rf build"), true);
+        assert!(
+            matches!(&denied, Decision::Deny(why) if why.contains("non-interactive")),
+            "{denied:?}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_rule_is_a_startup_error_not_a_silent_no_op() {
+        let mut cfg = crate::config::Config::default();
+        cfg.permissions.deny = vec!["Bash(rm *".into()];
+        let err = PermissionGate::from_config(&cfg, Path::new("/work"), true)
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("Bash(rm *"), "{err:#}");
+    }
+
+    /// hook が確認を求めた呼び出しでは、「常に許可」を選ばせない (選んでも、次回また hook が
+    /// 尋ねさせるので効かない。(p) はファイルにまで書いてしまう)。
+    #[test]
+    fn a_prompt_requested_by_a_hook_offers_only_yes_and_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate_in(dir.path());
+        let args = bash("cargo test");
+        let mut out = Vec::new();
+        // a / e / p は答えとして受け付けず、尋ね直す。最後の n で拒否。
+        let allowed = gate.prompt_full(
+            "Bash",
+            &args,
+            &mut "a\ne\np\nn\n".as_bytes(),
+            &mut out,
+            true,
+            true,
+            None,
+        );
+        assert!(!allowed);
+        let shown = String::from_utf8_lossy(&out);
+        assert!(shown.contains("a hook asked for confirmation"), "{shown}");
+        assert!(!shown.contains("(a)") && !shown.contains("(p)"), "{shown}");
+        assert!(!dir.path().join(".lodan/config.local.toml").exists());
+        // 「常に許可」が記録されていないので、同じ呼び出しは次も尋ねる必要がある。
+        assert_eq!(gate.decide_quietly("Bash", &args, true), None);
+    }
+
+    /// モード × ルール × hook の希望 の表。尋ねる相手のいないゲートで見るので、「尋ねる」は拒否になる。
+    /// どのマスでも、ルールの deny が消えないこと・hook の allow が ask ルールと dont-ask を
+    /// 越えないこと・hook の ask が自動承認を止めることを確かめる。
+    #[test]
+    fn the_hinted_decision_table() {
+        use crate::config::PermissionMode::{AcceptEdits, Bypass, Default as Normal, DontAsk};
+        use crate::hooks::PermissionHint::{Allow, Ask};
+        let args = bash("cargo test");
+        let gate = |mode, rule: &str| {
+            let mut cfg = crate::config::Config::default();
+            cfg.permissions.mode = mode;
+            match rule {
+                "deny" => cfg.permissions.deny = vec!["Bash".into()],
+                "ask" => cfg.permissions.ask = vec!["Bash".into()],
+                "allow" => cfg.permissions.allow = vec!["Bash".into()],
+                _ => {}
+            }
+            PermissionGate::from_config(&cfg, Path::new("/work"), false).unwrap()
+        };
+        // (mode, rule, hint) -> 通るか
+        let table = [
+            (Normal, "none", None, false),
+            (Normal, "none", Some(Allow), true),
+            (Normal, "none", Some(Ask), false),
+            (Normal, "allow", None, true),
+            (Normal, "allow", Some(Ask), false),
+            (Normal, "ask", Some(Allow), false),
+            (Normal, "deny", Some(Allow), false),
+            (AcceptEdits, "none", Some(Allow), true),
+            (DontAsk, "none", Some(Allow), false),
+            (DontAsk, "allow", Some(Allow), true),
+            (Bypass, "none", None, true),
+            (Bypass, "none", Some(Ask), false),
+            (Bypass, "ask", Some(Allow), true),
+            (Bypass, "deny", None, false),
+            (Bypass, "deny", Some(Allow), false),
+        ];
+        for (mode, rule, hint, expected) in table {
+            let decision = gate(mode, rule).decide_hinted("Bash", &args, true, hint);
+            assert_eq!(
+                decision == Decision::Allow,
+                expected,
+                "{mode:?} / {rule} rule / hook {hint:?} -> {decision:?}"
+            );
+        }
+
+        // 確かめきれなかった deny (`Unverifiable`) は、自動承認でも hook の allow でも通らない。
+        let bypass = gate(Bypass, "none");
+        let unverifiable = Some(Verdict::Unverifiable("Grep(**/.env)".into()));
+        assert!(matches!(
+            bypass.quiet_decision(
+                unverifiable,
+                "Grep",
+                &serde_json::json!({}),
+                false,
+                Path::new("/work")
+            ),
+            Some(Decision::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn a_hook_allow_does_not_override_dont_ask_mode() {
+        use crate::hooks::PermissionHint;
+        let args = bash("cargo test");
+        let dont_ask = gate_with(crate::config::PermissionMode::DontAsk, &[], &[], &[]);
+        assert!(matches!(
+            dont_ask.decide_hinted("Bash", &args, true, Some(PermissionHint::Allow)),
+            Decision::Deny(_)
+        ));
+        // 尋ねる相手がいないだけの実行 (`-p`) では、hook が承認役になれる。
+        let headless = PermissionGate::from_config(
+            &crate::config::Config::default(),
+            Path::new("/work"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            headless.decide_hinted("Bash", &args, true, Some(PermissionHint::Allow)),
+            Decision::Allow
+        );
+        assert!(matches!(
+            headless.decide_hinted("Bash", &args, true, None),
+            Decision::Deny(_)
+        ));
+    }
+
+    fn answer(input: &str, enter_means_yes: bool) -> bool {
+        let gate = PermissionGate::new(false);
+        let args = serde_json::json!({ "command": "rm -rf build" });
+        let mut out = Vec::new();
+        gate.prompt_with(
+            "Bash",
+            &args,
+            &mut input.as_bytes(),
+            &mut out,
+            enter_means_yes,
+        )
+    }
+
+    #[test]
+    fn a_prompt_nobody_answers_is_denied() {
+        // プロンプトをパイプで渡した実行: 承認の時点で stdin は EOF。
+        assert!(!answer("", true));
+        assert!(!answer("", false));
+    }
+
+    #[test]
+    fn enter_is_yes_only_at_a_terminal() {
+        assert!(answer("\n", true));
+        // パイプの空行は答えではない。読み飛ばして EOF に達したら拒否。
+        assert!(!answer("\n\n", false));
+        // 空行の後に明示的な答えがあればそれに従う。
+        assert!(answer("\ny\n", false));
+        assert!(!answer("\nn\n", false));
+    }
+
+    #[test]
+    fn explicit_answers_work_from_a_pipe() {
+        assert!(answer("y\n", false));
+        assert!(!answer("n\n", false));
+        assert!(
+            answer("garbage\ny\n", false),
+            "unrecognised input re-prompts"
+        );
+    }
+
+    #[test]
+    fn eof_is_not_an_answer_but_an_empty_line_is() {
+        // EOF: read_line は Ok(0)。誰も答えていないので拒否する。
+        assert!(nobody_answered(&Ok(0)));
+        assert!(nobody_answered(&Err(io::Error::other("closed"))));
+        // Enter だけの行は "\n" の 1 バイト。従来どおり yes として扱う。
+        assert!(!nobody_answered(&Ok(1)));
+    }
 
     #[test]
     fn auto_approve_short_circuits() {

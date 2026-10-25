@@ -1,7 +1,11 @@
+pub mod fallback;
+pub mod kimi;
+pub mod metered;
 pub mod openai;
 pub mod sakana;
+pub mod sakura;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -38,6 +42,22 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     /// サーバが usage を返さない場合は `None` (呼び出し側で概算フォールバック)。
     pub usage: Option<Usage>,
+    /// モデルの思考過程 (`reasoning_content` / `reasoning`)。返さないサーバでは `None`。
+    pub reasoning: Option<String>,
+}
+
+tokio::task_local! {
+    static PLAN_MODE: bool;
+}
+
+/// `fut` の中の LLM 呼び出しを「プランモード中のもの」として扱う (`plan_reasoning_effort` が効く)。
+/// クライアントはモードを知らないので、呼び出し側が印を付ける (`metered::with_kind` と同じ方式)。
+pub async fn in_plan_mode<F: std::future::Future>(active: bool, fut: F) -> F::Output {
+    PLAN_MODE.scope(active, fut).await
+}
+
+pub fn plan_mode_active() -> bool {
+    PLAN_MODE.try_with(|active| *active).unwrap_or(false)
 }
 
 /// Streaming events emitted by `chat_stream`.
@@ -45,10 +65,19 @@ pub struct ChatResponse {
 pub enum ChatEvent {
     /// Incremental assistant text.
     TextDelta(String),
+    /// 思考過程の断片。本文より先に流れてくる。
+    ReasoningDelta(String),
+    /// 本文を出す前に切れたので、最初からやり直す (再試行、または fallback provider へ)。
+    /// ここまでに流した思考は捨てられた応答のもの — 受け手は数え直すこと。
+    AttemptRestarted,
     /// Final assembled response (sent once at the end).
     Done(ChatResponse),
 }
 
+// clippy 1.99 の `double_must_use`: `#[async_trait]` が `async fn` を `#[must_use]` つきの
+// `Pin<Box<dyn Future>>` に展開するため、trait 側の must_use と二重になる。展開結果の話で
+// こちらに直せるものが無いので、trait 定義で抑える (CI の toolchain は stable 無ピン)。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// `max_tokens` で 1 応答の生成上限を渡せる (`None` はモデル既定)。MCP sampling は
@@ -70,9 +99,113 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<()>;
 }
 
-pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
-    match cfg.llm.provider {
-        Provider::Local => Ok(Arc::new(openai::OpenAiClient::new(&cfg.llm.local)?)),
-        Provider::Sakana => Ok(Arc::new(sakana::SakanaClient::new(&cfg.llm.sakana)?)),
+/// 時間を置くか、別の provider に投げれば通り得る失敗。再試行を使い切った接続エラー /
+/// 408 / 429 / 5xx、本文を出す前のストリーム断、タイムアウトがこれで返る。
+/// **利用者にまだ何も見せていない**ことを含意する (fallback が同じ sink を使い回せる根拠)。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TransientLlmError(pub String);
+
+/// `e` が (context を重ねた後でも) 一時的な失敗か。
+pub fn is_transient(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<TransientLlmError>().is_some())
+}
+
+/// 設定どおりのクライアントと、その使用量の台帳。台帳は provider ごとのクライアントの**内側**で
+/// 共有するので、fallback に切り替わって送り直したリクエストも 1 件ずつ数えられる。
+pub fn build_metered(cfg: &Config) -> Result<(Arc<dyn LlmClient>, Arc<metered::Ledger>)> {
+    for (model, price) in &cfg.pricing {
+        price.validate(model).map_err(|e| anyhow::anyhow!(e))?;
     }
+    let ledger = Arc::new(
+        metered::Ledger::new(metered::Budget {
+            max_requests: cfg.agent.max_requests,
+            max_total_tokens: cfg.agent.max_total_tokens,
+        })
+        .with_pricing(cfg.pricing.clone()),
+    );
+    let client = build_metered_with(cfg, &ledger)?;
+    Ok((client, ledger))
+}
+
+/// 既存の台帳に計上するクライアント。`/model` でセッション中に作り直すとき、累計と予算を
+/// 引き継ぐために使う (#81)。
+pub fn build_metered_with(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+) -> Result<Arc<dyn LlmClient>> {
+    build_with(cfg, &|inner| {
+        Arc::new(metered::MeteredClient::new(inner, ledger.clone())) as Arc<dyn LlmClient>
+    })
+}
+
+/// `/goal` の評価器を別のモデルにする設定があれば、そのクライアントとモデル名。同じ台帳に載せるので、
+/// 評価器の呼び出しも `/cost` と予算に入る。設定が無ければ None (作業側のクライアントを使う)。
+pub fn build_goal_evaluator(
+    cfg: &Config,
+    ledger: &Arc<metered::Ledger>,
+) -> Result<Option<(Arc<dyn LlmClient>, String)>> {
+    let goal = &cfg.goal;
+    if goal.evaluator_provider.is_none() && goal.evaluator_model.is_none() {
+        return Ok(None);
+    }
+    let provider = goal.evaluator_provider.unwrap_or(cfg.llm.provider);
+    let inner = build_for(provider, cfg)
+        .with_context(|| format!("building the /goal evaluator ({})", provider.as_str()))?;
+    let model = goal
+        .evaluator_model
+        .clone()
+        .unwrap_or_else(|| cfg.llm.get(provider).model.clone());
+    let client: Arc<dyn LlmClient> = Arc::new(metered::MeteredClient::new(inner, ledger.clone()));
+    Ok(Some((client, model)))
+}
+
+/// 計上なしのクライアント。**本体では使わない** (使用量も予算も効かなくなる) — `build_metered` を使うこと。
+/// 台帳を持たないテスト用に残してある。
+pub fn build_client(cfg: &Config) -> Result<Arc<dyn LlmClient>> {
+    build_with(cfg, &|inner| inner)
+}
+
+/// `wrap` は provider ごとのクライアント 1 つずつに掛かる。
+fn build_with(
+    cfg: &Config,
+    wrap: &dyn Fn(Arc<dyn LlmClient>) -> Arc<dyn LlmClient>,
+) -> Result<Arc<dyn LlmClient>> {
+    let primary = wrap(build_for(cfg.llm.provider, cfg)?);
+    let Some(fallback) = cfg.llm.fallback else {
+        return Ok(primary);
+    };
+    if fallback == cfg.llm.provider {
+        tracing::warn!(
+            "llm.fallback is the same as llm.provider ({}); ignoring it",
+            fallback.as_str()
+        );
+        return Ok(primary);
+    }
+    // fallback は保険。キーが無いなどで組めなくても、primary での実行は止めない。
+    match build_for(fallback, cfg) {
+        Ok(client) => Ok(Arc::new(fallback::FallbackClient::new(
+            primary,
+            wrap(client),
+            fallback.as_str(),
+            cfg.llm.get(fallback).model.clone(),
+        ))),
+        Err(e) => {
+            tracing::warn!(
+                "llm.fallback = {} is unusable, continuing without it: {e:#}",
+                fallback.as_str()
+            );
+            Ok(primary)
+        }
+    }
+}
+
+fn build_for(provider: Provider, cfg: &Config) -> Result<Arc<dyn LlmClient>> {
+    Ok(match provider {
+        Provider::Local => Arc::new(openai::OpenAiClient::new(&cfg.llm.local)?),
+        Provider::Sakana => Arc::new(sakana::SakanaClient::new(&cfg.llm.sakana)?),
+        Provider::Sakura => Arc::new(sakura::SakuraClient::new(&cfg.llm.sakura)?),
+        Provider::Kimi => Arc::new(kimi::KimiClient::new(&cfg.llm.kimi)?),
+    })
 }

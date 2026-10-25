@@ -34,6 +34,11 @@ impl Tool for Glob {
         false
     }
 
+    /// 検索するだけで状態を持たない。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,

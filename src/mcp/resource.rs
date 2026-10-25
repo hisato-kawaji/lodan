@@ -18,6 +18,9 @@ pub struct McpResourceTool {
     /// 公開 uri 一覧 (schema の enum 用)。
     uris: Vec<String>,
     client: Arc<McpClient>,
+    /// サーバ別の `toolTimeoutSecs` / `maxOutputBytes` (tools/call と同じ上限を resources/read にも。#83)。
+    timeout: std::time::Duration,
+    max_output_bytes: usize,
 }
 
 impl McpResourceTool {
@@ -28,7 +31,15 @@ impl McpResourceTool {
             description,
             uris,
             client,
+            timeout: crate::mcp::transport::REQUEST_TIMEOUT,
+            max_output_bytes: crate::mcp::config::DEFAULT_MAX_OUTPUT_BYTES,
         }
+    }
+
+    pub fn with_limits(mut self, timeout: std::time::Duration, max_output_bytes: usize) -> Self {
+        self.timeout = timeout;
+        self.max_output_bytes = max_output_bytes;
+        self
     }
 }
 
@@ -86,8 +97,16 @@ impl Tool for McpResourceTool {
             .ok_or_else(|| ToolError::InvalidArgs("read_resource: missing `uri`".into()))?;
         // schema の uri enum は advisory。クライアントは uri を制限せず、認可境界は
         // サーバ側に委ねる (enum 外 uri はサーバが error を返し ToolOutput::error になる)。
-        match self.client.read_resource(uri).await {
-            Ok(result) => Ok(ToolOutput::ok(result.flatten_text())),
+        match self
+            .client
+            .read_resource_with_timeout(uri, self.timeout)
+            .await
+        {
+            Ok(result) => {
+                let mut text = result.flatten_text();
+                crate::mcp::tool::cap_output(&mut text, self.max_output_bytes);
+                Ok(ToolOutput::ok(text))
+            }
             Err(e) => Ok(ToolOutput::error(format!("resources/read failed: {e}"))),
         }
     }

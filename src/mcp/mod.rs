@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod config;
+pub mod elicitation;
 pub mod prompt;
 pub mod protocol;
 pub mod registry;

@@ -1,13 +1,50 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::agent::messages::{ToolSpec, ToolSpecFunction};
 use crate::tools::{Tool, bash, edit, glob, grep, multi_edit, read, todo_write, write};
 use crate::tools::{ask_user_question, kill_shell, monitor, notebook_edit, web_fetch, web_search};
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// モデルに見せるツール名。`None` は全部。隠したツールも登録は残すので、呼ばれたときに
+    /// 「存在しない」ではなく「このプロファイルでは無効」と答えられる。
+    visible: Option<BTreeSet<String>>,
+    /// 定義は送らず、`ToolSearch` で読み込ませてから使わせるツール (#72)。`visible` とは重ならない。
+    deferred: BTreeSet<String>,
+    /// `ToolSearch` の説明文。遅延ツールの名前と 1 行説明を載せるので、`apply_profile` で作る。
+    tool_search_description: String,
+    /// `apply_profile_with_search` で遅延ロードを有効にしたか (後から足す MCP ツールも遅延にする)。
+    tool_search: bool,
+    /// `readonly` プロファイル (明示リスト無し) か。破壊的ツールはツール単位で隠し、遅延にもしない —
+    /// 後から足す MCP ツールにも同じ判定を掛ける (#142 のレビュー)。
+    readonly: bool,
 }
+
+/// `tool_profile = "core"` でモデルに見せるツール。
+/// TodoWrite を入れるのは、小型モデルが「計画だけ述べて実行しない」「要件を途中で落とす」のを、
+/// やることリストを書かせて抑えるため (#72 の判断。定義は約 +0.5 KB)。
+pub const CORE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "TodoWrite",
+    // 要件台帳 (#65) が有効なときだけ登録されるので、無ければ無視される。
+    "Requirements",
+];
+
+/// 遅延ツールを読み込む擬似ツール (#72)。registry には登録せず、ループが横取りする。
+pub const TOOL_SEARCH: &str = "ToolSearch";
+/// `ToolSearch` が 1 回に返す定義の上限。見境なく全部を返すと遅延させた意味がない。
+pub const TOOL_SEARCH_MAX_RESULTS: usize = 5;
+/// `ToolSearch` の説明に載せる 1 行説明の長さ。
+const ONE_LINE_CHARS: usize = 100;
+/// MCP ツールの名前の接頭辞 (`mcp__<server>__<tool>`)。
+const MCP_PREFIX: &str = "mcp__";
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -19,42 +56,299 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: BTreeMap::new(),
+            visible: None,
+            deferred: BTreeSet::new(),
+            tool_search_description: String::new(),
+            tool_search: false,
+            readonly: false,
         }
+    }
+
+    /// 設定に従ってモデルに見せるツールを絞る。全ツールの登録が済んでから呼ぶこと。
+    /// 明示リストにある未登録の名前は無視して返す (呼び出し側が警告できるように)。
+    pub fn apply_profile(
+        &mut self,
+        profile: crate::config::ToolProfile,
+        explicit: &[String],
+    ) -> Vec<String> {
+        self.apply_profile_with_search(profile, explicit, false)
+    }
+
+    /// `apply_profile` に加えて、`tool_search` なら「プロファイルで隠したツール」と「MCP ツール」を
+    /// 遅延ツールにする: 定義は送らず、`ToolSearch` の説明に名前と 1 行説明だけを載せ、
+    /// 読み込まれたら次のリクエストから定義を送る (#72)。
+    pub fn apply_profile_with_search(
+        &mut self,
+        profile: crate::config::ToolProfile,
+        explicit: &[String],
+        tool_search: bool,
+    ) -> Vec<String> {
+        let unknown = self.restrict(profile, explicit);
+        self.deferred.clear();
+        self.tool_search = tool_search;
+        if tool_search {
+            // `readonly` が隠すのは破壊的だからで、読み込ませてよいものではない。遅延にもしない
+            // (「readonly では破壊的ツールは実行されない」を tool_search が覆さない)。
+            let readonly = self.readonly;
+            let hidden_or_mcp: Vec<String> = self
+                .tools
+                .iter()
+                .filter(|(n, t)| {
+                    (!self.is_visible(n) || n.starts_with(MCP_PREFIX))
+                        && !(readonly && t.is_destructive())
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            if let Some(visible) = &mut self.visible {
+                visible.retain(|n| !n.starts_with(MCP_PREFIX));
+            } else if hidden_or_mcp.iter().any(|n| n.starts_with(MCP_PREFIX)) {
+                // `full` は「全部」(None) で表しているので、MCP を外すには実体の集合にする。
+                self.visible = Some(
+                    self.tools
+                        .keys()
+                        .filter(|n| !n.starts_with(MCP_PREFIX))
+                        .cloned()
+                        .collect(),
+                );
+            }
+            self.deferred = hidden_or_mcp.into_iter().collect();
+        }
+        self.tool_search_description = self.build_tool_search_description();
+        unknown
+    }
+
+    fn restrict(
+        &mut self,
+        profile: crate::config::ToolProfile,
+        explicit: &[String],
+    ) -> Vec<String> {
+        use crate::config::ToolProfile;
+        let mut unknown = Vec::new();
+        self.readonly = profile == ToolProfile::Readonly && explicit.is_empty();
+        self.visible = if !explicit.is_empty() {
+            let (known, missing): (Vec<_>, Vec<_>) = explicit
+                .iter()
+                .cloned()
+                .partition(|n| self.tools.contains_key(n));
+            unknown = missing;
+            Some(known.into_iter().collect())
+        } else {
+            match profile {
+                ToolProfile::Full => None,
+                ToolProfile::Core => Some(
+                    CORE_TOOLS
+                        .iter()
+                        .filter(|n| self.tools.contains_key(**n))
+                        .map(|n| n.to_string())
+                        .collect(),
+                ),
+                ToolProfile::Readonly => Some(
+                    self.tools
+                        .values()
+                        .filter(|t| !t.is_destructive())
+                        .map(|t| t.name().to_string())
+                        .collect(),
+                ),
+            }
+        };
+        unknown
+    }
+
+    /// モデルに見せているか。未登録の名前は false。遅延ツールは読み込まれるまで false。
+    pub fn is_visible(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+            && !self.deferred.contains(name)
+            && self.visible.as_ref().is_none_or(|v| v.contains(name))
+    }
+
+    /// `ToolSearch` で読み込める遅延ツールか。
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.deferred.contains(name)
+    }
+
+    /// 遅延ツールの名前。
+    pub fn deferred_names(&self) -> Vec<&str> {
+        self.deferred.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// 遅延ツールがあるときだけ、`ToolSearch` の定義を返す。
+    pub fn tool_search_spec(&self) -> Option<ToolSpec<'_>> {
+        (!self.deferred.is_empty()).then(|| ToolSpec {
+            kind: "function",
+            function: ToolSpecFunction {
+                name: TOOL_SEARCH,
+                description: &self.tool_search_description,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "\"select:Name1,Name2\" to load tools by exact name, or keywords to search their names and descriptions"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        })
+    }
+
+    fn build_tool_search_description(&self) -> String {
+        let mut text = String::from(
+            "Load tools that are not in your current tool list. Loaded tools appear in the list \
+             from your next response; call them only after loading. Tools you can load \
+             (name: purpose):\n",
+        );
+        for name in &self.deferred {
+            let purpose = self.tools.get(name).map_or("", |t| t.description());
+            text.push_str(&format!("- {name}: {}\n", one_line(purpose)));
+        }
+        text.push_str(
+            "Query with \"select:Name1,Name2\" for exact names, or with keywords to search.",
+        );
+        text
+    }
+
+    /// `ToolSearch` の検索。`select:A,B` は名前の完全一致、それ以外は名前と説明の部分一致
+    /// (大文字小文字は区別しない)。返すのは遅延ツールだけ、最大 `TOOL_SEARCH_MAX_RESULTS` 個。
+    pub fn search_deferred(&self, query: &str) -> Vec<Arc<dyn Tool>> {
+        let query = query.trim();
+        let mut hits: Vec<Arc<dyn Tool>> = if let Some(names) = query.strip_prefix("select:") {
+            // 名前は大文字小文字を区別しない (小型モデルは `todowrite` と書きがち)。
+            names
+                .split(',')
+                .map(str::trim)
+                .filter_map(|want| {
+                    self.deferred
+                        .iter()
+                        .find(|n| n.eq_ignore_ascii_case(want))
+                        .and_then(|n| self.tools.get(n).cloned())
+                })
+                .collect()
+        } else {
+            let needles: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+            self.deferred
+                .iter()
+                .filter_map(|n| self.tools.get(n))
+                .filter(|t| {
+                    let hay = format!("{} {}", t.name(), t.description()).to_lowercase();
+                    !needles.is_empty() && needles.iter().any(|w| hay.contains(w))
+                })
+                .cloned()
+                .collect()
+        };
+        hits.truncate(TOOL_SEARCH_MAX_RESULTS);
+        hits
+    }
+
+    /// 登録済みの全ツール名 (隠したものを含む)。
+    pub fn all_names(&self) -> Vec<&str> {
+        self.tools.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// 登録済みの全ツール数 (隠したものを含む)。
+    pub fn registered_len(&self) -> usize {
+        self.tools.len()
     }
 
     pub fn register(&mut self, t: Arc<dyn Tool>) {
         self.tools.insert(t.name().to_string(), t);
     }
 
+    /// あるサーバの MCP ツール (`mcp__<server>__*`、`read_resource` は除く) を `tools` で入れ替える
+    /// (`notifications/tools/list_changed`、#83)。見せ方は前と同じ: 遅延ロード中なら新しいものも
+    /// 遅延に、プロファイルで隠されていた (`core` など) なら隠したまま、見えていたなら見せる。
+    pub fn replace_server_tools(&mut self, server: &str, tools: Vec<Arc<dyn Tool>>) {
+        let prefix = format!("{MCP_PREFIX}{server}__");
+        let keep = format!("{prefix}read_resource");
+        let old: Vec<String> = self
+            .tools
+            .keys()
+            .filter(|n| n.starts_with(&prefix) && **n != keep)
+            .cloned()
+            .collect();
+        // 見えていたか: 隠す集合が無い (full) か、前のツールのどれかが見えていた。
+        let shown = match &self.visible {
+            None => true,
+            Some(visible) => old.iter().any(|n| visible.contains(n)),
+        };
+        for n in &old {
+            self.tools.remove(n);
+            self.deferred.remove(n);
+            if let Some(visible) = &mut self.visible {
+                visible.remove(n);
+            }
+        }
+        for t in tools {
+            let name = t.name().to_string();
+            // readonly の判定はツール単位: 破壊的なものは見せず、遅延にもしない (初回ロードの
+            // `restrict` / `apply_profile_with_search` と同じ)。
+            let blocked = self.readonly && t.is_destructive();
+            if blocked {
+                // 登録は残す (呼ばれたら「このプロファイルでは無効」と答えられる)。
+            } else if self.tool_search {
+                self.deferred.insert(name.clone());
+            } else if shown && let Some(visible) = &mut self.visible {
+                visible.insert(name.clone());
+            }
+            self.tools.insert(name, t);
+        }
+        self.tool_search_description = self.build_tool_search_description();
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }
 
+    /// モデルに見せているツール名。
     pub fn names(&self) -> Vec<&str> {
-        self.tools.keys().map(|s| s.as_str()).collect()
+        self.tools
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|n| self.is_visible(n))
+            .collect()
     }
 
+    /// モデルに見せているツール数。
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.names().len()
     }
 
+    /// モデルに見せているツールが 1 つも無いか (`len() == 0` と同じ意味)。
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.len() == 0
     }
 
     pub fn tool_specs(&self) -> Vec<ToolSpec<'_>> {
-        self.specs(|_| true)
+        self.tool_specs_with(&BTreeSet::new())
     }
 
     /// 破壊的ツールを除いた specs (プランモードで LLM から不可視にする用)。
     pub fn read_only_tool_specs(&self) -> Vec<ToolSpec<'_>> {
-        self.specs(|t| !t.is_destructive())
+        self.read_only_tool_specs_with(&BTreeSet::new())
     }
 
-    fn specs(&self, keep: impl Fn(&dyn Tool) -> bool) -> Vec<ToolSpec<'_>> {
+    /// 見せているツールに、`ToolSearch` で読み込んだ遅延ツールを足した specs。
+    pub fn tool_specs_with(&self, loaded: &BTreeSet<String>) -> Vec<ToolSpec<'_>> {
+        self.specs(loaded, |_| true)
+    }
+
+    pub fn read_only_tool_specs_with(&self, loaded: &BTreeSet<String>) -> Vec<ToolSpec<'_>> {
+        self.specs(loaded, |t| !t.is_destructive())
+    }
+
+    /// 呼び出しに応じてよいか: 見せているか、遅延ツールが読み込み済みか。
+    pub fn is_usable(&self, name: &str, loaded: &BTreeSet<String>) -> bool {
+        self.is_visible(name) || (self.is_deferred(name) && loaded.contains(name))
+    }
+
+    fn specs(
+        &self,
+        loaded: &BTreeSet<String>,
+        keep: impl Fn(&dyn Tool) -> bool,
+    ) -> Vec<ToolSpec<'_>> {
         self.tools
             .values()
-            .filter(|t| keep(t.as_ref()))
+            .filter(|t| self.is_usable(t.name(), loaded) && keep(t.as_ref()))
             .map(|t| ToolSpec {
                 kind: "function",
                 function: ToolSpecFunction {
@@ -65,6 +359,16 @@ impl ToolRegistry {
             })
             .collect()
     }
+}
+
+/// 説明の 1 行目を `ONE_LINE_CHARS` 文字までに詰める。
+fn one_line(description: &str) -> String {
+    let first = description.lines().next().unwrap_or("").trim();
+    let mut out: String = first.chars().take(ONE_LINE_CHARS).collect();
+    if first.chars().count() > ONE_LINE_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 pub fn default_registry() -> ToolRegistry {
@@ -101,6 +405,232 @@ pub fn read_only_registry() -> ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tools/list_changed` の入れ替え (#83): そのサーバのツールだけ入れ替わり、`read_resource` は
+    /// 残り、遅延ロード中なら新しいものも遅延になる。他のサーバには触らない。
+    #[test]
+    fn replacing_a_servers_tools_keeps_its_resource_tool_and_follows_the_profile() {
+        struct Named(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "d"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn is_destructive(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &crate::tools::ToolCtx,
+            ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+                Ok(crate::tools::ToolOutput::ok(""))
+            }
+        }
+        let mut reg = default_registry();
+        for n in ["mcp__a__old", "mcp__a__read_resource", "mcp__b__keep"] {
+            reg.register(Arc::new(Named(n)));
+        }
+        // full + tool_search: MCP は遅延。
+        reg.apply_profile_with_search(crate::config::ToolProfile::Full, &[], true);
+        assert!(reg.is_deferred("mcp__a__old"));
+        reg.replace_server_tools("a", vec![Arc::new(Named("mcp__a__new"))]);
+        assert!(reg.get("mcp__a__old").is_none());
+        assert!(reg.get("mcp__a__new").is_some() && reg.is_deferred("mcp__a__new"));
+        assert!(reg.get("mcp__a__read_resource").is_some());
+        assert!(reg.get("mcp__b__keep").is_some() && reg.is_deferred("mcp__b__keep"));
+        assert!(
+            reg.tool_search_spec()
+                .unwrap()
+                .function
+                .description
+                .contains("mcp__a__new")
+        );
+
+        // core (MCP は隠れている) で tool_search 無し: 新しいものも隠れたまま。
+        let mut reg = default_registry();
+        reg.register(Arc::new(Named("mcp__a__old")));
+        reg.apply_profile(crate::config::ToolProfile::Core, &[]);
+        assert!(!reg.is_visible("mcp__a__old"));
+        reg.replace_server_tools("a", vec![Arc::new(Named("mcp__a__new"))]);
+        assert!(reg.get("mcp__a__new").is_some() && !reg.is_visible("mcp__a__new"));
+
+        // full で tool_search 無し: 見える。
+        let mut reg = default_registry();
+        reg.register(Arc::new(Named("mcp__a__old")));
+        reg.replace_server_tools("a", vec![Arc::new(Named("mcp__a__new"))]);
+        assert!(reg.is_visible("mcp__a__new"));
+
+        // readonly: 判定はツール単位。非破壊の古いツールが見えていても、新しく来た破壊的ツールは
+        // 見せず、tool_search 中でも遅延にしない (#142 のレビュー)。
+        struct Harmless(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for Harmless {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "d"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn is_destructive(&self) -> bool {
+                false
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &crate::tools::ToolCtx,
+            ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+                Ok(crate::tools::ToolOutput::ok(""))
+            }
+        }
+        for tool_search in [false, true] {
+            let mut reg = default_registry();
+            reg.register(Arc::new(Harmless("mcp__a__look")));
+            reg.apply_profile_with_search(crate::config::ToolProfile::Readonly, &[], tool_search);
+            reg.replace_server_tools(
+                "a",
+                vec![
+                    Arc::new(Harmless("mcp__a__peek")),
+                    Arc::new(Named("mcp__a__wipe")),
+                ],
+            );
+            assert!(reg.get("mcp__a__wipe").is_some(), "registered but hidden");
+            assert!(!reg.is_visible("mcp__a__wipe") && !reg.is_deferred("mcp__a__wipe"));
+            if tool_search {
+                assert!(reg.is_deferred("mcp__a__peek"));
+            } else {
+                assert!(reg.is_visible("mcp__a__peek"));
+            }
+        }
+    }
+
+    fn spec_names(r: &ToolRegistry) -> Vec<String> {
+        r.tool_specs()
+            .iter()
+            .map(|s| s.function.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn only_the_listed_tools_opt_into_parallel_execution() {
+        // 並列可の宣言は個別の判断。増やすときはこの一覧も理由つきで更新すること。
+        let r = default_registry();
+        let mut safe: Vec<&str> = r
+            .all_names()
+            .into_iter()
+            .filter(|n| r.get(n).unwrap().parallel_safe())
+            .collect();
+        safe.sort();
+        assert_eq!(safe, ["Glob", "Grep", "Read", "WebFetch", "WebSearch"]);
+        for name in safe {
+            assert!(!r.get(name).unwrap().is_destructive(), "{name}");
+        }
+    }
+
+    #[test]
+    fn full_profile_shows_everything() {
+        let mut r = default_registry();
+        assert!(
+            r.apply_profile(crate::config::ToolProfile::Full, &[])
+                .is_empty()
+        );
+        assert_eq!(r.len(), r.registered_len());
+    }
+
+    #[test]
+    fn core_profile_shows_exactly_the_core_tools() {
+        let mut r = default_registry();
+        r.apply_profile(crate::config::ToolProfile::Core, &[]);
+        // `Requirements` (#65) は有効なときだけ登録されるので、登録済みのものだけが期待値。
+        let mut expected: Vec<String> = CORE_TOOLS
+            .iter()
+            .filter(|n| r.get(n).is_some())
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+        assert!(!expected.iter().any(|n| n == "Requirements"));
+        assert_eq!(spec_names(&r), expected);
+        // 登録されていれば core に入る。
+        let mut with_req = default_registry();
+        with_req.register(Arc::new(crate::tools::requirements::RequirementsTool));
+        with_req.apply_profile(crate::config::ToolProfile::Core, &[]);
+        assert!(with_req.is_visible("Requirements"));
+        assert_eq!(
+            r.names(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        // 隠しただけで、登録は残っている (呼ばれたら「無効」と答えるため)。
+        assert!(r.get("WebFetch").is_some());
+        assert!(!r.is_visible("WebFetch"));
+        assert_eq!(r.registered_len(), default_registry().registered_len());
+    }
+
+    #[test]
+    fn readonly_profile_hides_every_destructive_tool() {
+        let mut r = default_registry();
+        r.apply_profile(crate::config::ToolProfile::Readonly, &[]);
+        for name in r.names() {
+            assert!(!r.get(name).unwrap().is_destructive(), "{name}");
+        }
+        assert!(r.is_visible("Read") && !r.is_visible("Bash"));
+    }
+
+    #[test]
+    fn an_explicit_list_wins_over_the_profile_and_reports_unknown_names() {
+        let mut r = default_registry();
+        let unknown = r.apply_profile(
+            crate::config::ToolProfile::Core,
+            &["Read".into(), "TodoWrite".into(), "NoSuchTool".into()],
+        );
+        assert_eq!(unknown, ["NoSuchTool"]);
+        assert_eq!(spec_names(&r), ["Read", "TodoWrite"]);
+        assert!(!r.is_empty());
+
+        let mut none = default_registry();
+        none.apply_profile(crate::config::ToolProfile::Full, &["NoSuchTool".into()]);
+        assert!(none.is_empty(), "nothing visible");
+        assert!(
+            none.names().is_empty(),
+            "is_empty must agree with what the model sees"
+        );
+    }
+
+    #[test]
+    fn plan_mode_specs_respect_the_profile_too() {
+        let mut r = default_registry();
+        r.apply_profile(crate::config::ToolProfile::Core, &[]);
+        let names: Vec<String> = r
+            .read_only_tool_specs()
+            .iter()
+            .map(|s| s.function.name.to_string())
+            .collect();
+        // TodoWrite は共有状態を書くが破壊的ではない (plan モードでも使える)。
+        assert_eq!(names, ["Glob", "Grep", "Read", "TodoWrite"]);
+    }
+
+    #[test]
+    fn core_profile_cuts_the_tool_spec_payload_by_nearly_half() {
+        // この registry は built-in 14 個 (Task 無し) なので 6,036 → 3,065 (-49%) で半減に 1% 届かない。
+        // ランタイムの `tools` イベント (Task 込み 15 個、6,643) では半減以上で、そちらは e2e が固定する。
+        let bytes = |r: &ToolRegistry| serde_json::to_string(&r.tool_specs()).unwrap().len();
+        let full = bytes(&default_registry());
+        let mut core = default_registry();
+        core.apply_profile(crate::config::ToolProfile::Core, &[]);
+        let core = bytes(&core);
+        assert!(
+            core * 100 <= full * 55,
+            "core = {core} bytes, full = {full} bytes"
+        );
+    }
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -128,6 +658,145 @@ mod tests {
         ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::ok("ok"))
         }
+    }
+
+    fn dyn_tool(name: &str, description: &str) -> Arc<dyn Tool> {
+        Arc::new(Dyn {
+            n: name.into(),
+            d: description.into(),
+        })
+    }
+
+    /// ToolSearch のテスト用: TodoWrite を隠す明示リスト (core に TodoWrite が入ったので、
+    /// 「隠したツールを読み込む」の例には明示リストを使う)。
+    fn six_without_todo() -> Vec<String> {
+        ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tool_search_defers_the_tools_the_profile_hides() {
+        let mut r = default_registry();
+        r.apply_profile_with_search(crate::config::ToolProfile::Full, &six_without_todo(), true);
+        assert!(r.is_visible("Read") && !r.is_visible("TodoWrite"));
+        assert!(r.is_deferred("TodoWrite") && !r.is_deferred("Read"));
+        // 定義は送らないが、ToolSearch の説明には名前と 1 行説明が載る。
+        let names: BTreeSet<&str> = r.tool_specs().iter().map(|s| s.function.name).collect();
+        assert_eq!(
+            names,
+            six_without_todo()
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        );
+        let search = r.tool_search_spec().expect("deferred tools exist");
+        assert!(search.function.description.contains("- TodoWrite:"));
+        // 読み込んだら次の specs に入り、呼び出しにも応じる。
+        let loaded: BTreeSet<String> = ["TodoWrite".to_string()].into();
+        assert!(r.is_usable("TodoWrite", &loaded));
+        assert!(!r.is_usable("TodoWrite", &BTreeSet::new()));
+        assert!(
+            r.tool_specs_with(&loaded)
+                .iter()
+                .any(|s| s.function.name == "TodoWrite")
+        );
+    }
+
+    /// `core` + `tool_search` (ラダーの `core-search`): TodoWrite は core に入ったので遅延にならず、
+    /// 残り (NotebookEdit など) が遅延になる。
+    #[test]
+    fn core_profile_with_tool_search_defers_only_what_core_hides() {
+        let mut r = default_registry();
+        r.apply_profile_with_search(crate::config::ToolProfile::Core, &[], true);
+        assert!(r.is_visible("TodoWrite") && !r.is_deferred("TodoWrite"));
+        assert!(!r.is_visible("NotebookEdit") && r.is_deferred("NotebookEdit"));
+        assert_eq!(
+            r.deferred_names().len(),
+            r.registered_len() - CORE_TOOLS.iter().filter(|n| r.get(n).is_some()).count()
+        );
+        assert!(r.tool_search_spec().is_some());
+    }
+
+    #[test]
+    fn without_tool_search_nothing_is_deferred_and_there_is_no_search_spec() {
+        let mut r = default_registry();
+        r.apply_profile(crate::config::ToolProfile::Core, &[]);
+        assert!(r.deferred_names().is_empty());
+        assert!(r.tool_search_spec().is_none());
+    }
+
+    /// `readonly` が隠した破壊的ツールは、`tool_search` でも読み込めない (#120 のレビュー)。
+    #[test]
+    fn readonly_profile_never_defers_destructive_tools() {
+        let mut r = default_registry();
+        r.register(dyn_tool("mcp__fs__write", "Write a file over MCP"));
+        r.apply_profile_with_search(crate::config::ToolProfile::Readonly, &[], true);
+        assert!(!r.is_visible("Write") && !r.is_deferred("Write"));
+        assert!(
+            !r.is_deferred("mcp__fs__write"),
+            "MCP tools are destructive"
+        );
+        assert!(r.search_deferred("select:Write").is_empty());
+        assert!(
+            r.tool_search_spec().is_none(),
+            "nothing to load, so no ToolSearch: {:?}",
+            r.deferred_names()
+        );
+    }
+
+    #[test]
+    fn select_ignores_case() {
+        let mut r = default_registry();
+        r.apply_profile_with_search(crate::config::ToolProfile::Full, &six_without_todo(), true);
+        let hits = r.search_deferred("select:todowrite");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name(), "TodoWrite");
+    }
+
+    #[test]
+    fn full_profile_with_tool_search_defers_only_mcp_tools() {
+        let mut r = default_registry();
+        r.register(dyn_tool("mcp__fs__read", "Read a file over MCP"));
+        r.apply_profile_with_search(crate::config::ToolProfile::Full, &[], true);
+        assert!(r.is_visible("Read") && r.is_visible("TodoWrite"));
+        assert!(!r.is_visible("mcp__fs__read") && r.is_deferred("mcp__fs__read"));
+        assert_eq!(r.deferred_names(), ["mcp__fs__read"]);
+
+        // tool_search 無しなら MCP ツールもこれまでどおり見せる。
+        let mut plain = default_registry();
+        plain.register(dyn_tool("mcp__fs__read", "Read a file over MCP"));
+        plain.apply_profile(crate::config::ToolProfile::Full, &[]);
+        assert!(plain.is_visible("mcp__fs__read"));
+    }
+
+    #[test]
+    fn search_deferred_matches_by_exact_name_or_keyword_and_caps_the_results() {
+        let mut r = default_registry();
+        r.register(dyn_tool("mcp__fs__read", "Read a file over MCP"));
+        r.apply_profile_with_search(crate::config::ToolProfile::Full, &six_without_todo(), true);
+        let names = |hits: Vec<Arc<dyn Tool>>| -> Vec<String> {
+            hits.iter().map(|t| t.name().to_string()).collect()
+        };
+        assert_eq!(
+            names(r.search_deferred("select:TodoWrite, mcp__fs__read, Read")),
+            ["TodoWrite", "mcp__fs__read"],
+            "exact names only, and never a tool that is already visible"
+        );
+        assert_eq!(names(r.search_deferred("MCP")), ["mcp__fs__read"]);
+        assert!(names(r.search_deferred("")).is_empty());
+        assert!(names(r.search_deferred("nothing-like-this")).is_empty());
+        assert!(r.search_deferred("a e i o u").len() <= TOOL_SEARCH_MAX_RESULTS);
+    }
+
+    #[test]
+    fn one_line_keeps_the_first_line_and_marks_a_cut() {
+        assert_eq!(one_line("first\nsecond"), "first");
+        let long = "x".repeat(150);
+        let cut = one_line(&long);
+        assert_eq!(cut.chars().count(), ONE_LINE_CHARS + 1);
+        assert!(cut.ends_with('…'));
     }
 
     #[test]

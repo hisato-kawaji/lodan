@@ -16,13 +16,14 @@ impl Tool for Monitor {
     }
     fn description(&self) -> &str {
         "Read newly-produced output and the running/exited status of a background process \
-         started by Bash with run_in_background. Returns only output since the last Monitor call."
+         started by Bash with run_in_background (bash_N) or a background sub-agent started by \
+         Task (agent_N). Returns only output since the last Monitor call."
     }
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "id": { "type": "string", "description": "Background process id, e.g. bash_1" }
+                "id": { "type": "string", "description": "Background id: bash_N (Bash) or agent_N (Task)" }
             },
             "required": ["id"]
         })

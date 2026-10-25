@@ -12,6 +12,7 @@ pub mod write;
 pub mod ask_user_question;
 pub mod multi_edit;
 pub mod notebook_edit;
+pub mod requirements;
 pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
@@ -21,6 +22,8 @@ pub mod monitor;
 
 // バックグラウンドプロセスの共有ストア（Bash run_in_background ↔ Monitor / KillShell）
 pub mod background;
+/// 編集直後の構文チェック (#65 D2)。`Tool` ではなく、ループが書き込みの後に呼ぶ補助。
+pub mod syntax;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -84,6 +87,12 @@ pub struct ToolCtx {
     pub todos: Arc<Mutex<Vec<TodoItem>>>,
     /// `Bash` の run_in_background が登録し、`Monitor` が読むバックグラウンドプロセス。
     pub bg: Arc<Mutex<background::BgStore>>,
+    /// Bash を包むサンドボックスの方針 (#75)。既定は off。
+    pub sandbox: crate::sandbox::SandboxPolicy,
+    /// 要件台帳 (#65 B1)。ループが抽出し、`Requirements` ツールが更新する。
+    pub requirements: Arc<Mutex<crate::agent::requirements::Ledger>>,
+    /// `Write` 1 回の行数上限 (#65 A2)。0 は無制限。
+    pub write_max_lines: usize,
 }
 
 impl ToolCtx {
@@ -93,7 +102,27 @@ impl ToolCtx {
             read_tracker: Arc::new(Mutex::new(HashSet::new())),
             todos: Arc::new(Mutex::new(Vec::new())),
             bg: Arc::new(Mutex::new(background::BgStore::default())),
+            sandbox: crate::sandbox::SandboxPolicy::off(),
+            requirements: Arc::new(Mutex::new(crate::agent::requirements::Ledger::default())),
+            write_max_lines: 0,
         }
+    }
+
+    /// 要件台帳を差し替える (cwd の `.lodan/requirements.json` を読んだもの。#65)。
+    pub fn with_requirements(mut self, ledger: crate::agent::requirements::Ledger) -> Self {
+        self.requirements = Arc::new(Mutex::new(ledger));
+        self
+    }
+
+    pub fn with_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.sandbox = policy;
+        self
+    }
+
+    /// `[agent] write_max_lines` (#65 A2)。
+    pub fn with_write_limit(mut self, lines: usize) -> Self {
+        self.write_max_lines = lines;
+        self
     }
 
     pub fn mark_read(&self, p: &std::path::Path) {
@@ -144,6 +173,10 @@ pub fn render_todo_list(items: &[TodoItem]) -> String {
     out
 }
 
+// clippy 1.99 の `double_must_use`: `#[async_trait]` が `async fn` を `#[must_use]` つきの
+// `Pin<Box<dyn Future>>` に展開するため、trait 側の must_use と二重になる。展開結果の話で
+// こちらに直せるものが無いので、trait 定義で抑える (CI の toolchain は stable 無ピン)。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -156,6 +189,14 @@ pub trait Tool: Send + Sync {
     /// false を実装すること。
     fn is_destructive(&self) -> bool {
         true
+    }
+    /// 同じ応答の中の他の呼び出しと同時に実行してよいなら true (#73)。
+    /// 既定は安全側の false。read-only でも並列にできないものがある — 共有状態を書く
+    /// (TodoWrite)、stdin を取り合う (AskUserQuestion)、読み取り位置を持つ (Monitor)。
+    /// 「呼び出し同士が互いの結果に影響しない」と言えるツールにだけ、明示的に true を実装すること。
+    /// `is_destructive()` が true のツールは、これが true でも並列にしない (承認の直列性を保つ)。
+    fn parallel_safe(&self) -> bool {
+        false
     }
     async fn execute(
         &self,

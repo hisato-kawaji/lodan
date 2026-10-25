@@ -1,7 +1,7 @@
-# PR レビュー ポリシー（v0.1）
+# PR レビュー ポリシー（v0.2）
 
-- 最終更新: 2026-06-24
-- ステータス: Draft v0.1
+- 最終更新: 2026-09-26
+- ステータス: Draft v0.2
 - 関連:
   - レビュー Agent: [`.claude/agents/pr-reviewer.md`](../../.claude/agents/pr-reviewer.md)
   - 手動起動コマンド: [`.claude/commands/pr-review.md`](../../.claude/commands/pr-review.md)
@@ -19,14 +19,14 @@ lodan の特徴 (個人開発・Rust CLI・ローカル LLM ↔ Sakana provider)
 
 ---
 
-## 1. レビュー観点（v0.1）
+## 1. レビュー観点（v0.2）
 
 すべての PR に対して、以下 6 観点を **PASS / WARN / FAIL** の 3 値で評価する。
 
 | # | 観点 | 概要 | 主要チェックポイント |
 |---|---|---|---|
 | 1 | **動作する** | 変更が実際に意図通り動くか | `cargo build` / `cargo test` 通過、`tests/e2e_mock.rs` グリーン、REPL 起動 (`echo /exit \| cargo run -- ...`) でバナーまで届く、tool calling が破綻していない |
-| 2 | **MVP スコープ整合** | 既存ロードマップと境界を守っているか | README §ロードマップ / `memory/project_roadmap.md` との整合、MVP 外スタブ (`hooks/`, `mcp/`, `skills/`, `slash/`, `session.rs`) の `unimplemented!()` を意図せず外していないか、`tools/registry.rs` のコメントアウト境界を尊重 |
+| 2 | **MVP スコープ整合** | 既存ロードマップと境界を守っているか | README §ロードマップ / `memory/project_roadmap.md` との整合、README に書いていない機能を黙って足していないか（hooks / mcp / skills / slash / session は 2026-09 時点で全て実装済み。スタブは残っていない）、`tools/registry.rs` の `parallel_safe` / `is_destructive` の宣言一覧を理由つきで更新しているか |
 | 3 | **Rust 規約・コード品質** | Rust + 本リポの慣行に準拠か | `cargo fmt --check` / `cargo clippy -D warnings` 相当、`anyhow` (アプリ層) と `thiserror` (ライブラリ層 / `tools::ToolError`) の使い分け、`async_trait` 整合、`Tool` trait (name/description/schema/is_destructive/execute) 規約、`ToolCtx` を経由した read_tracker / todos 操作、`println!` ではなく必要時のみ `tracing` |
 | 4 | **CI** | GitHub Actions が緑か | `.github/workflows/*` 上の `test` ジョブ通過、push / pull_request 両 trigger が壊れていない、`cargo test` 全数 pass |
 | 5 | **見落とし** | レビュー対象として見落とされがちな点 | 新規ツール追加時に `tools::registry::default_registry` 登録漏れ、新規ツールの `is_destructive` 設定漏れ、permission gate (`PermissionGate`) のバイパス、`Read` 必須ガード (`ToolCtx::was_read`) の欠落、`Config` スキーマ変更時の README / e2e test 追従漏れ、`.env` / `LODAN_*` env の整合性、`println!`/`dbg!` のデバッグ残骸 |
@@ -45,7 +45,8 @@ lodan の特徴 (個人開発・Rust CLI・ローカル LLM ↔ Sakana provider)
 集計の判定ルール:
 
 - **APPROVE**: 6 観点すべて PASS、または PR body で明示的に waiver された WARN のみ
-- **REQUEST_CHANGES**: いずれかが FAIL、または重大な WARN が複数（reviewer 裁量）
+- **APPROVE（条件つき）**: FAIL が無く、waiver されていない WARN が **1 件だけ**。verdict は APPROVE とし、その WARN を「マージ前に対応するか、PR body で waiver するか」の 2 択で作者に返す。作者がどちらかを済ませた head で再レビューはしない（対応の確認は `loop-pr-discussion` の往復で行う）
+- **REQUEST_CHANGES**: いずれかが FAIL、または重大な WARN が複数（reviewer 裁量）。WARN が 1 件でも、放置するとマージ後に壊れると reviewer が判断するものは WARN ではなく FAIL にする
 - **NEEDS_DISCUSSION**: 設計判断・スコープ判断・トレードオフ判断が必要で、レビュー観点では結論を出せない
 
 自動レビューは **コメントのみ**（GitHub の Approve / Request changes は **人間 (最終的に `loop-pr-discussion` の自動 approve も含む) の専有**）。

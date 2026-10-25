@@ -9,14 +9,33 @@ emits a final summary. Otherwise it returns a greeting.
 Supports both stream=false (single JSON) and stream=true (SSE).
 
 Usage: mock_llm.py <port> [<demo_dir>]
+
+Set MOCK_LLM_TEXT to replace the greeting (tests use it to return hostile text).
+
+Pass port 0 to let the OS choose. The port actually bound is printed on the first
+line of stdout ("PORT <n>"), so a test harness never has to guess a free port and
+race other tests for it.
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-def build_steps(demo_dir):
+def build_steps(demo_dir, model=None):
+    # MOCK_LLM_STEPS: demo をこの手順に差し替える。JSON 配列 [[name, args], ...]。
+    # 1 手順 = 1 応答で、順にツールを呼んでから最後に本文を返す。
+    # MOCK_LLM_STEPS_MODEL を置くと、そのモデル名のリクエストだけに差し替えが効く
+    # (親は Task を呼び、子 (別モデル) は既定の demo を走らせる、という組み合わせ用)。
+    scripted = os.environ.get("MOCK_LLM_STEPS")
+    only_for = os.environ.get("MOCK_LLM_STEPS_MODEL")
+    if scripted and (not only_for or model == only_for):
+        return [(name, args) for name, args in json.loads(scripted)]
+    # MOCK_LLM_BASH: demo を「この Bash コマンド 1 回」に差し替える (サンドボックスの e2e 用)。
+    bash_only = os.environ.get("MOCK_LLM_BASH")
+    if bash_only:
+        return [("Bash", {"command": bash_only})]
     return [
         ("Write", {"path": f"{demo_dir}/hello.txt", "content": "hi"}),
         ("Read",  {"path": f"{demo_dir}/hello.txt"}),
@@ -29,9 +48,25 @@ def build_steps(demo_dir):
 
 
 def make_handler(demo_dir):
-    steps = build_steps(demo_dir)
+    default_steps = build_steps(demo_dir)
+    # MOCK_LLM_TEXTS: JSON 配列。本文の返事を呼ばれるたびに順に返す (尽きたら最後を繰り返す)。
+    # 「1 回目は駄目な答え、直せと言われたら正しい答え」を再現するためのもの。
+    scripted = json.loads(os.environ.get("MOCK_LLM_TEXTS", "[]"))
+    served = {"n": 0}
 
-    def decide(messages):
+    def decide(messages, model=None):
+        # MOCK_LLM_JUDGE_MODEL / MOCK_LLM_JUDGE_TEXT: このモデル名で来たリクエストにだけ別の返事をする
+        # (`/goal` の評価器を別モデルにする設定が、本当にそのモデルへ尋ねているかを見る)。
+        judge = os.environ.get("MOCK_LLM_JUDGE_MODEL")
+        if judge and model == judge:
+            return ("text", os.environ.get("MOCK_LLM_JUDGE_TEXT", ""))
+        # MOCK_LLM_ECHO_SYSTEM: 受け取った system prompt をそのまま本文にして返す
+        # (`--append-system-prompt` が本当に届いているか、どこに置かれたかを見る)。
+        if os.environ.get("MOCK_LLM_ECHO_SYSTEM"):
+            system = next(
+                (m for m in messages if m.get("role") == "system"), None
+            )
+            return ("text", (system or {}).get("content", "") or "")
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -39,6 +74,7 @@ def make_handler(demo_dir):
         tool_count = sum(1 for m in messages if m.get("role") == "tool")
 
         if "demo" in user_content.lower():
+            steps = build_steps(demo_dir, model) if os.environ.get("MOCK_LLM_STEPS_MODEL") else default_steps
             if tool_count < len(steps):
                 name, args = steps[tool_count]
                 return ("tools", [(name, args)])
@@ -46,8 +82,13 @@ def make_handler(demo_dir):
                     f"Demo complete: exercised {len(steps)} tools "
                     f"({', '.join(s[0] for s in steps)}).")
 
-        return ("text",
-                "Hello from mock LLM. Send 'demo' to run the full tool sequence.")
+        if scripted:
+            reply = scripted[min(served["n"], len(scripted) - 1)]
+            served["n"] += 1
+            return ("text", reply)
+        return ("text", os.environ.get(
+            "MOCK_LLM_TEXT",
+            "Hello from mock LLM. Send 'demo' to run the full tool sequence."))
 
     def build_message(decision):
         kind, payload = decision
@@ -136,7 +177,7 @@ def make_handler(demo_dir):
 
             messages = req.get("messages", [])
             stream = bool(req.get("stream"))
-            decision = decide(messages)
+            decision = decide(messages, req.get("model"))
 
             if not stream:
                 resp = non_streaming_body(decision)
@@ -166,7 +207,11 @@ def make_handler(demo_dir):
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     demo_dir = sys.argv[2] if len(sys.argv) > 2 else "/tmp/lodan-mock"
+    server = HTTPServer(("127.0.0.1", port), make_handler(demo_dir))
+    port = server.server_port
+    # The socket is already listening here, so whoever reads this line can connect.
+    print(f"PORT {port}", flush=True)
     sys.stderr.write(
         f"[mock] listening on http://127.0.0.1:{port} demo_dir={demo_dir}\n"
     )
-    HTTPServer(("127.0.0.1", port), make_handler(demo_dir)).serve_forever()
+    server.serve_forever()

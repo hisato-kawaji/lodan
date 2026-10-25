@@ -210,6 +210,7 @@ mod tests {
                 content: Some("ok".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             })
         }
 
@@ -230,6 +231,7 @@ mod tests {
                 content: Some("ok".into()),
                 tool_calls: vec![],
                 usage: None,
+                reasoning: None,
             }));
             Ok(())
         }

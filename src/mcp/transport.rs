@@ -50,12 +50,27 @@ pub type ServerRequestHandler = Arc<
         + Sync,
 >;
 
+// clippy 1.99 の `double_must_use`: `#[async_trait]` が `async fn` を `#[must_use]` つきの
+// `Pin<Box<dyn Future>>` に展開するため、trait 側の must_use と二重になる。展開結果の話で
+// こちらに直せるものが無いので、trait 定義で抑える (CI の toolchain は stable 無ピン)。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Transport: Send + Sync {
-    /// `line` (JSON-RPC リクエスト) を送り、`id` で相関した応答を返す。
-    async fn send_request(&self, id: u64, line: String) -> Result<JsonRpcIncoming>;
+    /// `line` (JSON-RPC リクエスト) を送り、`id` で相関した応答を返す。`timeout` を超えたら諦める
+    /// (ツール呼び出しは `toolTimeoutSecs`、それ以外は `REQUEST_TIMEOUT`)。
+    async fn send_request(
+        &self,
+        id: u64,
+        line: String,
+        timeout: Duration,
+    ) -> Result<JsonRpcIncoming>;
     /// 通知 (応答なし) を送る。
     async fn send_notification(&self, line: String) -> Result<()>;
+    /// サーバから `notifications/tools/list_changed` が届いていたら true を返し、印を消す (#83)。
+    /// 受信の口が無い transport (HTTP の POST だけ) は常に false。
+    fn take_tools_changed(&self) -> bool {
+        false
+    }
 }
 
 // ---------------- stdio ----------------
@@ -67,6 +82,8 @@ pub struct StdioTransport {
     outbound: mpsc::UnboundedSender<String>,
     pending: Pending,
     child: Mutex<Option<Child>>,
+    /// `notifications/tools/list_changed` を受けた印。次のターンの入口で読まれる (#83)。
+    tools_changed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StdioTransport {
@@ -123,6 +140,8 @@ impl StdioTransport {
         //         method のみ = 通知 (無視)。
         let pending_clone = Arc::clone(&pending);
         let label_for_reader = label.to_string();
+        let tools_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools_changed_for_reader = Arc::clone(&tools_changed);
         let reader_outbound = outbound_tx.clone();
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
@@ -164,7 +183,12 @@ impl StdioTransport {
                         });
                     }
                     (Some(method), None) => {
-                        tracing::debug!(server=%label_for_reader, method, "mcp: notification ignored");
+                        if method == "notifications/tools/list_changed" {
+                            tools_changed_for_reader
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        } else {
+                            tracing::debug!(server=%label_for_reader, method, "mcp: notification ignored");
+                        }
                     }
                     (None, Some(id)) => {
                         if let Some(tx) = pending_clone.lock().await.remove(&id) {
@@ -194,19 +218,25 @@ impl StdioTransport {
             outbound: outbound_tx,
             pending,
             child: Mutex::new(Some(child)),
+            tools_changed,
         })
     }
 }
 
 #[async_trait]
 impl Transport for StdioTransport {
-    async fn send_request(&self, id: u64, line: String) -> Result<JsonRpcIncoming> {
+    async fn send_request(
+        &self,
+        id: u64,
+        line: String,
+        limit: Duration,
+    ) -> Result<JsonRpcIncoming> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
         self.outbound
             .send(line)
             .map_err(|_| anyhow!("mcp[{}]: writer channel closed", self.label))?;
-        match timeout(REQUEST_TIMEOUT, rx).await {
+        match timeout(limit, rx).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(_)) => Err(anyhow!(
                 "mcp[{}]: response channel dropped (server died?)",
@@ -215,9 +245,9 @@ impl Transport for StdioTransport {
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 Err(anyhow!(
-                    "mcp[{}]: request timed out after {:?}",
+                    "mcp[{}]: request timed out after {}s",
                     self.label,
-                    REQUEST_TIMEOUT
+                    limit.as_secs()
                 ))
             }
         }
@@ -227,6 +257,11 @@ impl Transport for StdioTransport {
         self.outbound
             .send(line)
             .map_err(|_| anyhow!("mcp[{}]: writer channel closed", self.label))
+    }
+
+    fn take_tools_changed(&self) -> bool {
+        self.tools_changed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -279,10 +314,11 @@ impl HttpTransport {
         })
     }
 
-    async fn post(&self, line: String) -> Result<reqwest::Response> {
+    async fn post(&self, line: String, limit: Duration) -> Result<reqwest::Response> {
         let mut req = self
             .client
             .post(&self.url)
+            .timeout(limit)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(line);
@@ -300,8 +336,13 @@ impl HttpTransport {
 
 #[async_trait]
 impl Transport for HttpTransport {
-    async fn send_request(&self, id: u64, line: String) -> Result<JsonRpcIncoming> {
-        let resp = self.post(line).await?;
+    async fn send_request(
+        &self,
+        id: u64,
+        line: String,
+        limit: Duration,
+    ) -> Result<JsonRpcIncoming> {
+        let resp = self.post(line, limit).await?;
         let status = resp.status();
         // サーバが割り当てたセッション ID を引き継ぐ。
         if let Some(sid) = resp.headers().get(SESSION_HEADER)
@@ -339,7 +380,7 @@ impl Transport for HttpTransport {
     }
 
     async fn send_notification(&self, line: String) -> Result<()> {
-        let resp = self.post(line).await?;
+        let resp = self.post(line, REQUEST_TIMEOUT).await?;
         if let Some(sid) = resp.headers().get(SESSION_HEADER)
             && let Ok(s) = sid.to_str()
         {

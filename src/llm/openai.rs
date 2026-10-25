@@ -12,18 +12,185 @@ use tokio::sync::mpsc;
 
 use crate::agent::messages::{Message, ToolCall, ToolCallFunction, ToolSpec};
 use crate::config::ProviderConfig;
-use crate::llm::{ChatEvent, ChatResponse, LlmClient, Usage};
+use crate::llm::{ChatEvent, ChatResponse, LlmClient, TransientLlmError, Usage};
 
 pub struct OpenAiClient {
     base_url: String,
     api_key: String,
     /// None はリクエストに含めない (サーバ既定)。#61: 小型モデルの整形安定用。
     temperature: Option<f32>,
+    /// None は送らない (サーバ既定)。値はそのまま渡す (#78)。
+    reasoning_effort: Option<String>,
+    /// プランモードの間だけ `reasoning_effort` の代わりに使う値。
+    plan_reasoning_effort: Option<String>,
+    /// `required` なら全リクエストをツール呼び出しで答えさせ、`Finish` を足して最終回答を受ける (#65 A1)。
+    require_tool_call: bool,
+    /// body にそのまま足すサーバ固有のパラメータ。`new` で予約キーとの衝突を弾いてある。
+    extra_body: serde_json::Map<String, serde_json::Value>,
+    retry: RetryPolicy,
+    /// ストリームの無通信許容時間。None は無効。
+    stream_idle_timeout: Option<Duration>,
     http: reqwest::Client,
+}
+
+/// 再試行可能なステータスに付いてくるエラーボディを読む上限。ボディは表示用でしかないのに、
+/// 黙ったサーバ相手に `timeout_secs` を丸ごと使ってから再試行するのは割に合わない。
+const ERROR_BODY_READ_LIMIT: Duration = Duration::from_secs(5);
+
+/// エラーメッセージに載せるレスポンスボディの上限 (文字数)。ボディはそのまま stderr・
+/// runlog・`stream-json` の stdout に出るので、サーバが返した巨大な HTML や、エコーされた
+/// リクエスト内容を丸ごと流さない。
+const ERROR_BODY_MAX_CHARS: usize = 500;
+
+fn clip_body(body: &str) -> String {
+    match body.char_indices().nth(ERROR_BODY_MAX_CHARS) {
+        Some((cut, _)) => format!("{}… ({} bytes total)", &body[..cut], body.len()),
+        None => body.to_string(),
+    }
+}
+
+/// 利用者にまだ何も見せていない一時的な失敗。fallback provider が拾える (`llm::is_transient`)。
+fn transient(message: String) -> anyhow::Error {
+    TransientLlmError(message).into()
+}
+
+/// `source()` をたどって原因を 1 行にする。reqwest の Display は種類 (`error decoding
+/// response body`) で止まり、切断なのか UTF-8 破損なのかが分からないため。
+///
+/// URL は落とす。reqwest は送信エラーに ` for url (…)` を付けるが、`base_url` に資格情報を
+/// 埋め込む構成 (`https://user:pass@host/…` やクエリのトークン) では、それが runlog と
+/// `stream-json` の stdout に流れてしまう。接続先は設定を見れば分かる。
+fn error_chain(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    if let Some(url) = e.url() {
+        out = out.replace(&format!(" for url ({url})"), "");
+    }
+    let e: &dyn std::error::Error = e;
+    let mut source = e.source();
+    while let Some(s) = source {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        source = s.source();
+    }
+    out
+}
+
+/// 再試行待ちの上限。`Retry-After` がこれより長くても待たない (対話が固まるため)。
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    max_retries: u32,
+    base: Duration,
+}
+
+/// 1 回の `chat` / `chat_stream` 呼び出しの中で共有する再試行の残数。
+/// 送信の失敗とストリーム途中の断を同じ予算から引く。
+struct RetryBudget {
+    policy: RetryPolicy,
+    used: u32,
+}
+
+impl RetryBudget {
+    fn new(policy: RetryPolicy) -> Self {
+        Self { policy, used: 0 }
+    }
+
+    /// 予算が残っていれば待ってから `true`。使い切っていれば待たずに `false`。
+    async fn wait(&mut self, why: &str, retry_after: Option<Duration>) -> bool {
+        if self.used >= self.policy.max_retries {
+            return false;
+        }
+        // 送り直しも 1 リクエスト。予算 (`max_requests` など) に数え、残っていなければ再試行しない。
+        if !super::metered::admit_retry() {
+            return false;
+        }
+        self.used += 1;
+        let delay = backoff_delay(self.policy.base, self.used, retry_after, jitter_seed());
+        // `why` にはプロバイダの応答本文が入り得る。tracing の fmt は `%` (Display) のフィールドを
+        // 無加工で出すので、無害化は `sanitize` が担っている (外さないこと。fallback.rs も同じ)。
+        tracing::warn!(
+            why = %crate::term::sanitize(why),
+            "LLM request failed; retry {}/{} in {}ms",
+            self.used,
+            self.policy.max_retries,
+            delay.as_millis()
+        );
+        crate::runlog::record(
+            "api_retry",
+            serde_json::json!({
+                "attempt": self.used,
+                "max_retries": self.policy.max_retries,
+                "why": why,
+                "delay_ms": delay.as_millis() as u64,
+            }),
+        );
+        tokio::time::sleep(delay).await;
+        true
+    }
+}
+
+/// 待ち時間。`Retry-After` があればそれ、無ければ `base * 2^(attempt-1)` に最大 25% の
+/// 揺らぎを足す (同時に落ちたクライアントが同時に戻らないように)。どちらも上限つき。
+fn backoff_delay(
+    base: Duration,
+    attempt: u32,
+    retry_after: Option<Duration>,
+    jitter_seed: u64,
+) -> Duration {
+    if let Some(d) = retry_after {
+        return d.min(RETRY_MAX_DELAY);
+    }
+    let exp = base.saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+    let capped = exp.min(RETRY_MAX_DELAY);
+    let jitter_range_ms = (capped.as_millis() as u64) / 4;
+    let jitter = if jitter_range_ms == 0 {
+        0
+    } else {
+        jitter_seed % jitter_range_ms
+    };
+    (capped + Duration::from_millis(jitter)).min(RETRY_MAX_DELAY)
+}
+
+/// 揺らぎの種。暗号的な乱数は要らないので時計の下位ビットで足りる。
+fn jitter_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// 時間を置けば通り得る応答か。400 / 401 / 404 のような恒久的な失敗は含めない。
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+/// `Retry-After` の秒数形式だけを読む (HTTP-date 形式は無視して通常のバックオフに任せる)。
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 impl OpenAiClient {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
+        if let Some(key) = cfg
+            .extra_body
+            .keys()
+            .find(|k| RESERVED_BODY_KEYS.contains(&k.as_str()))
+        {
+            anyhow::bail!(
+                "extra_body must not set `{key}`: lodan builds that part of the request itself \
+                 (use the dedicated setting instead)"
+            );
+        }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()
@@ -32,8 +199,152 @@ impl OpenAiClient {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
             temperature: cfg.temperature,
+            reasoning_effort: cfg
+                .reasoning_effort
+                .clone()
+                .filter(|e| !e.trim().is_empty()),
+            plan_reasoning_effort: cfg
+                .plan_reasoning_effort
+                .clone()
+                .filter(|e| !e.trim().is_empty()),
+            require_tool_call: match cfg.tool_choice.as_deref().map(str::trim) {
+                None | Some("") | Some("auto") => false,
+                Some("required") => true,
+                Some(other) => anyhow::bail!(
+                    "tool_choice `{other}` is not supported (use `auto` or `required`)"
+                ),
+            },
+            extra_body: cfg.extra_body.clone(),
+            retry: RetryPolicy {
+                max_retries: cfg.max_retries,
+                base: Duration::from_millis(cfg.retry_base_ms),
+            },
+            stream_idle_timeout: (cfg.stream_idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(cfg.stream_idle_timeout_secs)),
             http,
         })
+    }
+
+    /// このリクエストの `tool_choice`。ツールが無ければ送らない (`required` で tools 無しは
+    /// サーバがエラーにする)。
+    fn choice(&self, tools: &[ToolSpec<'_>]) -> Option<&'static str> {
+        if tools.is_empty() {
+            None
+        } else if self.require_tool_call {
+            Some("required")
+        } else {
+            Some("auto")
+        }
+    }
+
+    /// `required` のときは `Finish` 擬似ツールを足したツール一覧 (それ以外はそのまま)。
+    fn with_finish<'a>(&self, tools: &'a [ToolSpec<'a>]) -> std::borrow::Cow<'a, [ToolSpec<'a>]> {
+        if self.require_tool_call && !tools.is_empty() {
+            let mut v = tools.to_vec();
+            v.push(finish_spec());
+            std::borrow::Cow::Owned(v)
+        } else {
+            std::borrow::Cow::Borrowed(tools)
+        }
+    }
+
+    /// `Finish` だけを呼んだ応答を、本文 (最終回答) の応答に読み替える。**追加で画面に出す分**を
+    /// 返す (ストリームでは既に流れた本文との差分だけを送るため。何も足さないなら None)。
+    /// 他のツール呼び出しと一緒に来た `Finish` はそのまま (ループが unknown tool として返し、
+    /// モデルは次の応答で改めて Finish を呼ぶ)。
+    ///
+    /// 本文とツールコールの両方を返すモデルもある。その本文は既に画面へ流れているので、
+    /// **上書きせず**、`answer` がそこに含まれていなければ後ろに足す (捨てない・二重に出さない)。
+    fn absorb_finish(&self, resp: &mut ChatResponse) -> Option<String> {
+        if !self.require_tool_call || resp.tool_calls.len() != 1 {
+            return None;
+        }
+        let call = &resp.tool_calls[0];
+        if call.function.name != FINISH {
+            return None;
+        }
+        let answer = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            .ok()
+            .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(str::to_string))
+            .unwrap_or_else(|| call.function.arguments.clone());
+        resp.tool_calls.clear();
+        let said = resp.content.as_deref().unwrap_or("");
+        if said.trim().is_empty() {
+            resp.content = Some(answer.clone());
+            return Some(answer);
+        }
+        if said.contains(answer.trim()) || answer.trim().is_empty() {
+            // 既に同じことを言っている (本文に前置きして Finish に同じ答えを入れる挙動)。
+            return None;
+        }
+        let added = format!("\n{answer}");
+        resp.content = Some(format!("{said}{added}"));
+        Some(added)
+    }
+
+    /// このリクエストに付ける推論の深さ。プランモードの呼び出しで、専用の値があればそちら。
+    fn effort(&self) -> Option<&str> {
+        self.plan_reasoning_effort
+            .as_deref()
+            .filter(|_| super::plan_mode_active())
+            .or(self.reasoning_effort.as_deref())
+    }
+
+    /// リクエストを送り、成功ステータスの応答を返す。接続エラーと再試行可能な
+    /// ステータスは予算の範囲で送り直す。リクエスト全体のタイムアウトは再試行しない
+    /// (`timeout_secs` ぶん待った末の失敗をもう一度待つのは、遅いモデルでは害のほうが大きい)。
+    async fn send(
+        &self,
+        req: &ChatRequest<'_>,
+        budget: &mut RetryBudget,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/chat/completions", self.base_url);
+        loop {
+            let mut builder = self.http.post(&url).json(req);
+            if !self.api_key.is_empty() {
+                builder = builder.bearer_auth(&self.api_key);
+            }
+            match builder.send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let after = retry_after(&resp);
+                    let body = tokio::time::timeout(ERROR_BODY_READ_LIMIT, resp.text())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    let body = clip_body(&body);
+                    if !is_retryable_status(status) {
+                        return Err(anyhow!("LLM HTTP {status}: {body}"));
+                    }
+                    if budget.wait(&format!("HTTP {status}"), after).await {
+                        continue;
+                    }
+                    return Err(transient(format!("LLM HTTP {status}: {body}")));
+                }
+                Err(e) if e.is_connect() => {
+                    if budget
+                        .wait(&format!("connect error: {}", error_chain(&e)), None)
+                        .await
+                    {
+                        continue;
+                    }
+                    return Err(transient(format!(
+                        "sending chat request: {}",
+                        error_chain(&e)
+                    )));
+                }
+                // 再試行はしないが (同じ待ちを繰り返すだけ)、別の provider なら通り得る。
+                Err(e) if e.is_timeout() => {
+                    return Err(transient(format!(
+                        "sending chat request: {}",
+                        error_chain(&e)
+                    )));
+                }
+                Err(e) => return Err(e.without_url()).context("sending chat request"),
+            }
+        }
     }
 }
 
@@ -49,12 +360,31 @@ struct ChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     stream: bool,
     /// ストリーミング時に最終チャンクへ usage を含めるよう要求する
     /// (OpenAI / vLLM / llama.cpp が対応。非対応サーバは無視する)。
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// `extra_body`。空なら body は 1 バイトも変わらない。
+    #[serde(flatten)]
+    extra: &'a serde_json::Map<String, serde_json::Value>,
 }
+
+/// lodan 自身が組み立てる body のキー。`extra_body` に書かれると JSON のキーが重複し、どちらが
+/// 効くかがサーバ次第になる (`stream` や `messages` を差し替えられると動作も壊れる)。
+const RESERVED_BODY_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "max_tokens",
+    "temperature",
+    "reasoning_effort",
+    "stream",
+    "stream_options",
+];
 
 #[derive(Serialize)]
 struct StreamOptions {
@@ -82,6 +412,18 @@ struct ChatMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<RawToolCall>,
+    /// 思考過程。DeepSeek / Moonshot / vLLM は `reasoning_content`、Ollama / OpenRouter は `reasoning`。
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+/// 2 通りの名前のうち、来ている方。空文字は「無い」と同じ。
+fn pick_reasoning(reasoning_content: Option<String>, reasoning: Option<String>) -> Option<String> {
+    reasoning_content
+        .filter(|s| !s.is_empty())
+        .or(reasoning.filter(|s| !s.is_empty()))
 }
 
 #[derive(Deserialize, Debug)]
@@ -109,42 +451,66 @@ impl LlmClient for OpenAiClient {
         model: &str,
         max_tokens: Option<u32>,
     ) -> Result<ChatResponse> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let tools = self.with_finish(tools);
         let req = ChatRequest {
             model,
             messages: history,
-            tools,
-            tool_choice: if tools.is_empty() { None } else { Some("auto") },
+            tools: &tools,
+            tool_choice: self.choice(&tools),
             max_tokens,
             temperature: self.temperature,
+            reasoning_effort: self.effort(),
             stream: false,
             stream_options: None,
+            extra: &self.extra_body,
         };
 
-        let mut builder = self.http.post(&url).json(&req);
-        if !self.api_key.is_empty() {
-            builder = builder.bearer_auth(&self.api_key);
-        }
-
-        let resp = builder.send().await.context("sending chat request")?;
-        let status = resp.status();
-        let text = resp.text().await.context("reading chat response")?;
-        if !status.is_success() {
-            return Err(anyhow!("LLM HTTP {status}: {text}"));
-        }
+        let mut budget = RetryBudget::new(self.retry);
+        // 200 の後に本文が途中で切れるのも一時的な失敗。非ストリームでは利用者にまだ何も
+        // 見せていないので、ストリームの「出力前の断」と同じく送り直してよい。
+        let text = loop {
+            let resp = self.send(&req, &mut budget).await?;
+            match resp.text().await {
+                Ok(text) => break text,
+                // `timeout_secs` は本文の読み込みまで含む。使い切った失敗は送り直さない。
+                Err(e)
+                    if !e.is_timeout()
+                        && budget
+                            .wait(
+                                &format!("response body interrupted: {}", error_chain(&e)),
+                                None,
+                            )
+                            .await =>
+                {
+                    continue;
+                }
+                // 非ストリームでは利用者にまだ何も見せていない。
+                Err(e) => {
+                    return Err(transient(format!(
+                        "reading chat response: {}",
+                        error_chain(&e)
+                    )));
+                }
+            }
+        };
 
         let body: ChatResponseBody = serde_json::from_str(&text)
-            .with_context(|| format!("parsing chat response: {text}"))?;
+            .with_context(|| format!("parsing chat response: {}", clip_body(&text)))?;
         let usage = body.usage.map(Usage::normalized);
         let choice = body
             .choices
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("LLM returned no choices"))?;
+        let ChatMessage {
+            content,
+            tool_calls: raw_calls,
+            reasoning_content,
+            reasoning,
+        } = choice.message;
+        let reasoning = pick_reasoning(reasoning_content, reasoning);
 
-        let tool_calls = choice
-            .message
-            .tool_calls
+        let tool_calls = raw_calls
             .into_iter()
             .enumerate()
             .map(|(i, tc)| ToolCall {
@@ -157,11 +523,14 @@ impl LlmClient for OpenAiClient {
             })
             .collect();
 
-        Ok(ChatResponse {
-            content: choice.message.content,
+        let mut out = ChatResponse {
+            content,
             tool_calls,
             usage,
-        })
+            reasoning,
+        };
+        self.absorb_finish(&mut out);
+        Ok(out)
     }
 
     async fn chat_stream(
@@ -171,38 +540,141 @@ impl LlmClient for OpenAiClient {
         model: &str,
         sink: mpsc::UnboundedSender<ChatEvent>,
     ) -> Result<()> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let tools = self.with_finish(tools);
         let req = ChatRequest {
             model,
             messages: history,
-            tools,
-            tool_choice: if tools.is_empty() { None } else { Some("auto") },
+            tools: &tools,
+            tool_choice: self.choice(&tools),
             max_tokens: None,
             temperature: self.temperature,
+            reasoning_effort: self.effort(),
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            extra: &self.extra_body,
         };
 
-        let mut builder = self.http.post(&url).json(&req);
-        if !self.api_key.is_empty() {
-            builder = builder.bearer_auth(&self.api_key);
-        }
-        let resp = builder.send().await.context("sending stream request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("LLM HTTP {status}: {body}"));
-        }
+        let mut budget = RetryBudget::new(self.retry);
+        let StreamParts {
+            text_buf,
+            reasoning_buf,
+            calls,
+            usage,
+        } = loop {
+            let resp = self.send(&req, &mut budget).await?;
+            match self.consume_stream(resp, &sink).await {
+                Ok(parts) => break parts,
+                // 本文を 1 文字でも流した後にやり直すと、利用者には同じ文が二重に見える。
+                // 何も出していない断だけを送り直す (ツールコールの断片は sink に流して
+                // いないので捨てて構わない)。
+                Err(f)
+                    if f.retryable()
+                        && budget
+                            .wait(&format!("stream interrupted: {:#}", f.error), None)
+                            .await =>
+                {
+                    // 思考を流していたら、受け手に、やり直しであることを伝える。
+                    if f.emitted_reasoning {
+                        let _ = sink.send(ChatEvent::AttemptRestarted);
+                    }
+                    continue;
+                }
+                // 本文を出す前の断は fallback が拾える。出した後は拾わせない (二重表示)。
+                Err(f) if !f.emitted_text => return Err(transient(format!("{:#}", f.error))),
+                Err(f) => return Err(f.error),
+            }
+        };
 
+        let tool_calls = calls
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| ToolCall {
+                id: p.id.unwrap_or_else(|| format!("call_{i}")),
+                kind: p.kind.unwrap_or_else(|| "function".to_string()),
+                function: ToolCallFunction {
+                    name: p.name.unwrap_or_default(),
+                    arguments: if p.arguments.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        p.arguments
+                    },
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let mut resp = ChatResponse {
+            content: if text_buf.is_empty() {
+                None
+            } else {
+                Some(text_buf)
+            },
+            tool_calls,
+            usage,
+            reasoning: (!reasoning_buf.is_empty()).then_some(reasoning_buf),
+        };
+        // `Finish` を本文に読み替えたら、画面にも出す (本文のデルタは 1 つも流れていない)。
+        if let Some(answer) = self.absorb_finish(&mut resp) {
+            let _ = sink.send(ChatEvent::TextDelta(answer));
+        }
+        let _ = sink.send(ChatEvent::Done(resp));
+        Ok(())
+    }
+}
+
+impl OpenAiClient {
+    /// SSE を最後まで読み、本文デルタを `sink` へ流しながら応答の部品を組み立てる。
+    async fn consume_stream(
+        &self,
+        resp: reqwest::Response,
+        sink: &mpsc::UnboundedSender<ChatEvent>,
+    ) -> std::result::Result<StreamParts, StreamFailure> {
         let mut stream = resp.bytes_stream().eventsource();
         let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
         let mut calls: Vec<PartialCall> = Vec::new();
         let mut usage: Option<Usage> = None;
 
-        while let Some(event) = stream.next().await {
-            let event = event.context("SSE chunk error")?;
+        loop {
+            let next = match self.stream_idle_timeout {
+                Some(idle) => match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        return Err(StreamFailure {
+                            emitted_text: !text_buf.is_empty(),
+                            emitted_reasoning: !reasoning_buf.is_empty(),
+                            request_timed_out: false,
+                            error: anyhow!("LLM stream idle for {}s", idle.as_secs()),
+                        });
+                    }
+                },
+                None => stream.next().await,
+            };
+            let Some(event) = next else { break };
+            let event = match event {
+                Ok(event) => event,
+                Err(e) => {
+                    let request_timed_out = matches!(
+                        &e,
+                        eventsource_stream::EventStreamError::Transport(t) if t.is_timeout()
+                    );
+                    return Err(StreamFailure {
+                        emitted_text: !text_buf.is_empty(),
+                        emitted_reasoning: !reasoning_buf.is_empty(),
+                        request_timed_out,
+                        // eventsource の Error は source() を実装していないので、`{:#}` では
+                        // 「Transport error: error decoding response body」で止まる。
+                        // 転送エラーは中の reqwest エラーを自前でたどって原因まで出す。
+                        error: match &e {
+                            eventsource_stream::EventStreamError::Transport(t) => {
+                                anyhow!("SSE chunk error: {}", error_chain(t))
+                            }
+                            _ => anyhow::Error::new(e).context("SSE chunk error"),
+                        },
+                    });
+                }
+            };
             if event.data == "[DONE]" {
                 break;
             }
@@ -215,6 +687,14 @@ impl LlmClient for OpenAiClient {
                 usage = Some(u.normalized());
             }
             for choice in chunk.choices {
+                // 思考は本文より先に流れてくる。ここで断が起きても「本文は未出力」のままなので、
+                // 再試行も fallback もこれまでどおり効く (思考の表示が重なるだけ)。
+                if let Some(r) =
+                    pick_reasoning(choice.delta.reasoning_content, choice.delta.reasoning)
+                {
+                    reasoning_buf.push_str(&r);
+                    let _ = sink.send(ChatEvent::ReasoningDelta(r));
+                }
                 if let Some(d) = choice.delta.content
                     && !d.is_empty()
                 {
@@ -245,34 +725,37 @@ impl LlmClient for OpenAiClient {
             }
         }
 
-        let tool_calls = calls
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| ToolCall {
-                id: p.id.unwrap_or_else(|| format!("call_{i}")),
-                kind: p.kind.unwrap_or_else(|| "function".to_string()),
-                function: ToolCallFunction {
-                    name: p.name.unwrap_or_default(),
-                    arguments: if p.arguments.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        p.arguments
-                    },
-                },
-            })
-            .collect::<Vec<_>>();
-
-        let resp = ChatResponse {
-            content: if text_buf.is_empty() {
-                None
-            } else {
-                Some(text_buf)
-            },
-            tool_calls,
+        Ok(StreamParts {
+            text_buf,
+            reasoning_buf,
+            calls,
             usage,
-        };
-        let _ = sink.send(ChatEvent::Done(resp));
-        Ok(())
+        })
+    }
+}
+
+struct StreamParts {
+    text_buf: String,
+    reasoning_buf: String,
+    calls: Vec<PartialCall>,
+    usage: Option<Usage>,
+}
+
+/// ストリーム途中の失敗。`emitted_text` が false なら、利用者に**本文**は見えていない。
+struct StreamFailure {
+    emitted_text: bool,
+    /// 思考過程は流していた (やり直すなら、受け手に数え直させる)。
+    emitted_reasoning: bool,
+    /// リクエスト全体の `timeout_secs` を使い切った (idle timeout とは別物)。
+    request_timed_out: bool,
+    error: anyhow::Error,
+}
+
+impl StreamFailure {
+    /// 送り直してよいか。表示済みの本文があれば二重表示になり、`timeout_secs` 切れは
+    /// 同じ待ちを繰り返すだけなので、どちらも再試行しない。
+    fn retryable(&self) -> bool {
+        !self.emitted_text && !self.request_timed_out
     }
 }
 
@@ -307,6 +790,10 @@ struct StreamDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<StreamToolCall>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -336,9 +823,787 @@ fn arguments_to_string(v: serde_json::Value) -> String {
     }
 }
 
+/// `tool_choice = "required"` のときに足す擬似ツール (#65 A1)。呼ばれたら lodan が本文に読み替える
+/// ので、registry には無く、ループにも見えない。
+pub const FINISH: &str = "Finish";
+
+fn finish_spec() -> ToolSpec<'static> {
+    ToolSpec {
+        kind: "function",
+        function: crate::agent::messages::ToolSpecFunction {
+            name: FINISH,
+            description: "Call this with your final answer when the task is complete (or when no \
+                          tool is needed to answer). The answer is shown to the user as your reply.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "answer": { "type": "string", "description": "The final reply to the user" }
+                },
+                "required": ["answer"]
+            }),
+        },
+    }
+}
+
+#[cfg(test)]
+mod required_tests {
+    use super::*;
+
+    fn client(tool_choice: Option<&str>) -> OpenAiClient {
+        let cfg = ProviderConfig {
+            tool_choice: tool_choice.map(str::to_string),
+            ..ProviderConfig::default()
+        };
+        OpenAiClient::new(&cfg).unwrap()
+    }
+
+    fn read_spec() -> ToolSpec<'static> {
+        ToolSpec {
+            kind: "function",
+            function: crate::agent::messages::ToolSpecFunction {
+                name: "Read",
+                description: "d",
+                parameters: serde_json::json!({}),
+            },
+        }
+    }
+
+    /// `required` では Finish が足され、tool_choice が required になる。ツール無しなら何も変えない。
+    #[test]
+    fn required_adds_finish_and_sets_tool_choice() {
+        let c = client(Some("required"));
+        let tools = [read_spec()];
+        let with = c.with_finish(&tools);
+        assert_eq!(with.len(), 2);
+        assert_eq!(with[1].function.name, FINISH);
+        assert_eq!(c.choice(&with), Some("required"));
+        assert_eq!(c.choice(&[]), None);
+        assert!(c.with_finish(&[]).is_empty());
+        let auto = client(None);
+        assert_eq!(auto.with_finish(&tools).len(), 1);
+        assert_eq!(auto.choice(&tools), Some("auto"));
+        assert!(
+            OpenAiClient::new(&ProviderConfig {
+                tool_choice: Some("none".into()),
+                ..ProviderConfig::default()
+            })
+            .is_err()
+        );
+    }
+
+    /// 本文とツールコールの両方を返すモデル: 本文は捨てず、answer が無ければ後ろに足す。
+    #[test]
+    fn text_alongside_a_finish_call_is_kept_not_overwritten() {
+        let c = client(Some("required"));
+        let with_text = |text: &str, answer: &str| ChatResponse {
+            content: Some(text.to_string()),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: ToolCallFunction {
+                    name: FINISH.into(),
+                    arguments: serde_json::json!({ "answer": answer }).to_string(),
+                },
+            }],
+            usage: None,
+            reasoning: None,
+        };
+        // 違うことを言っていれば後ろに足す (画面に出すのは足した分だけ)。
+        let mut resp = with_text("Let me check.", "all done");
+        assert_eq!(c.absorb_finish(&mut resp).as_deref(), Some("\nall done"));
+        assert_eq!(resp.content.as_deref(), Some("Let me check.\nall done"));
+        assert!(resp.tool_calls.is_empty());
+        // 既に同じことを言っていれば何も足さない (二重に出さない)。
+        let mut same = with_text("all done — wrote the file", "all done");
+        assert!(c.absorb_finish(&mut same).is_none());
+        assert_eq!(same.content.as_deref(), Some("all done — wrote the file"));
+        assert!(same.tool_calls.is_empty());
+        // 空の answer でも本文は消さない。
+        let mut empty = with_text("the answer", "  ");
+        assert!(c.absorb_finish(&mut empty).is_none());
+        assert_eq!(empty.content.as_deref(), Some("the answer"));
+    }
+
+    /// Finish だけの応答は本文に読み替える。他の呼び出しと一緒なら触らない。auto では触らない。
+    #[test]
+    fn a_lone_finish_call_becomes_the_final_text() {
+        let finish = |args: &str| ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: FINISH.into(),
+                arguments: args.into(),
+            },
+        };
+        let mut resp = ChatResponse {
+            content: None,
+            tool_calls: vec![finish(r#"{"answer": "all done"}"#)],
+            usage: None,
+            reasoning: None,
+        };
+        let c = client(Some("required"));
+        assert_eq!(c.absorb_finish(&mut resp).as_deref(), Some("all done"));
+        assert_eq!(resp.content.as_deref(), Some("all done"));
+        assert!(resp.tool_calls.is_empty());
+
+        let mut two = ChatResponse {
+            content: None,
+            tool_calls: vec![
+                finish(r#"{"answer": "x"}"#),
+                ToolCall {
+                    id: "c2".into(),
+                    kind: "function".into(),
+                    function: ToolCallFunction {
+                        name: "Read".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            ],
+            usage: None,
+            reasoning: None,
+        };
+        assert!(c.absorb_finish(&mut two).is_none());
+        assert_eq!(two.tool_calls.len(), 2);
+
+        let mut auto_resp = ChatResponse {
+            content: None,
+            tool_calls: vec![finish(r#"{"answer": "x"}"#)],
+            usage: None,
+            reasoning: None,
+        };
+        assert!(client(None).absorb_finish(&mut auto_resp).is_none());
+        // 壊れた引数でも、引数そのものを本文にして止まらない。
+        let mut broken = ChatResponse {
+            content: None,
+            tool_calls: vec![finish("not json")],
+            usage: None,
+            reasoning: None,
+        };
+        assert_eq!(c.absorb_finish(&mut broken).as_deref(), Some("not json"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const OK_JSON: &str = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+    const STALL: &str = "STALL:";
+    const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1000\r\nconnection: close\r\n\r\n";
+
+    fn http(status: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// 接続ごとに台本の次の応答を返すサーバ。台本が尽きたら最後の応答を繰り返す。
+    /// 戻り値は base_url と、受けたリクエスト数。
+    async fn scripted_server(script: Vec<String>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let reply = script[n.min(script.len() - 1)].clone();
+                tokio::spawn(async move {
+                    // ヘッダと JSON 本文を読み切る (content-length ぶん)。
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(read) = sock.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some(head_end) = text.find("\r\n\r\n") {
+                            let len = text[..head_end]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= head_end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    // `STALL:` で始まる台本は、残りを送ったあと黙ったまま接続を保つ。
+                    if let Some(head) = reply.strip_prefix(STALL) {
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
+                    }
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (base_url, hits)
+    }
+
+    fn client(base_url: &str, max_retries: u32) -> OpenAiClient {
+        let mut cfg = ProviderConfig::default_local();
+        cfg.base_url = base_url.to_string();
+        cfg.max_retries = max_retries;
+        cfg.retry_base_ms = 1;
+        OpenAiClient::new(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retries_5xx_then_succeeds() {
+        let (url, hits) = scripted_server(vec![
+            http("503 Service Unavailable", "", "busy"),
+            http("503 Service Unavailable", "", "busy"),
+            http("200 OK", "", OK_JSON),
+        ])
+        .await;
+        let resp = client(&url, 3).chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("hi"));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// 再試行で送り直した分も予算に数える。`--max-requests N` が約束するのは「プロバイダに届く
+    /// リクエストが N 件まで」で、数えないと実際は N × (1 + max_retries) 件になる (レビューで実測)。
+    #[tokio::test]
+    async fn retries_are_counted_against_the_request_budget_and_stop_when_it_runs_out() {
+        use crate::llm::metered::{Budget, Ledger, MeteredClient};
+        let (url, hits) = scripted_server(vec![http("503 Service Unavailable", "", "busy")]).await;
+        let ledger = Arc::new(Ledger::new(Budget {
+            max_requests: Some(2),
+            max_total_tokens: None,
+        }));
+        let metered = MeteredClient::new(Arc::new(client(&url, 5)), ledger.clone());
+        let err = metered.chat(&[], &[], "m", None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("503"), "{err:#}");
+        // 失敗の本当の理由は予算。呼び出し側 (`-p` の終了コード 4) が見分けられる。
+        assert!(
+            err.chain().any(|c| c
+                .downcast_ref::<crate::llm::metered::BudgetExceededError>()
+                .is_some()),
+            "{err:#}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "5 retries were allowed, but the budget had room for one"
+        );
+        assert_eq!(ledger.requests(), 2);
+
+        // 計上の外で使われているクライアントの再試行は、これまでどおり。
+        let (url, hits) = scripted_server(vec![http("503 Service Unavailable", "", "busy")]).await;
+        assert!(client(&url, 2).chat(&[], &[], "m", None).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_retries_and_reports_last_status() {
+        let (url, hits) =
+            scripted_server(vec![http("429 Too Many Requests", "", "slow down")]).await;
+        let err = client(&url, 2).chat(&[], &[], "m", None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("429"), "{err:#}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "1 try + 2 retries");
+    }
+
+    #[tokio::test]
+    async fn errors_carry_neither_the_request_url_nor_an_unbounded_body() {
+        // 誰も listen していないポート。base_url に埋めた資格情報がエラー文に出ないこと。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let secret_url = format!("http://user:hunter2@127.0.0.1:{port}/v1");
+        let err = client(&secret_url, 0)
+            .chat(&[], &[], "m", None)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("127.0.0.1"),
+            "{text}"
+        );
+        assert!(text.contains("sending chat request"), "{text}");
+
+        let huge = "x".repeat(50_000);
+        let (url, _) = scripted_server(vec![http("500 Internal Server Error", "", &huge)]).await;
+        let text = format!(
+            "{:#}",
+            client(&url, 0).chat(&[], &[], "m", None).await.unwrap_err()
+        );
+        assert!(
+            text.len() < 1_000,
+            "body must be clipped, got {} chars",
+            text.len()
+        );
+        assert!(text.contains("50000 bytes total"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_success_body_is_clipped_in_the_error() {
+        // 200 で巨大な HTML を返すプロキシ。パース失敗のエラーに本文を丸ごと載せない。
+        let html = format!("<html>{}</html>", "y".repeat(50_000));
+        let (url, _) = scripted_server(vec![http("200 OK", "", &html)]).await;
+        let text = format!(
+            "{:#}",
+            client(&url, 0).chat(&[], &[], "m", None).await.unwrap_err()
+        );
+        assert!(
+            text.contains("parsing chat response"),
+            "{}",
+            &text[..200.min(text.len())]
+        );
+        assert!(text.len() < 1_500, "got {} chars", text.len());
+    }
+
+    #[test]
+    fn clip_body_cuts_on_a_char_boundary() {
+        let body = "あ".repeat(ERROR_BODY_MAX_CHARS + 10);
+        let clipped = clip_body(&body);
+        assert!(clipped.starts_with(&"あ".repeat(ERROR_BODY_MAX_CHARS)));
+        assert!(clipped.contains("bytes total"));
+        assert_eq!(clip_body("short"), "short");
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_are_transient_but_client_errors_are_not() {
+        use crate::llm::is_transient;
+        let (url, _) = scripted_server(vec![http("503 Service Unavailable", "", "busy")]).await;
+        let err = client(&url, 1).chat(&[], &[], "m", None).await.unwrap_err();
+        assert!(is_transient(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("503"));
+
+        let (url, _) = scripted_server(vec![http("401 Unauthorized", "", "bad key")]).await;
+        let err = client(&url, 1).chat(&[], &[], "m", None).await.unwrap_err();
+        assert!(
+            !is_transient(&err),
+            "another provider cannot fix a bad key: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_after_text_is_not_transient() {
+        use crate::llm::is_transient;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len() + 100
+        );
+        let (url, _) = scripted_server(vec![cut]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = client(&url, 0)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap_err();
+        assert!(
+            !is_transient(&err),
+            "text was shown; a fallback would print it twice"
+        );
+
+        // 本文を出す前の断は一時的な失敗。
+        let head_only = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 100\r\nconnection: close\r\n\r\n".to_string();
+        let (url, _) = scripted_server(vec![head_only]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = client(&url, 0)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap_err();
+        assert!(is_transient(&err), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_error_body_does_not_eat_the_request_timeout() {
+        // 503 のヘッダだけ返して本文を送らないサーバ。ボディ読みで timeout_secs (既定 120s) を
+        // 待たずに、上限 (5s) で切り上げて再試行へ進む。
+        let head =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 500\r\nconnection: close\r\n\r\n";
+        let (url, hits) =
+            scripted_server(vec![format!("{STALL}{head}"), http("200 OK", "", OK_JSON)]).await;
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            client(&url, 3).chat(&[], &[], "m", None),
+        )
+        .await
+        .expect("must not wait out timeout_secs")
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("hi"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn permanent_client_errors_are_not_retried() {
+        for status in ["400 Bad Request", "401 Unauthorized", "404 Not Found"] {
+            let (url, hits) = scripted_server(vec![http(status, "", "nope")]).await;
+            assert!(client(&url, 3).chat(&[], &[], "m", None).await.is_err());
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "{status} must not be retried"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_max_retries_disables_retry() {
+        let (url, hits) = scripted_server(vec![
+            http("503 Service Unavailable", "", "busy"),
+            http("200 OK", "", OK_JSON),
+        ])
+        .await;
+        assert!(client(&url, 0).chat(&[], &[], "m", None).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// 思考過程は `reasoning_content` (DeepSeek / Moonshot / vLLM) でも `reasoning` (Ollama /
+    /// OpenRouter) でも来る。本文とは別のイベントで流し、最終応答にまとめて載せる。
+    #[tokio::test]
+    async fn reasoning_is_streamed_apart_from_the_answer_under_either_field_name() {
+        for field in ["reasoning_content", "reasoning"] {
+            let sse = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"{field}\":\"let me \"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"{field}\":\"think\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"42\"}}}}]}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            let ok = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let (url, _hits) = scripted_server(vec![ok]).await;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            client(&url, 0)
+                .chat_stream(&[], &[], "m", tx)
+                .await
+                .unwrap();
+            let (mut thought, mut text, mut done) = (String::new(), String::new(), None);
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    ChatEvent::ReasoningDelta(d) => {
+                        assert!(text.is_empty(), "thinking comes before the answer");
+                        thought.push_str(&d);
+                    }
+                    ChatEvent::TextDelta(d) => text.push_str(&d),
+                    ChatEvent::AttemptRestarted => thought.clear(),
+                    ChatEvent::Done(r) => done = Some(r),
+                }
+            }
+            let done = done.unwrap();
+            assert_eq!(
+                (thought.as_str(), text.as_str()),
+                ("let me think", "42"),
+                "{field}"
+            );
+            assert_eq!(done.reasoning.as_deref(), Some("let me think"), "{field}");
+            assert_eq!(
+                done.content.as_deref(),
+                Some("42"),
+                "the answer does not contain the thinking"
+            );
+        }
+    }
+
+    /// 思考の途中で切れたストリームは送り直す (本文はまだ出していない)。受け手には、ここまでの
+    /// 思考が捨てられた応答のものだと伝える。最終応答の思考は、やり直した分だけ。
+    #[tokio::test]
+    async fn a_stream_cut_mid_reasoning_is_retried_and_the_receiver_is_told() {
+        let cut_body =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"0123456789\"}}]}\n\n";
+        // content-length を実際より長く名乗って、本文の前に接続が切れた形にする。
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{cut_body}",
+            cut_body.len() + 100
+        );
+        let good_body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"01234\"}}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        let good = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{good_body}",
+            good_body.len()
+        );
+        let (url, hits) = scripted_server(vec![cut, good]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        client(&url, 3)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap();
+        let mut kinds = Vec::new();
+        let mut done = None;
+        while let Some(ev) = rx.recv().await {
+            kinds.push(match &ev {
+                ChatEvent::ReasoningDelta(_) => "reasoning",
+                ChatEvent::AttemptRestarted => "restarted",
+                ChatEvent::TextDelta(_) => "text",
+                ChatEvent::Done(_) => "done",
+            });
+            if let ChatEvent::Done(r) = ev {
+                done = Some(r);
+            }
+        }
+        assert_eq!(
+            kinds,
+            ["reasoning", "restarted", "reasoning", "text", "done"]
+        );
+        assert_eq!(done.unwrap().reasoning.as_deref(), Some("01234"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_non_streamed_response_carries_its_reasoning_too() {
+        let body = r#"{"choices":[{"message":{"content":"42","reasoning_content":"6*7"}}]}"#;
+        let (url, _hits) = scripted_server(vec![http("200 OK", "", body)]).await;
+        let resp = client(&url, 0).chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(resp.reasoning.as_deref(), Some("6*7"));
+        // 思考を返さないサーバ (これまでの全て) では None のまま。
+        let (url, _hits) = scripted_server(vec![http("200 OK", "", OK_JSON)]).await;
+        let resp = client(&url, 0).chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(resp.reasoning, None);
+    }
+
+    /// プランモードの呼び出しでだけ、`plan_reasoning_effort` が `reasoning_effort` に取って代わる。
+    #[tokio::test]
+    async fn plan_mode_uses_its_own_effort_when_one_is_set() {
+        let mut cfg = ProviderConfig::default_local();
+        cfg.reasoning_effort = Some("low".into());
+        let plain = OpenAiClient::new(&cfg).unwrap();
+        cfg.plan_reasoning_effort = Some("high".into());
+        let planner = OpenAiClient::new(&cfg).unwrap();
+
+        assert_eq!(planner.effort(), Some("low"), "outside plan mode");
+        crate::llm::in_plan_mode(true, async {
+            assert_eq!(planner.effort(), Some("high"));
+            assert_eq!(plain.effort(), Some("low"), "no plan value: unchanged");
+        })
+        .await;
+        crate::llm::in_plan_mode(false, async {
+            assert_eq!(planner.effort(), Some("low"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_retries_failed_status_then_streams() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n";
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len()
+        );
+        let (url, hits) = scripted_server(vec![http("502 Bad Gateway", "", "upstream"), ok]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        client(&url, 3)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        let mut done = None;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                ChatEvent::TextDelta(d) => text.push_str(&d),
+                ChatEvent::ReasoningDelta(_) | ChatEvent::AttemptRestarted => {}
+                ChatEvent::Done(r) => done = Some(r),
+            }
+        }
+        assert_eq!(
+            text, "hello",
+            "no duplicated deltas from the failed attempt"
+        );
+        assert_eq!(done.unwrap().content.as_deref(), Some("hello"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_cut_after_text_is_not_retried() {
+        // content-length を実体より長く宣言して途中で閉じる = 本文の途中で断。
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len() + 100
+        );
+        let (url, hits) = scripted_server(vec![cut]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let res = client(&url, 3).chat_stream(&[], &[], "m", tx).await;
+        assert!(res.is_err(), "a truncated stream must surface as an error");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "text was already shown; retrying would duplicate it"
+        );
+        assert!(matches!(rx.recv().await, Some(ChatEvent::TextDelta(d)) if d == "partial"));
+    }
+
+    #[tokio::test]
+    async fn stream_cut_before_any_text_is_retried() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len()
+        );
+        // ヘッダだけ返して本文を 1 バイトも送らずに閉じる。
+        let cut = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 100\r\nconnection: close\r\n\r\n".to_string();
+        let (url, hits) = scripted_server(vec![cut, ok]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        client(&url, 3)
+            .chat_stream(&[], &[], "m", tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(ChatEvent::TextDelta(d)) if d == "ok"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    fn sse_ok(text: &str) -> String {
+        let sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\ndata: [DONE]\n\n"
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len()
+        )
+    }
+
+    /// STALL サーバ相手のテストが、退行時に 30 秒ぶら下がらないようにする上限。
+    async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .expect("timed out: the client kept waiting on a stalled server")
+    }
+
+    fn short_timeout_client(base_url: &str) -> OpenAiClient {
+        let mut cfg = ProviderConfig::default_local();
+        cfg.base_url = base_url.to_string();
+        cfg.retry_base_ms = 1;
+        cfg.timeout_secs = 1;
+        OpenAiClient::new(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_timeout_while_reading_body_is_not_retried() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n\r\n";
+        let (url, hits) =
+            scripted_server(vec![format!("{STALL}{head}"), http("200 OK", "", OK_JSON)]).await;
+        let res = within(short_timeout_client(&url).chat(&[], &[], "m", None)).await;
+        assert!(res.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "timeout_secs was spent; do not spend it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_mid_stream_is_not_retried() {
+        let (url, hits) = scripted_server(vec![format!("{STALL}{SSE_HEAD}"), sse_ok("ok")]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let res = within(short_timeout_client(&url).chat_stream(&[], &[], "m", tx)).await;
+        assert!(res.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    fn idle_client(base_url: &str) -> OpenAiClient {
+        let mut cfg = ProviderConfig::default_local();
+        cfg.base_url = base_url.to_string();
+        cfg.retry_base_ms = 1;
+        cfg.stream_idle_timeout_secs = 1;
+        OpenAiClient::new(&cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn idle_stream_before_any_text_is_retried() {
+        let (url, hits) = scripted_server(vec![format!("{STALL}{SSE_HEAD}"), sse_ok("ok")]).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        within(idle_client(&url).chat_stream(&[], &[], "m", tx))
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(ChatEvent::TextDelta(d)) if d == "ok"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn idle_stream_after_text_is_an_error_not_a_retry() {
+        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let (url, hits) =
+            scripted_server(vec![format!("{STALL}{SSE_HEAD}{partial}"), sse_ok("ok")]).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = within(idle_client(&url).chat_stream(&[], &[], "m", tx))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("idle"), "{err:#}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_non_stream_body_is_retried() {
+        let cut = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n\r\n{\"choi".to_string();
+        let (url, hits) = scripted_server(vec![cut, http("200 OK", "", OK_JSON)]).await;
+        let resp = client(&url, 3).chat(&[], &[], "m", None).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("hi"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_call_cancels_a_pending_backoff() {
+        // Ctrl-C は run_turn の future を drop する。バックオフ待ちがそれを妨げないこと。
+        let (url, hits) = scripted_server(vec![http("503 Service Unavailable", "", "busy")]).await;
+        let mut cfg = ProviderConfig::default_local();
+        cfg.base_url = url;
+        cfg.retry_base_ms = 60_000;
+        let c = OpenAiClient::new(&cfg).unwrap();
+        let started = std::time::Instant::now();
+        let res =
+            tokio::time::timeout(Duration::from_millis(300), c.chat(&[], &[], "m", None)).await;
+        assert!(res.is_err(), "still backing off when the caller gave up");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn backoff_doubles_is_capped_and_prefers_retry_after() {
+        let base = Duration::from_millis(500);
+        assert_eq!(backoff_delay(base, 1, None, 0), Duration::from_millis(500));
+        assert_eq!(backoff_delay(base, 2, None, 0), Duration::from_millis(1000));
+        assert_eq!(backoff_delay(base, 3, None, 0), Duration::from_millis(2000));
+        // 揺らぎは待ち時間の 25% 未満。
+        assert!(backoff_delay(base, 1, None, u64::MAX) < Duration::from_millis(625));
+        assert_eq!(backoff_delay(base, 30, None, 0), RETRY_MAX_DELAY);
+        assert_eq!(
+            backoff_delay(base, 1, Some(Duration::from_secs(7)), 123),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            backoff_delay(base, 1, Some(Duration::from_secs(3600)), 0),
+            RETRY_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn retryable_statuses() {
+        use reqwest::StatusCode as S;
+        for s in [
+            S::REQUEST_TIMEOUT,
+            S::TOO_MANY_REQUESTS,
+            S::INTERNAL_SERVER_ERROR,
+            S::BAD_GATEWAY,
+            S::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(is_retryable_status(s), "{s}");
+        }
+        for s in [S::BAD_REQUEST, S::UNAUTHORIZED, S::FORBIDDEN, S::NOT_FOUND] {
+            assert!(!is_retryable_status(s), "{s}");
+        }
+    }
 
     #[test]
     fn non_stream_body_parses_usage() {
@@ -386,6 +1651,7 @@ mod tests {
 
     #[test]
     fn stream_request_includes_stream_options() {
+        let no_extra = serde_json::Map::new();
         let req = ChatRequest {
             model: "m",
             messages: &[],
@@ -393,10 +1659,12 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            extra: &no_extra,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["stream_options"]["include_usage"], true);
@@ -413,6 +1681,7 @@ mod tests {
     /// temperature は None なら省略・Some なら数値で入る (#61)。
     #[test]
     fn request_temperature_omitted_unless_set() {
+        let no_extra = serde_json::Map::new();
         let req = ChatRequest {
             model: "m",
             messages: &[],
@@ -420,8 +1689,10 @@ mod tests {
             tool_choice: None,
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             stream: false,
             stream_options: None,
+            extra: &no_extra,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(
@@ -435,5 +1706,110 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!((json["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+    }
+
+    /// #78 の受け入れ条件: 何も設定しなければ、body は reasoning 対応を入れる前と 1 バイトも違わない。
+    #[test]
+    fn an_unconfigured_request_body_is_byte_identical_to_before() {
+        let no_extra = serde_json::Map::new();
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &[],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            extra: &no_extra,
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"model":"m","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_and_extra_body_are_sent_as_given() {
+        let extra: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{"chat_template_kwargs":{"enable_thinking":false},"top_k":20}"#,
+        )
+        .unwrap();
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &[],
+            tool_choice: None,
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: Some("none"),
+            stream: false,
+            stream_options: None,
+            extra: &extra,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["reasoning_effort"], "none");
+        assert_eq!(json["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(json["top_k"], 20);
+    }
+
+    /// `ChatRequest` にフィールドを足したら、予約キーにも足すこと。忘れると JSON のキーが重複し得る。
+    /// 下のリテラルは**全フィールドを値つきで**埋めること (`None` のままだと直列化されず、ずれを検出できない)。
+    #[test]
+    fn the_reserved_keys_are_exactly_what_a_full_request_serializes() {
+        let no_extra = serde_json::Map::new();
+        let tool = ToolSpec {
+            kind: "function",
+            function: crate::agent::messages::ToolSpecFunction {
+                name: "T",
+                description: "d",
+                parameters: serde_json::json!({}),
+            },
+        };
+        let tools = [tool];
+        let req = ChatRequest {
+            model: "m",
+            messages: &[],
+            tools: &tools,
+            tool_choice: Some("auto"),
+            max_tokens: Some(1),
+            temperature: Some(0.5),
+            reasoning_effort: Some("low"),
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+            extra: &no_extra,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let mut sent: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut reserved = RESERVED_BODY_KEYS.to_vec();
+        sent.sort_unstable();
+        reserved.sort_unstable();
+        assert_eq!(sent, reserved);
+    }
+
+    #[test]
+    fn extra_body_cannot_replace_what_lodan_builds() {
+        for key in RESERVED_BODY_KEYS {
+            let mut cfg = ProviderConfig::default_local();
+            cfg.extra_body
+                .insert(key.to_string(), serde_json::json!(true));
+            let err = OpenAiClient::new(&cfg).err().expect(key).to_string();
+            assert!(err.contains(key), "{err}");
+        }
+        let mut cfg = ProviderConfig::default_local();
+        cfg.extra_body.insert("top_k".into(), serde_json::json!(20));
+        cfg.reasoning_effort = Some("  ".into());
+        let client = OpenAiClient::new(&cfg).unwrap();
+        assert_eq!(client.reasoning_effort, None, "a blank effort is not sent");
     }
 }

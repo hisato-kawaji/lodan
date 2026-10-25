@@ -26,29 +26,48 @@ pub struct McpClient {
     server_label: String,
     transport: Box<dyn Transport>,
     sampling_enabled: bool,
+    elicitation_enabled: bool,
 }
 
 impl McpClient {
     /// `sampling` に `Some` を渡すと、このサーバの sampling/createMessage を許可し
     /// capability を広告する (config の allowSampling が真のサーバのみ)。
+    /// `elicitation` に `Some` を渡すと、このサーバの `elicitation/create` に利用者の答えを返し、
+    /// capability を広告する (REPL のみ。#83)。
     pub async fn connect(
         label: &str,
         spec: &McpServerSpec,
         sampling: Option<Arc<SamplingProvider>>,
+        elicitation: Option<Arc<crate::mcp::elicitation::ElicitationProvider>>,
     ) -> Result<Self> {
         // server→client リクエストのハンドラ (stdio のみ有効)。
         //   roots/list           → cwd を返す
         //   sampling/createMessage → opt-in 時のみ LLM を呼ぶ
+        //   elicitation/create   → REPL なら利用者に尋ねる
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let roots = crate::mcp::roots::RootsProvider::from_cwd(&cwd);
         let sampling_enabled = sampling.is_some();
+        let elicitation_enabled = elicitation.is_some();
         let handler: transport::ServerRequestHandler =
             Arc::new(move |method: String, params: Option<Value>| {
                 let roots = roots.clone();
                 let sampling = sampling.clone();
+                let elicitation = elicitation.clone();
                 Box::pin(async move {
                     if let Some(result) = roots.handle(&method) {
                         return HandlerOutcome::Result(result);
+                    }
+                    if method == "elicitation/create" {
+                        // 広告していないのに尋ねてきても、method-not-found ではなく decline を返す
+                        // (サーバがその応答を待ったまま固まらないように)。
+                        let Some(elicitation) = elicitation else {
+                            return HandlerOutcome::Result(
+                                crate::mcp::elicitation::ElicitationProvider::declined(),
+                            );
+                        };
+                        return HandlerOutcome::Result(
+                            elicitation.create(params.unwrap_or(Value::Null)).await,
+                        );
                     }
                     if method == "sampling/createMessage" {
                         let Some(sampling) = sampling else {
@@ -72,6 +91,7 @@ impl McpClient {
             server_label: label.to_string(),
             transport,
             sampling_enabled,
+            elicitation_enabled,
         };
         client.handshake().await?;
         Ok(client)
@@ -80,7 +100,7 @@ impl McpClient {
     async fn handshake(&self) -> Result<()> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ClientCapabilities::new(self.sampling_enabled),
+            capabilities: ClientCapabilities::new(self.sampling_enabled, self.elicitation_enabled),
             client_info: ClientInfo {
                 name: CLIENT_NAME,
                 version: CLIENT_VERSION,
@@ -148,14 +168,43 @@ impl McpClient {
         Ok(all)
     }
 
+    /// サーバから `tools/list_changed` が届いていたか (読むと印は消える。#83)。
+    pub fn take_tools_changed(&self) -> bool {
+        self.transport.take_tools_changed()
+    }
+
     pub async fn read_resource(&self, uri: &str) -> Result<ResourcesReadResult> {
+        self.read_resource_with_timeout(uri, transport::REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// `toolTimeoutSecs` つき (tools/call と同じ扱い。#83)。
+    pub async fn read_resource_with_timeout(
+        &self,
+        uri: &str,
+        timeout: std::time::Duration,
+    ) -> Result<ResourcesReadResult> {
         let params = ResourcesReadParams { uri };
-        self.request("resources/read", Some(&params)).await
+        self.request_with("resources/read", Some(&params), timeout)
+            .await
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolOutput> {
+        self.call_tool_with_timeout(name, arguments, transport::REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// `toolTimeoutSecs` つき。transport の上限もこの値になる (既定の 30 秒に頭を抑えられない)。
+    pub async fn call_tool_with_timeout(
+        &self,
+        name: &str,
+        arguments: Value,
+        timeout: std::time::Duration,
+    ) -> Result<ToolOutput> {
         let params = ToolsCallParams { name, arguments };
-        let result: ToolsCallResult = self.request("tools/call", Some(&params)).await?;
+        let result: ToolsCallResult = self
+            .request_with("tools/call", Some(&params), timeout)
+            .await?;
         let text = result.flatten_text();
         let content = if text.is_empty() && !result.is_error {
             "(no content)".to_string()
@@ -174,6 +223,16 @@ impl McpClient {
         method: &str,
         params: Option<&P>,
     ) -> Result<R> {
+        self.request_with(method, params, transport::REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<&P>,
+        timeout: std::time::Duration,
+    ) -> Result<R> {
         let id = transport::next_id(&self.next_id);
         let payload = JsonRpcRequest {
             jsonrpc: "2.0",
@@ -182,7 +241,7 @@ impl McpClient {
             params,
         };
         let line = serde_json::to_string(&payload).context("serializing JSON-RPC request")?;
-        let inc = self.transport.send_request(id, line).await?;
+        let inc = self.transport.send_request(id, line, timeout).await?;
 
         if let Some(err) = inc.error {
             return Err(anyhow!(

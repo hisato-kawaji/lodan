@@ -11,23 +11,42 @@ use std::sync::Arc;
 
 use crate::agent;
 use crate::config::Config;
-use crate::hooks::{self, HookOutcome, Lifecycle};
+use crate::hooks::Lifecycle;
 use crate::llm;
-use crate::mcp;
 use crate::mcp::prompt::McpPrompt;
 use crate::permission::PermissionGate;
+use crate::runtime::{Notices, Runtime};
 use crate::session::Recorder;
 use crate::slash::{self, SlashCommand};
-use crate::tools::registry::default_registry;
 
 /// REPL 組み込みコマンド。ユーザ定義コマンドより優先する。
 const BUILTINS: &[&str] = &[
-    "exit", "quit", "help", "clear", "tools", "compact", "cost", "goal", "loop", "plan", "accept",
+    "exit",
+    "quit",
+    "help",
+    "clear",
+    "tools",
+    "compact",
+    "cost",
+    "goal",
+    "loop",
+    "plan",
+    "accept",
     "undo",
+    "memory",
+    "model",
+    "status",
+    "context",
+    "fork",
+    "rename",
+    "export",
+    "requirements",
 ];
 
 /// `/goal` の解除サブコマンド別名 (Claude Code と同じ)。
 const GOAL_CLEAR_ALIASES: &[&str] = &["clear", "stop", "off", "reset", "none", "cancel"];
+/// `/goal resume`: paused の goal を続きから走らせる。
+const GOAL_RESUME_ALIASES: &[&str] = &["resume", "continue"];
 
 /// rustyline の補完ヘルパ (#42 P7)。行頭の `/…` は slash コマンド名を、
 /// それ以外の語は FilenameCompleter でパスを補完する。
@@ -151,7 +170,7 @@ fn normalize_input(input: &str) -> String {
         .join("\n")
 }
 
-pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
+pub async fn run(mut cfg: Config, resume: Option<String>) -> Result<()> {
     let mut rl: Editor<ReplHelper, DefaultHistory> = Editor::new()?;
     println!(
         "{} {} — type {} for commands, {} to quit",
@@ -172,49 +191,20 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     );
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let user_commands = load_user_commands(&cwd.join(".lodan/commands"));
+    // プロジェクトの slash コマンドも、信頼済みのディレクトリでだけ読む (#75)。
+    let user_commands = if crate::trust::project_trusted() {
+        load_user_commands(&cwd.join(".lodan/commands"))
+    } else {
+        BTreeMap::new()
+    };
     if !user_commands.is_empty() {
         println!("slash: {} user command(s) loaded", user_commands.len());
     }
 
-    let user_skills = crate::skills::load_from(&cwd.join(".lodan/skills")).unwrap_or_else(|e| {
-        eprintln!("skills: load failed: {e}");
-        Vec::new()
-    });
-    if !user_skills.is_empty() {
-        println!("skills: {} loaded", user_skills.len());
-    }
-
-    let llm_client: Arc<dyn llm::LlmClient> = llm::build_client(&cfg)?;
-
-    let mut registry = default_registry();
-    // sampling は opt-in サーバにのみ active モデルの LLM を貸す。
-    let sampling_ctx = mcp::registry::SamplingContext {
-        llm: Arc::clone(&llm_client),
-        model: cfg.llm.active().model.clone(),
-    };
-    let mcp_outcome = mcp::registry::load_and_register(&mut registry, Some(sampling_ctx))
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("mcp: {e}");
-            mcp::registry::LoadOutcome::default()
-        });
-    if mcp_outcome.servers > 0 {
-        println!(
-            "mcp: {} server(s), {} tool(s), {} prompt(s), {} resource(s) registered",
-            mcp_outcome.servers,
-            mcp_outcome.tools,
-            mcp_outcome.prompts.len(),
-            mcp_outcome.resources
-        );
-    }
-    let mcp_prompts: BTreeMap<String, McpPrompt> = mcp_outcome
-        .prompts
-        .into_iter()
-        .map(|p| (p.full_name().to_string(), p))
-        .collect();
-    // Keep clients alive for the full session; Drop kills subprocesses.
-    let _mcp_clients = mcp_outcome.clients;
+    let runtime = Runtime::build(&cfg, Notices::Stdout, true).await?;
+    // `/model` で作り直す。サブエージェント (Task) と MCP sampling は起動時のクライアントのまま。
+    let mut llm_client = Arc::clone(&runtime.llm);
+    let mcp_prompts = &runtime.mcp_prompts;
 
     // 補完対象が出揃ったところで helper を装着する (#42 P7)。
     let completion_names: Vec<String> = BUILTINS
@@ -225,49 +215,72 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         .collect();
     rl.set_helper(Some(ReplHelper::new(completion_names)));
 
-    // サブエージェント (Task): 読み取り専用ツールで調査を委譲する。
-    // LLM クライアントが要るため default_registry ではなくここで登録する。
-    let sub_tools = Arc::new(crate::tools::registry::read_only_registry());
-    registry.register(Arc::new(agent::subagent::SubAgentTool::new(
-        Arc::clone(&llm_client),
-        cfg.llm.active().model.clone(),
-        sub_tools,
-        cwd.clone(),
-        cfg.agent.max_iterations,
-    )));
+    let gate = Arc::clone(&runtime.gate);
 
-    // Skill ツール: モデルが名前で手順書を読み込める。skill が無ければ登録しない。
-    if !user_skills.is_empty() {
-        registry.register(Arc::new(crate::skills::SkillTool::new(user_skills)));
+    let (mut session, mut recorder) =
+        runtime.open_session(&cfg, resume.as_deref(), Notices::Stdout);
+    if cfg.permissions.mode == crate::config::PermissionMode::Plan {
+        session.set_mode(agent::Mode::Plan);
     }
-
-    let registry = Arc::new(registry);
-    let gate = PermissionGate::new(cfg.agent.auto_approve);
-
-    let (mut session, mut recorder) = match resume {
-        Some(arg) => resume_session(&arg, &cfg, &registry),
-        None => new_session(&cwd, &cfg, &registry),
-    };
 
     // /goal の状態。上限到達などで未達のまま止まった goal は paused として残り、
     // `/goal` (状態表示) と `/goal clear` (解除) の対象になる。
     let mut goal_state: Option<crate::goal::Goal> = None;
+    // 再開したセッションに goal が残っていれば、paused として戻す (勝手には走らせない)。
+    if let Some(rec) = recorder.as_ref() {
+        match rec
+            .load_goal()
+            .and_then(|r| r.map(crate::goal::Goal::from_record).transpose())
+        {
+            Ok(Some(goal)) => {
+                println!(
+                    "{}",
+                    crate::term::dim(&format!(
+                        "[goal] restored (paused after {} turn(s)): {} — /goal resume to continue, /goal clear to drop",
+                        goal.total_turns,
+                        crate::term::sanitize(&first_line(&goal.condition))
+                    ))
+                );
+                goal_state = Some(goal);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("session: ignoring the saved goal: {e:#}"),
+        }
+    }
 
     // SessionStart hook: 起動を通知する。ブロックされても起動は止めず警告のみ。
-    let session_payload =
-        serde_json::json!({ "hook_event_name": "SessionStart", "cwd": cwd.display().to_string() });
-    if let Ok(HookOutcome::Block(reason)) =
-        hooks::runner::dispatch(Lifecycle::SessionStart, None, &session_payload, &cfg.hooks).await
+    let session_source = if resume.is_some() {
+        "resume"
+    } else {
+        "startup"
+    };
+    match session
+        .fire_hook(
+            Lifecycle::SessionStart,
+            Some(session_source),
+            serde_json::json!({ "source": session_source }),
+        )
+        .await
     {
-        eprintln!("session-start hook: {reason}");
+        Ok(started) => {
+            if let Some(reason) = &started.block {
+                eprintln!("session-start hook: {}", crate::term::sanitize(reason));
+            }
+            // plain な stdout と `additionalContext` は、最初のユーザ入力と一緒にモデルへ渡す。
+            started
+                .context
+                .into_iter()
+                .for_each(|c| session.add_context(c));
+        }
+        Err(e) => eprintln!(
+            "session-start hook: {}",
+            crate::term::sanitize(&e.to_string())
+        ),
     }
 
     loop {
-        let prompt = match session.mode() {
-            agent::Mode::Plan => "lodan (plan)> ",
-            agent::Mode::Normal => "lodan> ",
-        };
-        let line = match rl.readline(prompt) {
+        let prompt = prompt_line(&cfg, &session);
+        let line = match rl.readline(&prompt) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
                 println!("(Ctrl-C, type /exit to quit)");
@@ -290,6 +303,22 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         if line.is_empty() {
             continue;
         }
+
+        // `!<cmd>`: シェルで直接実行して、出力を次のユーザ発話の文脈に添える (#81)。承認ゲートも
+        // サンドボックスも deny ルールも通さない — 打ったのは利用者自身で、モデルではない。
+        if let Some(cmd) = shell_escape(line) {
+            let output = run_shell_for_user(cmd, &runtime.cwd, cfg.tools.bash.timeout_secs).await;
+            println!("{}", crate::term::sanitize(&output));
+            session.add_context(format!(
+                "The user ran this shell command themselves at the prompt (not a hook, not a tool \
+                 call); its output is context for their next message:\n$ {cmd}\n{output}"
+            ));
+            continue;
+        }
+        // `\!…` は `!` で始まる普通の発話。
+        let line = line
+            .strip_prefix("\\!")
+            .map_or(line, |rest| &line[line.len() - rest.len() - 1..]);
 
         if let Some(rest) = line
             .strip_prefix('/')
@@ -314,16 +343,257 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                 continue;
             }
 
+            // /requirements: 要件台帳 (#65) の表示と clear。session が持つのでここで処理する。
+            if head == "requirements" {
+                match session.requirements().lock() {
+                    Ok(mut ledger) => {
+                        if args == "clear" {
+                            ledger.clear();
+                            println!("requirements: cleared");
+                        } else {
+                            println!("{}", crate::term::sanitize(&ledger.describe()));
+                        }
+                    }
+                    Err(_) => println!("requirements: ledger unavailable"),
+                }
+                continue;
+            }
+
             // /cost も session を要するためここで処理する。
             if head == "cost" {
-                println!("{}", session.usage().describe());
+                // 合計と内訳はプロセス全体の台帳から (サブエージェントや /goal の評価器も入る)。
+                // 現在のコンテキストの大きさだけは、このセッションのループが知っている。
+                println!("{}", runtime.ledger.describe());
+                if session.usage().llm_calls > 0 {
+                    println!(
+                        "last context: {} prompt tokens",
+                        session.usage().last_context_tokens
+                    );
+                }
+                continue;
+            }
+
+            // /memory: いま読まれているメモリの一覧 (#79)。
+            if head == "memory" {
+                let loaded = crate::memory::load_memory_detailed(&runtime.cwd);
+                if loaded.sources.is_empty() {
+                    println!(
+                        "no memory files (LODAN.md / CLAUDE.md / AGENTS.md in the cwd hierarchy, ~/.lodan/LODAN.md)"
+                    );
+                }
+                // パスは clone したリポジトリの中の名前かもしれない。端末に出す前に無害化する。
+                for s in &loaded.sources {
+                    let via = s.imported_from.as_ref().map_or(String::new(), |f| {
+                        format!("  (imported from {})", crate::trust::shown(f))
+                    });
+                    println!("{} — {} bytes{via}", crate::trust::shown(&s.path), s.bytes);
+                }
+                if !loaded.sources.is_empty() {
+                    println!(
+                        "total: {} bytes in the system prompt (cap {} bytes){}",
+                        loaded.text.len(),
+                        crate::memory::MEMORY_CAP,
+                        if loaded.truncated { ", truncated" } else { "" }
+                    );
+                }
+                for w in &loaded.warnings {
+                    println!("warning: {}", crate::term::sanitize(w));
+                }
+                let rules = crate::memory::rules::load_rules(&runtime.cwd);
+                for r in &rules {
+                    println!(
+                        "rule {} — paths: {}  ({} bytes, injected when a matching file is read or edited)",
+                        r.path.display(),
+                        if r.patterns.is_empty() {
+                            "(all)".to_string()
+                        } else {
+                            crate::term::sanitize(&r.patterns.join(", ")).into_owned()
+                        },
+                        r.body.len()
+                    );
+                }
+                continue;
+            }
+
+            // /model: セッション中に provider / model を切り替える (#81)。台帳は引き継ぐ。
+            if head == "model" {
+                if args.is_empty() {
+                    let active = cfg.llm.active();
+                    println!(
+                        "model: {}:{}",
+                        cfg.llm.provider.as_str(),
+                        crate::term::sanitize(&active.model)
+                    );
+                    for (p, c) in cfg.llm.configured() {
+                        let marker = if p == cfg.llm.provider { "*" } else { " " };
+                        println!(
+                            "  {marker} {}:{}",
+                            p.as_str(),
+                            crate::term::sanitize(&c.model)
+                        );
+                    }
+                    println!(
+                        "usage: /model <provider> | /model <provider>:<model> | /model <model>"
+                    );
+                    continue;
+                }
+                let Some((provider, model)) = parse_model_arg(args, cfg.llm.provider) else {
+                    println!(
+                        "model: nothing to switch to (usage: /model <provider> | /model <provider>:<model> | /model <model>)"
+                    );
+                    continue;
+                };
+                let mut next = cfg.clone();
+                next.llm.provider = provider;
+                if let Some(m) = model {
+                    next.llm.get_mut(provider).model = m;
+                }
+                match crate::llm::build_metered_with(&next, &runtime.ledger) {
+                    Ok(client) => {
+                        llm_client = client;
+                        cfg = next;
+                        session.switch_llm(cfg.llm.clone());
+                        println!(
+                            "model: now {}:{}",
+                            cfg.llm.provider.as_str(),
+                            crate::term::sanitize(&cfg.llm.active().model)
+                        );
+                    }
+                    Err(e) => println!(
+                        "model: not switched: {}",
+                        crate::term::sanitize(&format!("{e:#}"))
+                    ),
+                }
+                continue;
+            }
+
+            // /status: いま何で動いているか (#81)。
+            if head == "status" {
+                let active = cfg.llm.active();
+                let shown = cfg.redacted();
+                println!(
+                    "provider: {}  model: {}",
+                    cfg.llm.provider.as_str(),
+                    crate::term::sanitize(&active.model)
+                );
+                println!(
+                    "base_url: {}",
+                    crate::term::sanitize(&shown.llm.active().base_url)
+                );
+                let used = session.usage().last_context_tokens;
+                match (used * 100).checked_div(active.context_window) {
+                    Some(pct) => println!(
+                        "context: {used} / {} tokens ({pct}%; auto-compact at {}%)",
+                        active.context_window, cfg.agent.auto_compact_percent
+                    ),
+                    None => println!("context: {used} tokens (window unknown)"),
+                }
+                println!(
+                    "mode: {}  permissions: {}  sandbox: {}",
+                    match session.mode() {
+                        agent::Mode::Plan => "plan",
+                        agent::Mode::Normal => "normal",
+                    },
+                    cfg.permissions.mode.as_str(),
+                    cfg.sandbox.mode.as_str()
+                );
+                println!("cwd: {}", runtime.cwd.display());
+                println!(
+                    "session: {}",
+                    recorder.as_ref().map_or("(not saved)", |r| r.id())
+                );
+                // MCP の `tools/list_changed` で入れ替わるので、セッションの現物を見る。
+                let registry = session.registry();
+                let deferred = registry.deferred_names().len();
+                println!(
+                    "tools: {} of {} visible{}  hooks: {}  mcp prompts: {}",
+                    registry.len(),
+                    registry.registered_len(),
+                    if deferred > 0 {
+                        format!(" (+{deferred} loadable with ToolSearch)")
+                    } else {
+                        String::new()
+                    },
+                    cfg.hooks.len(),
+                    mcp_prompts.len()
+                );
+                continue;
+            }
+
+            // /context: コンテキストの内訳 (#81)。
+            if head == "context" {
+                println!("{}", session.context_breakdown().describe());
+                continue;
+            }
+
+            // /fork: いまの会話を新しいセッションに複製し、以後はそちらへ保存する (#80)。
+            if head == "fork" {
+                persist(&mut recorder, &session);
+                match recorder
+                    .as_ref()
+                    .map(|r| crate::session::fork_session(r.id()))
+                {
+                    None => println!("session: persistence is disabled; nothing to fork"),
+                    Some(Err(e)) => println!("session: fork failed: {e:#}"),
+                    Some(Ok(meta)) => match Recorder::open_resumed(
+                        &meta.id,
+                        session.history(),
+                        session.compacted_away(),
+                    ) {
+                        Ok(rec) => {
+                            println!(
+                                "session: forked {} -> {} (now saving to the fork)",
+                                meta.forked_from.as_deref().unwrap_or("?"),
+                                meta.id
+                            );
+                            recorder = Some(rec);
+                        }
+                        Err(e) => println!("session: fork created but cannot switch: {e:#}"),
+                    },
+                }
+                continue;
+            }
+
+            // /rename: セッションに名前を付ける (#80)。
+            if head == "rename" {
+                match recorder.as_ref() {
+                    None => println!("session: persistence is disabled; nothing to rename"),
+                    Some(rec) => match rec.rename(args) {
+                        Ok(()) if args.trim().is_empty() => println!("session: name cleared"),
+                        Ok(()) => {
+                            println!("session: named \"{}\"", crate::term::sanitize(args.trim()))
+                        }
+                        Err(e) => println!("session: rename failed: {e:#}"),
+                    },
+                }
+                continue;
+            }
+
+            // /export [path]: 会話を Markdown に書き出す (#80)。
+            if head == "export" {
+                let id = recorder
+                    .as_ref()
+                    .map_or("ephemeral", |r| r.id())
+                    .to_string();
+                let path = if args.is_empty() {
+                    runtime.cwd.join(format!("lodan-session-{id}.md"))
+                } else {
+                    runtime.cwd.join(args)
+                };
+                let markdown = crate::session::transcript_markdown(&id, session.history());
+                // transcript と同じく本人だけが読める形で書く (中身は同じもの)。
+                match crate::session::write_private(&path, &markdown) {
+                    Ok(()) => println!("session: exported to {}", path.display()),
+                    Err(e) => println!("session: export failed ({}): {e:#}", path.display()),
+                }
                 continue;
             }
 
             // /undo は直近ターンのファイル変更を巻き戻す (session を要する)。
             if head == "undo" {
                 match session.undo_last_turn() {
-                    Some(report) => println!("{}", report.describe()),
+                    // パスはモデルが選んだもの。
+                    Some(report) => println!("{}", crate::term::sanitize(&report.describe())),
                     None => println!("nothing to undo (no recorded file changes)"),
                 }
                 continue;
@@ -378,12 +648,22 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
 
             // /goal も session/llm を要するためここで処理する。
             if head == "goal" {
+                let evaluator = match &runtime.goal_evaluator {
+                    Some((client, model)) => crate::goal::Evaluator {
+                        llm: client.as_ref(),
+                        model,
+                    },
+                    None => crate::goal::Evaluator {
+                        llm: llm_client.as_ref(),
+                        model: &cfg.llm.active().model,
+                    },
+                };
                 handle_goal(
                     args,
                     &mut goal_state,
                     &mut session,
                     llm_client.as_ref(),
-                    &cfg.llm.active().model,
+                    evaluator,
                     &gate,
                     &mut recorder,
                 )
@@ -391,7 +671,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                 continue;
             }
 
-            match handle_slash(head, &registry, &user_commands, &mcp_prompts) {
+            match handle_slash(head, session.registry(), &user_commands, mcp_prompts) {
                 SlashResult::Exit => break,
                 SlashResult::Handled => continue,
                 SlashResult::Unknown => {
@@ -415,7 +695,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                                 persist(&mut recorder, &session);
                             }
                             Ok(_) => eprintln!("mcp prompt /{head} returned no text"),
-                            Err(e) => eprintln!("mcp prompt /{head} failed: {e:#}"),
+                            // MCP サーバの文言が入る。
+                            Err(e) => eprintln!(
+                                "{}",
+                                crate::term::red_err(&format!("mcp prompt /{head} failed: {e:#}"))
+                            ),
                         }
                     } else {
                         eprintln!("unknown command: /{head}");
@@ -430,73 +714,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }
 
     // SessionEnd hook: 終了を通知する（ブロック不能・ベストエフォート）。
-    let end_payload = serde_json::json!({ "hook_event_name": "SessionEnd" });
-    let _ = hooks::runner::dispatch(Lifecycle::SessionEnd, None, &end_payload, &cfg.hooks).await;
+    let _ = session
+        .fire_hook(Lifecycle::SessionEnd, None, serde_json::json!({}))
+        .await;
 
     Ok(())
-}
-
-/// 新規セッションを作り、永続化レコーダを用意する。
-/// レコーダ作成に失敗してもセッションは続行する (永続化なしの ephemeral)。
-fn new_session(
-    cwd: &std::path::Path,
-    cfg: &Config,
-    registry: &Arc<crate::tools::registry::ToolRegistry>,
-) -> (agent::Session, Option<Recorder>) {
-    let session = agent::Session::new(cfg.clone(), Arc::clone(registry));
-    let recorder = match Recorder::create(cwd, cfg.llm.provider.as_str(), &cfg.llm.active().model) {
-        Ok(r) => {
-            println!("session: {}", r.id());
-            Some(r)
-        }
-        Err(e) => {
-            eprintln!("session: persistence disabled ({e})");
-            None
-        }
-    };
-    (session, recorder)
-}
-
-/// 保存済みセッションを復元する。失敗時は警告して新規セッションにフォールバックする。
-fn resume_session(
-    arg: &str,
-    cfg: &Config,
-    registry: &Arc<crate::tools::registry::ToolRegistry>,
-) -> (agent::Session, Option<Recorder>) {
-    let resolved = if arg == "last" {
-        crate::session::latest_session_id().ok().flatten()
-    } else {
-        Some(arg.to_string())
-    };
-
-    let Some(id) = resolved else {
-        eprintln!("session: no session to resume");
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        return new_session(&cwd, cfg, registry);
-    };
-
-    match crate::session::load_transcript(&id) {
-        Ok(prior) => {
-            let n = prior.len();
-            let session = agent::Session::resume(cfg.clone(), Arc::clone(registry), prior);
-            // recorder は復元後の history を基準に「保存済み」位置を決める。
-            match Recorder::open_resumed(&id, session.history()) {
-                Ok(recorder) => {
-                    println!("session: resumed {id} ({n} messages)");
-                    (session, Some(recorder))
-                }
-                Err(e) => {
-                    eprintln!("session: resumed {id} but persistence disabled ({e})");
-                    (session, None)
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("session: cannot resume {id}: {e}");
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            new_session(&cwd, cfg, registry)
-        }
-    }
 }
 
 /// `/goal` builtin。引数なし = 状態表示、解除別名 = 解除、それ以外 = 条件設定＋
@@ -507,7 +729,30 @@ async fn handle_goal(
     goal_state: &mut Option<crate::goal::Goal>,
     session: &mut agent::Session,
     llm: &dyn llm::LlmClient,
-    model: &str,
+    evaluator: crate::goal::Evaluator<'_>,
+    gate: &PermissionGate,
+    recorder: &mut Option<Recorder>,
+) {
+    run_goal_command(args, goal_state, session, llm, evaluator, gate, recorder).await;
+    // どの経路で抜けても、残った状態 (paused の goal、または「無い」) をセッションに残す。
+    save_goal_state(recorder.as_ref(), goal_state.as_ref());
+}
+
+/// goal の状態をセッションに保存する。失敗しても作業は止めない。
+fn save_goal_state(recorder: Option<&Recorder>, goal: Option<&crate::goal::Goal>) {
+    if let Some(rec) = recorder
+        && let Err(e) = rec.save_goal(goal.map(crate::goal::Goal::to_record).as_ref())
+    {
+        eprintln!("session: could not save the goal: {e:#}");
+    }
+}
+
+async fn run_goal_command(
+    args: &str,
+    goal_state: &mut Option<crate::goal::Goal>,
+    session: &mut agent::Session,
+    llm: &dyn llm::LlmClient,
+    evaluator: crate::goal::Evaluator<'_>,
     gate: &PermissionGate,
     recorder: &mut Option<Recorder>,
 ) {
@@ -516,7 +761,8 @@ async fn handle_goal(
     // 状態表示
     if args.is_empty() {
         match goal_state {
-            Some(g) => println!("goal (paused):\n{}", g.describe()),
+            // 条件文は保存されたファイルから戻ってくることもある。
+            Some(g) => println!("goal (paused):\n{}", crate::term::sanitize(&g.describe())),
             None => println!("no active goal — set one with /goal <condition>"),
         }
         return;
@@ -525,40 +771,69 @@ async fn handle_goal(
     // 解除
     if GOAL_CLEAR_ALIASES.contains(&args) {
         match goal_state.take() {
-            Some(g) => println!("goal cleared: {}", first_line(&g.condition)),
+            Some(g) => println!(
+                "goal cleared: {}",
+                crate::term::sanitize(&first_line(&g.condition))
+            ),
             None => println!("no active goal to clear"),
         }
         return;
     }
 
-    // 設定＋実行
-    let mut goal = match Goal::new(args) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("{}", crate::term::red_err(&format!("goal: {e:#}")));
+    // 再開: paused の goal を、新しい上限の枠で続きから走らせる。
+    let mut goal = if GOAL_RESUME_ALIASES.contains(&args) {
+        let Some(mut paused) = goal_state.take() else {
+            println!("no paused goal to resume — set one with /goal <condition>");
             return;
+        };
+        paused.begin_new_window();
+        println!(
+            "{}",
+            crate::term::dim(&format!(
+                "[goal] resumed after {} turn(s) (limits for this run: {} turns / {}s): {}",
+                paused.total_turns,
+                paused.max_turns,
+                paused.max_duration.as_secs(),
+                crate::term::sanitize(&first_line(&paused.condition))
+            ))
+        );
+        paused
+    } else {
+        // 設定＋実行
+        let goal = match Goal::new(args) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("{}", crate::term::red_err(&shown_error("goal", &e)));
+                return;
+            }
+        };
+        if let Some(old) = goal_state.take() {
+            println!(
+                "goal replaced: {}",
+                crate::term::sanitize(&first_line(&old.condition))
+            );
         }
+        println!(
+            "{}",
+            crate::term::dim(&format!(
+                "[goal] started (limits: {} turns / {}s). destructive tools still ask for approval unless --yes",
+                goal.max_turns,
+                goal.max_duration.as_secs()
+            ))
+        );
+        goal
     };
-    if let Some(old) = goal_state.take() {
-        println!("goal replaced: {}", first_line(&old.condition));
-    }
-    println!(
-        "{}",
-        crate::term::dim(&format!(
-            "[goal] started (limits: {} turns / {}s). destructive tools still ask for approval unless --yes",
-            goal.max_turns,
-            goal.max_duration.as_secs()
-        ))
-    );
 
     // Ctrl-C で自律ループごと中断できるようにする (ターン途中なら履歴を修復)。
     let outcome = {
-        let fut = crate::goal::drive(&mut goal, session, llm, model, gate, |s| {
+        let fut = crate::goal::drive_with(&mut goal, session, llm, evaluator, gate, |s, g| {
             if let Some(rec) = recorder.as_mut()
-                && let Err(e) = rec.sync(s.history())
+                && let Err(e) = rec.sync_with(s.history(), s.compacted_away())
             {
                 eprintln!("session: save failed: {e}");
             }
+            // 途中で落ちても、ここまでの goal が paused として残るように。
+            save_goal_state(recorder.as_ref(), Some(g));
         });
         tokio::pin!(fut);
         tokio::select! {
@@ -567,9 +842,11 @@ async fn handle_goal(
         }
     };
     let Some(outcome) = outcome else {
+        // 中断されると `drive_with` の後始末を通らないので、ここで時計を止める。
+        goal.pause();
         session.interrupt_repair();
         if let Some(rec) = recorder.as_mut()
-            && let Err(e) = rec.sync(session.history())
+            && let Err(e) = rec.sync_with(session.history(), session.compacted_away())
         {
             eprintln!("session: save failed: {e}");
         }
@@ -589,7 +866,8 @@ async fn handle_goal(
             println!(
                 "{}",
                 crate::term::bold(&crate::term::cyan(&format!(
-                    "[goal] achieved after {turns} turn(s): {reason}"
+                    "[goal] achieved after {turns} turn(s): {}",
+                    crate::term::sanitize(&reason)
                 )))
             );
             // 達成した goal は解除する。
@@ -685,7 +963,7 @@ async fn handle_loop(
     let spec = match LoopSpec::new(interval, &prompt) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{}", crate::term::red_err(&format!("loop: {e:#}")));
+            eprintln!("{}", crate::term::red_err(&shown_error("loop", &e)));
             return;
         }
     };
@@ -702,7 +980,7 @@ async fn handle_loop(
     let outcome = {
         let fut = drive(&spec, session, llm, gate, |s| {
             if let Some(rec) = recorder.as_mut()
-                && let Err(e) = rec.sync(s.history())
+                && let Err(e) = rec.sync_with(s.history(), s.compacted_away())
             {
                 eprintln!("session: save failed: {e}");
             }
@@ -735,7 +1013,8 @@ async fn handle_loop(
         Some(LoopOutcome::TurnFailed { iterations, error }) => eprintln!(
             "{}",
             crate::term::red_err(&format!(
-                "[loop] stopped: turn failed after {iterations} completed iteration(s): {error:#}"
+                "[loop] stopped: turn failed after {iterations} completed iteration(s): {}",
+                crate::term::sanitize(&format!("{error:#}"))
             ))
         ),
     }
@@ -764,7 +1043,7 @@ async fn run_turn_interruptible(
         tokio::select! {
             res = &mut turn => {
                 if let Err(e) = res {
-                    eprintln!("{}", crate::term::red_err(&format!("error: {e:#}")));
+                    eprintln!("{}", crate::term::red_err(&shown_error("error", &e)));
                 }
                 false
             }
@@ -781,10 +1060,17 @@ async fn run_turn_interruptible(
 /// ターン後に履歴を transcript へ追記する (レコーダ無効時は no-op)。
 fn persist(recorder: &mut Option<Recorder>, session: &agent::Session) {
     if let Some(rec) = recorder.as_mut()
-        && let Err(e) = rec.sync(session.history())
+        && let Err(e) = rec.sync_with(session.history(), session.compacted_away())
     {
         eprintln!("session: save failed: {e}");
     }
+}
+
+/// 端末に出すエラー文。エラーにはプロバイダの応答本文やツールの出力が入り込む
+/// (`LLM HTTP 500: <body>`)。`base_url` は任意に設定できるので、本文は外から来る文字列。
+fn shown_error(label: &str, e: &anyhow::Error) -> String {
+    // 無害化は `term::red_err` が行う。
+    format!("{label}: {e:#}")
 }
 
 enum SlashResult {
@@ -816,6 +1102,123 @@ fn first_line(desc: &str) -> String {
     }
 }
 
+/// `!<cmd>` として実行するコマンド。`!` の直後が空白や `!` なら発話 (`!!! 急ぎで`)、
+/// `!important` のような単語も発話と区別できないので、コマンドとして扱うのは先頭の語が
+/// シェルの組み込みか PATH 上の実行ファイルのときだけ。それ以外は `\!…` と同じくモデルへ渡る。
+fn shell_escape(line: &str) -> Option<&str> {
+    let cmd = line.strip_prefix('!')?;
+    let first = cmd.chars().next()?;
+    if first.is_whitespace() || first == '!' {
+        return None;
+    }
+    let word = cmd.split_whitespace().next()?;
+    const BUILTINS: &[&str] = &[
+        "cd", "export", "echo", "pwd", "set", "unset", "type", "test", "[",
+    ];
+    let word_is_command = BUILTINS.contains(&word)
+        || word.contains('/') && std::path::Path::new(word).exists()
+        || std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(word).is_file()));
+    word_is_command.then_some(cmd.trim())
+}
+
+/// プロンプト文字列。`[ui] prompt_status = true` で tty のときだけ、モデル名とコンテキスト使用率を
+/// 添える (#81)。パイプには装飾を出さない。
+fn prompt_line(cfg: &Config, session: &agent::Session) -> String {
+    let base = match session.mode() {
+        agent::Mode::Plan => "lodan (plan)",
+        agent::Mode::Normal => "lodan",
+    };
+    if !cfg.ui.prompt_status || !crate::term::is_terminal() {
+        return format!("{base}> ");
+    }
+    let active = cfg.llm.active();
+    decorated_prompt(
+        base,
+        &active.model,
+        session.usage().last_context_tokens,
+        active.context_window,
+    )
+}
+
+/// 装飾つきのプロンプト (tty 判定を除いた純粋な整形。テスト用に分けてある)。
+fn decorated_prompt(base: &str, model: &str, used: u64, window: u64) -> String {
+    let ctx = (used * 100)
+        .checked_div(window)
+        .map_or_else(|| format!("{used} tok"), |pct| format!("ctx {pct}%"));
+    format!("{base} [{} · {ctx}]> ", crate::term::sanitize(model))
+}
+
+/// `!<cmd>` の実行。`sh -c` で cwd から、Bash ツールと同じ timeout。出力は stdout + stderr を
+/// 順に並べ、長すぎる分は切る (文脈として添えるものなので)。
+async fn run_shell_for_user(cmd: &str, cwd: &std::path::Path, timeout_secs: u64) -> String {
+    const MAX_BYTES: usize = 16 * 1024;
+    // Bash ツールと同じく、timeout で諦めたら子を殺す (放置すると `!sleep 300` が生き残る)。
+    let run = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return format!("(failed to start: {e})"),
+        Err(_) => return format!("(timed out after {timeout_secs}s)"),
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    // 切り詰めてから exit を足す (長い出力で失敗の印が消えないように)。
+    if text.len() > MAX_BYTES {
+        let cut = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= MAX_BYTES)
+            .last()
+            .unwrap_or(0);
+        text.truncate(cut);
+        text.push_str("\n… (truncated)");
+    }
+    if !out.status.success() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("(exit {})", out.status.code().unwrap_or(-1)));
+    }
+    text
+}
+
+/// `/model` の引数。provider 名そのもの / `provider:model` / モデル名 (コロンを含んでよい —
+/// ollama の `qwen2.5-coder:7b` が local の標準)。`:` の前が provider として読めるときだけ
+/// provider:model と解釈し、それ以外は全体をいまの provider のモデル名にする。
+fn parse_model_arg(
+    args: &str,
+    current: crate::config::Provider,
+) -> Option<(crate::config::Provider, Option<String>)> {
+    let parse =
+        |s: &str| <crate::config::Provider as clap::ValueEnum>::from_str(s.trim(), true).ok();
+    let args = args.trim();
+    if args.is_empty() || args == ":" {
+        return None;
+    }
+    if let Some(p) = parse(args) {
+        return Some((p, None));
+    }
+    if let Some((head, rest)) = args.split_once(':')
+        && let Some(p) = parse(head)
+    {
+        let rest = rest.trim();
+        return Some((p, (!rest.is_empty()).then(|| rest.to_string())));
+    }
+    Some((current, Some(args.to_string())))
+}
+
 fn handle_slash(
     cmd: &str,
     registry: &crate::tools::registry::ToolRegistry,
@@ -833,6 +1236,29 @@ fn handle_slash(
                 ("/tools", "利用可能なツール一覧"),
                 ("/compact [指示]", "会話履歴を要約して圧縮"),
                 ("/cost", "セッション累積のトークン使用量を表示"),
+                (
+                    "/model [provider[:model]]",
+                    "セッション中にモデルを切り替え / 引数なしで現在値と設定済み provider",
+                ),
+                (
+                    "/status",
+                    "provider / model / コンテキスト使用率 / モード / cwd / session",
+                ),
+                (
+                    "/context",
+                    "コンテキストの内訳 (system / tools / user / assistant / tool)",
+                ),
+                ("/memory", "読み込まれているメモリファイルの一覧とサイズ"),
+                ("!<cmd>", "シェルで実行して、出力を次の発話の文脈に添える"),
+                (
+                    "/fork",
+                    "いまの会話を新しいセッションに複製して、以後そちらへ保存",
+                ),
+                (
+                    "/rename <名前>",
+                    "セッションに名前を付ける (lodan sessions に出る)",
+                ),
+                ("/export [path]", "会話を Markdown に書き出す"),
                 (
                     "/goal <条件> | /goal | /goal clear",
                     "条件達成までターンを自律継続 / 状態表示 / 解除",
@@ -855,22 +1281,25 @@ fn handle_slash(
             if !user_commands.is_empty() {
                 println!("{}", crate::term::bold("user commands:"));
                 for c in user_commands.values() {
-                    let name = crate::term::cyan(&format!("/{}", c.name));
+                    // 名前はプロジェクトのファイル名由来。
+                    let name = crate::term::cyan(&format!("/{}", crate::term::sanitize(&c.name)));
                     if c.description.is_empty() {
                         println!("  {name}");
                     } else {
-                        println!("  {name} — {}", c.description);
+                        println!("  {name} — {}", crate::term::sanitize(&c.description));
                     }
                 }
             }
             if !mcp_prompts.is_empty() {
                 println!("{}", crate::term::bold("mcp prompts:"));
                 for p in mcp_prompts.values() {
-                    let name = crate::term::cyan(&format!("/{}", p.full_name()));
+                    // MCP サーバが名乗った名前と説明。
+                    let name =
+                        crate::term::cyan(&format!("/{}", crate::term::sanitize(p.full_name())));
                     if p.description().is_empty() {
                         println!("  {name}");
                     } else {
-                        println!("  {name} — {}", p.description());
+                        println!("  {name} — {}", crate::term::sanitize(p.description()));
                     }
                 }
             }
@@ -882,8 +1311,13 @@ fn handle_slash(
         }
         "tools" => {
             for spec in registry.tool_specs() {
+                // MCP ツールの名前と説明はサーバが決める。
                 let desc = first_line(spec.function.description);
-                println!("{} — {desc}", crate::term::cyan(spec.function.name));
+                println!(
+                    "{} — {}",
+                    crate::term::cyan(&crate::term::sanitize(spec.function.name)),
+                    crate::term::sanitize(&desc)
+                );
             }
             SlashResult::Handled
         }
@@ -903,7 +1337,10 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
     let mut map = BTreeMap::new();
     for cmd in cmds {
         if BUILTINS.contains(&cmd.name.as_str()) {
-            eprintln!("slash: /{} shadows a builtin, skipped", cmd.name);
+            eprintln!(
+                "slash: /{} shadows a builtin, skipped",
+                crate::term::sanitize(&cmd.name)
+            );
             continue;
         }
         map.insert(cmd.name.clone(), cmd);
@@ -913,6 +1350,95 @@ fn load_user_commands(dir: &std::path::Path) -> BTreeMap<String, SlashCommand> {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_model_arg;
+    use super::prompt_line;
+
+    #[test]
+    fn decorated_prompt_shows_percent_or_tokens() {
+        assert_eq!(
+            super::decorated_prompt("lodan", "qwen3.5:9b", 420, 1000),
+            "lodan [qwen3.5:9b · ctx 42%]> "
+        );
+        assert_eq!(
+            super::decorated_prompt("lodan (plan)", "m", 1234, 0),
+            "lodan (plan) [m · 1234 tok]> "
+        );
+    }
+
+    /// timeout で諦めたら子を殺す (孤児を残さない)。
+    #[tokio::test]
+    async fn bang_timeout_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("still-alive");
+        // 1 秒で切られる。生き残っていれば 3 秒後にマーカーを書く。
+        let cmd = format!("sleep 3; touch '{}'", marker.display());
+        let out = super::run_shell_for_user(&cmd, dir.path(), 1).await;
+        assert!(out.contains("timed out after 1s"), "{out}");
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(!marker.exists(), "the child kept running after the timeout");
+    }
+
+    /// 長い出力は切り詰めた後に exit を付ける (失敗の印が消えない)。
+    #[tokio::test]
+    async fn bang_truncates_before_appending_the_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let out =
+            super::run_shell_for_user("yes 0123456789 | head -c 40000; exit 7", dir.path(), 10)
+                .await;
+        assert!(out.len() < 20_000, "truncated: {}", out.len());
+        assert!(
+            out.ends_with("… (truncated)\n(exit 7)"),
+            "{}",
+            &out[out.len() - 40..]
+        );
+    }
+
+    #[test]
+    fn bang_is_a_command_only_when_the_first_word_is_one() {
+        assert_eq!(super::shell_escape("!echo hi"), Some("echo hi"));
+        assert_eq!(super::shell_escape("!ls -la"), Some("ls -la"));
+        assert_eq!(super::shell_escape("!important: fix it"), None);
+        assert_eq!(super::shell_escape("!!! 急ぎで"), None);
+        assert_eq!(super::shell_escape("! not a command"), None);
+        assert_eq!(super::shell_escape("!"), None);
+        assert_eq!(super::shell_escape("plain"), None);
+    }
+
+    /// テストの stdout は tty ではないので、`prompt_status = true` でも装飾は付かない。
+    #[test]
+    fn prompt_has_no_decoration_off_a_tty() {
+        let mut cfg = crate::config::Config::default();
+        cfg.ui.prompt_status = true;
+        let session = crate::agent::Session::new(
+            cfg.clone(),
+            std::sync::Arc::new(crate::tools::registry::default_registry()),
+        );
+        assert_eq!(prompt_line(&cfg, &session), "lodan> ");
+    }
+
+    #[test]
+    fn model_arg_keeps_colons_inside_model_names() {
+        use crate::config::Provider;
+        let p = |s: &str| parse_model_arg(s, Provider::Local);
+        assert_eq!(
+            p("qwen2.5-coder:7b"),
+            Some((Provider::Local, Some("qwen2.5-coder:7b".into())))
+        );
+        assert_eq!(p("kimi"), Some((Provider::Kimi, None)));
+        assert_eq!(p("LOCAL"), Some((Provider::Local, None)));
+        assert_eq!(
+            p("local:qwen3.5:9b"),
+            Some((Provider::Local, Some("qwen3.5:9b".into())))
+        );
+        assert_eq!(p("sakana:"), Some((Provider::Sakana, None)));
+        assert_eq!(p(":"), None);
+        assert_eq!(p(""), None);
+        assert_eq!(
+            parse_model_arg("gpt-oss:20b", Provider::Kimi),
+            Some((Provider::Kimi, Some("gpt-oss:20b".into())))
+        );
+    }
+
     use super::looks_like_slash_command;
     use super::slash_candidates;
 

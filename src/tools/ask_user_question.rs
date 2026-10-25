@@ -70,6 +70,15 @@ impl Tool for AskUserQuestion {
             ));
         }
 
+        // ヘッドレス実行では尋ねる相手がいない。質問を stdout に書くと機械可読な出力を壊し、
+        // stdin はプロンプトに使われているので答えも読めない。
+        if crate::term::display_to_stderr() {
+            return Ok(ToolOutput::error(
+                "AskUserQuestion: this is a non-interactive run, so nobody can answer. \
+                 Choose the most reasonable option yourself and state the assumption.",
+            ));
+        }
+
         // stdin は同期ブロッキングなので blocking スレッドで読む。
         let chosen = tokio::task::spawn_blocking(move || prompt_loop(&question, &options))
             .await
@@ -86,9 +95,10 @@ impl Tool for AskUserQuestion {
 
 /// 質問＋番号付き選択肢を表示する文字列。
 fn render(question: &str, options: &[String]) -> String {
-    let mut out = format!("{question}\n");
+    // 質問も選択肢もモデルが書いた文字列。利用者が答える直前の画面を書き換えさせない。
+    let mut out = format!("{}\n", crate::term::sanitize(question));
     for (i, opt) in options.iter().enumerate() {
-        out.push_str(&format!("  {}) {}\n", i + 1, opt));
+        out.push_str(&format!("  {}) {}\n", i + 1, crate::term::sanitize(opt)));
     }
     out
 }

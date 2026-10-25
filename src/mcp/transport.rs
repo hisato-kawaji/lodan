@@ -393,20 +393,21 @@ impl HttpTransport {
 }
 
 impl HttpInner {
-    /// 保存しているトークン (このサーバの URL のものだけ)。期限が近ければ先に更新する。
+    /// 保存しているアクセストークン (このサーバの URL のものだけ)。期限が近ければ先に更新する。
     async fn bearer(&self) -> Option<String> {
         let store = self.oauth.as_ref()?;
         crate::mcp::oauth::current(&self.url, store)
             .await
-            .map(|t| format!("Bearer {}", t.access_token))
+            .map(|t| t.access_token)
     }
 
-    /// 401 を受けたあと、refresh_token で更新できたら true (呼び出し側が 1 回だけ送り直す)。
-    async fn refresh_after_401(&self) -> bool {
-        let Some(store) = &self.oauth else {
+    /// `used` で 401 を受けたあと、新しいトークンが手に入れば true (呼び出し側が 1 回だけ送り直す)。
+    /// 別の呼び出しが先に更新していれば、更新せずにそれを使う。
+    async fn refresh_after_401(&self, used: Option<&str>) -> bool {
+        let (Some(store), Some(used)) = (&self.oauth, used) else {
             return false;
         };
-        match crate::mcp::oauth::refresh(&self.url, store).await {
+        match crate::mcp::oauth::refresh(&self.url, store, Some(used)).await {
             Ok(_) => true,
             Err(e) => {
                 tracing::debug!(server=%self.label, "mcp: token refresh failed: {e:#}");
@@ -416,15 +417,26 @@ impl HttpInner {
     }
 
     async fn post(&self, line: String, limit: Duration) -> Result<reqwest::Response> {
-        let mut resp = self.post_once(line.clone(), limit).await?;
+        let token = self.bearer().await;
+        let mut resp = self
+            .post_once(line.clone(), limit, token.as_deref())
+            .await?;
         // トークンが失効していたら、1 回だけ更新して送り直す。
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.refresh_after_401().await {
-            resp = self.post_once(line, limit).await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.refresh_after_401(token.as_deref()).await
+        {
+            let token = self.bearer().await;
+            resp = self.post_once(line, limit, token.as_deref()).await?;
         }
         Ok(resp)
     }
 
-    async fn post_once(&self, line: String, limit: Duration) -> Result<reqwest::Response> {
+    async fn post_once(
+        &self,
+        line: String,
+        limit: Duration,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response> {
         let mut req = self
             .client
             .post(&self.url)
@@ -435,8 +447,8 @@ impl HttpInner {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
-        if let Some(bearer) = self.bearer().await {
-            req = req.header("Authorization", bearer);
+        if let Some(token) = token {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         if let Some(sid) = self.session_id.lock().await.as_ref() {
             req = req.header(SESSION_HEADER, sid);
@@ -502,8 +514,9 @@ impl HttpInner {
             if let Some(last) = &last_event_id {
                 req = req.header("Last-Event-ID", last);
             }
-            if let Some(bearer) = self.bearer().await {
-                req = req.header("Authorization", bearer);
+            let token = self.bearer().await;
+            if let Some(token) = &token {
+                req = req.header("Authorization", format!("Bearer {token}"));
             }
             match req.send().await {
                 Ok(mut resp) if resp.status().is_success() && is_event_stream(&resp) => {
@@ -535,7 +548,7 @@ impl HttpInner {
                 Ok(resp)
                     if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                         && failures < STREAM_MAX_FAILURES
-                        && self.refresh_after_401().await =>
+                        && self.refresh_after_401(token.as_deref()).await =>
                 {
                     failures += 1;
                 }

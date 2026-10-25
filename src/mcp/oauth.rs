@@ -42,6 +42,13 @@ impl StoredToken {
     }
 }
 
+/// このプロセスの中で、読み → 足し → 書きを 1 つずつにする (POST と GET のストリームが同時に
+/// 更新すると、片方の書き込みが消える)。プロセスをまたぐ同時書き込みは扱わない。
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 更新 (refresh) を 1 つずつにする。refresh_token を使い捨てにする認可サーバでは、同時に 2 回
+/// 更新すると後の方が失敗する。
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// `mcp-tokens.json`。中身は `{ "<server url>": StoredToken }`。
 #[derive(Debug, Clone)]
 pub struct TokenStore {
@@ -64,26 +71,31 @@ impl TokenStore {
         &self.path
     }
 
-    fn load(&self) -> BTreeMap<String, StoredToken> {
-        std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+    /// 読めない (壊れた) ファイルは Err。空として扱うと、次の保存で他のサーバのトークンを消してしまう。
+    fn load(&self) -> Result<BTreeMap<String, StoredToken>> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => serde_json::from_str(&text)
+                .with_context(|| format!("{} is not valid JSON", self.path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", self.path.display())),
+        }
     }
 
     pub fn get(&self, server_url: &str) -> Option<StoredToken> {
-        self.load().remove(server_url)
+        self.load().ok()?.remove(server_url)
     }
 
     pub fn put(&self, server_url: &str, token: StoredToken) -> Result<()> {
-        let mut all = self.load();
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.load()?;
         all.insert(server_url.to_string(), token);
         self.save(&all)
     }
 
     /// 消したら true。
     pub fn remove(&self, server_url: &str) -> Result<bool> {
-        let mut all = self.load();
+        let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.load()?;
         let had = all.remove(server_url).is_some();
         if had {
             self.save(&all)?;
@@ -153,6 +165,9 @@ struct AuthServer {
 
 #[derive(Deserialize)]
 struct ProtectedResource {
+    /// このメタデータが述べている保護リソース (RFC 9728)。あれば、頼んだサーバの URL と一致させる。
+    #[serde(default)]
+    resource: Option<String>,
     #[serde(default)]
     authorization_servers: Vec<String>,
     #[serde(default)]
@@ -161,6 +176,9 @@ struct ProtectedResource {
 
 #[derive(Deserialize)]
 struct AuthServerMetadata {
+    /// RFC 8414: メタデータを取りに行った issuer と一致しなければ使わない。
+    #[serde(default)]
+    issuer: Option<String>,
     authorization_endpoint: String,
     token_endpoint: String,
     #[serde(default)]
@@ -221,7 +239,11 @@ async fn discover(http: &reqwest::Client, server_url: &str) -> Result<AuthServer
         .get("www-authenticate")
         .and_then(|v| v.to_str().ok())
         .and_then(resource_metadata_from);
-    let mut candidates: Vec<String> = hinted.into_iter().collect();
+    // ヘッダはサーバが言うことなので、取りに行く先も https (か loopback) に限る。
+    let mut candidates: Vec<String> = hinted
+        .filter(|u| check_endpoint(u, "resource_metadata").is_ok())
+        .into_iter()
+        .collect();
     candidates.extend(well_known(&server, "oauth-protected-resource"));
     let mut prm = None;
     for url in &candidates {
@@ -235,6 +257,12 @@ async fn discover(http: &reqwest::Client, server_url: &str) -> Result<AuthServer
             "{server_url} does not publish OAuth protected-resource metadata (tried {candidates:?})"
         )
     })?;
+    // 別のリソースのメタデータ (別サーバのものを指された) は使わない。
+    if let Some(resource) = &prm.resource
+        && resource.trim_end_matches('/') != server_url.trim_end_matches('/')
+    {
+        bail!("protected-resource metadata is for {resource}, not {server_url}");
+    }
     let issuer = prm
         .authorization_servers
         .first()
@@ -256,6 +284,13 @@ async fn discover(http: &reqwest::Client, server_url: &str) -> Result<AuthServer
     let meta = meta.ok_or_else(|| {
         anyhow!("no authorization server metadata for {issuer} (tried {tried:?})")
     })?;
+    if meta.issuer.as_deref().map(|i| i.trim_end_matches('/')) != Some(issuer.trim_end_matches('/'))
+    {
+        bail!(
+            "authorization server metadata names issuer {:?}, expected {issuer}",
+            meta.issuer
+        );
+    }
     // PKCE (S256) を広告していない認可サーバには進まない (仕様: 確かめられなければ断る)。
     if !meta
         .code_challenge_methods_supported
@@ -321,13 +356,19 @@ async fn register(http: &reqwest::Client, endpoint: &str, redirect_uri: &str) ->
     Ok(resp.json::<Registered>().await?.client_id)
 }
 
-/// 認可コードの届け先 (`/callback`) で 1 回だけ待つ。`state` が違えば拒否する。
+/// 認可コードの届け先 (`/callback`) で待つ。`state` が違うものは受け取らずに待ち続ける
+/// (同じ機械の誰かが偽の戻りを送っても、サインインを潰せない)。`error` も `state` が合うときだけ受ける。
 async fn wait_for_code(listener: tokio::net::TcpListener, state: &str) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
         let (mut sock, _) = listener.accept().await?;
         let mut buf = vec![0u8; 8192];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
+        // 何も送らずに繋ぎっぱなしの接続で、待ち受けを塞がせない。
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
         let head = String::from_utf8_lossy(&buf[..n]);
         let target = head
             .lines()
@@ -345,12 +386,22 @@ async fn wait_for_code(listener: tokio::net::TcpListener, state: &str) -> Result
         };
         let url = reqwest::Url::parse(&format!("http://127.0.0.1/callback{query}"))?;
         let params: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+        if params.get("state").map(String::as_str) != Some(state) {
+            let body = "lodan: this sign-in link does not match the one lodan opened.";
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            eprintln!("mcp: ignored an OAuth callback with the wrong state");
+            continue;
+        }
         let outcome = if let Some(err) = params.get("error") {
             Err(anyhow!("the authorization server refused: {err}"))
-        } else if params.get("state").map(String::as_str) != Some(state) {
-            Err(anyhow!(
-                "state mismatch in the OAuth callback (refusing the code)"
-            ))
         } else {
             params
                 .get("code")
@@ -442,17 +493,31 @@ pub async fn login(server_url: &str, store: &TokenStore, open: &dyn Fn(&str)) ->
 }
 
 /// refresh_token で更新して保存し、新しいトークンを返す。refresh_token が無ければ Err。
-pub async fn refresh(server_url: &str, store: &TokenStore) -> Result<StoredToken> {
+///
+/// `used` は呼び出し側が使って断られたアクセストークン。待っている間に別の呼び出しが更新して
+/// いたら (保存されているものが `used` と違えば)、更新せずにそれを返す。
+pub async fn refresh(
+    server_url: &str,
+    store: &TokenStore,
+    used: Option<&str>,
+) -> Result<StoredToken> {
+    let _guard = REFRESH_LOCK.lock().await;
     let old = store
         .get(server_url)
         .ok_or_else(|| anyhow!("not signed in to {server_url}"))?;
+    if used.is_some_and(|u| u != old.access_token) {
+        return Ok(old);
+    }
     let refresh_token = old
         .refresh_token
         .clone()
         .ok_or_else(|| anyhow!("the token for {server_url} cannot be refreshed"))?;
     check_endpoint(&old.token_endpoint, "token_endpoint")?;
+    // リダイレクトはたどらない: 307 は本文 (refresh_token) ごと転送先へ送り直すので、
+    // https の確認を素通りして別の場所へ渡してしまう (#165 のレビュー)。
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let resp = http
         .post(&old.token_endpoint)
@@ -484,7 +549,11 @@ pub async fn refresh(server_url: &str, store: &TokenStore) -> Result<StoredToken
 pub async fn current(server_url: &str, store: &TokenStore) -> Option<StoredToken> {
     let token = store.get(server_url)?;
     if token.expired(now_secs()) && token.refresh_token.is_some() {
-        return Some(refresh(server_url, store).await.unwrap_or(token));
+        return Some(
+            refresh(server_url, store, Some(&token.access_token))
+                .await
+                .unwrap_or(token),
+        );
     }
     Some(token)
 }
@@ -492,6 +561,7 @@ pub async fn current(server_url: &str, store: &TokenStore) -> Option<StoredToken
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn the_pkce_challenge_is_the_rfc_7636_example() {
@@ -577,40 +647,135 @@ mod tests {
         assert!(!store.remove("https://mcp.example.com/mcp").unwrap());
     }
 
-    /// 戻ってきた `state` が違うコードは受け取らない (CSRF)。
+    /// 戻ってきた `state` が違うコードは受け取らず、待ち続ける (偽の戻りでサインインを潰せない)。
     #[tokio::test]
-    async fn a_callback_with_the_wrong_state_is_refused() {
+    async fn a_callback_with_the_wrong_state_is_ignored_not_accepted() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let waiter = tokio::spawn(async move { wait_for_code(listener, "expected").await });
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        let hit = |req: &'static [u8]| async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            s.write_all(req).await.unwrap();
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out).await;
+            out
+        };
+        // 何も送らない接続があっても塞がらない。
+        let idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        s.write_all(b"GET /callback?code=c&state=forged HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
-            .unwrap();
-        let mut out = String::new();
-        let _ = s.read_to_string(&mut out).await;
-        let err = waiter.await.unwrap().unwrap_err().to_string();
-        assert!(err.contains("state mismatch"), "{err}");
+        let forged = hit(b"GET /callback?code=evil&state=forged HTTP/1.1\r\n\r\n").await;
+        assert!(forged.starts_with("HTTP/1.1 400"), "{forged}");
+        let aborted = hit(b"GET /callback?error=access_denied&state=forged HTTP/1.1\r\n\r\n").await;
+        assert!(aborted.starts_with("HTTP/1.1 400"), "{aborted}");
+        assert!(
+            !waiter.is_finished(),
+            "a forged callback must not end the login"
+        );
+        hit(b"GET /callback?code=the-code&state=expected HTTP/1.1\r\n\r\n").await;
+        drop(idle);
+        assert_eq!(waiter.await.unwrap().unwrap(), "the-code");
+    }
 
-        // 正しい state ならコードを受け取る。
+    /// 1 回だけ HTTP の応答を返すサーバ。受けた接続の数を数える。
+    async fn one_shot(response: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let waiter = tokio::spawn(async move { wait_for_code(listener, "ok").await });
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, hits)
+    }
+
+    fn token_at(endpoint: String, access: &str) -> StoredToken {
+        StoredToken {
+            access_token: access.into(),
+            refresh_token: Some("SECRET_RT".into()),
+            expires_at: None,
+            token_endpoint: endpoint,
+            client_id: "cid".into(),
+        }
+    }
+
+    /// 更新はリダイレクトをたどらない: 307 は refresh_token ごと転送先へ送り直す (#165 のレビュー)。
+    #[tokio::test]
+    async fn a_refresh_does_not_follow_redirects_with_the_refresh_token() {
+        let (thief, stolen) = one_shot(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 23\r\n\r\n{\"access_token\":\"evil\"}".into(),
+        )
+        .await;
+        let (as_port, _) = one_shot(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{thief}/stolen\r\nContent-Length: 0\r\n\r\n"
+        ))
+        .await;
+        let endpoint = format!("http://127.0.0.1:{as_port}/token");
+        // 陽性対照: 既定の client なら転送先に届く (= 仕掛けが本物)。
+        let _ = reqwest::Client::new()
+            .post(&endpoint)
+            .form(&[("refresh_token", "x")])
+            .send()
+            .await;
+        assert_eq!(stolen.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::at(dir.path().join("t.json"));
+        store
+            .put("https://mcp/x", token_at(endpoint, "old"))
             .unwrap();
-        s.write_all(b"GET /callback?code=the-code&state=ok HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
+        assert!(refresh("https://mcp/x", &store, Some("old")).await.is_err());
+        assert_eq!(
+            stolen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the refresh token must not reach the redirect target"
+        );
+        assert_eq!(store.get("https://mcp/x").unwrap().access_token, "old");
+    }
+
+    /// 待っている間に別の呼び出しが更新していたら、もう一度は更新しない (使い捨ての refresh_token)。
+    #[tokio::test]
+    async fn a_token_someone_else_already_refreshed_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::at(dir.path().join("t.json"));
+        // 送られれば必ず失敗する (接続できない) エンドポイント。
+        store
+            .put(
+                "https://mcp/x",
+                token_at("http://127.0.0.1:1/token".into(), "new"),
+            )
             .unwrap();
-        let _ = s.read_to_string(&mut out).await;
-        assert_eq!(waiter.await.unwrap().unwrap(), "the-code");
+        let got = refresh("https://mcp/x", &store, Some("old")).await.unwrap();
+        assert_eq!(got.access_token, "new");
+        assert!(refresh("https://mcp/x", &store, Some("new")).await.is_err());
+    }
+
+    /// 読めない保存ファイルは上書きしない (他のサーバのトークンを消さない)。
+    #[test]
+    fn a_broken_store_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let store = TokenStore::at(&path);
+        assert!(
+            store
+                .put("https://mcp/x", token_at("https://as/t".into(), "a"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
     }
 
     #[test]

@@ -12,7 +12,9 @@ Authorization server:
 - POST /token: authorization_code (checks PKCE, redirect_uri, resource) / refresh_token
 - POST /admin/revoke: invalidates the current access token (forces a refresh)
 
-Usage: mock_mcp_oauth_server.py <port>
+Usage: mock_mcp_oauth_server.py <port> [bad-issuer|bad-resource]
+  bad-issuer   the AS metadata names a different issuer than the one it was fetched for
+  bad-resource the protected-resource metadata describes a different resource
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCK = threading.Lock()
+MODE = sys.argv[2] if len(sys.argv) > 2 else ""
 STATE = {
     "clients": {},  # client_id -> redirect_uris
     "codes": {},  # code -> (client_id, redirect_uri, challenge, resource)
@@ -62,10 +65,11 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         q = dict(urllib.parse.parse_qsl(url.query))
         if url.path == "/.well-known/oauth-protected-resource":
-            return self.reply(200, {"resource": self.base + "/mcp", "authorization_servers": [self.base]})
+            resource = "https://elsewhere.example/mcp" if MODE == "bad-resource" else self.base + "/mcp"
+            return self.reply(200, {"resource": resource, "authorization_servers": [self.base]})
         if url.path == "/.well-known/oauth-authorization-server":
             return self.reply(200, {
-                "issuer": self.base,
+                "issuer": self.base + "/impostor" if MODE == "bad-issuer" else self.base,
                 "authorization_endpoint": self.base + "/authorize",
                 "token_endpoint": self.base + "/token",
                 "registration_endpoint": self.base + "/register",

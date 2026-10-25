@@ -26,6 +26,10 @@ impl Drop for Server {
 }
 
 fn start() -> (Server, u16) {
+    start_in("")
+}
+
+fn start_in(mode: &str) -> (Server, u16) {
     let port = {
         let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         l.local_addr().unwrap().port()
@@ -35,6 +39,7 @@ fn start() -> (Server, u16) {
     let child = Command::new("python3")
         .arg(script)
         .arg(port.to_string())
+        .arg(mode)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -185,4 +190,36 @@ async fn login_stores_a_token_that_is_used_refreshed_and_kept_to_its_server() {
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("signed out of srv"));
     assert!(store.get(&url).is_none());
+
+    // 8) メタデータの食い違いは断る (別の #[tokio::test] にすると、上の set_var と並行して
+    //    環境変数を読むことになるので、同じテストの中で行う)。
+    mismatched_metadata_is_refused_before_any_sign_in().await;
+}
+
+/// 認可サーバのメタデータの issuer が取りに行った先と違う / 保護リソースのメタデータが別の
+/// リソースのものなら、サインインに進まない (RFC 8414 / 9728。#165 のレビュー)。
+async fn mismatched_metadata_is_refused_before_any_sign_in() {
+    for (mode, expected) in [
+        ("bad-issuer", "issuer"),
+        ("bad-resource", "elsewhere.example"),
+    ] {
+        let (_server, port) = start_in(mode);
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::at(dir.path().join("t.json"));
+        let opened = std::sync::atomic::AtomicBool::new(false);
+        let err =
+            lodan::mcp::oauth::login(&format!("http://127.0.0.1:{port}/mcp"), &store, &|_| {
+                opened.store(true, std::sync::atomic::Ordering::SeqCst)
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{mode}: login must fail"))
+            .to_string();
+        assert!(err.contains(expected), "{mode}: {err}");
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "{mode}: no browser"
+        );
+        assert!(!store.path().exists());
+    }
 }

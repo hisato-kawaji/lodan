@@ -508,6 +508,31 @@ mod tests {
         with_plan_step_profile(task, cfg, &llm)
     }
 
+    /// 計画器を別のモデルにしても (#65 C1)、手順を実行する子は作業しているクライアントとモデルのまま
+    /// (#160 のレビュー: 子を計画器のモデルに替えても、どのテストも落ちなかった)。
+    #[test]
+    fn plan_steps_run_on_the_working_model_even_with_a_separate_planner() {
+        let mut cfg = Config::default();
+        cfg.agent.plan_execute = true;
+        cfg.agent.plan_model = Some("big-planner".into());
+        let llm: Arc<dyn LlmClient> = Arc::new(UnusedLlm);
+        let task = with_plan_step_profile(
+            agent::subagent::SubAgentTool::new(
+                Arc::clone(&llm),
+                "mock".into(),
+                Arc::new(read_only_registry()),
+                PathBuf::from("."),
+                cfg.agent.max_iterations,
+            ),
+            &cfg,
+            &llm,
+        );
+        let step = task.profile_of(PLAN_STEP_AGENT).expect("registered");
+        assert_eq!(step.model, cfg.llm.active().model);
+        assert_ne!(step.model, "big-planner");
+        assert!(Arc::ptr_eq(&step.llm, &llm), "the working client");
+    }
+
     /// 手順を実行する子は親より強くならない。`readonly` の親の下では子も読み取り専用
     /// (#154 のレビュー: モデルは `subagent_type` を名指しで呼べるので、ここが権限の境界)。
     /// **`Task` に実際に載った**プロファイルを見る — 絞り方だけ正しくて配線が違うのが

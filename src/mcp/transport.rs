@@ -337,6 +337,9 @@ struct HttpInner {
     handler: ServerRequestHandler,
     /// `notifications/tools/list_changed` を受けた印 (#83)。
     tools_changed: Arc<std::sync::atomic::AtomicBool>,
+    /// `lodan mcp login` で得たトークンの置き場所 (#164)。`headers` に `Authorization` を
+    /// 明示したサーバでは使わない (そちらが優先)。
+    oauth: Option<crate::mcp::oauth::TokenStore>,
 }
 
 impl HttpTransport {
@@ -361,11 +364,17 @@ impl HttpTransport {
             .connect_timeout(REQUEST_TIMEOUT)
             .build()
             .context("building HTTP client")?;
-        let headers = spec
+        let headers: Vec<(String, String)> = spec
             .headers
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let explicit_auth = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+        let oauth = (!explicit_auth)
+            .then(crate::mcp::oauth::TokenStore::default_store)
+            .flatten();
         Ok(Self {
             inner: Arc::new(HttpInner {
                 label: label.to_string(),
@@ -376,6 +385,7 @@ impl HttpTransport {
                 session_id: Mutex::new(None),
                 handler,
                 tools_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                oauth,
             }),
             listener: std::sync::Mutex::new(None),
         })
@@ -383,7 +393,50 @@ impl HttpTransport {
 }
 
 impl HttpInner {
+    /// 保存しているアクセストークン (このサーバの URL のものだけ)。期限が近ければ先に更新する。
+    async fn bearer(&self) -> Option<String> {
+        let store = self.oauth.as_ref()?;
+        crate::mcp::oauth::current(&self.url, store)
+            .await
+            .map(|t| t.access_token)
+    }
+
+    /// `used` で 401 を受けたあと、新しいトークンが手に入れば true (呼び出し側が 1 回だけ送り直す)。
+    /// 別の呼び出しが先に更新していれば、更新せずにそれを使う。
+    async fn refresh_after_401(&self, used: Option<&str>) -> bool {
+        let (Some(store), Some(used)) = (&self.oauth, used) else {
+            return false;
+        };
+        match crate::mcp::oauth::refresh(&self.url, store, Some(used)).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!(server=%self.label, "mcp: token refresh failed: {e:#}");
+                false
+            }
+        }
+    }
+
     async fn post(&self, line: String, limit: Duration) -> Result<reqwest::Response> {
+        let token = self.bearer().await;
+        let mut resp = self
+            .post_once(line.clone(), limit, token.as_deref())
+            .await?;
+        // トークンが失効していたら、1 回だけ更新して送り直す。
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.refresh_after_401(token.as_deref()).await
+        {
+            let token = self.bearer().await;
+            resp = self.post_once(line, limit, token.as_deref()).await?;
+        }
+        Ok(resp)
+    }
+
+    async fn post_once(
+        &self,
+        line: String,
+        limit: Duration,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response> {
         let mut req = self
             .client
             .post(&self.url)
@@ -393,6 +446,9 @@ impl HttpInner {
             .body(line);
         for (k, v) in &self.headers {
             req = req.header(k, v);
+        }
+        if let Some(token) = token {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         if let Some(sid) = self.session_id.lock().await.as_ref() {
             req = req.header(SESSION_HEADER, sid);
@@ -458,6 +514,10 @@ impl HttpInner {
             if let Some(last) = &last_event_id {
                 req = req.header("Last-Event-ID", last);
             }
+            let token = self.bearer().await;
+            if let Some(token) = &token {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
             match req.send().await {
                 Ok(mut resp) if resp.status().is_success() && is_event_stream(&resp) => {
                     let mut sse = SseParser::default();
@@ -483,6 +543,14 @@ impl HttpInner {
                     }
                     // 何も届かずに閉じたストリームは失敗に数える (すぐ閉じるサーバに毎秒張り直さない)。
                     failures = if delivered { 0 } else { failures + 1 };
+                }
+                // 失効したトークンは更新して張り直す (更新できなければ下の 4xx で諦める)。
+                Ok(resp)
+                    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                        && failures < STREAM_MAX_FAILURES
+                        && self.refresh_after_401(token.as_deref()).await =>
+                {
+                    failures += 1;
                 }
                 Ok(resp) if resp.status().is_client_error() => {
                     tracing::debug!(server=%self.label, status=%resp.status(), "mcp: no server→client stream");
@@ -532,8 +600,16 @@ impl Transport for HttpTransport {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+                format!(
+                    " (if the server uses OAuth, sign in with `lodan mcp login {}`)",
+                    inner.label
+                )
+            } else {
+                String::new()
+            };
             return Err(anyhow!(
-                "mcp[{}]: HTTP {} from server: {}",
+                "mcp[{}]: HTTP {} from server: {}{hint}",
                 inner.label,
                 status,
                 body.trim()

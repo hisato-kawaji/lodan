@@ -40,7 +40,7 @@ impl McpClient {
         sampling: Option<Arc<SamplingProvider>>,
         elicitation: Option<Arc<crate::mcp::elicitation::ElicitationProvider>>,
     ) -> Result<Self> {
-        // server→client リクエストのハンドラ (stdio のみ有効)。
+        // server→client リクエストのハンドラ (stdio と HTTP で共通)。
         //   roots/list           → cwd を返す
         //   sampling/createMessage → opt-in 時のみ LLM を呼ぶ
         //   elicitation/create   → REPL なら利用者に尋ねる
@@ -109,6 +109,8 @@ impl McpClient {
         let _: InitializeResult = self.request("initialize", Some(&params)).await?;
         // notifications/initialized — no response expected.
         self.notify::<()>("notifications/initialized", None).await?;
+        // HTTP はここで server→client のストリーム (GET) を開く (#83)。
+        self.transport.on_initialized();
         Ok(())
     }
 

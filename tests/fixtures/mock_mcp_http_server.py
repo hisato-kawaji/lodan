@@ -7,6 +7,13 @@ tools/list → tools/call(echo), over a single HTTP endpoint.
 - Client POSTs newline-free JSON-RPC; we reply with application/json.
 - initialize response carries an `Mcp-Session-Id` header; later requests echo it.
 - Notifications (no `id`) get 202 Accepted with no body.
+- GET with `Accept: text/event-stream` opens the server→client stream (#83): it sends a
+  `roots/list` request and `notifications/tools/list_changed`, then closes the first stream. The client reconnects with
+  `Last-Event-ID`; later streams stay open, and `tools/call last_event_id` returns that header.
+  The client's answer comes back as a POSTed JSON-RPC response; `tools/call last_roots`
+  returns it.
+- `tools/call ask` answers with SSE: first a `roots/list` request on the POST's own stream,
+  then (only after the client POSTed its answer) the tool result built from that answer.
 
 Usage: mock_mcp_http_server.py <port>
 """
@@ -14,7 +21,9 @@ from __future__ import annotations
 
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROTOCOL_VERSION = "2025-06-18"
 SESSION_ID = "test-session-123"
@@ -24,6 +33,18 @@ ECHO_TOOL = {
     "description": "Return the input arguments as text.",
     "inputSchema": {"type": "object", "properties": {"msg": {"type": "string"}}},
 }
+
+
+# server→client リクエストへの、クライアントの答え (POST で届く)。id → response。
+ANSWERS: dict = {}
+ANSWERED = threading.Condition()
+GETS = {"count": 0, "last_event_id": None}
+
+
+def wait_answer(req_id: str, timeout: float = 10.0):
+    with ANSWERED:
+        ANSWERED.wait_for(lambda: req_id in ANSWERS, timeout=timeout)
+        return ANSWERS.get(req_id)
 
 
 def result_for(msg: dict) -> dict | None:
@@ -39,6 +60,13 @@ def result_for(msg: dict) -> dict | None:
         return {"tools": [ECHO_TOOL]}
     if method == "tools/call":
         params = msg.get("params") or {}
+        if params.get("name") == "last_event_id":
+            text = GETS["last_event_id"] or "none"
+            return {"content": [{"type": "text", "text": text}], "isError": False}
+        if params.get("name") == "last_roots":
+            ans = ANSWERS.get("get-1")
+            text = json.dumps(ans, separators=(",", ":")) if ans else "none"
+            return {"content": [{"type": "text", "text": text}], "isError": False}
         if params.get("name") == "echo":
             text = json.dumps(params.get("arguments") or {}, separators=(",", ":"))
             return {"content": [{"type": "text", "text": f"echo:{text}"}], "isError": False}
@@ -57,6 +85,27 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_response(400)
             self.end_headers()
+            return
+
+        # クライアントの答え (server→client リクエストへの response) → 202。
+        if "method" not in msg and msg.get("id") is not None:
+            with ANSWERED:
+                ANSWERS[msg["id"]] = msg
+                ANSWERED.notify_all()
+            self.send_response(202)
+            self.end_headers()
+            return
+
+        if msg.get("method") == "tools/call" and (msg.get("params") or {}).get("name") == "ask":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Mcp-Session-Id", SESSION_ID)
+            self.end_headers()
+            self.sse({"jsonrpc": "2.0", "id": "post-1", "method": "roots/list"})
+            ans = wait_answer("post-1")
+            text = json.dumps(ans, separators=(",", ":")) if ans else "no answer"
+            self.sse({"jsonrpc": "2.0", "id": msg["id"],
+                      "result": {"content": [{"type": "text", "text": text}], "isError": False}})
             return
 
         # Notification (no id) → 202 Accepted, no body.
@@ -81,9 +130,49 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+    def sse(self, obj: dict, event_id: str | None = None) -> None:
+        frame = ""
+        if event_id:
+            frame += f"id: {event_id}\n"
+        frame += "event: message\ndata: " + json.dumps(obj, separators=(",", ":")) + "\n\n"
+        self.wfile.write(frame.encode())
+        self.wfile.flush()
+
+    def do_GET(self):
+        if "text/event-stream" not in (self.headers.get("Accept") or ""):
+            self.send_response(405)
+            self.end_headers()
+            return
+        if self.headers.get("Mcp-Session-Id") != SESSION_ID:
+            self.send_response(400)
+            self.end_headers()
+            return
+        GETS["count"] += 1
+        first = GETS["count"] == 1
+        if not first:
+            GETS["last_event_id"] = self.headers.get("Last-Event-ID")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        try:
+            if first:
+                self.sse({"jsonrpc": "2.0", "id": "get-1", "method": "roots/list"}, "e1")
+                self.sse({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}, "e2")
+                return  # 最初のストリームは閉じる (張り直しを確かめる)
+            # 開いたままにする (クライアントが閉じるまで)。
+            while True:
+                time.sleep(0.5)
+                self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
 def main() -> None:
     port = int(sys.argv[1])
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
+    server.serve_forever()
 
 
 if __name__ == "__main__":

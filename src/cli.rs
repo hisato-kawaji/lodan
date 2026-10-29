@@ -269,10 +269,45 @@ pub enum McpCommand {
         #[arg(long)]
         user: bool,
     },
+    /// Sign in to an HTTP server with OAuth (opens the authorization page; the token is stored 0600)
+    Login { name: String },
+    /// Forget the OAuth token stored for an HTTP server
+    Logout { name: String },
 }
 
-/// `lodan mcp …`。設定ファイルを読み書きするだけで、サーバには繋がない。
-fn manage_mcp(cmd: McpCommand) -> Result<()> {
+/// `lodan mcp login|logout <name>` が対象にするサーバの URL (user + 信頼済みのプロジェクト)。
+fn oauth_target(name: &str) -> Result<(String, crate::mcp::oauth::TokenStore)> {
+    let (servers, _) = crate::mcp::config::McpServersConfig::load_effective()?;
+    let spec = servers
+        .mcp_servers
+        .get(name)
+        .with_context(|| format!("no MCP server named `{name}` (lodan mcp list)"))?;
+    let url = spec.url.clone().with_context(|| {
+        format!("`{name}` is not an HTTP server; OAuth applies to `url` servers only")
+    })?;
+    let store = crate::mcp::oauth::TokenStore::default_store()
+        .context("could not resolve the user config directory")?;
+    Ok((url, store))
+}
+
+/// 認可ページを開かせる。URL は必ず表示し、ブラウザを起動できればそれも試す (失敗は無視)。
+fn open_in_browser(url: &str) {
+    eprintln!("mcp: open this URL to sign in:\n  {url}");
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// `lodan mcp …`。login 以外は設定ファイルを読み書きするだけで、サーバには繋がない。
+async fn manage_mcp(cmd: McpCommand) -> Result<()> {
     use crate::mcp::config::{
         McpServersConfig, Scope, remove_server, upsert_server, user_mcp_path,
     };
@@ -389,6 +424,24 @@ fn manage_mcp(cmd: McpCommand) -> Result<()> {
             }
             Ok(())
         }
+        McpCommand::Login { name } => {
+            let (url, store) = oauth_target(&name)?;
+            crate::mcp::oauth::login(&url, &store, &open_in_browser).await?;
+            println!(
+                "mcp: signed in to {name} (token stored in {})",
+                store.path().display()
+            );
+            Ok(())
+        }
+        McpCommand::Logout { name } => {
+            let (url, store) = oauth_target(&name)?;
+            if store.remove(&url)? {
+                println!("mcp: signed out of {name}");
+            } else {
+                println!("mcp: no stored token for {name}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -398,7 +451,7 @@ pub async fn dispatch(args: Cli) -> Result<i32> {
         return manage_trust(*list, *remove).map(|()| 0);
     }
     if let Some(Command::Mcp { cmd }) = args.cmd {
-        return manage_mcp(cmd).map(|()| 0);
+        return manage_mcp(cmd).await.map(|()| 0);
     }
     // プロジェクトのファイルを読むかどうかは、設定を読む前に決める (設定そのものが対象なので)。
     // バイナリでは main が `.env` を読む前に済ませている。ここは、それ以外の呼び出し元のための保険

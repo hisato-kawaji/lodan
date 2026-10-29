@@ -5,9 +5,9 @@
 //! - `HttpTransport`: Streamable HTTP。POST で JSON-RPC を送り、`application/json` か
 //!   `text/event-stream` (SSE) の応答を受ける。`Mcp-Session-Id` を引き継ぐ
 //!
-//! stdio は server→client リクエスト (roots/list, sampling/createMessage) に
-//! `ServerRequestHandler` 経由で応答する。HTTP は server→client チャネルを
-//! 持たないため handler を使わない。
+//! server→client リクエスト (roots/list, sampling/createMessage, elicitation/create) には
+//! `ServerRequestHandler` 経由で応答する。stdio は stdout から読み、HTTP は POST の応答の SSE と、
+//! 初期化のあとに開く GET の SSE ストリームから読んで、答えを POST で返す (#83)。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -70,6 +70,62 @@ pub trait Transport: Send + Sync {
     /// 受信の口が無い transport (HTTP の POST だけ) は常に false。
     fn take_tools_changed(&self) -> bool {
         false
+    }
+    /// `notifications/initialized` を送った直後に呼ばれる。HTTP はここで GET のストリームを開く
+    /// (セッション ID は initialize の応答で決まるので、それより前には開けない)。
+    fn on_initialized(&self) {}
+}
+
+/// サーバから届いた 1 フレームの種類。server→client リクエストの id は文字列でもよい (仕様上
+/// `string | number`) ので、`JsonRpcIncoming` (id が数値) に通す前に生の JSON で見分ける。
+enum Frame {
+    /// server→client リクエスト。答えを返す。
+    Request {
+        id: serde_json::Value,
+        method: String,
+        params: Option<serde_json::Value>,
+    },
+    /// 通知 (答えない)。
+    Notification { method: String },
+    /// 自分のリクエストへの応答。
+    Response(JsonRpcIncoming),
+}
+
+fn classify(text: &str) -> Option<Frame> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let method = v.get("method").and_then(|m| m.as_str()).map(str::to_string);
+    let id = v.get("id").filter(|id| !id.is_null()).cloned();
+    match (method, id) {
+        (Some(method), Some(id)) => Some(Frame::Request {
+            id,
+            method,
+            params: v.get("params").cloned(),
+        }),
+        (Some(method), None) => Some(Frame::Notification { method }),
+        (None, Some(_)) => serde_json::from_value(v).ok().map(Frame::Response),
+        (None, None) => None,
+    }
+}
+
+/// server→client リクエストに `handler` で答えた JSON-RPC 応答 (stdio / HTTP で共通)。
+async fn answer(
+    handler: &ServerRequestHandler,
+    id: serde_json::Value,
+    method: String,
+    params: Option<serde_json::Value>,
+) -> serde_json::Value {
+    match handler(method.clone(), params).await {
+        HandlerOutcome::Result(result) => {
+            serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+        }
+        HandlerOutcome::Error { code, message } => serde_json::json!({
+            "jsonrpc":"2.0","id":id,
+            "error":{"code":code,"message":message}
+        }),
+        HandlerOutcome::Unhandled => serde_json::json!({
+            "jsonrpc":"2.0","id":id,
+            "error":{"code":-32601,"message":format!("method not found: {method}")}
+        }),
     }
 }
 
@@ -134,10 +190,7 @@ impl StdioTransport {
             }
         });
 
-        // Reader task: newline-delimited JSON from stdout.
-        // 三分岐: method+id = server→client リクエスト (応答する) /
-        //         id のみ = 自分のリクエストへの応答 (pending へ) /
-        //         method のみ = 通知 (無視)。
+        // Reader task: newline-delimited JSON from stdout。フレームの種類は `classify`。
         let pending_clone = Arc::clone(&pending);
         let label_for_reader = label.to_string();
         let tools_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -150,39 +203,23 @@ impl StdioTransport {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let inc: JsonRpcIncoming = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!(server=%label_for_reader, %e, "mcp: unparseable frame");
-                        continue;
-                    }
+                let Some(frame) = classify(&line) else {
+                    tracing::debug!(server=%label_for_reader, "mcp: unparseable frame");
+                    continue;
                 };
-                match (inc.method.clone(), inc.id) {
+                match frame {
                     // server→client リクエスト (roots/list, sampling/createMessage 等)。
                     // handler は async (sampling は LLM 呼び出しを伴う) なので、reader を
                     // 塞がないよう要求ごとに task を spawn して応答する。
-                    (Some(method), Some(id)) => {
+                    Frame::Request { id, method, params } => {
                         let handler = Arc::clone(&handler);
                         let out = reader_outbound.clone();
-                        let params = inc.params.clone();
                         tokio::spawn(async move {
-                            let response = match handler(method.clone(), params).await {
-                                HandlerOutcome::Result(result) => {
-                                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                                }
-                                HandlerOutcome::Error { code, message } => serde_json::json!({
-                                    "jsonrpc":"2.0","id":id,
-                                    "error":{"code":code,"message":message}
-                                }),
-                                HandlerOutcome::Unhandled => serde_json::json!({
-                                    "jsonrpc":"2.0","id":id,
-                                    "error":{"code":-32601,"message":format!("method not found: {method}")}
-                                }),
-                            };
+                            let response = answer(&handler, id, method, params).await;
                             let _ = out.send(response.to_string());
                         });
                     }
-                    (Some(method), None) => {
+                    Frame::Notification { method } => {
                         if method == "notifications/tools/list_changed" {
                             tools_changed_for_reader
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -190,15 +227,16 @@ impl StdioTransport {
                             tracing::debug!(server=%label_for_reader, method, "mcp: notification ignored");
                         }
                     }
-                    (None, Some(id)) => {
+                    Frame::Response(inc) => {
+                        let Some(id) = inc.id else {
+                            tracing::debug!(server=%label_for_reader, "mcp: response with a non-numeric id");
+                            continue;
+                        };
                         if let Some(tx) = pending_clone.lock().await.remove(&id) {
                             let _ = tx.send(inc);
                         } else {
                             tracing::debug!(server=%label_for_reader, id, "mcp: response with no waiter");
                         }
-                    }
-                    (None, None) => {
-                        tracing::debug!(server=%label_for_reader, "mcp: malformed frame (no method/id)");
                     }
                 }
             }
@@ -278,17 +316,39 @@ impl Drop for StdioTransport {
 // ---------------- Streamable HTTP ----------------
 
 const SESSION_HEADER: &str = "Mcp-Session-Id";
+/// GET のストリームが続けて失敗したら諦める回数 (間隔は 1, 2, 4, 8, 16 秒)。
+const STREAM_MAX_FAILURES: u32 = 5;
 
 pub struct HttpTransport {
+    inner: Arc<HttpInner>,
+    /// GET のストリームを読むタスク。transport を捨てたら止める。
+    listener: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// POST と GET のストリームで共有する部分。
+struct HttpInner {
     label: String,
     url: String,
     client: reqwest::Client,
+    /// GET のストリーム用。全体のタイムアウトを付けない (開いたままが正常)。
+    stream_client: reqwest::Client,
     headers: Vec<(String, String)>,
     session_id: Mutex<Option<String>>,
+    handler: ServerRequestHandler,
+    /// `notifications/tools/list_changed` を受けた印 (#83)。
+    tools_changed: Arc<std::sync::atomic::AtomicBool>,
+    /// `lodan mcp login` で得たトークンの置き場所 (#164)。`headers` に `Authorization` を
+    /// 明示したサーバでは使わない (そちらが優先)。
+    oauth: Option<crate::mcp::oauth::TokenStore>,
 }
 
 impl HttpTransport {
-    pub fn connect(label: &str, url: &str, spec: &McpServerSpec) -> Result<Self> {
+    pub fn connect(
+        label: &str,
+        url: &str,
+        spec: &McpServerSpec,
+        handler: ServerRequestHandler,
+    ) -> Result<Self> {
         // http:// に認証ヘッダを載せると平文でトークンが流れる。明示的に警告する。
         if !url.starts_with("https://") && !spec.headers.is_empty() {
             eprintln!(
@@ -300,21 +360,83 @@ impl HttpTransport {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building HTTP client")?;
-        let headers = spec
+        let stream_client = reqwest::Client::builder()
+            .connect_timeout(REQUEST_TIMEOUT)
+            .build()
+            .context("building HTTP client")?;
+        let headers: Vec<(String, String)> = spec
             .headers
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let explicit_auth = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+        let oauth = (!explicit_auth)
+            .then(crate::mcp::oauth::TokenStore::default_store)
+            .flatten();
         Ok(Self {
-            label: label.to_string(),
-            url: url.to_string(),
-            client,
-            headers,
-            session_id: Mutex::new(None),
+            inner: Arc::new(HttpInner {
+                label: label.to_string(),
+                url: url.to_string(),
+                client,
+                stream_client,
+                headers,
+                session_id: Mutex::new(None),
+                handler,
+                tools_changed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                oauth,
+            }),
+            listener: std::sync::Mutex::new(None),
         })
+    }
+}
+
+impl HttpInner {
+    /// 保存しているアクセストークン (このサーバの URL のものだけ)。期限が近ければ先に更新する。
+    async fn bearer(&self) -> Option<String> {
+        let store = self.oauth.as_ref()?;
+        crate::mcp::oauth::current(&self.url, store)
+            .await
+            .map(|t| t.access_token)
+    }
+
+    /// `used` で 401 を受けたあと、新しいトークンが手に入れば true (呼び出し側が 1 回だけ送り直す)。
+    /// 別の呼び出しが先に更新していれば、更新せずにそれを使う。
+    async fn refresh_after_401(&self, used: Option<&str>) -> bool {
+        let (Some(store), Some(used)) = (&self.oauth, used) else {
+            return false;
+        };
+        match crate::mcp::oauth::refresh(&self.url, store, Some(used)).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!(server=%self.label, "mcp: token refresh failed: {e:#}");
+                false
+            }
+        }
     }
 
     async fn post(&self, line: String, limit: Duration) -> Result<reqwest::Response> {
+        let token = self.bearer().await;
+        let mut resp = self
+            .post_once(line.clone(), limit, token.as_deref())
+            .await?;
+        // トークンが失効していたら、1 回だけ更新して送り直す。
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.refresh_after_401(token.as_deref()).await
+        {
+            let token = self.bearer().await;
+            resp = self.post_once(line, limit, token.as_deref()).await?;
+        }
+        Ok(resp)
+    }
+
+    async fn post_once(
+        &self,
+        line: String,
+        limit: Duration,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response> {
         let mut req = self
             .client
             .post(&self.url)
@@ -325,13 +447,144 @@ impl HttpTransport {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
+        if let Some(token) = token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
         if let Some(sid) = self.session_id.lock().await.as_ref() {
             req = req.header(SESSION_HEADER, sid);
         }
-        req.send()
+        let resp = req
+            .send()
             .await
-            .with_context(|| format!("mcp[{}]: HTTP POST to {}", self.label, self.url))
+            .with_context(|| format!("mcp[{}]: HTTP POST to {}", self.label, self.url))?;
+        // サーバが割り当てたセッション ID を引き継ぐ。
+        if let Some(sid) = resp.headers().get(SESSION_HEADER)
+            && let Ok(s) = sid.to_str()
+        {
+            *self.session_id.lock().await = Some(s.to_string());
+        }
+        Ok(resp)
     }
+
+    /// 応答以外のフレームを処理する。リクエストには別タスクで答えて POST で返し (応答を待っている
+    /// ストリームの読み取りを塞がない)、通知は印にする。応答ならそのまま返す。
+    fn handle(self: &Arc<Self>, frame: Frame) -> Option<JsonRpcIncoming> {
+        match frame {
+            Frame::Request { id, method, params } => {
+                let inner = Arc::clone(self);
+                tokio::spawn(async move {
+                    let response = answer(&inner.handler, id, method, params).await;
+                    if let Err(e) = inner.post(response.to_string(), REQUEST_TIMEOUT).await {
+                        tracing::debug!(server=%inner.label, "mcp: could not post the answer: {e:#}");
+                    }
+                });
+                None
+            }
+            Frame::Notification { method } => {
+                if method == "notifications/tools/list_changed" {
+                    self.tools_changed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    tracing::debug!(server=%self.label, method, "mcp: notification ignored");
+                }
+                None
+            }
+            Frame::Response(inc) => Some(inc),
+        }
+    }
+
+    /// server→client のストリーム (GET) を読み続ける。サーバが対応していない (405) / セッションが
+    /// 無い (4xx) なら黙ってやめる。切れたら `Last-Event-ID` を付けて張り直す。
+    async fn listen(self: Arc<Self>) {
+        let mut last_event_id: Option<String> = None;
+        let mut failures = 0u32;
+        // サーバが `retry:` で指定した待ち時間 (無ければ 1 秒)。
+        let mut retry = Duration::from_secs(1);
+        loop {
+            let mut req = self
+                .stream_client
+                .get(&self.url)
+                .header("Accept", "text/event-stream");
+            for (k, v) in &self.headers {
+                req = req.header(k, v);
+            }
+            if let Some(sid) = self.session_id.lock().await.as_ref() {
+                req = req.header(SESSION_HEADER, sid);
+            }
+            if let Some(last) = &last_event_id {
+                req = req.header("Last-Event-ID", last);
+            }
+            let token = self.bearer().await;
+            if let Some(token) = &token {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            match req.send().await {
+                Ok(mut resp) if resp.status().is_success() && is_event_stream(&resp) => {
+                    let mut sse = SseParser::default();
+                    let mut delivered = false;
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        for event in sse.feed(&chunk) {
+                            delivered = true;
+                            if let Some(frame) = classify(&event) {
+                                // GET のストリームに応答は来ない (来ても待っている人がいない)。
+                                let _ = self.handle(frame);
+                            }
+                        }
+                        if sse.last_event_id.is_some() {
+                            last_event_id = sse.last_event_id.clone();
+                        }
+                    }
+                    if let Some(frame) = sse.finish().and_then(|e| classify(&e)) {
+                        delivered = true;
+                        let _ = self.handle(frame);
+                    }
+                    if let Some(ms) = sse.retry_ms {
+                        retry = Duration::from_millis(ms.max(1000));
+                    }
+                    // 何も届かずに閉じたストリームは失敗に数える (すぐ閉じるサーバに毎秒張り直さない)。
+                    failures = if delivered { 0 } else { failures + 1 };
+                }
+                // 失効したトークンは更新して張り直す (更新できなければ下の 4xx で諦める)。
+                Ok(resp)
+                    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                        && failures < STREAM_MAX_FAILURES
+                        && self.refresh_after_401(token.as_deref()).await =>
+                {
+                    failures += 1;
+                }
+                Ok(resp) if resp.status().is_client_error() => {
+                    tracing::debug!(server=%self.label, status=%resp.status(), "mcp: no server→client stream");
+                    return;
+                }
+                Ok(resp) => {
+                    tracing::debug!(server=%self.label, status=%resp.status(), "mcp: stream refused");
+                    failures += 1;
+                }
+                Err(e) => {
+                    tracing::debug!(server=%self.label, "mcp: stream failed: {e:#}");
+                    failures += 1;
+                }
+            }
+            if failures >= STREAM_MAX_FAILURES {
+                tracing::debug!(server=%self.label, "mcp: giving up on the server→client stream");
+                return;
+            }
+            // 届いたあとで閉じたストリームは、サーバの `retry:` (無ければ 1 秒) で張り直す。
+            // 失敗が続けば 1, 2, 4, 8, 16 秒と延ばす。
+            let wait = match failures {
+                0 => retry,
+                n => Duration::from_secs(1 << (n - 1).min(4)),
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+fn is_event_stream(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.contains("text/event-stream"))
 }
 
 #[async_trait]
@@ -342,85 +595,171 @@ impl Transport for HttpTransport {
         line: String,
         limit: Duration,
     ) -> Result<JsonRpcIncoming> {
-        let resp = self.post(line, limit).await?;
+        let inner = &self.inner;
+        let mut resp = inner.post(line, limit).await?;
         let status = resp.status();
-        // サーバが割り当てたセッション ID を引き継ぐ。
-        if let Some(sid) = resp.headers().get(SESSION_HEADER)
-            && let Ok(s) = sid.to_str()
-        {
-            *self.session_id.lock().await = Some(s.to_string());
-        }
-        let ctype = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+                format!(
+                    " (if the server uses OAuth, sign in with `lodan mcp login {}`)",
+                    inner.label
+                )
+            } else {
+                String::new()
+            };
             return Err(anyhow!(
-                "mcp[{}]: HTTP {} from server: {}",
-                self.label,
+                "mcp[{}]: HTTP {} from server: {}{hint}",
+                inner.label,
                 status,
                 body.trim()
             ));
         }
-        let body = resp
-            .text()
-            .await
-            .with_context(|| format!("mcp[{}]: reading HTTP response body", self.label))?;
-
-        if ctype.contains("text/event-stream") {
-            extract_response_from_sse(&body, id)
-                .ok_or_else(|| anyhow!("mcp[{}]: no JSON-RPC response in SSE stream", self.label))
-        } else {
-            serde_json::from_str(&body)
-                .with_context(|| format!("mcp[{}]: decoding JSON response", self.label))
+        if !is_event_stream(&resp) {
+            let body = resp
+                .text()
+                .await
+                .with_context(|| format!("mcp[{}]: reading HTTP response body", inner.label))?;
+            return serde_json::from_str(&body)
+                .with_context(|| format!("mcp[{}]: decoding JSON response", inner.label));
         }
+        // SSE: 応答より前に server→client リクエスト (sampling / elicitation …) が来ることがある。
+        // サーバはその答えを待ってから応答を書くので、届いた順に処理しながら応答を探す
+        // (本文を全部読んでから探すと、互いに待ったまま固まる)。
+        let mut sse = SseParser::default();
+        let mut fallback: Option<JsonRpcIncoming> = None;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("mcp[{}]: reading SSE stream", inner.label))?
+        {
+            for event in sse.feed(&chunk) {
+                let Some(inc) = classify(&event).and_then(|f| inner.handle(f)) else {
+                    continue;
+                };
+                if inc.id == Some(id) {
+                    return Ok(inc);
+                }
+                if fallback.is_none() && (inc.result.is_some() || inc.error.is_some()) {
+                    fallback = Some(inc);
+                }
+            }
+        }
+        // 空行で閉じずに終わった最後のイベント (以前の「本文を全部読む」実装は受け取っていた)。
+        if let Some(inc) = sse
+            .finish()
+            .and_then(|e| classify(&e))
+            .and_then(|f| inner.handle(f))
+            && (inc.id == Some(id) || fallback.is_none())
+        {
+            return Ok(inc);
+        }
+        fallback.ok_or_else(|| anyhow!("mcp[{}]: no JSON-RPC response in SSE stream", inner.label))
     }
 
     async fn send_notification(&self, line: String) -> Result<()> {
-        let resp = self.post(line, REQUEST_TIMEOUT).await?;
-        if let Some(sid) = resp.headers().get(SESSION_HEADER)
-            && let Ok(s) = sid.to_str()
-        {
-            *self.session_id.lock().await = Some(s.to_string());
-        }
         // 通知は 202 Accepted 等。本文があっても無視する。
+        self.inner.post(line, REQUEST_TIMEOUT).await?;
         Ok(())
+    }
+
+    fn take_tools_changed(&self) -> bool {
+        self.inner
+            .tools_changed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn on_initialized(&self) {
+        if let Ok(mut listener) = self.listener.lock()
+            && listener.is_none()
+        {
+            *listener = Some(tokio::spawn(Arc::clone(&self.inner).listen()));
+        }
     }
 }
 
-/// SSE 本文から、`id` に一致する JSON-RPC 応答を取り出す。一致が無ければ最初に
-/// 見つかった result/error を持つ応答を返す。`data:` 行のみを解釈する。
-fn extract_response_from_sse(body: &str, id: u64) -> Option<JsonRpcIncoming> {
-    let mut fallback: Option<JsonRpcIncoming> = None;
-    for line in body.lines() {
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() {
-            continue;
-        }
-        let Ok(inc) = serde_json::from_str::<JsonRpcIncoming>(data) else {
-            continue;
-        };
-        if inc.id == Some(id) {
-            return Some(inc);
-        }
-        if fallback.is_none() && (inc.result.is_some() || inc.error.is_some()) {
-            fallback = Some(inc);
+impl Drop for HttpTransport {
+    fn drop(&mut self) {
+        if let Ok(mut listener) = self.listener.lock()
+            && let Some(task) = listener.take()
+        {
+            task.abort();
         }
     }
-    fallback
+}
+
+/// SSE の 1 行・1 イベントの上限。改行の来ないストリームで際限なく溜め込まない
+/// (GET のストリームには全体のタイムアウトが無い)。超えたら、そこまでを捨てる。
+const SSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// SSE を少しずつ読んで、イベントごとの `data` を返す。`data:` 行は改行でつなぎ、空行で 1 イベント。
+/// チャンクの境目は行の途中 (UTF-8 の途中) でもよい。
+#[derive(Default)]
+struct SseParser {
+    buf: Vec<u8>,
+    data: Vec<String>,
+    data_bytes: usize,
+    /// 最後に見た `id:` (張り直すときの `Last-Event-ID`)。
+    last_event_id: Option<String>,
+    /// サーバが `retry:` で指定した、張り直すまでの待ち時間 (ミリ秒)。
+    retry_ms: Option<u64>,
+}
+
+impl SseParser {
+    /// ストリームが終わったとき、空行で閉じられていない最後のイベントを返す。
+    fn finish(&mut self) -> Option<String> {
+        let mut events = self.feed(b"\n\n");
+        events.pop()
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        if self.buf.len() > SSE_MAX_BYTES && !self.buf.contains(&b'\n') {
+            tracing::debug!("mcp: dropping an over-long SSE line");
+            self.buf.clear();
+            return events;
+        }
+        while let Some(nl) = self.buf.iter().position(|b| *b == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(..=nl).collect();
+            let line = String::from_utf8_lossy(&raw);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                if !self.data.is_empty() {
+                    events.push(std::mem::take(&mut self.data).join("\n"));
+                    self.data_bytes = 0;
+                }
+                continue;
+            }
+            let (field, value) = match line.split_once(':') {
+                Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+                None => (line, ""),
+            };
+            match field {
+                "data" => {
+                    self.data_bytes += value.len();
+                    if self.data_bytes > SSE_MAX_BYTES {
+                        tracing::debug!("mcp: dropping an over-long SSE event");
+                        self.data.clear();
+                        self.data_bytes = 0;
+                    } else {
+                        self.data.push(value.to_string());
+                    }
+                }
+                "id" => self.last_event_id = Some(value.to_string()),
+                "retry" => self.retry_ms = value.trim().parse().ok(),
+                // コメント (`: keep-alive`) と `event:` は使わない。
+                _ => {}
+            }
+        }
+        events
+    }
 }
 
 // ---------------- dispatch ----------------
 
 /// spec の transport 種別に応じて接続し、boxed transport を返す。
 /// `handler` は server→client リクエスト (roots/list 等) の応答に使う。
-/// HTTP は server→client チャネルを持たないため handler を使わない。
 pub async fn connect(
     label: &str,
     spec: &McpServerSpec,
@@ -431,7 +770,7 @@ pub async fn connect(
         Kind::Stdio { command } => Ok(Box::new(
             StdioTransport::connect(label, command, spec, handler).await?,
         )),
-        Kind::Http { url } => Ok(Box::new(HttpTransport::connect(label, url, spec)?)),
+        Kind::Http { url } => Ok(Box::new(HttpTransport::connect(label, url, spec, handler)?)),
     }
 }
 
@@ -449,25 +788,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sse_extracts_matching_id() {
-        let body = "event: message\n\
-                    data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
-        let inc = extract_response_from_sse(body, 7).unwrap();
-        assert_eq!(inc.id, Some(7));
-        assert!(inc.result.is_some());
+    fn sse_events_are_split_on_blank_lines_even_across_chunks() {
+        let mut p = SseParser::default();
+        // 行の途中・CRLF・コメント・複数行の data。
+        let mut events = p.feed(b"event: message\r\nid: e1\r\ndata: {\"a\":");
+        assert!(events.is_empty());
+        events.extend(p.feed(b"1}\r\n\r\n: keep-alive\n\ndata: x\ndata: y\n\n"));
+        assert_eq!(events, vec!["{\"a\":1}".to_string(), "x\ny".to_string()]);
+        assert_eq!(p.last_event_id.as_deref(), Some("e1"));
+        // 終わっていないイベントは出さない。ストリームが終われば出す。
+        assert!(p.feed(b"data: z\n").is_empty());
+        assert_eq!(p.finish().as_deref(), Some("z"));
+        // 1 バイトずつでも多バイト文字が壊れない。retry も読む。
+        let mut q = SseParser::default();
+        let mut got = Vec::new();
+        for b in "retry: 2500\ndata: 日本語\n\n".as_bytes() {
+            got.extend(q.feed(std::slice::from_ref(b)));
+        }
+        assert_eq!(got, vec!["日本語".to_string()]);
+        assert_eq!(q.retry_ms, Some(2500));
     }
 
     #[test]
-    fn sse_falls_back_to_first_result_when_id_absent() {
-        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":1}}\n";
-        // request id 99 has no exact match → fallback to the id:1 result.
-        let inc = extract_response_from_sse(body, 99).unwrap();
-        assert_eq!(inc.id, Some(1));
+    fn an_endless_sse_line_is_dropped_instead_of_buffered() {
+        let mut p = SseParser::default();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..9 {
+            assert!(p.feed(&chunk).is_empty());
+        }
+        assert!(p.buf.len() <= SSE_MAX_BYTES);
+        // その後のイベントは普通に読める。
+        assert_eq!(p.feed(b"\ndata: ok\n\n"), vec!["ok".to_string()]);
     }
 
     #[test]
-    fn sse_ignores_non_data_and_unparseable() {
-        let body = ": comment\nevent: ping\ndata: not-json\n";
-        assert!(extract_response_from_sse(body, 1).is_none());
+    fn frames_with_string_ids_are_requests_not_garbage() {
+        match classify(r#"{"jsonrpc":"2.0","id":"s-1","method":"roots/list"}"#) {
+            Some(Frame::Request { id, method, .. }) => {
+                assert_eq!(id, serde_json::json!("s-1"));
+                assert_eq!(method, "roots/list");
+            }
+            _ => panic!("a request"),
+        }
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#),
+            Some(Frame::Notification { .. })
+        ));
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","id":7,"result":{}}"#),
+            Some(Frame::Response(r)) if r.id == Some(7)
+        ));
+        assert!(classify("not json").is_none());
+        assert!(classify(r#"{"jsonrpc":"2.0"}"#).is_none());
     }
 }

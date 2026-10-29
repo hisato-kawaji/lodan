@@ -94,3 +94,98 @@ async fn http_handshake_list_and_call_round_trip() {
         result.content
     );
 }
+
+fn spec_for(port: u16) -> McpServerSpec {
+    McpServerSpec {
+        command: None,
+        args: vec![],
+        env: BTreeMap::new(),
+        url: Some(format!("http://127.0.0.1:{port}/")),
+        headers: BTreeMap::new(),
+        allow_sampling: false,
+        trust_annotations: false,
+        enabled_tools: Vec::new(),
+        disabled_tools: Vec::new(),
+        tool_timeout_secs: Some(15),
+        max_output_bytes: None,
+    }
+}
+
+/// #83: 初期化のあと GET の SSE ストリームを開き、そこに来た server→client リクエスト
+/// (`roots/list`) には POST で答え、通知 (`tools/list_changed`) は印として持つ。
+#[tokio::test]
+async fn the_get_stream_carries_server_requests_and_notifications() {
+    let port = pick_port();
+    let _server = start(port);
+    let client = McpClient::connect("mock-http", &spec_for(port), None, None)
+        .await
+        .expect("connect HTTP MCP mock");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut changed = false;
+    let mut answer = String::new();
+    while Instant::now() < deadline {
+        changed |= client.take_tools_changed();
+        answer = client
+            .call_tool("last_roots", serde_json::json!({}))
+            .await
+            .expect("call_tool")
+            .content;
+        if changed && answer != "none" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        changed,
+        "tools/list_changed from the GET stream was not seen"
+    );
+    assert!(
+        answer.contains("\"id\":\"get-1\"") && answer.contains("file://"),
+        "roots/list over the GET stream was not answered: {answer}"
+    );
+}
+
+/// #83: GET のストリームが切れたら、最後に見たイベントの id を `Last-Event-ID` に付けて張り直す。
+#[tokio::test]
+async fn a_closed_get_stream_is_reopened_with_the_last_event_id() {
+    let port = pick_port();
+    let _server = start(port);
+    let client = McpClient::connect("mock-http", &spec_for(port), None, None)
+        .await
+        .expect("connect HTTP MCP mock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        seen = client
+            .call_tool("last_event_id", serde_json::json!({}))
+            .await
+            .expect("call_tool")
+            .content;
+        if seen != "none" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(seen, "e2", "the reconnect must carry Last-Event-ID");
+}
+
+/// #83: POST の応答が SSE のとき、応答より前に来た server→client リクエストに答えてから
+/// 応答を受け取る (本文を全部読んでから探すと、サーバが答えを待ったまま固まる)。
+#[tokio::test]
+async fn a_server_request_inside_a_post_stream_is_answered_before_the_response() {
+    let port = pick_port();
+    let _server = start(port);
+    let client = McpClient::connect("mock-http", &spec_for(port), None, None)
+        .await
+        .expect("connect HTTP MCP mock");
+    let result = client
+        .call_tool("ask", serde_json::json!({}))
+        .await
+        .expect("call_tool ask");
+    assert!(
+        result.content.contains("\"id\":\"post-1\"") && result.content.contains("file://"),
+        "{}",
+        result.content
+    );
+}

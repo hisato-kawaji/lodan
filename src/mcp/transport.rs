@@ -332,6 +332,10 @@ struct HttpInner {
     client: reqwest::Client,
     /// GET のストリーム用。全体のタイムアウトを付けない (開いたままが正常)。
     stream_client: reqwest::Client,
+    /// OAuth のトークンを付けて送るとき用 (POST / GET)。転送は同じ URL へのものしかたどらない
+    /// (トークンは発行先の URL のもの。同じオリジンの別パスへは渡さない)。
+    authed_client: reqwest::Client,
+    authed_stream_client: reqwest::Client,
     headers: Vec<(String, String)>,
     session_id: Mutex<Option<String>>,
     handler: ServerRequestHandler,
@@ -364,6 +368,16 @@ impl HttpTransport {
             .connect_timeout(REQUEST_TIMEOUT)
             .build()
             .context("building HTTP client")?;
+        let authed_client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(same_resource_redirects())
+            .build()
+            .context("building HTTP client")?;
+        let authed_stream_client = reqwest::Client::builder()
+            .connect_timeout(REQUEST_TIMEOUT)
+            .redirect(same_resource_redirects())
+            .build()
+            .context("building HTTP client")?;
         let headers: Vec<(String, String)> = spec
             .headers
             .iter()
@@ -381,6 +395,8 @@ impl HttpTransport {
                 url: url.to_string(),
                 client,
                 stream_client,
+                authed_client,
+                authed_stream_client,
                 headers,
                 session_id: Mutex::new(None),
                 handler,
@@ -437,8 +453,12 @@ impl HttpInner {
         limit: Duration,
         token: Option<&str>,
     ) -> Result<reqwest::Response> {
-        let mut req = self
-            .client
+        let client = if token.is_some() {
+            &self.authed_client
+        } else {
+            &self.client
+        };
+        let mut req = client
             .post(&self.url)
             .timeout(limit)
             .header("Content-Type", "application/json")
@@ -501,10 +521,13 @@ impl HttpInner {
         // サーバが `retry:` で指定した待ち時間 (無ければ 1 秒)。
         let mut retry = Duration::from_secs(1);
         loop {
-            let mut req = self
-                .stream_client
-                .get(&self.url)
-                .header("Accept", "text/event-stream");
+            let token = self.bearer().await;
+            let client = if token.is_some() {
+                &self.authed_stream_client
+            } else {
+                &self.stream_client
+            };
+            let mut req = client.get(&self.url).header("Accept", "text/event-stream");
             for (k, v) in &self.headers {
                 req = req.header(k, v);
             }
@@ -514,7 +537,6 @@ impl HttpInner {
             if let Some(last) = &last_event_id {
                 req = req.header("Last-Event-ID", last);
             }
-            let token = self.bearer().await;
             if let Some(token) = &token {
                 req = req.header("Authorization", format!("Bearer {token}"));
             }
@@ -578,6 +600,27 @@ impl HttpInner {
             tokio::time::sleep(wait).await;
         }
     }
+}
+
+/// トークンを付けたリクエストの転送: 同じ URL (末尾の `/` の違いだけ許す) へのものだけたどる。
+/// 別のパス・ホストへの転送は、3xx をそのまま返してエラーにする。
+fn same_resource_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let first = attempt.previous().first();
+        if attempt.previous().len() < 10 && first.is_some_and(|f| same_resource(f, attempt.url())) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+fn same_resource(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+        && a.path().trim_end_matches('/') == b.path().trim_end_matches('/')
+        && a.query() == b.query()
 }
 
 fn is_event_stream(resp: &reqwest::Response) -> bool {

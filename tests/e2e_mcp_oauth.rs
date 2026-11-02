@@ -164,9 +164,33 @@ async fn login_stores_a_token_that_is_used_refreshed_and_kept_to_its_server() {
     let second = store.get(&url).unwrap();
     assert_ne!(second.access_token, first.access_token, "refreshed");
 
-    // 6) 別の URL のサーバには、トークンを送らない。
+    // 6) 別の URL のサーバには、トークンを送らない。直接繋いでも、/mcp からの転送でも。
     let other = McpClient::connect("other", &spec(format!("{base}/other")), None, None).await;
     assert!(other.is_err());
+    let redirect_to = |to: &'static str| {
+        let http = http.clone();
+        let base = base.clone();
+        async move {
+            http.post(format!("{base}/admin/redirect"))
+                .json(&serde_json::json!({ "to": to }))
+                .send()
+                .await
+                .unwrap();
+        }
+    };
+    redirect_to("/other").await;
+    assert!(
+        client.list_tools().await.is_err(),
+        "a redirect to another path is not followed with the token"
+    );
+    // 末尾の `/` だけ違う転送はたどる (同じサーバ)。
+    redirect_to("/mcp/").await;
+    assert_eq!(client.list_tools().await.unwrap()[0].name, "echo");
+    http.post(format!("{base}/admin/redirect"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
     let seen: BTreeMap<String, Vec<Option<String>>> = http
         .get(format!("{base}/admin/seen"))
         .send()

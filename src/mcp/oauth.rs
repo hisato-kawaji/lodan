@@ -58,7 +58,7 @@ impl StoredToken {
 }
 
 /// このプロセスの中で、読み → 足し → 書きを 1 つずつにする (POST と GET のストリームが同時に
-/// 更新すると、片方の書き込みが消える)。プロセスをまたぐ同時書き込みは扱わない。
+/// 更新すると、片方の書き込みが消える)。プロセスをまたぐ分は `TokenStore::lock_file` で揃える。
 static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 更新 (refresh) を 1 つずつにする。refresh_token を使い捨てにする認可サーバでは、同時に 2 回
 /// 更新すると後の方が失敗する。
@@ -102,6 +102,7 @@ impl TokenStore {
 
     pub fn put(&self, server_url: &str, token: StoredToken) -> Result<()> {
         let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _file = self.lock_file("lock")?;
         let mut all = self.load()?;
         all.insert(server_url.to_string(), token);
         self.save(&all)
@@ -110,12 +111,35 @@ impl TokenStore {
     /// 消したら true。
     pub fn remove(&self, server_url: &str) -> Result<bool> {
         let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _file = self.lock_file("lock")?;
         let mut all = self.load()?;
         let had = all.remove(server_url).is_some();
         if had {
             self.save(&all)?;
         }
         Ok(had)
+    }
+
+    /// プロセスをまたいで 1 つずつにするためのロック (`mcp-tokens.json.<suffix>`)。返した File を
+    /// 閉じると外れる。取れるまで待つ (ブロックする)。
+    fn lock_file(&self, suffix: &str) -> Result<std::fs::File> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let path = self.path.with_extension(format!("json.{suffix}"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
     }
 
     fn save(&self, all: &BTreeMap<String, StoredToken>) -> Result<()> {
@@ -544,6 +568,14 @@ pub async fn refresh(
     used: Option<&str>,
 ) -> Result<StoredToken> {
     let _guard = REFRESH_LOCK.lock().await;
+    // 別の lodan も同じ refresh_token を使う。使い捨ての refresh_token では、同時に更新すると後の方が
+    // 失敗するので、プロセスをまたいでも 1 つずつにする (保存の "lock" とは別のファイル)。
+    let _file = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || store.lock_file("refresh.lock"))
+            .await
+            .context("waiting for the refresh lock")??
+    };
     let old = store
         .get(server_url)
         .ok_or_else(|| anyhow!("not signed in to {server_url}"))?;
@@ -732,6 +764,23 @@ mod tests {
         hit(b"GET /callback?code=the-code&state=expected HTTP/1.1\r\n\r\n").await;
         drop(idle);
         assert_eq!(waiter.await.unwrap().unwrap(), "the-code");
+    }
+
+    #[test]
+    fn a_save_waits_for_another_process_holding_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::at(dir.path().join("t.json"));
+        // 別の lodan が保存の途中にいる (ロックを持っている) つもり。
+        let held = store.lock_file("lock").unwrap();
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || store.put("https://a/mcp", token_at("e".into(), "x")))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!writer.is_finished(), "the save must wait for the lock");
+        drop(held);
+        writer.join().unwrap().unwrap();
+        assert!(store.get("https://a/mcp").is_some());
     }
 
     #[tokio::test]

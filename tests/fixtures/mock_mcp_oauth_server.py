@@ -11,6 +11,7 @@ Authorization server:
 - GET /authorize → 302 to redirect_uri with code + state (checks client_id, S256, resource)
 - POST /token: authorization_code (checks PKCE, redirect_uri, resource) / refresh_token
 - POST /admin/revoke: invalidates the current access token (forces a refresh)
+- POST /admin/redirect {"to": "<path>"}: POSTs to /mcp answer 307 to <path> (`{}` turns it off)
 
 Usage: mock_mcp_oauth_server.py <port> [bad-issuer|bad-resource]
   bad-issuer   the AS metadata names a different issuer than the one it was fetched for
@@ -35,6 +36,7 @@ STATE = {
     "refresh": {},  # refresh token -> client_id
     "n": 0,
     "seen": {},  # path -> list of Authorization headers
+    "redirect": None,  # path that POST /mcp is redirected to
 }
 ECHO_TOOL = {"name": "echo", "description": "echo", "inputSchema": {"type": "object"}}
 
@@ -142,12 +144,19 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 STATE["valid"].clear()
             return self.reply(204)
+        if url.path == "/admin/redirect":
+            with LOCK:
+                STATE["redirect"] = json.loads(raw or b"{}").get("to")
+            return self.reply(204)
 
         # MCP resource server.
         auth = self.headers.get("Authorization")
         with LOCK:
             STATE["seen"].setdefault(url.path, []).append(auth)
+            redirect = STATE["redirect"] if url.path == "/mcp" else None
             authorized = auth is not None and auth.startswith("Bearer ") and auth[7:] in STATE["valid"]
+        if redirect:
+            return self.reply(307, None, {"Location": f"{self.base}{redirect}"})
         if not authorized:
             return self.reply(401, {"error": "unauthorized"}, {
                 "WWW-Authenticate": f'Bearer resource_metadata="{self.base}/.well-known/oauth-protected-resource"',

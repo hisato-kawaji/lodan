@@ -699,7 +699,10 @@ struct SseParser {
     buf: Vec<u8>,
     data: Vec<String>,
     data_bytes: usize,
-    /// 最後に見た `id:` (張り直すときの `Last-Event-ID`)。
+    /// 読んだ `id:`。イベントが空行で閉じたときに `last_event_id` へ移す (途中で切れたイベントの id で
+    /// 張り直すと、受け取れていないイベントをサーバが送り直さない)。
+    id_buffer: Option<String>,
+    /// 最後に閉じたイベントの `id:` (張り直すときの `Last-Event-ID`)。
     last_event_id: Option<String>,
     /// サーバが `retry:` で指定した、張り直すまでの待ち時間 (ミリ秒)。
     retry_ms: Option<u64>,
@@ -725,6 +728,9 @@ impl SseParser {
             let line = String::from_utf8_lossy(&raw);
             let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
+                if self.id_buffer.is_some() {
+                    self.last_event_id = self.id_buffer.clone();
+                }
                 if !self.data.is_empty() {
                     events.push(std::mem::take(&mut self.data).join("\n"));
                     self.data_bytes = 0;
@@ -737,7 +743,8 @@ impl SseParser {
             };
             match field {
                 "data" => {
-                    self.data_bytes += value.len();
+                    // 行をつなぐ改行も数える (空の `data:` を延々と送られても上限に届くように)。
+                    self.data_bytes += value.len() + 1;
                     if self.data_bytes > SSE_MAX_BYTES {
                         tracing::debug!("mcp: dropping an over-long SSE event");
                         self.data.clear();
@@ -746,7 +753,7 @@ impl SseParser {
                         self.data.push(value.to_string());
                     }
                 }
-                "id" => self.last_event_id = Some(value.to_string()),
+                "id" => self.id_buffer = Some(value.to_string()),
                 "retry" => self.retry_ms = value.trim().parse().ok(),
                 // コメント (`: keep-alive`) と `event:` は使わない。
                 _ => {}
@@ -819,6 +826,21 @@ mod tests {
         assert!(p.buf.len() <= SSE_MAX_BYTES);
         // その後のイベントは普通に読める。
         assert_eq!(p.feed(b"\ndata: ok\n\n"), vec!["ok".to_string()]);
+        // 空の `data:` 行も上限に数える (0 バイトとして数えると、際限なく溜まる)。
+        let mut q = SseParser::default();
+        assert!(q.feed(&b"data:\n".repeat(1000)).is_empty());
+        assert_eq!(q.data_bytes, 1000);
+    }
+
+    #[test]
+    fn the_event_id_is_committed_only_when_the_event_is_complete() {
+        let mut p = SseParser::default();
+        assert_eq!(p.feed(b"id: e1\ndata: a\n\n"), vec!["a".to_string()]);
+        // 途中で切れたイベントの id は、張り直しの `Last-Event-ID` に使わない。
+        assert!(p.feed(b"id: e2\ndata: {\"trunc").is_empty());
+        assert_eq!(p.last_event_id.as_deref(), Some("e1"));
+        assert_eq!(p.feed(b"ated\":1}\n\n").len(), 1);
+        assert_eq!(p.last_event_id.as_deref(), Some("e2"));
     }
 
     #[test]

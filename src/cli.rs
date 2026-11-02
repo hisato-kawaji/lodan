@@ -573,16 +573,26 @@ pub fn decide_project_trust(args: &Cli) {
     if crate::trust::is_decided() {
         return;
     }
+    // `mcp login|logout` は、実行時と同じサーバ (信頼済みなら `.mcp.json` のものも) を対象にする。
+    // 尋ねはしない (対話の REPL ではないので、記録済みの信頼か `--trust` だけで決まる)。
+    let mcp_oauth = matches!(
+        &args.cmd,
+        Some(Command::Mcp {
+            cmd: McpCommand::Login { .. } | McpCommand::Logout { .. }
+        })
+    );
     // 信頼の管理と、プロジェクトのファイルを使わないサブコマンドでは尋ねない。読みもしない。
-    if matches!(
-        args.cmd,
-        Some(
-            Command::Trust { .. }
-                | Command::Sessions { .. }
-                | Command::Mcp { .. }
-                | Command::Presets
+    if !mcp_oauth
+        && matches!(
+            args.cmd,
+            Some(
+                Command::Trust { .. }
+                    | Command::Sessions { .. }
+                    | Command::Mcp { .. }
+                    | Command::Presets
+            )
         )
-    ) {
+    {
         crate::trust::set_project_trusted(false);
         return;
     }

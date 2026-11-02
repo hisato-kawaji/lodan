@@ -124,7 +124,10 @@ impl TokenStore {
         }
         // 別名で書いてから差し替える (書きかけを残さない)。別名のファイルは作る時点で 0600 にする
         // (書いてから chmod すると、umask 次第で他人に読める瞬間ができる)。
-        let tmp = self.path.with_extension("json.tmp");
+        // 別名はプロセスごとに変える (同時に動く別の lodan の書きかけを消さない)。
+        let tmp = self
+            .path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         write_private(&tmp, (serde_json::to_string_pretty(all)? + "\n").as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
@@ -393,14 +396,20 @@ async fn wait_for_code(listener: tokio::net::TcpListener, state: &str) -> Result
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
         let (mut sock, _) = listener.accept().await?;
-        let mut buf = vec![0u8; 8192];
-        // 何も送らずに繋ぎっぱなしの接続で、待ち受けを塞がせない。
-        let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        let head = String::from_utf8_lossy(&buf[..n]);
+        // リクエスト行は 1 回の read で届くとは限らない。改行まで (上限 8 KiB) 読み足す。
+        // 何も送らずに繋ぎっぱなしの接続で、待ち受けを塞がせない (全体で 5 秒)。
+        let mut buf = Vec::with_capacity(1024);
+        let read_line = async {
+            let mut chunk = [0u8; 1024];
+            while !buf.contains(&b'\n') && buf.len() < 8192 {
+                match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_line).await;
+        let head = String::from_utf8_lossy(&buf);
         let target = head
             .lines()
             .next()
@@ -723,6 +732,31 @@ mod tests {
         hit(b"GET /callback?code=the-code&state=expected HTTP/1.1\r\n\r\n").await;
         drop(idle);
         assert_eq!(waiter.await.unwrap().unwrap(), "the-code");
+    }
+
+    #[tokio::test]
+    async fn a_callback_split_across_reads_is_read_whole() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(async move { wait_for_code(listener, "expected").await });
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        s.set_nodelay(true).unwrap();
+        // state の途中で区切って、間を空けて送る。
+        s.write_all(b"GET /callback?code=the-code&state=exp")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        s.write_all(b"ected HTTP/1.1\r\n\r\n").await.unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the split callback was not accepted");
+        assert_eq!(code.unwrap().unwrap(), "the-code");
     }
 
     /// 1 回だけ HTTP の応答を返すサーバ。受けた接続の数を数える。

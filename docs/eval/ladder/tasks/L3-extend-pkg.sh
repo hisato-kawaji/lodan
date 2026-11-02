@@ -136,7 +136,8 @@ checks() {
   cp .probe/todo.json todo.json
   check tests_pass     'python3 -m unittest discover -s tests -t . >/dev/null 2>&1'
   # 旧形式の todo.json をそのまま読める (add の前に確かめる)
-  check old_data_loads 'test "$(python3 -m todo.cli list)" = "$(printf "[ ] 1 write report (normal)\n[x] 2 buy milk (normal)")"'
+  # 出力の比較の前に終了コードも見る (期待どおりに出力してから落ちる実装に点をやらない)。
+  check old_data_loads 'out=$(python3 -m todo.cli list) && test "$out" = "$(printf "[ ] 1 write report (normal)\n[x] 2 buy milk (normal)")"'
   check model_default  'python3 -c "from todo.model import Task; t=Task.from_dict({\"id\":1,\"title\":\"x\"}); assert t.priority==\"normal\", t; assert t.to_dict()[\"priority\"]==\"normal\""'
   check store_rejects  'python3 -c "
 import tempfile, os
@@ -153,7 +154,18 @@ else:
 assert len(store.load(p)) == 1
 "'
   check cli_add_priority 'python3 -m todo.cli add "call bob" --priority high >/dev/null && python3 -c "import json; d=json.load(open(\"todo.json\")); assert d[-1][\"title\"]==\"call bob\" and d[-1][\"priority\"]==\"high\", d"'
-  check cli_sort       'python3 -m todo.cli add "nap" --priority low >/dev/null 2>&1; test "$(python3 -m todo.cli list --sort priority)" = "$(printf "[ ] 3 call bob (high)\n[ ] 1 write report (normal)\n[x] 2 buy milk (normal)\n[ ] 4 nap (low)")"'
+  # 並べ替えは専用のデータで見る。同じ priority を id の降順に置き、priority だけの安定ソートを落とす。
+  # priority の無い旧形式の行 (id 3) も混ぜる。
+  check cli_sort       'cat > todo.json <<JSON
+[
+  {"id": 5, "title": "e", "done": false, "priority": "low"},
+  {"id": 4, "title": "d", "done": false, "priority": "high"},
+  {"id": 3, "title": "c", "done": true},
+  {"id": 2, "title": "b", "done": false, "priority": "high"},
+  {"id": 1, "title": "a", "done": false, "priority": "normal"}
+]
+JSON
+out=$(python3 -m todo.cli list --sort priority) && test "$out" = "$(printf "[ ] 2 b (high)\n[ ] 4 d (high)\n[ ] 1 a (normal)\n[x] 3 c (normal)\n[ ] 5 e (low)")"'
   # 正しい priority の add が動くことを先に確かめてから、不正値の拒否を見る (未実装の argparse エラーで通さない)。
   check cli_rejects    'python3 -m todo.cli add ok --priority low >/dev/null 2>&1 && cp todo.json .probe/before.json && ! python3 -m todo.cli add bad --priority urgent >/dev/null 2>&1 && cmp -s todo.json .probe/before.json'
 }

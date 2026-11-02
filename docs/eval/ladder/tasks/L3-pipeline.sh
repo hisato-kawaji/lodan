@@ -18,6 +18,7 @@ CSV
 
   # 判定用の別データ。data/orders.csv の答えを直書きした実装を落とすため、モデルには見せない。
   # hank と gina は同額で、ファイルでは hank が先に出る (名前順の同点処理を省いた実装を落とす)。
+# ivy は 0.333 × 2 = 0.666 で、足したあとに丸めないと 0.67 にならない (丸めを省いた実装を落とす)。
   mkdir -p .probe
   cat > .probe/other.csv <<'CSV'
 order_id,customer,item,qty,unit_price,status
@@ -27,6 +28,8 @@ order_id,customer,item,qty,unit_price,status
 13,erin,lid,3,0.25,paid
 14,frank,mug,1,9.99,refunded
 15,gina,mug,1,4.85,paid
+16,ivy,pin,1,0.333,paid
+17,ivy,pin,1,0.333,paid
 CSV
 }
 
@@ -41,11 +44,13 @@ checks() {
   check stage1_load   'python3 -c "from shop.orders import load_orders; o=load_orders(\"data/orders.csv\"); assert len(o)==6, o; r=o[0]; assert (r[\"order_id\"],r[\"customer\"],r[\"qty\"],r[\"unit_price\"],r[\"status\"])==(\"1\",\"alice\",3,1.5,\"paid\"), r"'
   # 段 2: 集計 (paid だけ・小数 2 桁)。別データでも確かめる。
   check stage2_totals 'python3 -c "from shop.orders import load_orders; from shop.stats import customer_totals; t=customer_totals(load_orders(\"data/orders.csv\")); assert t=={\"alice\":4.5,\"bob\":18.5,\"carol\":15.0}, t"'
-  check stage2_other  'python3 -c "from shop.orders import load_orders; from shop.stats import customer_totals; t=customer_totals(load_orders(\".probe/other.csv\")); assert t=={\"erin\":8.95,\"frank\":4.1,\"gina\":4.85,\"hank\":4.85}, t"'
+  check stage2_other  'python3 -c "from shop.orders import load_orders; from shop.stats import customer_totals; t=customer_totals(load_orders(\".probe/other.csv\")); assert t=={\"erin\":8.95,\"frank\":4.1,\"gina\":4.85,\"hank\":4.85,\"ivy\":0.67}, t"'
   check stage2_top    'python3 -c "from shop.orders import load_orders; from shop.stats import top_customers; t=top_customers(load_orders(\".probe/other.csv\"), 3); assert [tuple(x) for x in t]==[(\"erin\",8.95),(\"gina\",4.85),(\"hank\",4.85)], t"'
   # 段 3: CLI (前の 2 段の約束を運べているか)
   check stage3_report 'python3 cli.py report data/orders.csv out/report.json >/dev/null && python3 -c "import json; d=json.load(open(\"out/report.json\")); assert d=={\"customers\":{\"alice\":4.5,\"bob\":18.5,\"carol\":15.0},\"grand_total\":38.0,\"orders_counted\":4}, d"'
-  check stage3_top    'test "$(python3 cli.py top data/orders.csv 2)" = "$(printf "bob: 18.50\ncarol: 15.00")"'
+  check stage3_top    'out=$(python3 cli.py top data/orders.csv 2) && test "$out" = "$(printf "bob: 18.50\ncarol: 15.00")"'
+  # CLI も見せていない別データで確かめる (data/orders.csv の答えを CLI に直書きした実装を落とす)。
+  check stage3_other  'python3 cli.py report .probe/other.csv out/other.json >/dev/null && python3 -c "import json; d=json.load(open(\"out/other.json\")); assert d=={\"customers\":{\"erin\":8.95,\"frank\":4.1,\"gina\":4.85,\"hank\":4.85,\"ivy\":0.67},\"grand_total\":23.42,\"orders_counted\":7}, d" && out=$(python3 cli.py top .probe/other.csv 3) && test "$out" = "$(printf "erin: 8.95\ngina: 4.85\nhank: 4.85")"'
   # top が動くことを先に確かめる (未実装なら argparse が落ちて通ってしまうため)。
   check stage3_missing 'python3 cli.py top data/orders.csv 1 >/dev/null 2>&1 && ! python3 cli.py top nosuch.csv 1 >/dev/null 2>&1 && ! python3 cli.py report nosuch.csv out/x.json >/dev/null 2>&1'
 }

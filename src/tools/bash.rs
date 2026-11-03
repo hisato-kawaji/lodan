@@ -67,6 +67,7 @@ impl Tool for Bash {
             Err(why) => return Ok(ToolOutput::error(why)),
         };
         let unguarded = crate::sandbox::unguarded(&ctx.sandbox);
+        let gitlinks = crate::sandbox::gitlinks(&ctx.sandbox);
         let mut cmd = Command::new(program);
         cmd.args(program_args).current_dir(&ctx.cwd);
         // foreground 実行はタイムアウトや Ctrl-C 中断で future を破棄したとき
@@ -102,6 +103,17 @@ impl Tool for Bash {
             eprintln!("{}", crate::term::red_err(&warning));
             notes.push_str(&warning);
             notes.push('\n');
+        }
+        if let Some(before) = &gitlinks {
+            let changed = crate::sandbox::gitlinks(&ctx.sandbox)
+                .map(|after| crate::sandbox::changed_gitlinks(before, &after))
+                .unwrap_or_default();
+            if !changed.is_empty() {
+                let warning = crate::sandbox::gitlink_warning(&changed);
+                eprintln!("{}", crate::term::red_err(&warning));
+                notes.push_str(&warning);
+                notes.push('\n');
+            }
         }
         let body = format!(
             "$ {command}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n{notes}--- exit ---\n{code}\n"
@@ -306,6 +318,71 @@ mod tests {
             !marker.exists(),
             "child survived the timeout; kill_on_drop should have killed it"
         );
+    }
+
+    /// #162: workspace-write の Bash が埋め込みリポジトリを gitlink にしたら、ツール出力に警告が載る。
+    /// 比較の部品は `sandbox` のテストで確かめてあるので、ここでは Bash に配線されていることを見る。
+    #[tokio::test]
+    async fn a_gitlink_added_by_a_sandboxed_command_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(tmp.path()).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&ws, &["init", "-q"]);
+        std::fs::create_dir(ws.join("sub")).unwrap();
+        git(&ws.join("sub"), &["init", "-q"]);
+        git(
+            &ws.join("sub"),
+            &["commit", "-q", "--allow-empty", "-m", "s"],
+        );
+        let ctx = ToolCtx::new(ws.clone()).with_sandbox(crate::sandbox::SandboxPolicy {
+            mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+            network: true,
+            cwd: ws.clone(),
+            linked_git: None,
+        });
+        let run = |command: &'static str| {
+            let ctx = &ctx;
+            async move {
+                Bash.execute(serde_json::json!({ "command": command }), ctx)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let quiet = run("git status --short").await;
+        if quiet.is_error {
+            // サンドボックスを起動できない環境 (bwrap が無い / user namespace が塞がれている)。
+            eprintln!("skipped: no usable OS sandbox here: {}", quiet.content);
+            return;
+        }
+        assert!(
+            !quiet
+                .content
+                .contains("added or changed the embedded git repository"),
+            "{}",
+            quiet.content
+        );
+
+        let out = run("GIT_CONFIG_GLOBAL=/dev/null git add sub").await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content
+                .contains("added or changed the embedded git repository"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("sub"), "{}", out.content);
     }
 
     /// バックグラウンド実行 → Monitor で終了まで読み切れることを確認する。

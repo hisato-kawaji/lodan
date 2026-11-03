@@ -2474,6 +2474,67 @@ fn the_configured_evaluator_model_is_the_one_that_is_asked() {
     assert!(unjudged.contains("evaluator failed"), "{unjudged}");
 }
 
+/// `--plan-model` を渡したら、Plan→Execute の計画は本当にそのモデルに尋ねる (#65 C1)。
+/// 作業側の返事は計画として読めないので、計画器が作業側のままなら分解されない。
+#[test]
+fn the_configured_planner_model_is_the_one_that_makes_the_plan() {
+    let run = |extra: &[&str]| -> Vec<serde_json::Value> {
+        let home = tempfile::tempdir().unwrap();
+        let server = start_mock_with(
+            home.path(),
+            &[
+                ("MOCK_LLM_TEXT", "I am working on it."),
+                ("MOCK_LLM_JUDGE_MODEL", "the-planner"),
+                (
+                    "MOCK_LLM_JUDGE_TEXT",
+                    r#"{"steps": [{"title": "Write a.py"}, {"title": "Write b.py"}]}"#,
+                ),
+            ],
+        );
+        let log = home.path().join("run.jsonl");
+        let mut args = vec![
+            "-p",
+            "Write a.py that prints one, then write b.py that imports a.py and prints two, and keep both working.",
+            "--plan-execute",
+            "--yes",
+            "--log-jsonl",
+            log.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let out = lodan(home.path(), server.port, &args, Stdin::OpenAndSilent);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let planned = run(&["--plan-model", "the-planner"]);
+    let made = planned
+        .iter()
+        .find(|e| e["event"] == "plan_made")
+        .unwrap_or_else(|| panic!("no plan_made: {planned:?}"));
+    assert_eq!(made["steps"], 2);
+    assert_eq!(made["model"], "the-planner");
+    // 手順は作業側のモデルで走る (計画器のモデルは計画の 1 回だけ)。
+    assert_eq!(
+        planned.iter().filter(|e| e["event"] == "plan_step").count(),
+        2
+    );
+    // 陽性対照: 指定が無ければ作業側が計画し、その返事は計画として読めない。
+    let unplanned = run(&[]);
+    assert!(
+        unplanned
+            .iter()
+            .any(|e| e["event"] == "plan_skipped" && e["reason"] == "no_plan"),
+        "{unplanned:?}"
+    );
+}
+
 // ---- #88: `lodan config` は秘密を伏せる ----
 
 #[test]

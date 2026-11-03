@@ -481,6 +481,80 @@ pub fn planted_warning(paths: &[PathBuf]) -> String {
     )
 }
 
+/// index にある gitlink (mode 160000) ごとの、その中の git の指紋 (#162)。
+///
+/// 作業ディレクトリの中に作った埋め込みリポジトリを `git add` で gitlink にすると、外の `git status`
+/// などが gitlink の中を覗くときに `<gitlink>/.git/config` を読み、そこの `core.fsmonitor` が
+/// サンドボックスの**外で**走る。`.git/` はどこにでも作れるので先回りして守れない。代わりに、
+/// コマンドの前後で gitlink とその `.git` を比べ、増えたり変わったりしたら知らせる。
+pub type Gitlinks = std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>;
+
+/// 実行前と実行後に呼ぶ。workspace-write でなければ、または git の index が読めなければ None。
+pub fn gitlinks(policy: &SandboxPolicy) -> Option<Gitlinks> {
+    if policy.mode != SandboxMode::WorkspaceWrite {
+        return None;
+    }
+    // ここで走る git はサンドボックスの外。本体の config は守ってあるが、index を読むときに
+    // fsmonitor が呼ばれ得るので、コマンドラインの設定 (一番強い) で切っておく。
+    let out = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"])
+        .current_dir(&policy.cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut links = Gitlinks::new();
+    // 1 件は `<mode> <object> <stage>\t<path>`、区切りは NUL。
+    for entry in out.stdout.split(|b| *b == 0) {
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(b"160000 ") {
+            continue;
+        }
+        let path = policy
+            .cwd
+            .join(String::from_utf8_lossy(&entry[tab + 1..]).as_ref());
+        let fingerprint = git_fingerprint(&path.join(".git"));
+        links.insert(path, fingerprint);
+    }
+    Some(links)
+}
+
+/// gitlink の `.git` のうち、外の git が設定として読むもの。ディレクトリなら `config`、
+/// ファイル (サブモジュールの `gitdir: ...`) ならその中身。どちらも無ければ None。
+fn git_fingerprint(dot_git: &Path) -> Option<Vec<u8>> {
+    if dot_git.is_dir() {
+        std::fs::read(dot_git.join("config")).ok()
+    } else {
+        std::fs::read(dot_git).ok()
+    }
+}
+
+/// 実行後に呼ぶ: 実行中に増えた gitlink と、`.git` が変わった gitlink。
+pub fn changed_gitlinks(before: &Gitlinks, after: &Gitlinks) -> Vec<PathBuf> {
+    after
+        .iter()
+        .filter(|(path, now)| before.get(*path) != Some(*now))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// `changed_gitlinks` が空でないときにツール出力と利用者の両方へ出す警告。
+pub fn gitlink_warning(paths: &[PathBuf]) -> String {
+    let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    format!(
+        "[sandbox] WARNING: this command added or changed the embedded git repository {} in \
+         the index. A plain `git status` / `git diff` OUTSIDE the sandbox reads its \
+         `.git/config` (e.g. `core.fsmonitor`) and runs what it says. Review it before running \
+         git here again.",
+        list.join(", ")
+    )
+}
+
 /// サンドボックスに拒否されたらしい失敗に添える注記。モデルが同じコマンドを繰り返したり、
 /// 回り道を探したりしないように、何が起きたかを伝える。
 pub fn denial_hint(policy: &SandboxPolicy, stderr: &str, succeeded: bool) -> Option<String> {
@@ -1129,6 +1203,123 @@ mod tests {
             std::fs::read_to_string(common.join("worktrees/t-1/commondir"))
                 .unwrap()
                 .starts_with("../..")
+        );
+    }
+
+    /// テストの中で素の git を走らせる (サンドボックスの外)。利用者の設定は読ませない。
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// 作業ディレクトリを git リポジトリにした作業場。中に埋め込みリポジトリ `sub` を作っておく
+    /// (まだ index には入れない)。
+    fn repo_with_embedded() -> (tempfile::TempDir, SandboxPolicy) {
+        let root = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(root.path()).unwrap();
+        git(&ws, &["init", "-q"]);
+        let sub = ws.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "s"]);
+        let policy = SandboxPolicy {
+            mode: SandboxMode::WorkspaceWrite,
+            network: true,
+            cwd: ws,
+            linked_git: None,
+        };
+        (root, policy)
+    }
+
+    /// #162: 埋め込みリポジトリを gitlink にすると、外の git がその config を読む。増えたら必ず知らせる。
+    /// gitlink でない (untracked の) うちは外の git も中を覗かないので、知らせない。
+    #[test]
+    fn a_new_gitlink_is_reported_but_an_untracked_embedded_repository_is_not() {
+        let (_root, p) = repo_with_embedded();
+        let before = gitlinks(&p).expect("a git repository");
+        assert!(before.is_empty(), "{before:?}");
+
+        git(&p.cwd.join("sub"), &["config", "core.fsmonitor", "true"]);
+        assert!(changed_gitlinks(&before, &gitlinks(&p).unwrap()).is_empty());
+
+        git(&p.cwd, &["add", "sub"]);
+        let changed = changed_gitlinks(&before, &gitlinks(&p).unwrap());
+        assert_eq!(changed, vec![p.cwd.join("sub")]);
+        assert!(gitlink_warning(&changed).contains("sub"));
+    }
+
+    /// 既にある gitlink でも、中の config を書き換えたら同じことが起きる。
+    #[test]
+    fn rewriting_the_config_of_an_existing_gitlink_is_reported() {
+        let (_root, p) = repo_with_embedded();
+        git(&p.cwd, &["add", "sub"]);
+        let before = gitlinks(&p).unwrap();
+        assert!(changed_gitlinks(&before, &gitlinks(&p).unwrap()).is_empty());
+
+        git(&p.cwd.join("sub"), &["config", "core.fsmonitor", "true"]);
+        assert_eq!(
+            changed_gitlinks(&before, &gitlinks(&p).unwrap()),
+            vec![p.cwd.join("sub")]
+        );
+    }
+
+    /// 前後を比べるために lodan が走らせる git は、サンドボックスの外。そこで作業ディレクトリの
+    /// fsmonitor を呼ばない。workspace-write でなければ、そもそも走らせない。
+    #[test]
+    fn listing_gitlinks_does_not_run_the_fsmonitor_and_only_happens_in_workspace_write() {
+        let (root, p) = repo_with_embedded();
+        let marker = std::fs::canonicalize(root.path()).unwrap().join("PWNED");
+        git(
+            &p.cwd,
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("touch '{}'; false", marker.display()),
+            ],
+        );
+        // 陽性対照: この設定のままの素の git は、index を読むだけで fsmonitor を走らせる。
+        git(&p.cwd, &["add", "sub"]);
+        assert!(marker.exists(), "the fsmonitor must be real");
+        std::fs::remove_file(&marker).unwrap();
+
+        assert!(gitlinks(&p).is_some());
+        assert!(!marker.exists(), "lodan's own git ran the fsmonitor");
+
+        let off = SandboxPolicy {
+            mode: SandboxMode::Off,
+            ..p.clone()
+        };
+        assert!(gitlinks(&off).is_none());
+    }
+
+    /// 実際の workspace-write の中から、#162 の手順で gitlink を作れてしまうこと (塞げない) と、
+    /// それを前後の比較で拾えること。
+    #[test]
+    fn a_gitlink_made_inside_the_sandbox_is_reported() {
+        let Some(a) = usable_arena() else {
+            return;
+        };
+        git(&a.ws, &["init", "-q"]);
+        let p = workspace_write(&a, true);
+        let before = gitlinks(&p).expect("a git repository");
+        assert!(run(
+            &p,
+            "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 && \
+             git init -q sub && \
+             git -C sub -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m s && \
+             git -C sub config core.fsmonitor true && \
+             git add sub"
+        ));
+        assert_eq!(
+            changed_gitlinks(&before, &gitlinks(&p).unwrap()),
+            vec![a.ws.join("sub")]
         );
     }
 }

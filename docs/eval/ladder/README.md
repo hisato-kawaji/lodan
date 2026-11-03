@@ -16,7 +16,7 @@
 
 | 軸 | 内容 |
 |---|---|
-| **レベル** | L0 (ツール 1-2 回) → L1 (数ツールの連鎖) → L2 (要件 4-7 個を 1 ファイルで満たす) |
+| **レベル** | L0 (ツール 1-2 回) → L1 (数ツールの連鎖) → L2 (要件 4-7 個を 1 ファイルで満たす) → L3 (4-6 ファイル・2-3 段の積み上げ。先の段の成果物を後の段が使う) |
 | **判定** | 全てファイルシステムの状態と実際の実行で判定する。チェック項目単位で数え、`checks_passed/checks_total` を部分点として記録 |
 | **反復** | 同一条件を `REPEAT` 回 (既定 3)。先行ベンチで確認された PASS/FAIL の揺れを分散として見る |
 | **ablation** | `CONFIGS` で緩和策の組み合わせを切り替える。`base` は全て切った素の状態 |
@@ -60,7 +60,7 @@ python3 docs/eval/ladder/summarize.py docs/eval/ladder/results.jsonl
 ```
 
 主な環境変数: `MODEL` / `PROVIDER` / `LABEL` / `REPEAT` / `CONFIGS` / `TASKS` /
-`T_L0` `T_L1` `T_L2` (レベル別の実行上限秒) / `RESULTS` / `RUNS_DIR` / `LODAN`。
+`T_L0` `T_L1` `T_L2` `T_L3` (レベル別の実行上限秒) / `RESULTS` / `RUNS_DIR` / `LODAN`。
 
 結果は `results.jsonl` へ 1 実行 1 行で追記され、同じ `key`
 (`label/config/task/run`) の行があるものはスキップされる。長時間の実行が
@@ -89,13 +89,26 @@ lodan はヘッドレス (`-p "<prompt>" --output-format json`) で起動する�
 | `L2-cli-json` | L2 | 要件 7 個を 1 ファイルで満たす (mini-renovater S1 の縮小版) |
 | `L2-extend-cli` | L2 | 動いている既存 CLI へ 1 段積む (S2 以降の縮小版) |
 | `L2-http` | L2 | 実際に起動して応答するものを作る (S5 の縮小版) |
+| `L3-pipeline` | L3 | 読み込み → 集計 → CLI の 3 段を 4 ファイルで作る。前半の約束 (paid だけ数える・小数 2 桁) を終盤の CLI まで運べるか。集計は見せていない別データでも確かめる |
+| `L3-extend-pkg` | L3 | 既存パッケージの model → store → CLI に priority を通す。先に決めた既定値・旧形式の読み込みを後のファイルで守れるか、既存テストを壊さないか |
+
+**L3 は C1 (`plan-none`) を測るための粒度**として足した（[phase3-2026-10](phase3-2026-10.md) の
+「今のラダーは C1 にとって簡単すぎる」への対応）。C1 を足す前に、まず `think-none` だけで回して
+**基準が文脈の積み上がりで実際に劣化する**こと（終盤の段のチェックだけが落ちる、など）を確かめる。
+劣化しないなら、L3 も C1 の土俵ではない。2 タスクとも参照解で全チェックが通り、手を付けない状態では
+保存のチェック (`tests_pass`) 以外が落ちることを確かめてある。
+
+```bash
+CONFIGS="think-none" TASKS="L3" REPEAT=3 MODEL=qwen35-9b-8k:latest PROVIDER=local T_L3=1800 \
+  bash docs/eval/ladder/ladder.sh
+```
 
 ## タスクの足し方
 
 `tasks/<name>.sh` を置くだけで拾われる。契約は 4 つ。
 
 ```bash
-LEVEL=L1                  # L0 / L1 / L2 (実行時間上限の選択に使う)
+LEVEL=L1                  # L0 / L1 / L2 / L3 (実行時間上限の選択に使う)
 DESC="一行の説明"
 setup() { ... }           # 作業ディレクトリ (cwd) に fixture を用意する
 PROMPT="モデルへ渡す 1 行の指示"

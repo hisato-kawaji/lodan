@@ -5,3 +5,4 @@
 .lodan/config.local.toml
 .lodan/.config.local.toml.*.tmp
 __pycache__/
+/llmapi
